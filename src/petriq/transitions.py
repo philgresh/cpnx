@@ -1,7 +1,11 @@
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
+from petriq.sandbox import verify_callable_purity
 from petriq.tokens import Token
+
+if TYPE_CHECKING:
+    from petriq.engine import PetriNet
 
 
 @dataclass
@@ -15,30 +19,25 @@ class InputArc:
     Attributes:
         place: Name of the source place.
         count: Number of tokens to consume. Ignored when ``consume_all=True``.
-        consume_all: Drain the entire place atomically (CPN equivalent: arc
-                     expression binding a variable to the full multiset).
-                     Pragmatic extension — no direct CPN counterpart.
+        consume_all: Drain the entire place atomically.
         settle_secs: Wait for no new arrivals for this many seconds before
-                     consuming (batch-settle window). Pragmatic extension —
-                     Timed CPNs put timestamps on tokens, not settle windows
-                     on arcs.
+                     consuming.
         expression: CPN input arc expression. Receives all tokens currently
                     in the place; returns them in desired consumption order.
+                    Can be a pure Callable or a sandboxed expression string.
                     The engine consumes the first ``count`` tokens from the
                     result. ``None`` (default) = FIFO order.
-
-    Example — consume the highest-scored lead first::
-
-        InputArc("leads", count=1,
-                 expression=lambda tokens: sorted(tokens,
-                                                  key=lambda t: -t.payload.get("score", 0)))
     """
 
     place: str
     count: int = 1
     consume_all: bool = False
     settle_secs: float = 0.0
-    expression: Callable[[list[Token]], list[Token]] | None = field(default=None, compare=False)
+    expression: Callable[[list[Token]], list[Token]] | str | None = field(default=None, compare=False)
+
+    def __post_init__(self):
+        if callable(self.expression):
+            verify_callable_purity(self.expression)
 
 
 @dataclass
@@ -49,11 +48,6 @@ class OutputArc:
     evaluated against the transition's output tokens that determines whether
     tokens flow along this arc. :attr:`expression` is that predicate.
 
-    Note:
-        ``expression`` belongs on the arc, not the transition. This differs from
-        :attr:`Transition.guard`, which is a transition-level boolean predicate
-        evaluated *before* the action runs (CPN guard semantics).
-
     Attributes:
         place: Name of the target place.
         count: Number of tokens to deposit.
@@ -61,21 +55,16 @@ class OutputArc:
                     output tokens returned by the action; the arc is *skipped*
                     (no tokens deposited) when it returns ``False``. ``None``
                     (default) means the arc always fires.
-
-    Warning:
-        Do not set ``expression`` on arcs targeting
-        :class:`~petriq.places.ResourcePlace` or
-        :class:`~petriq.places.PacedResourcePlace` — resource tokens must always
-        return to a place; expressions on resource arcs are ignored by the engine.
-
-    Example — route to "fast" only when score > 0.8::
-
-        OutputArc("fast", expression=lambda tokens: tokens[0].payload.get("score", 0) > 0.8)
+                    Can be a pure Callable or a sandboxed expression string.
     """
 
     place: str
     count: int = 1
-    expression: Callable[[list[Token]], bool] | None = field(default=None, compare=False)
+    expression: Callable[[list[Token]], bool] | str | None = field(default=None, compare=False)
+
+    def __post_init__(self):
+        if callable(self.expression):
+            verify_callable_purity(self.expression)
 
 
 @dataclass
@@ -95,16 +84,45 @@ class Transition:
         outputs: Output arcs (transition → place).
         action: Callable consuming input tokens and returning output tokens.
                 Runs on the thread pool outside the engine lock.
-        guard: CPN transition guard — ``Callable[[], bool]``. Evaluated while
-               holding the engine lock; return ``False`` to block firing.
+        guard: CPN transition guard — ``Callable[[list[Token]], bool]`` or expression string.
+               Evaluated while holding the engine lock; return ``False`` to block firing.
                ``None`` (default) = always enabled.
         priority: Lower value fires first when multiple transitions are enabled.
-                  Priority classes are a recognised CPN extension (CPN Tools).
     """
 
     name: str
     inputs: list[InputArc]
     outputs: list[OutputArc]
     action: Callable[[list[Token]], list[Token]]
-    guard: Callable[[list[Token]], bool] | None = None
+    guard: Callable[[list[Token]], bool] | str | None = None
     priority: int = 10
+
+    def __post_init__(self):
+        if callable(self.action):
+            verify_callable_purity(self.action)
+        if callable(self.guard):
+            verify_callable_purity(self.guard)
+
+
+@dataclass
+class SubstitutionTransition(Transition):
+    """A transition that encapsulates an entire sub-PetriNet (Hierarchical CPN).
+
+    In CPNs, a substitution transition abstracts a subnet. The child subnet
+    is insulated from the parent net. Communication occurs strictly via Ports in
+    the subnet mapped to Sockets in the parent net.
+    """
+
+    subnet: "PetriNet" = field(default=None)  # type: ignore[assignment]
+    port_socket_map: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self):
+        super().__post_init__()
+        # Validate that the ports and sockets are structurally valid mapping names
+        if not isinstance(self.port_socket_map, dict):
+            raise TypeError("port_socket_map must be a dictionary.")
+        # Ensure context isolation: child subnet cannot refer directly to parent places
+        # that are not formally mapped.
+        for port, socket in self.port_socket_map.items():
+            if not isinstance(port, str) or not isinstance(socket, str):
+                raise TypeError("Port and socket mapping names must be strings.")

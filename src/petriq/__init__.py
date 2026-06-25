@@ -1,7 +1,7 @@
 from petriq.engine import PetriNet
 from petriq.places import PacedResourcePlace, Place, ResourcePlace, ThresholdPlace
 from petriq.tokens import Token
-from petriq.transitions import InputArc, OutputArc, Transition
+from petriq.transitions import InputArc, OutputArc, SubstitutionTransition, Transition
 from petriq.visualization import snapshot, to_dot
 
 __all__ = [
@@ -12,6 +12,7 @@ __all__ = [
     "ThresholdPlace",
     "Token",
     "Transition",
+    "SubstitutionTransition",
     "InputArc",
     "OutputArc",
     "snapshot",
