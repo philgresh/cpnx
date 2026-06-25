@@ -4,7 +4,10 @@ from typing import Any, Callable
 
 
 class SandboxEvaluator:
-    """A safe evaluator for string-based guard/arc expressions that strips dangerous builtins."""
+    """A safe evaluator for string-based guard/arc expressions.
+
+    Strictly validates allowed callables using an AST allowlist.
+    """
 
     ALLOWED_BUILTINS = {
         "abs": abs,
@@ -19,6 +22,19 @@ class SandboxEvaluator:
         "str": str,
     }
 
+    ALLOWED_METHODS = {
+        "get",
+        "keys",
+        "values",
+        "items",
+        "startswith",
+        "endswith",
+        "lower",
+        "upper",
+        "split",
+        "join",
+    }
+
     @classmethod
     def evaluate(cls, expression_str: str, context_dict: dict[str, Any]) -> Any:
         """Parse and evaluate expression_str safely without access to dangerous builtins."""
@@ -26,14 +42,14 @@ class SandboxEvaluator:
         exec_tree = ast.parse(expression_str, mode="exec")
         for node in ast.walk(exec_tree):
             if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in {
-                    "open",
-                    "print",
-                    "eval",
-                    "exec",
-                    "__import__",
-                }:
-                    raise PermissionError(f"Forbidden call to '{node.func.id}' in sandbox.")
+                if isinstance(node.func, ast.Name):
+                    if node.func.id not in cls.ALLOWED_BUILTINS:
+                        raise PermissionError(f"Forbidden call to '{node.func.id}' in sandbox.")
+                elif isinstance(node.func, ast.Attribute):
+                    if node.func.attr not in cls.ALLOWED_METHODS:
+                        raise PermissionError(f"Forbidden call to method '{node.func.attr}' in sandbox.")
+                else:
+                    raise PermissionError("Forbidden complex call in sandbox.")
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 raise PermissionError("Imports are forbidden in sandbox.")
             elif isinstance(node, ast.Attribute):

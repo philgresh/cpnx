@@ -24,6 +24,14 @@ def test_sandbox_evaluator_blacklist():
     with pytest.raises(PermissionError, match="Imports are forbidden"):
         SandboxEvaluator.evaluate("import os", {"tokens": []})
 
+    # Non-whitelisted attribute calls are blocked
+    with pytest.raises(PermissionError, match="Forbidden call to method 'system'"):
+        SandboxEvaluator.evaluate("os.system('ls')", {"tokens": []})
+
+    # Complex/nested calls are blocked
+    with pytest.raises(PermissionError, match="Forbidden complex call"):
+        SandboxEvaluator.evaluate("func()()", {"tokens": []})
+
 
 def test_sandbox_evaluator_private_attributes():
     # Accessing private/dunder attributes starting with _ is forbidden
