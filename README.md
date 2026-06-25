@@ -1,60 +1,56 @@
-# petriq
+# cpnx
 
-[![PyPI version](https://img.shields.io/pypi/v/petriq.svg)](https://pypi.org/project/petriq/)
-[![Python versions](https://img.shields.io/pypi/pyversions/petriq.svg)](https://pypi.org/project/petriq/)
-[![CI status](https://github.com/philgresh/petriq/actions/workflows/ci.yml/badge.svg)](https://github.com/philgresh/petriq/actions)
+[![PyPI version](https://img.shields.io/pypi/v/cpnx.svg)](https://pypi.org/project/cpnx/)
+[![Python versions](https://img.shields.io/pypi/pyversions/cpnx.svg)](https://pypi.org/project/cpnx/)
+[![CI status](https://github.com/philgresh/cpnx/actions/workflows/ci.yml/badge.svg)](https://github.com/philgresh/cpnx/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**petriq** is a lightweight, zero-dependency Petri net executor for concurrent Python pipelines.
+**cpnx** is a Coloured Petri Net (CPN) executor for concurrent Python pipelines — zero dependencies, stdlib-only threading.
 
 ---
 
 ## Motivation
 
-Python has excellent Petri net modeling libraries (like SNAKES for formal analysis and pm4py for process mining) but lacks a lightweight concurrent runtime executor. Developers managing resource-constrained workflows (e.g., GPU slots, API rate limits, database connection pools) often stitch together `threading.Semaphore`, `ThreadPoolExecutor`, and `queue.Queue` by hand—an ad-hoc wiring that is hard to visualize and impossible to analyze for deadlocks. 
+Python has excellent Petri net modeling libraries (like [SNAKES](https://snakes.ibisc.univ-evry.fr/) for formal analysis and [pm4py](https://pm4py.fit.fraunhofer.de/) for process mining) but lacks a lightweight concurrent runtime executor. Developers managing resource-constrained workflows (GPU slots, API rate limits, database connection pools) often stitch together `threading.Semaphore`, `ThreadPoolExecutor`, and `queue.Queue` by hand — ad-hoc wiring that is hard to visualise and impossible to formally reason about.
 
-`petriq` fills this gap: it lets you model your concurrent pipeline as a Petri net where the engine executes transitions as real concurrent work on thread pools, guarantees resource return on failure, handles rate limits gracefully, and remains under 400 lines of robust, stdlib-only Python code.
+**cpnx** fills this gap: it models your concurrent pipeline as a Coloured Petri Net where transitions execute real work on thread pools, resource tokens are returned atomically on failure, and the net's structure makes resource contention a mathematical property rather than scattered locking code.
+
+The execution model is aligned with Jensen's CPN formalism (see [Theoretical Foundation](#theoretical-foundation)), so the net you write is also amenable to formal analysis with standard CPN tools.
 
 ---
 
 ## Install
 
-Install `petriq` via pip:
-
 ```bash
-pip install petriq
+pip install cpnx
 ```
 
 ---
 
 ## Quickstart
 
-Here is a complete, runnable example showing how to manage a pool of 2 GPU slots across 10 concurrent training jobs:
+A pool of 2 GPU slots shared across 10 concurrent training jobs:
 
 ```python
-"""examples/gpu_pipeline.py — GPU slot management with petriq."""
+"""examples/gpu_pipeline.py — GPU slot management with cpnx."""
 
 import time
-from petriq import InputArc, OutputArc, PetriNet, Place, ResourcePlace, Token, Transition
+from cpnx import InputArc, OutputArc, PetriNet, Place, ResourcePlace, Token, Transition
 
 
 def train_model(tokens: list[Token]) -> list[Token]:
-    # tokens[0] is the raw data token
     data = tokens[0]
-    time.sleep(0.5)  # Simulate GPU training work
-    data.payload["trained"] = True
-    return [data]
+    time.sleep(0.5)  # simulate GPU work
+    # Tokens are immutable — produce a new one with updated payload
+    return [data.evolve(payload_updates={"trained": True})]
 
 
-# Initialize the Petri Net engine
 net = PetriNet(max_workers=4)
 
-# Create places
 net.add_place(Place("raw_data"))
 net.add_place(Place("trained_models"))
 net.add_place(ResourcePlace("gpu_slots", capacity=2))
 
-# Define the training transition
 net.add_transition(Transition(
     name="train",
     inputs=[InputArc("raw_data"), InputArc("gpu_slots")],
@@ -62,17 +58,14 @@ net.add_transition(Transition(
     action=train_model,
 ))
 
-# Deposit 10 raw data items
 for i in range(10):
     net.deposit("raw_data", Token(payload={"model_id": i}))
 
-# Run the net until all work is complete (or deadline is reached)
 net.run(deadline=time.monotonic() + 30)
 
-print(f"Trained: {len(net.places['trained_models'].tokens)}")
+print(f"Trained:            {len(net.places['trained_models'].tokens)}")
 print(f"GPU slots returned: {len(net.places['gpu_slots'].tokens)}")
-# Output:
-# Trained: 10
+# Trained:            10
 # GPU slots returned: 2
 ```
 
@@ -80,12 +73,12 @@ print(f"GPU slots returned: {len(net.places['gpu_slots'].tokens)}")
 
 ## Core Concepts
 
-A Petri net consists of **places** (token containers), **transitions** (processing steps), and **arcs** (directed connections).
+A CPN consists of **places** (token containers), **transitions** (processing steps), and **arcs** (directed connections). Tokens carry a **colour** that determines which places they may occupy and which transitions may consume them.
 
 ```mermaid
 graph LR
-    raw_data(("Place: raw_data<br>(FIFO Token Buffer)")) --> train[Transition: train]
-    gpu_slots(("ResourcePlace: gpu_slots<br>(Bounded Capacity Pool)")) --> train
+    raw_data(("Place: raw_data")) --> train[Transition: train]
+    gpu_slots(("ResourcePlace: gpu_slots\n(capacity=2)")) --> train
     train --> trained_models(("Place: trained_models"))
     train --> gpu_slots
 
@@ -95,63 +88,114 @@ graph LR
     style train fill:#fffde7,stroke:#fbc02d,stroke-width:2px
 ```
 
-- **Tokens**: The data payloads or resource permits passing through the system.
-- **Places**: Buffers that hold tokens. Custom place types include:
-  - `Place`: Unbounded FIFO queue for data/work items.
-  - `ResourcePlace`: Pre-filled bounded pool of resource permits.
-  - `PacedResourcePlace`: Like `ResourcePlace`, but returned resource tokens cool down for a specified duration before becoming reusable.
-  - `ThresholdPlace`: Holds tokens that are only consumable when the queue depth reaches a configured threshold (great for batch processing).
-- **Transitions**: Compute steps. A transition is *enabled* when all input places contain enough tokens and any user-defined guard functions return `True`. When fired, it consumes input tokens, executes an action on the thread pool, and deposits output tokens.
-- **Resource Return Invariant**: If a transition raises an exception, the engine automatically catches it, sends the offending data token to the `error_place` (default `"failed"`), and guarantees all resource tokens are returned to their source places. This prevents deadlocks even if network calls or model steps fail.
+### Tokens
+
+Tokens are **immutable**. Their `payload` is a [`FrozenDict`](#frozendict) — a hashable, recursively-immutable mapping. To produce a token with updated data, use `token.evolve()`:
+
+```python
+result = token.evolve(payload_updates={"score": 0.92})
+```
+
+Each token carries a `color: str | None` field — the CPN colour. `None` means an uncoloured data token; `"resource"` is the built-in colour for permit tokens. You can define your own colours for domain-typed nets.
+
+### Places
+
+All places are thread-safe.
+
+| Type | Behaviour |
+|---|---|
+| `Place` | Unbounded FIFO queue for data/work items |
+| `ResourcePlace(capacity)` | Pre-filled bounded pool of `"resource"` permit tokens; returned on transition completion or failure |
+| `PacedResourcePlace(capacity, pacing_secs)` | Like `ResourcePlace`, but returned tokens cool down for `pacing_secs` before becoming reusable (rate-limiting) |
+| `ThresholdPlace(threshold)` | Tokens only consumable once the queue depth reaches `threshold` (batch accumulation) |
+
+### Transitions
+
+A transition is **enabled** when all input places contain sufficient tokens and any guard expression evaluates to `True`. When fired, it consumes input tokens, executes the action on a thread pool, and deposits output tokens.
+
+**Resource Return Invariant:** if a transition action raises, the engine catches the exception, routes the data token to the `error_place` (default: `"failed"`), and atomically returns all resource tokens to their source places. Deadlocks from failed actions are structurally impossible.
+
+### Arc Expressions
+
+Both `InputArc` and `OutputArc` accept an `expression` — a callable that filters or orders token consumption (input) or gates token deposit (output):
+
+```python
+# Consume the highest-priority lead first
+InputArc("leads", count=1,
+         expression=lambda tokens: sorted(tokens, key=lambda t: -t.payload.get("score", 0)))
+
+# Only deposit to the output place if processing succeeded
+OutputArc("results", expression=lambda tokens: bool(tokens))
+```
+
+### Marking
+
+The **marking** is the complete distribution of tokens across all places at a given moment — the formal CPN state:
+
+```python
+m = net.marking           # dict[str, list[Token]]
+dead = net.is_dead()      # True if no transition can fire in this marking
+quiet = net.is_quiescent()  # True if dead AND no in-flight transitions
+```
 
 ---
 
 ## API Reference
 
-### Token
+### `Token`
 
 ```python
-@dataclass
+@dataclass(frozen=True)
 class Token:
-    id: str = ...          # Unique 16-character ID
-    payload: dict = ...    # User payload dict
-    created_at: float = ... # Monotonic creation time
-    is_resource: bool = False # Flag identifying resource tokens
+    id: str              # 16-char hex, auto-generated
+    payload: FrozenDict  # immutable enrichment data; use .evolve() to update
+    created_at: float    # monotonic creation timestamp
+    color: str | None    # CPN colour; None = uncoloured, "resource" = permit token
+    available_at: float  # timed CPN: earliest time this token may be consumed
+
+    def evolve(self, payload_updates: dict | None = None, **field_updates) -> Token: ...
+    @property
+    def is_resource(self) -> bool: ...  # shorthand for color == "resource"
+```
+
+### `FrozenDict`
+
+An immutable, hashable mapping. Nested dicts and lists are frozen recursively at construction time.
+
+```python
+fd = FrozenDict({"x": 1, "tags": ["a", "b"]})
+fd["x"]          # 1
+fd.as_dict()     # {"x": 1, "tags": ["a", "b"]}  — plain dict, JSON-serialisable
+fd.set("y", 2)   # returns a new FrozenDict — fd is unchanged
 ```
 
 ### Places
 
-All places are fully thread-safe.
+```python
+Place(name: str, bound: int | None = None, color_set: set[str] | None = None,
+      initial_marking: list[Token] | None = None)
 
-#### `Place(name: str)`
-Unbounded FIFO queue.
+ResourcePlace(name: str, capacity: int)
+PacedResourcePlace(name: str, capacity: int, pacing_secs: float)
+ThresholdPlace(name: str, threshold: int)
+```
 
-#### `ResourcePlace(name: str, capacity: int)`
-Pre-filled pool with `capacity` resource tokens (each has `is_resource=True`).
-
-#### `PacedResourcePlace(name: str, capacity: int, pacing_secs: float)`
-Resource pool where returned tokens are delayed by `pacing_secs` cooldown before being available for consumption again.
-
-#### `ThresholdPlace(name: str, threshold: int)`
-FIFO queue where tokens are only eligible for retrieval when the total count is `>= threshold`.
-
----
+- `bound` — k-bounded place; raises if a deposit would exceed capacity (standard CPN)
+- `color_set` — if set, `deposit()` rejects tokens whose `color` is not in the set
+- `initial_marking` — tokens deposited at construction time
 
 ### Arcs
 
-#### `InputArc(place: str, count: int = 1, consume_all: bool = False, settle_secs: float = 0.0)`
-- `place`: Source place name.
-- `count`: Minimum number of tokens required.
-- `consume_all`: If `True`, consumes all tokens currently in the place (useful for batching).
-- `settle_secs`: If specified, waits until no new tokens have arrived in the place for this duration before allowing retrieval.
+```python
+InputArc(place: str, count: int = 1, consume_all: bool = False,
+         settle_secs: float = 0.0,
+         expression: Callable[[list[Token]], list[Token]] | None = None)
 
-#### `OutputArc(place: str, count: int = 1)`
-- `place`: Target place name.
-- `count`: Number of tokens to deposit.
+OutputArc(place: str, count: int = 1,
+          expression: Callable[[list[Token]], bool] | None = None)
+```
 
----
-
-### Transition
+### `Transition`
 
 ```python
 @dataclass
@@ -160,68 +204,101 @@ class Transition:
     inputs: list[InputArc]
     outputs: list[OutputArc]
     action: Callable[[list[Token]], list[Token]]
-    guard: Callable[[], bool] | None = None
-    priority: int = 10  # Lower numbers fire first
+    guard: Callable[[], bool] | str | None = None  # transition guard (CPN standard)
+    priority: int = 10  # lower fires first among equally-enabled transitions
 ```
 
----
-
-### PetriNet
+### `PetriNet`
 
 ```python
 class PetriNet:
-    def __init__(self, max_workers: int = 4, error_place: str = "failed"): ...
-    
+    def __init__(self, max_workers: int = 4, timeout_secs: float = 30.0,
+                 expr_timeout_secs: float = 0.1, error_place: str = "failed",
+                 places: list[Place] | None = None,
+                 transitions: list[Transition] | None = None): ...
+
     def add_place(self, place: Place) -> None: ...
     def add_transition(self, transition: Transition) -> None: ...
     def deposit(self, place_name: str, token: Token) -> None: ...
-    
-    def step(self) -> bool: ...          # Fire a single enabled transition, scheduling it asynchronously
-    def run(self, deadline: float) -> None: ... # Block and execute enabled transitions until quiescent or deadline
-    
-    def snapshot(self) -> dict: ...      # Returns a JSON-serializable representation of current markings
-    def to_dot(self) -> str: ...         # Generates a Graphviz DOT representation of the Petri net
-    def is_quiescent(self) -> bool: ...  # Returns True if no transitions are running, and no transitions can fire
-    
-    # User-definable callback hooks:
-    on_transition_fired: Callable[[str, float], None] | None         # (transition_name, duration_secs)
+
+    def step(self) -> bool: ...                  # fire one enabled transition; False if none
+    def run(self, deadline: float) -> None: ...  # loop until quiescent or deadline
+
+    @property
+    def marking(self) -> dict[str, list[Token]]: ...  # current CPN marking
+    def is_dead(self) -> bool: ...                # no transition enabled in current marking
+    def is_quiescent(self) -> bool: ...           # dead AND no in-flight transitions
+    def advance_time(self, t: float) -> None: ... # advance timed CPN model clock
+    def snapshot(self) -> dict: ...               # JSON-serialisable marking snapshot
+    def to_dot(self) -> str: ...                  # Graphviz DOT representation
+
+    # Callback hooks
+    on_transition_fired: Callable[[str, float], None] | None         # (name, duration_secs)
     on_token_deposited: Callable[[str, Token], None] | None          # (place_name, token)
-    on_error: Callable[[str, Exception, Token | None], None] | None # (transition_name, exception, token)
+    on_error: Callable[[str, Exception, Token | None], None] | None  # (name, exc, token)
 ```
 
 ---
 
 ## Examples
 
-The following example scripts are located in the [examples/](examples/) directory:
-
-- [examples/gpu_pipeline.py](examples/gpu_pipeline.py): Models GPU slot constraints and shows how concurrent jobs are throttled.
-- [examples/api_rate_limit.py](examples/api_rate_limit.py): Shows how to use pacing and tokens to enforce external API rate limits.
-- [examples/etl_pipeline.py](examples/etl_pipeline.py): Demonstrates a multi-stage ETL pipeline using a `ThresholdPlace` to transform tokens in batches.
-
----
-
-## FAQ
-
-#### Why not Airflow or Celery?
-Airflow and Celery are excellent for heavy, distributed, slow-running DAGs. They are, however, heavyweight, require external message brokers/databases (Redis, Postgres), and add deployment complexity. `petriq` is a zero-dependency in-process threading library designed for fine-grained resource control within a single Python process.
-
-#### Why not asyncio?
-The primary target audience (ML/AI pipelines, CPU-bound parsing, legacy database integrations) uses synchronous libraries. Using thread pools allows synchronous code to run concurrently without rewriting blocking calls to async.
-
-#### Can it prevent deadlocks?
-Yes, Petri nets are mathematically analyzer-friendly. By expressing your orchestration constraints as explicit place and token structures rather than scattered locks, you can easily reason about and verify deadlock-free properties of your pipeline.
+- [examples/gpu_pipeline.py](examples/gpu_pipeline.py) — GPU slot pool; shows concurrent throttling
+- [examples/api_rate_limit.py](examples/api_rate_limit.py) — paced resource tokens enforce external API rate limits
+- [examples/etl_pipeline.py](examples/etl_pipeline.py) — multi-stage ETL using `ThresholdPlace` for batch accumulation
 
 ---
 
 ## Sandboxing & Pure Evaluation
 
-For safety and mathematical purity, `petriq` supports two ways of expressing guards and arc expressions:
-1. **String Expressions**: These are evaluated via `SandboxEvaluator` which performs static AST analysis to enforce a strict allowlist of mathematical and comparison operations. This provides a hermetic sandbox.
-2. **Callable Expressions**: Python callable objects (e.g. lambdas or functions) can also be used. While these are executed within a separate thread pool (`cpnx-expr`) and constrained by a timeout (`timeout_secs`), they are **not** I/O-isolated. In-memory closures can capture external modules or mutable states. Full hermetic sandboxing requires using string expressions.
+cpnx supports two forms of guard and arc expressions:
+
+1. **String expressions** — evaluated by `SandboxEvaluator` via static AST analysis against a strict allowlist of mathematical and comparison operations. Fully hermetic.
+
+2. **Callable expressions** — Python functions or lambdas. Executed in a separate thread pool (`cpnx-expr`) bounded by `expr_timeout_secs` (default 100 ms). Not I/O-isolated, but `verify_callable_purity` performs AST analysis at construction time to block common I/O calls (`open`, `print`, `time.sleep`, `os.system`, etc.). Full hermetic isolation requires string expressions.
+
+---
+
+## FAQ
+
+### Why not Airflow or Celery?
+
+Airflow and Celery are excellent for distributed, long-running DAGs. They require external brokers (Redis, Postgres) and add deployment complexity. cpnx is an in-process threading library for fine-grained resource control within a single Python process — no infrastructure required.
+
+### Why not asyncio?
+
+ML/AI pipelines, CPU-bound parsing, and legacy database integrations use synchronous libraries. Thread pools let synchronous code run concurrently without rewriting blocking calls to async.
+
+### Can it prevent deadlocks?
+
+Structurally, yes — as long as resource tokens are always returned (which the Resource Return Invariant enforces). Beyond that, CPNs are amenable to formal reachability analysis: expressing constraints as explicit token structures rather than scattered locks makes deadlock-freedom properties checkable with standard CPN tools.
+
+---
+
+## Theoretical Foundation
+
+cpnx's execution model is aligned with **Coloured Petri Nets (CPNs)** as formalised by Kurt Jensen's group at Aarhus University. The key CPN concepts — colour sets, arc expressions, transition guards, formal markings, and k-bounded places — map directly onto cpnx's API.
+
+**References:**
+
+- Jensen, K. et al. — *CPN Group at Aarhus University* — https://cs.au.dk/cpnets  
+  The canonical reference for CPN theory, tools (CPN Tools), and formalism.
+
+- Winkler, T. et al. — *CPN-Py: A Python Framework for Coloured Petri Nets* (2025) — https://arxiv.org/html/2506.12238v1  
+  The closest Python CPN library; cpnx differs by targeting concurrent **execution** rather than sequential **simulation** and formal state-space analysis.
+
+**Where cpnx intentionally diverges from standard CPN theory:**
+
+| cpnx feature | Status |
+|---|---|
+| `PacedResourcePlace`, `settle_secs` | Pragmatic concurrency extensions; no CPN equivalent |
+| `expr_timeout_secs`, `verify_callable_purity` | Pragmatic sandboxing; no CPN equivalent |
+| `is_quiescent()` | Dead marking AND no in-flight threads; no single CPN term |
+| `ResourcePlace`, `ThresholdPlace` | CPN patterns expressed as typed place shorthands |
+| `Place.bound` | Standard CPN: k-bounded place |
+| `Token.color`, `Place.color_set` | Standard CPN: colours and colour sets |
 
 ---
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT — see [LICENSE](LICENSE).
