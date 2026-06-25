@@ -236,3 +236,33 @@ def test_name_overlap_raises():
     )
     with pytest.raises(ValueError, match="already registered as a Transition"):
         net2.add_place(Place("shared_name"))
+
+
+def test_memoryerror_does_not_leak_running_count():
+    with PetriNet(max_workers=1) as net:
+        net.add_place(Place("input"))
+
+        def raise_memory_error(tokens):
+            raise MemoryError()
+
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[InputArc("input")],
+                outputs=[],
+                action=raise_memory_error,
+            )
+        )
+
+        net.deposit("input", Token())
+        assert net.step() is True
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with net._lock:
+                if net._running_count == 0:
+                    break
+            time.sleep(0.01)
+
+        with net._lock:
+            assert net._running_count == 0
