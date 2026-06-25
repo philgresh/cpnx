@@ -1,4 +1,5 @@
 import time
+import types
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -8,14 +9,19 @@ from uuid import uuid4
 class FrozenDict(Mapping):
     """An immutable dictionary wrapper that recursively freezes nested dicts and lists."""
 
+    __slots__ = ("_data", "_hash")
+
     def __init__(self, data: Mapping | None = None, **kwargs) -> None:
-        self._data = {}
+        temp = {}
         if data is not None:
             for k, v in data.items():
-                self._data[k] = self._freeze(v)
+                temp[k] = self._freeze(v)
         for k, v in kwargs.items():
-            self._data[k] = self._freeze(v)
-        self._hash = None
+            temp[k] = self._freeze(v)
+        # wrap in MappingProxyType to make it truly read-only
+        self._data = types.MappingProxyType(temp)
+        # Eagerly compute the hash to avoid post-construction mutation (M1)
+        self._hash = hash(frozenset(self._data.items()))
 
     def _freeze(self, val: Any) -> Any:
         if isinstance(val, (dict, Mapping)):
@@ -34,15 +40,13 @@ class FrozenDict(Mapping):
         return iter(self._data)
 
     def __hash__(self) -> int:
-        if self._hash is None:
-            self._hash = hash(frozenset(self._data.items()))
         return self._hash
 
     def __repr__(self) -> str:
-        return f"FrozenDict({self._data!r})"
+        return f"FrozenDict({dict(self._data)!r})"
 
-    def copy(self) -> dict:
-        return self._data.copy()
+    def as_dict(self) -> dict:
+        return dict(self._data)
 
     def set(self, key: Any, value: Any) -> "FrozenDict":
         """Functional update: return a new FrozenDict with key=value."""
