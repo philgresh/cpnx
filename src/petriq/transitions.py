@@ -106,5 +106,5 @@ class Transition:
     inputs: list[InputArc]
     outputs: list[OutputArc]
     action: Callable[[list[Token]], list[Token]]
-    guard: Callable[[], bool] | None = None
+    guard: Callable[[list[Token]], bool] | None = None
     priority: int = 10

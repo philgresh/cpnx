@@ -371,6 +371,7 @@ class PetriNet:
         Checks token availability (including cooldowns and thresholds), settle
         windows, and the user-supplied guard. Called while holding ``self._lock``.
         """
+        candidate_tokens: list[Token] = []
         for arc in transition.inputs:
             place = self.places.get(arc.place)
             if place is None:
@@ -382,6 +383,17 @@ class PetriNet:
                 # reading it here (also under self._lock) is safe without place._lock.
                 if time.monotonic() - place.last_deposit_time < arc.settle_secs:
                     return False
+
+            # Speculatively resolve candidate tokens
+            if arc.consume_all:
+                tokens = list(place._tokens)
+            elif arc.expression is not None:
+                ordered = arc.expression(place.tokens)
+                tokens = ordered[: arc.count]
+            else:
+                tokens = place.peek(arc.count)
+            candidate_tokens.extend(tokens)
+
         # Back-pressure: refuse to fire if an unguarded output arc's target place is full.
         # Guarded arcs are skipped — their target may never receive a token, so checking
         # capacity speculatively would cause spurious blocking.
@@ -394,7 +406,7 @@ class PetriNet:
 
         if transition.guard is not None:
             try:
-                if not transition.guard():
+                if not transition.guard(candidate_tokens):
                     return False
             except Exception:
                 return False
@@ -408,6 +420,7 @@ class PetriNet:
         as present) and settle windows. Used by :meth:`is_quiescent` to distinguish
         "no work possible" from "work temporarily blocked by timing".
         """
+        candidate_tokens: list[Token] = []
         for arc in transition.inputs:
             place = self.places.get(arc.place)
             if place is None:
@@ -415,12 +428,23 @@ class PetriNet:
             if isinstance(place, PacedResourcePlace):
                 if len(place) < arc.count:
                     return False
+                tokens = list(place._tokens)[: arc.count]
             else:
                 if not place.can_retrieve(arc.count):
                     return False
+                # Speculatively resolve candidate tokens
+                if arc.consume_all:
+                    tokens = list(place._tokens)
+                elif arc.expression is not None:
+                    ordered = arc.expression(place.tokens)
+                    tokens = ordered[: arc.count]
+                else:
+                    tokens = place.peek(arc.count)
+            candidate_tokens.extend(tokens)
+
         if transition.guard is not None:
             try:
-                if not transition.guard():
+                if not transition.guard(candidate_tokens):
                     return False
             except Exception:
                 return False

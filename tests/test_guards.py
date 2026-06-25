@@ -20,7 +20,7 @@ class TestTransitionGuard:
                 inputs=[InputArc("input")],
                 outputs=[OutputArc("output")],
                 action=lambda tokens: tokens,
-                guard=lambda: allow,
+                guard=lambda tokens: allow,
             )
         )
 
@@ -39,7 +39,7 @@ class TestTransitionGuard:
                 inputs=[InputArc("input")],
                 outputs=[OutputArc("output")],
                 action=lambda tokens: tokens,
-                guard=lambda: True,
+                guard=lambda tokens: True,
             )
         )
 
@@ -61,7 +61,7 @@ class TestTransitionGuard:
                 inputs=[InputArc("input")],
                 outputs=[OutputArc("output")],
                 action=lambda tokens: tokens,
-                guard=lambda: state["allow"],
+                guard=lambda tokens: state["allow"],
             )
         )
 
@@ -78,7 +78,7 @@ class TestTransitionGuard:
         net.add_place(Place("input"))
         net.add_place(Place("output"))
 
-        def bad_guard():
+        def bad_guard(tokens):
             raise RuntimeError("guard blew up")
 
         net.add_transition(
@@ -109,7 +109,7 @@ class TestTransitionGuard:
                 inputs=[InputArc("input"), InputArc("res")],
                 outputs=[OutputArc("output"), OutputArc("res")],
                 action=lambda tokens: [t for t in tokens if not t.is_resource],
-                guard=lambda: gate_open,
+                guard=lambda tokens: gate_open,
             )
         )
 
@@ -121,3 +121,32 @@ class TestTransitionGuard:
         net.run(deadline=time.monotonic() + 1.0)
         assert len(net.places["output"].tokens) == 1
         assert len(net.places["res"].tokens) == 1  # resource returned
+
+    def test_guard_receives_candidate_tokens(self):
+        net = PetriNet(max_workers=2)
+        net.add_place(Place("input"))
+        net.add_place(Place("output"))
+
+        received_tokens = []
+
+        def check_tokens(tokens):
+            received_tokens.extend(tokens)
+            return len(tokens) == 1 and tokens[0].payload.get("key") == "val"
+
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[InputArc("input")],
+                outputs=[OutputArc("output")],
+                action=lambda tokens: tokens,
+                guard=check_tokens,
+            )
+        )
+
+        t = Token(payload={"key": "val"})
+        net.deposit("input", t)
+        assert net.step()
+        net.run(deadline=time.monotonic() + 1.0)
+        assert len(net.places["output"].tokens) == 1
+        assert len(received_tokens) == 1
+        assert received_tokens[0] == t
