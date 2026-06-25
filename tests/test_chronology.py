@@ -26,6 +26,10 @@ def test_monotonic_clock_advance():
     with pytest.raises(ValueError, match="Clock mutability violation"):
         net.advance_time(90.0)
 
+    # Equal timestamp also raises ValueError
+    with pytest.raises(ValueError, match="Clock mutability violation"):
+        net.advance_time(105.5)
+
 
 def test_token_availability_time_gating():
     net = PetriNet()

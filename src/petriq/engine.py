@@ -133,9 +133,9 @@ class PetriNet:
     def advance_time(self, new_time: float) -> None:
         """Advance the logical clock of the net. Must be strictly monotonic."""
         with self._lock:
-            if self._model_time is not None and new_time < self._model_time:
+            if self._model_time is not None and new_time <= self._model_time:
                 raise ValueError(
-                    f"Clock mutability violation: cannot decrement global clock backward "
+                    f"Clock mutability violation: cannot decrement global clock backward or equal "
                     f"from {self._model_time} to {new_time}."
                 )
             self._model_time = new_time
