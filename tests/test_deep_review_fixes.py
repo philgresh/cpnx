@@ -225,3 +225,58 @@ class TestW2ModelTimeReadUnderLock:
 
         # Net ran without raising — lock-guarded read was safe
         assert len(net.places["socket_out"].tokens) == 1
+
+
+class TestM2ExprTimeoutDoesNotStallEngineLock:
+    """M2: expr_timeout_secs bounds how long the engine lock is held during expression eval."""
+
+    def test_expr_timeout_secs_param_accepted(self):
+        net = PetriNet(expr_timeout_secs=0.05)
+        assert net.expr_timeout_secs == 0.05
+
+    def test_slow_expression_times_out_with_expr_timeout(self):
+        """Expression that sleeps past expr_timeout_secs disables the transition (W1 path)."""
+        net = PetriNet(
+            expr_timeout_secs=0.05,
+            places=[Place("p"), Place("out")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[
+                        InputArc(
+                            "p",
+                            expression=lambda tokens: (time.sleep(0.5), tokens)[1],
+                        )
+                    ],
+                    outputs=[OutputArc("out")],
+                    action=lambda tokens: tokens,
+                )
+            ],
+        )
+        net.deposit("p", Token())
+        # Slow expression times out → transition disabled → step() returns False quickly
+        start = time.monotonic()
+        result = net.step()
+        elapsed = time.monotonic() - start
+        assert result is False
+        # Engine lock was not held for more than a generous multiple of expr_timeout_secs
+        assert elapsed < 0.5, f"step() took {elapsed:.2f}s — lock held too long"
+
+    def test_fast_expression_uses_expr_timeout_not_action_timeout(self):
+        """A fast expression is not penalised by the larger action timeout_secs."""
+        net = PetriNet(
+            timeout_secs=10.0,   # large action timeout
+            expr_timeout_secs=0.1,
+            places=[Place("p"), Place("out")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("p", expression=lambda tokens: tokens)],
+                    outputs=[OutputArc("out")],
+                    action=lambda tokens: tokens,
+                )
+            ],
+        )
+        net.deposit("p", Token())
+        net.run(deadline=time.monotonic() + 2.0)
+        assert len(net.places["out"].tokens) == 1
