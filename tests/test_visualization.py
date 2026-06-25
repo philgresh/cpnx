@@ -40,14 +40,14 @@ class TestSnapshot:
         token_data = snap["places"]["p"][0]
         assert token_data["id"] == t.id
         assert token_data["payload"] == {"x": 1}
-        assert token_data["is_resource"] is False
+        assert token_data["color"] is None
         assert isinstance(token_data["created_at"], float)
 
     def test_snapshot_resource_token_flagged(self):
         net = PetriNet()
         net.add_place(ResourcePlace("gpu", capacity=2))
         snap = net.snapshot()
-        assert all(t["is_resource"] for t in snap["places"]["gpu"])
+        assert all(t["color"] == "resource" for t in snap["places"]["gpu"])
 
     def test_snapshot_running_count(self):
         net = PetriNet()

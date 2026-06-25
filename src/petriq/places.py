@@ -6,6 +6,11 @@ All place classes are thread-safe. Choose the right type for your use case:
 - :class:`ResourcePlace`      — bounded permit pool (GPU slots, DB connections)
 - :class:`PacedResourcePlace` — permit pool with per-token cooldown (API rate limits)
 - :class:`ThresholdPlace`     — accumulates tokens until a batch threshold is met
+
+**CPN alignment:** In Coloured Petri Net theory a place has a *colour set* —
+the type of tokens it accepts. :attr:`Place.color_set` exposes this directly.
+:class:`ResourcePlace` and :class:`PacedResourcePlace` are Python shorthands for
+a place whose colour set is ``{"resource"}`` with a pre-filled initial marking.
 """
 
 import threading
@@ -18,19 +23,44 @@ from petriq.tokens import Token
 class Place:
     """An unbounded FIFO queue that holds tokens flowing through a Petri net.
 
+    **CPN equivalent:** a place with an unrestricted colour set (accepts any
+    colour) and no initial marking. Set ``color_set`` to restrict accepted
+    colours; set ``initial_marking`` to pre-fill with tokens at construction.
+
     All operations are thread-safe via an internal :class:`threading.Lock`.
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        bound: int | None = None,
+        color_set: set[str] | None = None,
+        initial_marking: list[Token] | None = None,
+    ) -> None:
         """Create a new Place.
 
         Args:
             name: Unique identifier for this place within a :class:`PetriNet`.
+            bound: Optional k-bound (capacity constraint). The engine will not
+                   fire a transition whose unguarded output arc targets this place
+                   if doing so would exceed the bound. ``None`` (default) means
+                   unbounded — this is standard CPN k-bounded place semantics.
+            color_set: Set of accepted token colours. ``None`` (default) accepts
+                       any colour. Pass e.g. ``{"data", "priority"}`` to enforce
+                       typing at deposit time.
+            initial_marking: Tokens to deposit at construction (CPN *I* function).
+                             Deposited before any external code runs.
         """
         self.name = name
+        self.bound = bound
+        self.color_set = color_set
         self._tokens: deque[Token] = deque()
         self._lock = threading.Lock()
         self.last_deposit_time: float = 0.0
+
+        for token in initial_marking or []:
+            self._tokens.append(token)
+            self.last_deposit_time = time.monotonic()
 
     def deposit(self, token: Token) -> None:
         """Append *token* to the tail of the queue.
@@ -39,8 +69,17 @@ class Place:
 
         Args:
             token: The token to deposit.
+
+        Raises:
+            TypeError: If the place has a ``color_set`` and the token's colour
+                       is not in it.
         """
         with self._lock:
+            if self.color_set is not None and token.color not in self.color_set:
+                raise TypeError(
+                    f"Place '{self.name}' has color_set {self.color_set!r} — "
+                    f"cannot deposit token with color {token.color!r}."
+                )
             self._tokens.append(token)
             self.last_deposit_time = time.monotonic()
             self._on_deposit(token)
@@ -73,6 +112,35 @@ class Place:
                     f"only {len(self._tokens)} available."
                 )
             return [self._tokens.popleft() for _ in range(count)]
+
+    def retrieve_specific(self, tokens: list[Token]) -> list[Token]:
+        """Remove and return exactly the tokens in *tokens* (matched by ``id``).
+
+        Used by the engine when an :class:`~petriq.transitions.InputArc` has an
+        ``expression`` that selects a specific subset of tokens to consume.
+        Uses an O(n) deque rebuild — same pattern as
+        :meth:`PacedResourcePlace.retrieve`.
+
+        Args:
+            tokens: Tokens to remove. Each must be present in this place.
+
+        Returns:
+            The removed tokens in the order given by *tokens*.
+
+        Raises:
+            ValueError: If any token id in *tokens* is not found in this place.
+        """
+        with self._lock:
+            remove_ids = {t.id for t in tokens}
+            present_ids = {t.id for t in self._tokens}
+            missing = remove_ids - present_ids
+            if missing:
+                raise ValueError(
+                    f"Place '{self.name}': token id(s) {missing} not found — "
+                    f"cannot retrieve_specific tokens that are not present."
+                )
+            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
+            return tokens
 
     def retrieve_all(self) -> list[Token]:
         """Remove and return every token currently in the place.
@@ -107,6 +175,21 @@ class Place:
         with self._lock:
             return len(self._tokens) >= count
 
+    def can_deposit(self, count: int = 1) -> bool:
+        """Return ``True`` if the place can accept *count* more tokens without exceeding its bound.
+
+        Implements k-bounded place semantics: a place with ``bound=k`` blocks when
+        depositing would push the token count above ``k``. Unbounded places
+        (``bound=None``) always return ``True``.
+
+        Args:
+            count: Number of tokens to be deposited.
+        """
+        with self._lock:
+            if self.bound is None:
+                return True
+            return len(self._tokens) + count <= self.bound
+
     @property
     def tokens(self) -> list[Token]:
         """Snapshot of current tokens as a list copy (does not consume them)."""
@@ -117,13 +200,13 @@ class Place:
 class ResourcePlace(Place):
     """A bounded resource-permit pool pre-filled with *capacity* resource tokens.
 
-    Resource tokens (``is_resource=True``) are consumed when a transition fires
+    **CPN equivalent:** ``Place(color_set={"resource"}, initial_marking=[Token(color="resource")] * capacity)``.
+    This class is a Python shorthand — it sets the colour set and initial marking
+    automatically and documents the resource-return invariant explicitly.
+
+    Resource tokens (``color="resource"``) are consumed when a transition fires
     and must be returned via a matching output arc. This models finite resources
     such as GPU slots, database connections, or thread-pool permits.
-
-    The pool is initialised with exactly *capacity* tokens. Do not deposit plain
-    data tokens here — the engine routes resource tokens based on
-    :attr:`~petriq.tokens.Token.is_resource`.
     """
 
     def __init__(self, name: str, capacity: int) -> None:
@@ -134,14 +217,21 @@ class ResourcePlace(Place):
             capacity: Number of resource permits in the pool. ``0`` is valid
                       (creates an empty, permanently-blocking place).
         """
-        super().__init__(name)
         self.capacity = capacity
-        for _ in range(capacity):
-            self._tokens.append(Token(is_resource=True))
+        super().__init__(
+            name,
+            color_set={"resource"},
+            initial_marking=[Token(color="resource") for _ in range(capacity)],
+        )
 
 
 class PacedResourcePlace(ResourcePlace):
     """A resource pool where returned tokens must cool down before becoming reusable.
+
+    **CPN equivalent:** a Timed CPN :class:`ResourcePlace` where returned tokens
+    carry a timestamp that prevents re-use until ``pacing_secs`` have elapsed.
+    This is a pragmatic extension — standard Timed CPNs put timestamps on tokens,
+    not cooldown windows on places.
 
     Useful for enforcing API rate limits or minimum inter-request intervals.
     Tokens are available immediately at construction; after each return via
@@ -174,7 +264,7 @@ class PacedResourcePlace(ResourcePlace):
         The token will not be retrievable until ``pacing_secs`` have elapsed.
 
         Args:
-            token: The resource token being returned. Must have ``is_resource=True``.
+            token: The resource token being returned. Must have ``color="resource"``.
         """
         with self._lock:
             self._tokens.append(token)
@@ -240,6 +330,11 @@ class PacedResourcePlace(ResourcePlace):
 
 class ThresholdPlace(Place):
     """A FIFO place where tokens are only retrievable once the queue depth reaches *threshold*.
+
+    **CPN equivalent:** a plain :class:`Place` whose associated transition has a
+    guard requiring ``|M(p)| >= threshold`` before firing. This class is a Python
+    shorthand that encodes the threshold directly on the place rather than
+    duplicating it in every downstream transition's guard.
 
     Useful for batch processing: tokens accumulate until enough are present,
     then they are released in groups matching the transition's ``arc.count``.

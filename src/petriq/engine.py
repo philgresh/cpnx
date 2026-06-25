@@ -22,15 +22,18 @@ class PetriNet:
 
     Typical usage::
 
-        net = PetriNet(max_workers=4)
-        net.add_place(Place("source"))
-        net.add_place(Place("sink"))
-        net.add_transition(Transition(
-            name="process",
-            inputs=[InputArc("source")],
-            outputs=[OutputArc("sink")],
-            action=lambda tokens: tokens,
-        ))
+        net = PetriNet(
+            max_workers=4,
+            places=[Place("source"), Place("sink")],
+            transitions=[
+                Transition(
+                    name="process",
+                    inputs=[InputArc("source")],
+                    outputs=[OutputArc("sink")],
+                    action=lambda tokens: tokens,
+                )
+            ],
+        )
         net.deposit("source", Token(payload={"job_id": 1}))
         net.run(deadline=time.monotonic() + 30)
 
@@ -41,7 +44,13 @@ class PetriNet:
             net.run(deadline=time.monotonic() + 30)
     """
 
-    def __init__(self, max_workers: int = 4, error_place: str = "failed") -> None:
+    def __init__(
+        self,
+        max_workers: int = 4,
+        error_place: str = "failed",
+        places: list[Place] | None = None,
+        transitions: list[Transition] | None = None,
+    ) -> None:
         """Initialise the executor.
 
         Args:
@@ -49,6 +58,10 @@ class PetriNet:
             error_place: Name of the place that receives data tokens from failed
                          transitions. Created automatically — do not register a
                          place with this name manually.
+            places: Optional list of :class:`~petriq.places.Place` instances to
+                    register at construction time.
+            transitions: Optional list of :class:`~petriq.transitions.Transition`
+                         instances to register at construction time.
         """
         self.max_workers = max_workers
         self.error_place = error_place
@@ -80,6 +93,10 @@ class PetriNet:
         self.on_error: Callable[[str, Exception, Token | None], None] | None = None
 
         self.add_place(Place(error_place))
+        for p in places or []:
+            self.add_place(p)
+        for t in transitions or []:
+            self.add_transition(t)
 
     # ------------------------------------------------------------------
     # Public API
@@ -164,7 +181,13 @@ class PetriNet:
             token_sources: list[tuple[str, Token]] = []
             for arc in selected.inputs:
                 place = self.places[arc.place]
-                tokens = place.retrieve_all() if arc.consume_all else place.retrieve(arc.count)
+                if arc.consume_all:
+                    tokens = place.retrieve_all()
+                elif arc.expression is not None:
+                    ordered = arc.expression(place.tokens)
+                    tokens = place.retrieve_specific(ordered[: arc.count])
+                else:
+                    tokens = place.retrieve(arc.count)
                 consumed_tokens.extend(tokens)
                 for t in tokens:
                     token_sources.append((arc.place, t))
@@ -231,6 +254,35 @@ class PetriNet:
             return not any(
                 self._is_transition_potentially_enabled(t) for t in self.transitions.values()
             )
+
+    @property
+    def marking(self) -> dict[str, list[Token]]:
+        """Current marking: maps each place name to its live token list.
+
+        In CPN formalism the *marking* ``M`` is a function from places to
+        multisets of colour values. This property returns live
+        :class:`~petriq.tokens.Token` objects — mutating them affects the net.
+        For a JSON-serialisable snapshot use :meth:`snapshot` instead.
+
+        Returns:
+            Dict mapping place name → list of tokens currently in that place.
+        """
+        with self._lock:
+            return {name: list(place._tokens) for name, place in self.places.items()}
+
+    def is_dead(self) -> bool:
+        """Return ``True`` if no transition is currently enabled (CPN dead state).
+
+        In CPN theory a *dead marking* is one in which no transition can fire
+        given the current token distribution. Unlike :meth:`is_quiescent`, this
+        does not check for in-flight transitions — it is a pure marking-level
+        check.
+
+        Returns:
+            ``True`` if every transition's enabling condition fails.
+        """
+        with self._lock:
+            return not any(self._is_transition_enabled(t) for t in self.transitions.values())
 
     def snapshot(self) -> dict:
         """Return a JSON-serialisable snapshot of current place markings.
@@ -321,6 +373,16 @@ class PetriNet:
                 # reading it here (also under self._lock) is safe without place._lock.
                 if time.monotonic() - place.last_deposit_time < arc.settle_secs:
                     return False
+        # Back-pressure: refuse to fire if an unguarded output arc's target place is full.
+        # Guarded arcs are skipped — their target may never receive a token, so checking
+        # capacity speculatively would cause spurious blocking.
+        for arc in transition.outputs:
+            if arc.expression is not None:
+                continue
+            place = self.places.get(arc.place)
+            if place and not place.can_deposit(arc.count):
+                return False
+
         if transition.guard is not None:
             try:
                 if not transition.guard():
@@ -393,21 +455,24 @@ class PetriNet:
                 res_deque: deque[Token] = deque(t for t in consumed_tokens if t.is_resource)
                 out_deque: deque[Token] = deque(t for t in output_tokens if not t.is_resource)
 
-                # Pre-flight: validate supply before any distribution so that a
-                # mismatch fails cleanly into the error path rather than minting
-                # phantom tokens or silently discarding work.
-                resource_demand = sum(
-                    arc.count for arc in transition.outputs
-                    if isinstance(self.places.get(arc.place), (ResourcePlace, PacedResourcePlace))
-                )
-                data_demand = sum(
-                    arc.count for arc in transition.outputs
-                    if not isinstance(self.places.get(arc.place), (ResourcePlace, PacedResourcePlace))
-                )
+                # Pass 1: evaluate arc guards to determine which output arcs fire.
+                # Guards receive the non-resource output tokens (CPN arc guard semantics).
+                # Resource arcs are never guarded — resources must always return to a place.
+                output_tokens_data = list(out_deque)
+                active_outputs: list[tuple] = []
+                for arc in transition.outputs:
+                    is_res = isinstance(self.places.get(arc.place), (ResourcePlace, PacedResourcePlace))
+                    if arc.expression is None or (not is_res and arc.expression(output_tokens_data)):
+                        active_outputs.append((arc, is_res))
+
+                # Pass 2: pre-flight — validate supply against active arcs only so that
+                # guarded-out arcs don't inflate the demand count and cause spurious failures.
+                resource_demand = sum(arc.count for arc, is_res in active_outputs if is_res)
+                data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)
                 if len(res_deque) < resource_demand:
                     success = False
                     error = ValueError(
-                        f"Transition '{transition.name}': output arcs to resource places require "
+                        f"Transition '{transition.name}': active resource output arcs require "
                         f"{resource_demand} resource token(s) but only {len(res_deque)} were consumed. "
                         f"Ensure each ResourcePlace/PacedResourcePlace InputArc has a matching OutputArc."
                     )
@@ -415,15 +480,13 @@ class PetriNet:
                     success = False
                     error = ValueError(
                         f"Transition '{transition.name}': action returned {len(out_deque)} non-resource "
-                        f"token(s) but non-resource output arcs require {data_demand}. "
+                        f"token(s) but active non-resource output arcs require {data_demand}. "
                         f"Ensure your action returns at least as many tokens as the sum of "
-                        f"non-resource OutputArc counts."
+                        f"non-resource OutputArc counts (after arc guard evaluation)."
                     )
 
             if success:
-                for arc in transition.outputs:
-                    place = self.places.get(arc.place)
-                    is_res_place = isinstance(place, (ResourcePlace, PacedResourcePlace))
+                for arc, is_res_place in active_outputs:
                     for _ in range(arc.count):
                         t = res_deque.popleft() if is_res_place else out_deque.popleft()
                         self._deposit_under_lock(arc.place, t)

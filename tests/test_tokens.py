@@ -19,7 +19,7 @@ class TestToken:
         assert t.payload["key"] == "value"
 
     def test_resource_flag(self):
-        t = Token(is_resource=True)
+        t = Token(color="resource")
         assert t.is_resource is True
 
     def test_payload_is_mutable(self):

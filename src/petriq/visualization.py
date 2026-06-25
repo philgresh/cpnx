@@ -12,7 +12,7 @@ def snapshot(net: Any) -> dict:
                         "id": t.id,
                         "payload": t.payload,
                         "created_at": t.created_at,
-                        "is_resource": t.is_resource,
+                        "color": t.color,
                     }
                 )
             places_snapshot[name] = tokens_list
