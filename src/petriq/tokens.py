@@ -100,4 +100,5 @@ class Token:
             merged_payload = dict(self.payload)
             merged_payload.update(payload_updates)
             new_fields["payload"] = FrozenDict(merged_payload)
+        new_fields.setdefault("id", uuid4().hex[:16])
         return replace(self, **new_fields)

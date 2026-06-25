@@ -48,3 +48,11 @@ class TestToken:
 
         with pytest.raises(AttributeError):
             fd.new_attribute = "allowed?"
+
+    def test_evolve_generates_new_id(self):
+        t1 = Token()
+        t2 = t1.evolve()
+        assert t1.id != t2.id
+        # Confirm we can override explicitly
+        t3 = t1.evolve(id="explicit_id")
+        assert t3.id == "explicit_id"

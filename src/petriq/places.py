@@ -295,7 +295,7 @@ class PacedResourcePlace(ResourcePlace):
         with self._lock:
             ref_time = model_time if model_time is not None else time.monotonic()
             # Create a new token with updated availability timestamp (stateless place cooldown)
-            timed_token = token.evolve(available_at=ref_time + self.pacing_secs)
+            timed_token = token.evolve(available_at=ref_time + self.pacing_secs, id=token.id)
             self._tokens.append(timed_token)
             self.last_deposit_time = time.monotonic()
             self._on_deposit(timed_token)
