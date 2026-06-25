@@ -118,3 +118,40 @@ class TestTransitionPriority:
         urgent_indices = [i for i, v in enumerate(order) if v == "urgent"]
         normal_indices = [i for i, v in enumerate(order) if v == "normal"]
         assert max(urgent_indices) < min(normal_indices)
+
+    def test_nondeterministic_conflict_resolution(self):
+        fired_transitions = set()
+        for _ in range(100):
+            net = PetriNet(max_workers=1)
+            net.add_place(Place("input"))
+            net.add_place(Place("output"))
+
+            net.add_transition(
+                Transition(
+                    name="t1",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda tokens: tokens,
+                )
+            )
+            net.add_transition(
+                Transition(
+                    name="t2",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda tokens: tokens,
+                )
+            )
+
+            # Record which transition fired
+            net.on_transition_fired = lambda name, dur: fired_transitions.add(name)
+
+            net.deposit("input", Token())
+            net.step()
+            net.run(deadline=time.monotonic() + 0.5)
+
+            if len(fired_transitions) == 2:
+                break
+
+        assert "t1" in fired_transitions
+        assert "t2" in fired_transitions

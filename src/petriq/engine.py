@@ -1,5 +1,6 @@
 """Concurrent Petri net executor."""
 
+import random
 import threading
 import time
 from collections import deque
@@ -182,7 +183,9 @@ class PetriNet:
             if not enabled:
                 return False
 
-            selected = min(enabled, key=lambda t: t.priority)
+            min_priority = min(t.priority for t in enabled)
+            candidates = [t for t in enabled if t.priority == min_priority]
+            selected = random.choice(candidates)
 
             consumed_tokens: list[Token] = []
             token_sources: list[tuple[str, Token]] = []
