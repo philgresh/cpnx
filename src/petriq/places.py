@@ -210,6 +210,16 @@ class Place:
                 return True
             return len(self._tokens) + count <= self.bound
 
+    def can_accept(self, token: Token) -> bool:
+        """Return ``True`` if the place can accept the token without violating colour sets.
+
+        This is a non-mutating pre-flight check that does not modify the place's tokens.
+        """
+        with self._lock:
+            if self.color_set is not None and token.color not in self.color_set:
+                return False
+            return True
+
     @property
     def tokens(self) -> tuple[Token, ...]:
         """Snapshot of current tokens as an immutable tuple (does not consume them)."""

@@ -572,11 +572,52 @@ class PetriNet:
                         )
 
                 if success:
-                    for arc, is_res_place in active_outputs:  # type: ignore[typing-target]
-                        for _ in range(arc.count):  # type: ignore[attr-defined]
-                            t = res_deque.popleft() if is_res_place else out_deque.popleft()
-                            self._deposit_under_lock(arc.place, t)  # type: ignore[attr-defined]
-                            deposited.append((arc.place, t))  # type: ignore[attr-defined]
+                    # Construct planned deposits list first
+                    planned_deposits: list[tuple[str, Token]] = []
+                    res_temp = deque(res_deque)
+                    out_temp = deque(out_deque)
+                    for arc, is_res_place in active_outputs:
+                        for _ in range(arc.count):
+                            t = res_temp.popleft() if is_res_place else out_temp.popleft()
+                            planned_deposits.append((arc.place, t))
+
+                    # Accumulate planned count per place to validate k-bound cumulatively
+                    place_deposit_counts = {}
+                    for place_name, _ in planned_deposits:
+                        place_deposit_counts[place_name] = place_deposit_counts.get(place_name, 0) + 1
+
+                    # Pre-flight checks (atomicity validation)
+                    for place_name, token in planned_deposits:
+                        place = self.places.get(place_name)
+                        if place is None:
+                            success = False
+                            error = KeyError(f"Place '{place_name}' is not registered.")
+                            break
+                        if not place.can_accept(token):
+                            success = False
+                            error = TypeError(f"Place '{place_name}' cannot accept token with color '{token.color}'.")
+                            break
+
+                    if success:
+                        for place_name, count in place_deposit_counts.items():
+                            place = self.places.get(place_name)
+                            if place is not None and not place.can_deposit(count):
+                                success = False
+                                error = ValueError(f"Place '{place_name}' would exceed its bound of {place.bound}.")
+                                break
+
+                # Only if all pre-flight checks passed, actually perform the deposits
+                if success:
+                    for place_name, token in planned_deposits:
+                        self._deposit_under_lock(place_name, token)
+                        deposited.append((place_name, token))
+
+                    for arc, is_res_place in active_outputs:
+                        for _ in range(arc.count):
+                            if is_res_place:
+                                res_deque.popleft()
+                            else:
+                                out_deque.popleft()
 
                     # Return any leftover resource tokens to their original source places
                     while res_deque:

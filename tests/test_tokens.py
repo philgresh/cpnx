@@ -39,8 +39,9 @@ class TestToken:
         assert t == t
 
     def test_frozen_dict_backdoor_blocked(self):
-        from petriq.tokens import FrozenDict
         import pytest
+
+        from petriq.tokens import FrozenDict
 
         fd = FrozenDict({"x": 1})
         with pytest.raises(TypeError):

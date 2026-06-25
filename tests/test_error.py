@@ -254,3 +254,29 @@ class TestCallbackDeadlockFix:
 
         assert len(net.places["output"].tokens) == 1
         assert len(net.places["log"].tokens) == 1
+
+
+def test_partial_deposit_rollback():
+    net = PetriNet(max_workers=1)
+    net.add_place(Place("input"))
+    net.add_place(Place("output_ok"))
+    net.add_place(Place("output_restricted", color_set={"restricted_only"}))
+
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("input")],
+            outputs=[OutputArc("output_ok"), OutputArc("output_restricted")],
+            action=lambda tokens: [Token(color=None), Token(color=None)],
+        )
+    )
+
+    t = Token()
+    net.deposit("input", t)
+    assert net.step() is True
+    net.run(deadline=time.monotonic() + 1.0)
+
+    # Rolled back successfully
+    assert len(net.places["output_ok"].tokens) == 0
+    assert len(net.places["output_restricted"].tokens) == 0
+    assert len(net.places["failed"].tokens) == 1
