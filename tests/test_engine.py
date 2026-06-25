@@ -156,3 +156,33 @@ class TestEngineMultiArcTransition:
         net.deposit("input", Token())
         net.run(deadline=time.monotonic() + 1.0)
         assert len(net.places["output"].tokens) == 3
+
+
+def test_basexception_does_not_leak_running_count():
+    net = PetriNet(max_workers=1)
+    net.add_place(Place("input"))
+
+    def raise_keyboard_interrupt(tokens):
+        raise KeyboardInterrupt()
+
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("input")],
+            outputs=[],
+            action=raise_keyboard_interrupt,
+        )
+    )
+
+    net.deposit("input", Token())
+    assert net.step() is True
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        with net._lock:
+            if net._running_count == 0:
+                break
+        time.sleep(0.01)
+
+    with net._lock:
+        assert net._running_count == 0

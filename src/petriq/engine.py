@@ -510,123 +510,128 @@ class PetriNet:
           the engine lock to prevent re-entrant deadlocks.
         - :attr:`_running_count` is always decremented exactly once.
         """
-        start_time = time.monotonic()
-        success = False
-        output_tokens: list[Token] = []
-        error: BaseException | None = None
-
         try:
-            if isinstance(transition, SubstitutionTransition):
-                output_tokens = self._execute_substitution_transition(transition, consumed_tokens, token_sources)
-            else:
-                output_tokens = transition.action(consumed_tokens)
-            success = True
-        except Exception as exc:
-            error = exc
+            start_time = time.monotonic()
+            success = False
+            output_tokens: list[Token] = []
+            error: BaseException | None = None
 
-        deposited: list[tuple[str, Token]] = []
-        duration = 0.0
-        data_tokens: list[Token] = []
+            try:
+                if isinstance(transition, SubstitutionTransition):
+                    output_tokens = self._execute_substitution_transition(transition, consumed_tokens, token_sources)
+                else:
+                    output_tokens = transition.action(consumed_tokens)
+                success = True
+            except BaseException as exc:
+                error = exc
 
-        with self._lock:
-            duration = time.monotonic() - start_time
+            deposited: list[tuple[str, Token]] = []
+            duration = 0.0
+            data_tokens: list[Token] = []
 
-            if success:
-                res_deque: deque[Token] = deque(t for t in consumed_tokens if t.is_resource)
-                out_deque: deque[Token] = deque(t for t in output_tokens if not t.is_resource)
+            with self._lock:
+                duration = time.monotonic() - start_time
 
-                # Pass 1: evaluate arc guards to determine which output arcs fire.
-                # Guards receive the non-resource output tokens (CPN arc guard semantics).
-                # Resource arcs are never guarded — resources must always return to a place.
-                output_tokens_data = list(out_deque)
-                active_outputs: list[tuple[Transition, bool]] = []  # type: ignore[type-arg]
-                for arc in transition.outputs:
-                    is_res = isinstance(self.places.get(arc.place), (ResourcePlace, PacedResourcePlace))
-                    if arc.expression is None:
-                        active_outputs.append((arc, is_res))  # type: ignore[arg-type]
-                    elif isinstance(arc.expression, str):
-                        if SandboxEvaluator.evaluate(arc.expression, {"tokens": output_tokens_data}):
+                if success:
+                    res_deque: deque[Token] = deque(t for t in consumed_tokens if t.is_resource)
+                    out_deque: deque[Token] = deque(t for t in output_tokens if not t.is_resource)
+
+                    # Pass 1: evaluate arc guards to determine which output arcs fire.
+                    # Guards receive the non-resource output tokens (CPN arc guard semantics).
+                    # Resource arcs are never guarded — resources must always return to a place.
+                    output_tokens_data = list(out_deque)
+                    active_outputs: list[tuple[Transition, bool]] = []  # type: ignore[type-arg]
+                    for arc in transition.outputs:
+                        is_res = isinstance(self.places.get(arc.place), (ResourcePlace, PacedResourcePlace))
+                        if arc.expression is None:
                             active_outputs.append((arc, is_res))  # type: ignore[arg-type]
-                    elif arc.expression(output_tokens_data):
-                        active_outputs.append((arc, is_res))  # type: ignore[arg-type]
+                        elif isinstance(arc.expression, str):
+                            if SandboxEvaluator.evaluate(arc.expression, {"tokens": output_tokens_data}):
+                                active_outputs.append((arc, is_res))  # type: ignore[arg-type]
+                        elif arc.expression(output_tokens_data):
+                            active_outputs.append((arc, is_res))  # type: ignore[arg-type]
 
-                # Pass 2: pre-flight — validate supply against active arcs only so that
-                # guarded-out arcs don't inflate the demand count and cause spurious failures.
-                resource_demand = sum(arc.count for arc, is_res in active_outputs if is_res)  # type: ignore[attr-defined]
-                data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)  # type: ignore[attr-defined]
-                if len(res_deque) < resource_demand:
-                    success = False
-                    error = ValueError(
-                        f"Transition '{transition.name}': active resource output arcs require "
-                        f"{resource_demand} resource token(s) but only {len(res_deque)} were consumed. "
-                        f"Ensure each ResourcePlace/PacedResourcePlace InputArc has a matching OutputArc."
-                    )
-                elif len(out_deque) < data_demand:
-                    success = False
-                    error = ValueError(
-                        f"Transition '{transition.name}': action returned {len(out_deque)} non-resource "
-                        f"token(s) but active non-resource output arcs require {data_demand}. "
-                        f"Ensure your action returns at least as many tokens as the sum of "
-                        f"non-resource OutputArc counts (after arc guard evaluation)."
-                    )
+                    # Pass 2: pre-flight — validate supply against active arcs only so that
+                    # guarded-out arcs don't inflate the demand count and cause spurious failures.
+                    resource_demand = sum(arc.count for arc, is_res in active_outputs if is_res)  # type: ignore[attr-defined]
+                    data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)  # type: ignore[attr-defined]
+                    if len(res_deque) < resource_demand:
+                        success = False
+                        error = ValueError(
+                            f"Transition '{transition.name}': active resource output arcs require "
+                            f"{resource_demand} resource token(s) but only {len(res_deque)} were consumed. "
+                            f"Ensure each ResourcePlace/PacedResourcePlace InputArc has a matching OutputArc."
+                        )
+                    elif len(out_deque) < data_demand:
+                        success = False
+                        error = ValueError(
+                            f"Transition '{transition.name}': action returned {len(out_deque)} non-resource "
+                            f"token(s) but active non-resource output arcs require {data_demand}. "
+                            f"Ensure your action returns at least as many tokens as the sum of "
+                            f"non-resource OutputArc counts (after arc guard evaluation)."
+                        )
 
-            if success:
-                for arc, is_res_place in active_outputs:  # type: ignore[typing-target]
-                    for _ in range(arc.count):  # type: ignore[attr-defined]
-                        t = res_deque.popleft() if is_res_place else out_deque.popleft()
-                        self._deposit_under_lock(arc.place, t)  # type: ignore[attr-defined]
-                        deposited.append((arc.place, t))  # type: ignore[attr-defined]
+                if success:
+                    for arc, is_res_place in active_outputs:  # type: ignore[typing-target]
+                        for _ in range(arc.count):  # type: ignore[attr-defined]
+                            t = res_deque.popleft() if is_res_place else out_deque.popleft()
+                            self._deposit_under_lock(arc.place, t)  # type: ignore[attr-defined]
+                            deposited.append((arc.place, t))  # type: ignore[attr-defined]
 
-                # Return any leftover resource tokens to their original source places
-                while res_deque:
-                    leftover_token = res_deque.popleft()
+                    # Return any leftover resource tokens to their original source places
+                    while res_deque:
+                        leftover_token = res_deque.popleft()
+                        for src_name, t in token_sources:
+                            if t.id == leftover_token.id:
+                                self._deposit_under_lock(src_name, leftover_token)
+                                deposited.append((src_name, leftover_token))
+                                break
+
+                if not success:
+                    # Return all resource tokens to their source places.
                     for src_name, t in token_sources:
-                        if t.id == leftover_token.id:
-                            self._deposit_under_lock(src_name, leftover_token)
-                            deposited.append((src_name, leftover_token))
-                            break
+                        if t.is_resource:
+                            self._deposit_under_lock(src_name, t)
+                            deposited.append((src_name, t))
 
-            if not success:
-                # Return all resource tokens to their source places.
-                for src_name, t in token_sources:
-                    if t.is_resource:
-                        self._deposit_under_lock(src_name, t)
-                        deposited.append((src_name, t))
+                    # Route data tokens to the error sink.
+                    data_tokens = [t for _, t in token_sources if not t.is_resource]
+                    for dt in data_tokens:
+                        self._deposit_under_lock(self.error_place, dt)
+                        deposited.append((self.error_place, dt))
 
-                # Route data tokens to the error sink.
-                data_tokens = [t for _, t in token_sources if not t.is_resource]
-                for dt in data_tokens:
-                    self._deposit_under_lock(self.error_place, dt)
-                    deposited.append((self.error_place, dt))
-
-        # --- OUTSIDE THE LOCK ---
-        if success:
-            if self.on_transition_fired:
-                try:
-                    self.on_transition_fired(transition.name, duration)
-                except Exception:
-                    pass
-        else:
-            if self.on_error and error:
-                # Unified dispatch: if there are no data tokens, call once with None.
-                dispatch_tokens: list[Token | None] = list(data_tokens) if data_tokens else [None]
-                for dt in dispatch_tokens:
+            # --- OUTSIDE THE LOCK ---
+            if success:
+                if self.on_transition_fired:
                     try:
-                        self.on_error(transition.name, error, dt)
+                        self.on_transition_fired(transition.name, duration)
+                    except Exception:
+                        pass
+            else:
+                if self.on_error and error:
+                    # Unified dispatch: if there are no data tokens, call once with None.
+                    dispatch_tokens: list[Token | None] = list(data_tokens) if data_tokens else [None]
+                    for dt in dispatch_tokens:
+                        try:
+                            self.on_error(transition.name, error, dt)
+                        except Exception:
+                            pass
+
+            if self.on_token_deposited:
+                for pname, tok in deposited:
+                    try:
+                        self.on_token_deposited(pname, tok)
                     except Exception:
                         pass
 
-        if self.on_token_deposited:
-            for pname, tok in deposited:
-                try:
-                    self.on_token_deposited(pname, tok)
-                except Exception:
-                    pass
+            if error is not None and not isinstance(error, Exception):
+                raise error
 
-        # Decrement running count and signal work available under lock
-        with self._lock:
-            self._running_count -= 1
-        self._work_available.set()
+        finally:
+            # Decrement running count and signal work available under lock
+            with self._lock:
+                self._running_count -= 1
+            self._work_available.set()
 
     def _execute_substitution_transition(
         self,
