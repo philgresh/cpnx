@@ -8,8 +8,9 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 from petriq.places import PacedResourcePlace, Place, ResourcePlace
+from petriq.sandbox import SandboxEvaluator
 from petriq.tokens import Token
-from petriq.transitions import Transition
+from petriq.transitions import SubstitutionTransition, Transition
 from petriq.visualization import snapshot, to_dot
 
 
@@ -69,6 +70,7 @@ class PetriNet:
         self.error_place = error_place
         self.cooldown_interval = cooldown_interval
         self._has_timed_features = False
+        self._model_time: float | None = None
         self.places: dict[str, Place] = {}
         self.transitions: dict[str, Transition] = {}
         self._lock = threading.Lock()
@@ -101,6 +103,30 @@ class PetriNet:
             self.add_place(p)
         for t in transitions or []:
             self.add_transition(t)
+
+    def _get_model_time_under_lock(self) -> float:
+        """Internal helper to get the model time without acquiring the engine lock."""
+        if self._model_time is not None:
+            return self._model_time
+        return time.monotonic()
+
+    @property
+    def model_time(self) -> float:
+        """Returns the current logical or real time of the PetriNet."""
+        with self._lock:
+            return self._get_model_time_under_lock()
+
+    def advance_time(self, new_time: float) -> None:
+        """Advance the logical clock of the net. Must be strictly monotonic."""
+        with self._lock:
+            if self._model_time is not None and new_time < self._model_time:
+                raise ValueError(
+                    f"Clock mutability violation: cannot decrement global clock backward "
+                    f"from {self._model_time} to {new_time}."
+                )
+            self._model_time = new_time
+        # Signal that new work might have become available due to time advancing!
+        self._work_available.set()
 
     # ------------------------------------------------------------------
     # Public API
@@ -156,7 +182,7 @@ class PetriNet:
         with self._lock:
             if place_name not in self.places:
                 self.places[place_name] = Place(place_name)
-            self.places[place_name].deposit(token)
+            self.places[place_name].deposit(token, model_time=self._get_model_time_under_lock())
         self._work_available.set()
         if self.on_token_deposited:
             try:
@@ -189,15 +215,20 @@ class PetriNet:
 
             consumed_tokens: list[Token] = []
             token_sources: list[tuple[str, Token]] = []
+            m_time = self._get_model_time_under_lock()
             for arc in selected.inputs:
                 place = self.places[arc.place]
                 if arc.consume_all:
-                    tokens = place.retrieve_all()
+                    tokens = place.retrieve_all(model_time=m_time)
                 elif arc.expression is not None:
-                    ordered = arc.expression(place.tokens)
-                    tokens = place.retrieve_specific(ordered[: arc.count])
+                    available = place.peek(len(place), model_time=m_time)
+                    if isinstance(arc.expression, str):
+                        ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
+                    else:
+                        ordered = arc.expression(available)
+                    tokens = place.retrieve_specific(ordered[: arc.count], model_time=m_time)
                 else:
-                    tokens = place.retrieve(arc.count)
+                    tokens = place.retrieve(arc.count, model_time=m_time)
                 consumed_tokens.extend(tokens)
                 for t in tokens:
                     token_sources.append((arc.place, t))
@@ -363,7 +394,7 @@ class PetriNet:
             raise KeyError(
                 f"Place '{place_name}' is not registered. Call add_place() before referencing it in a Transition arc."
             )
-        self.places[place_name].deposit(token)
+        self.places[place_name].deposit(token, model_time=self._get_model_time_under_lock())
 
     def _is_transition_enabled(self, transition: Transition) -> bool:
         """Return ``True`` if all preconditions for firing *transition* are satisfied.
@@ -372,11 +403,12 @@ class PetriNet:
         windows, and the user-supplied guard. Called while holding ``self._lock``.
         """
         candidate_tokens: list[Token] = []
+        m_time = self._get_model_time_under_lock()
         for arc in transition.inputs:
             place = self.places.get(arc.place)
             if place is None:
                 return False
-            if not place.can_retrieve(arc.count):
+            if not place.can_retrieve(arc.count, model_time=m_time):
                 return False
             if arc.settle_secs > 0.0:
                 # last_deposit_time is only written while self._lock is held, so
@@ -385,13 +417,17 @@ class PetriNet:
                     return False
 
             # Speculatively resolve candidate tokens
+            available = place.peek(len(place), model_time=m_time)
             if arc.consume_all:
-                tokens = list(place._tokens)
+                tokens = available
             elif arc.expression is not None:
-                ordered = arc.expression(place.tokens)
+                if isinstance(arc.expression, str):
+                    ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
+                else:
+                    ordered = arc.expression(available)
                 tokens = ordered[: arc.count]
             else:
-                tokens = place.peek(arc.count)
+                tokens = available[: arc.count]
             candidate_tokens.extend(tokens)
 
         # Back-pressure: refuse to fire if an unguarded output arc's target place is full.
@@ -406,8 +442,12 @@ class PetriNet:
 
         if transition.guard is not None:
             try:
-                if not transition.guard(candidate_tokens):
-                    return False
+                if isinstance(transition.guard, str):
+                    if not SandboxEvaluator.evaluate(transition.guard, {"tokens": candidate_tokens}):
+                        return False
+                else:
+                    if not transition.guard(candidate_tokens):
+                        return False
             except Exception:
                 return False
         return True
@@ -425,27 +465,31 @@ class PetriNet:
             place = self.places.get(arc.place)
             if place is None:
                 return False
-            if isinstance(place, PacedResourcePlace):
-                if len(place) < arc.count:
-                    return False
-                tokens = list(place._tokens)[: arc.count]
-            else:
-                if not place.can_retrieve(arc.count):
-                    return False
-                # Speculatively resolve candidate tokens
-                if arc.consume_all:
-                    tokens = list(place._tokens)
-                elif arc.expression is not None:
-                    ordered = arc.expression(place.tokens)
-                    tokens = ordered[: arc.count]
+            # Check count ignoring timing (model_time=float("inf"))
+            if not place.can_retrieve(arc.count, model_time=float("inf")):
+                return False
+            # Speculatively resolve candidate tokens ignoring timing
+            available = place.peek(len(place), model_time=float("inf"))
+            if arc.consume_all:
+                tokens = available
+            elif arc.expression is not None:
+                if isinstance(arc.expression, str):
+                    ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
                 else:
-                    tokens = place.peek(arc.count)
+                    ordered = arc.expression(available)
+                tokens = ordered[: arc.count]
+            else:
+                tokens = available[: arc.count]
             candidate_tokens.extend(tokens)
 
         if transition.guard is not None:
             try:
-                if not transition.guard(candidate_tokens):
-                    return False
+                if isinstance(transition.guard, str):
+                    if not SandboxEvaluator.evaluate(transition.guard, {"tokens": candidate_tokens}):
+                        return False
+                else:
+                    if not transition.guard(candidate_tokens):
+                        return False
             except Exception:
                 return False
         return True
@@ -472,7 +516,10 @@ class PetriNet:
         error: BaseException | None = None
 
         try:
-            output_tokens = transition.action(consumed_tokens)
+            if isinstance(transition, SubstitutionTransition):
+                output_tokens = self._execute_substitution_transition(transition, consumed_tokens, token_sources)
+            else:
+                output_tokens = transition.action(consumed_tokens)
             success = True
         except Exception as exc:
             error = exc
@@ -495,7 +542,12 @@ class PetriNet:
                 active_outputs: list[tuple[Transition, bool]] = []  # type: ignore[type-arg]
                 for arc in transition.outputs:
                     is_res = isinstance(self.places.get(arc.place), (ResourcePlace, PacedResourcePlace))
-                    if arc.expression is None or (not is_res and arc.expression(output_tokens_data)):
+                    if arc.expression is None:
+                        active_outputs.append((arc, is_res))  # type: ignore[arg-type]
+                    elif isinstance(arc.expression, str):
+                        if SandboxEvaluator.evaluate(arc.expression, {"tokens": output_tokens_data}):
+                            active_outputs.append((arc, is_res))  # type: ignore[arg-type]
+                    elif arc.expression(output_tokens_data):
                         active_outputs.append((arc, is_res))  # type: ignore[arg-type]
 
                 # Pass 2: pre-flight — validate supply against active arcs only so that
@@ -575,3 +627,53 @@ class PetriNet:
         with self._lock:
             self._running_count -= 1
         self._work_available.set()
+
+    def _execute_substitution_transition(
+        self,
+        transition: SubstitutionTransition,
+        consumed_tokens: list[Token],
+        token_sources: list[tuple[str, Token]],
+    ) -> list[Token]:
+        """Run a hierarchical sub-net and return its output tokens, isolated from parent context."""
+        subnet = transition.subnet
+        port_socket_map = transition.port_socket_map
+
+        # Verify strict port/socket boundaries
+        socket_to_ports: dict[str, list[str]] = {}
+        for port, socket in port_socket_map.items():
+            socket_to_ports.setdefault(socket, []).append(port)
+
+        # Verify that all consumed tokens come from mapped sockets
+        for socket_name, _ in token_sources:
+            if socket_name not in socket_to_ports:
+                raise ValueError(
+                    f"Port/Socket Boundary Violation: Parent place '{socket_name}' "
+                    f"is not mapped to any port, but tokens were consumed from it."
+                )
+
+        # Deposit consumed tokens into the corresponding subnet port places
+        for socket_name, token in token_sources:
+            for port_name in socket_to_ports[socket_name]:
+                if port_name not in subnet.places:
+                    subnet.add_place(Place(port_name))
+                subnet.deposit(port_name, token)
+
+        # Sync logical clock if active
+        if self._model_time is not None:
+            subnet.advance_time(self._model_time)
+
+        # Run subnet
+        subnet.run(deadline=time.monotonic() + 30.0)
+
+        # Retrieve output tokens from mapped child ports that correspond to parent output sockets
+        parent_outputs = [arc.place for arc in transition.outputs]
+        output_tokens = []
+        for port, socket in port_socket_map.items():
+            if socket in parent_outputs:
+                port_place = subnet.places.get(port)
+                if port_place:
+                    # Retrieve all available tokens
+                    tokens = port_place.retrieve_all(model_time=subnet.model_time)
+                    output_tokens.extend(tokens)
+
+        return output_tokens
