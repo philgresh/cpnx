@@ -240,22 +240,29 @@ class PetriNet:
             consumed_tokens: list[Token] = []
             token_sources: list[tuple[str, Token]] = []
             m_time = self._get_model_time_under_lock()
-            for arc in selected.inputs:
-                place = self.places[arc.place]
-                if arc.consume_all:
-                    tokens = place.retrieve_all(model_time=m_time)
-                elif arc.expression is not None:
-                    available = place.peek(len(place), model_time=m_time)
-                    if isinstance(arc.expression, str):
-                        ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
+            try:
+                for arc in selected.inputs:
+                    place = self.places[arc.place]
+                    if arc.consume_all:
+                        tokens = place.retrieve_all(model_time=m_time)
+                    elif arc.expression is not None:
+                        available = place.peek(len(place), model_time=m_time)
+                        if isinstance(arc.expression, str):
+                            ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
+                        else:
+                            ordered = self._call_expr(arc.expression, available)
+                        tokens = place.retrieve_specific(ordered[: arc.count], model_time=m_time)
                     else:
-                        ordered = self._call_expr(arc.expression, available)
-                    tokens = place.retrieve_specific(ordered[: arc.count], model_time=m_time)
-                else:
-                    tokens = place.retrieve(arc.count, model_time=m_time)
-                consumed_tokens.extend(tokens)
-                for t in tokens:
-                    token_sources.append((arc.place, t))
+                        tokens = place.retrieve(arc.count, model_time=m_time)
+                    consumed_tokens.extend(tokens)
+                    for t in tokens:
+                        token_sources.append((arc.place, t))
+            except Exception:
+                # Expression raised mid-loop — return already-consumed tokens to their
+                # source places so they are not silently lost.
+                for src_name, t in token_sources:
+                    self._deposit_under_lock(src_name, t)
+                raise
 
             self._running_count += 1
             try:
@@ -476,11 +483,14 @@ class PetriNet:
             if arc.consume_all:
                 tokens = available
             elif arc.expression is not None:
-                if isinstance(arc.expression, str):
-                    ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
-                else:
-                    ordered = self._call_expr(arc.expression, available)
-                tokens = ordered[: arc.count]
+                try:
+                    if isinstance(arc.expression, str):
+                        ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
+                    else:
+                        ordered = self._call_expr(arc.expression, available)
+                    tokens = ordered[: arc.count]
+                except Exception:
+                    return False
             else:
                 tokens = available[: arc.count]
             candidate_tokens.extend(tokens)
@@ -528,11 +538,14 @@ class PetriNet:
             if arc.consume_all:
                 tokens = available
             elif arc.expression is not None:
-                if isinstance(arc.expression, str):
-                    ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
-                else:
-                    ordered = self._call_expr(arc.expression, available)
-                tokens = ordered[: arc.count]
+                try:
+                    if isinstance(arc.expression, str):
+                        ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
+                    else:
+                        ordered = self._call_expr(arc.expression, available)
+                    tokens = ordered[: arc.count]
+                except Exception:
+                    return False
             else:
                 tokens = available[: arc.count]
             candidate_tokens.extend(tokens)
@@ -760,9 +773,12 @@ class PetriNet:
             for port_name in socket_to_ports[socket_name]:
                 subnet.deposit(port_name, token.evolve())
 
-        # Sync logical clock if active
-        if self._model_time is not None:
-            subnet.advance_time(self._model_time)
+        # Sync logical clock if active — read under lock to avoid torn reads on
+        # free-threaded Python builds where the GIL no longer protects float assignments.
+        with self._lock:
+            current_model_time = self._model_time
+        if current_model_time is not None:
+            subnet.advance_time(current_model_time)
 
         # Run subnet
         subnet.run(deadline=time.monotonic() + transition.subnet_deadline_secs)

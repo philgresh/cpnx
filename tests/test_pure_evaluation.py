@@ -151,5 +151,8 @@ def test_callable_expression_timeout():
             )
         )
         net.deposit("in", Token())
-        with pytest.raises(RuntimeError, match="exceeded 0.1s"):
-            net.step()
+        # W1 fix: a timed-out expression disables the transition rather than crashing
+        # step()/run(). The token stays in place; step() returns False.
+        result = net.step()
+        assert result is False
+        assert len(net.places["in"].tokens) == 1
