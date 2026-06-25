@@ -104,3 +104,33 @@ def test_paced_resource_logical_cooldown():
     # Advance logical clock to t=15.0, now it is available!
     net.advance_time(15.0)
     assert net.step() is True
+
+
+def test_settle_secs_respects_model_time():
+    with PetriNet() as net:
+        net.advance_time(100.0)
+
+        p_in = Place("in")
+        p_out = Place("out")
+        net.add_place(p_in)
+        net.add_place(p_out)
+
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[InputArc("in", settle_secs=10.0)],
+                outputs=[OutputArc("out")],
+                action=lambda tokens: tokens,
+            )
+        )
+
+        # Deposit at t=100.0
+        net.deposit("in", Token())
+        # Settle time is 100.0 + 10.0 = 110.0
+        # At t=105.0, it should not be enabled
+        net.advance_time(105.0)
+        assert net.step() is False
+
+        # At t=110.0, it should be enabled and fire
+        net.advance_time(110.0)
+        assert net.step() is True

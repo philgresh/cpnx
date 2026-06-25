@@ -57,6 +57,7 @@ class Place:
         self._tokens: deque[Token] = deque()
         self._lock = threading.Lock()
         self.last_deposit_time: float = 0.0
+        self.last_deposit_time_model: float = 0.0
 
         for token in initial_marking or []:
             self._tokens.append(token)
@@ -79,6 +80,8 @@ class Place:
                 )
             self._tokens.append(token)
             self.last_deposit_time = time.monotonic()
+            if model_time is not None:
+                self.last_deposit_time_model = model_time
             self._on_deposit(token)
 
     def _on_deposit(self, token: Token) -> None:
@@ -308,6 +311,8 @@ class PacedResourcePlace(ResourcePlace):
             timed_token = token.evolve(available_at=ref_time + self.pacing_secs, id=token.id)
             self._tokens.append(timed_token)
             self.last_deposit_time = time.monotonic()
+            if model_time is not None:
+                self.last_deposit_time_model = model_time
             self._on_deposit(timed_token)
 
     def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:

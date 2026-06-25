@@ -432,7 +432,11 @@ class PetriNet:
             if arc.settle_secs > 0.0:
                 # last_deposit_time is only written while self._lock is held, so
                 # reading it here (also under self._lock) is safe without place._lock.
-                if time.monotonic() - place.last_deposit_time < arc.settle_secs:
+                if self._model_time is not None:
+                    elapsed = self._model_time - place.last_deposit_time_model
+                else:
+                    elapsed = time.monotonic() - place.last_deposit_time
+                if elapsed < arc.settle_secs:
                     return False
 
             # Speculatively resolve candidate tokens
