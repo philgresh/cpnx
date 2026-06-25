@@ -5,6 +5,8 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import uuid4
 
+AVAILABLE_NOW: float = 0.0
+
 
 class FrozenDict(Mapping):
     """An immutable dictionary wrapper that recursively freezes nested dicts and lists."""
@@ -73,13 +75,14 @@ class Token:
                ``"resource"`` = permit token (see :class:`~petriq.places.ResourcePlace`);
                any other string = user-defined colour.
         available_at: Monotonic timestamp after which the token is available (timed CPNs).
+                      Defaults to ``AVAILABLE_NOW`` (0.0) which denotes immediate availability.
     """
 
     id: str = field(default_factory=lambda: uuid4().hex[:16])
     payload: FrozenDict = field(default_factory=FrozenDict)
     created_at: float = field(default_factory=time.monotonic)
     color: str | None = None
-    available_at: float = 0.0
+    available_at: float = AVAILABLE_NOW
 
     def __post_init__(self):
         if not isinstance(self.payload, FrozenDict):
