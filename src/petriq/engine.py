@@ -532,6 +532,9 @@ class PetriNet:
         - Callbacks (:attr:`on_token_deposited`, :attr:`on_error`) fire **outside**
           the engine lock to prevent re-entrant deadlocks.
         - :attr:`_running_count` is always decremented exactly once.
+        - Supply failures (where the action returns too few tokens to satisfy active non-resource
+          output arcs) are terminal for the data tokens — they are routed to :attr:`error_place`
+          rather than returned to their sources for retry.
         """
         try:
             start_time = time.monotonic()
