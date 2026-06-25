@@ -1,10 +1,10 @@
 import pytest
 
-from petriq.engine import PetriNet
-from petriq.places import Place
-from petriq.sandbox import SandboxEvaluator, verify_callable_purity
-from petriq.tokens import Token
-from petriq.transitions import InputArc, OutputArc, Transition
+from cpnx.engine import PetriNet
+from cpnx.places import Place
+from cpnx.sandbox import SandboxEvaluator, verify_callable_purity
+from cpnx.tokens import Token
+from cpnx.transitions import InputArc, OutputArc, Transition
 
 
 def test_sandbox_evaluator_whitelist():

@@ -94,7 +94,7 @@ class Token:
                  the net. Not used for resource tokens.
         created_at: Monotonic timestamp set at construction.
         color: CPN colour. ``None`` = uncoloured data token;
-               ``"resource"`` = permit token (see :class:`~petriq.places.ResourcePlace`);
+               ``"resource"`` = permit token (see :class:`~cpnx.places.ResourcePlace`);
                any other string = user-defined colour.
         available_at: Monotonic timestamp after which the token is available (timed CPNs).
                       Defaults to ``AVAILABLE_NOW`` (0.0) which denotes immediate availability.

@@ -4,10 +4,10 @@ import time
 
 import pytest
 
-from petriq.engine import PetriNet
-from petriq.places import Place
-from petriq.tokens import FrozenDict, Token
-from petriq.transitions import InputArc, OutputArc, Transition
+from cpnx.engine import PetriNet
+from cpnx.places import Place
+from cpnx.tokens import FrozenDict, Token
+from cpnx.transitions import InputArc, OutputArc, Transition
 
 
 class TestC1TokenRollbackOnExpressionError:
@@ -193,7 +193,7 @@ class TestW2ModelTimeReadUnderLock:
 
     def test_subnet_clock_synced_correctly_under_concurrent_advance(self):
         """Advance the parent clock while subnet execution is in flight — clock value must land."""
-        from petriq.transitions import SubstitutionTransition
+        from cpnx.transitions import SubstitutionTransition
 
         subnet = PetriNet(places=[Place("port_in"), Place("port_out")])
         subnet.add_transition(
@@ -292,7 +292,7 @@ class TestM1AttributeCallDenylistInVerifyCallablePurity:
     def test_time_sleep_blocked(self):
         import time as _time
 
-        from petriq.sandbox import verify_callable_purity
+        from cpnx.sandbox import verify_callable_purity
 
         # Import at module/test scope so the function body only shows t.sleep(1),
         # not an in-function import (which would be caught by the imports check first).
@@ -306,7 +306,7 @@ class TestM1AttributeCallDenylistInVerifyCallablePurity:
             verify_callable_purity(bad)
 
     def test_os_system_blocked(self):
-        from petriq.sandbox import verify_callable_purity
+        from cpnx.sandbox import verify_callable_purity
 
         def bad(tokens):
             import os
@@ -319,7 +319,7 @@ class TestM1AttributeCallDenylistInVerifyCallablePurity:
 
     def test_dict_get_allowed(self):
         """payload.get() is a legitimate pure operation and must not be blocked."""
-        from petriq.sandbox import verify_callable_purity
+        from cpnx.sandbox import verify_callable_purity
 
         def pure(tokens):
             return [t for t in tokens if t.payload.get("ok")]
@@ -328,7 +328,7 @@ class TestM1AttributeCallDenylistInVerifyCallablePurity:
         verify_callable_purity(pure)
 
     def test_string_methods_allowed(self):
-        from petriq.sandbox import verify_callable_purity
+        from cpnx.sandbox import verify_callable_purity
 
         def pure(tokens):
             return [t for t in tokens if t.payload.get("name", "").startswith("X")]

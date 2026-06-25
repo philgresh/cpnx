@@ -1,6 +1,6 @@
 # Petriq Agent Instructions & Rules
 
-These project-scoped guidelines apply to all AI agents working on the `petriq` codebase.
+These project-scoped guidelines apply to all AI agents working on the `cpnx` codebase.
 
 ---
 

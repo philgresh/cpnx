@@ -1,8 +1,8 @@
-"""Smoke tests for the public petriq API surface (imported from package root)."""
+"""Smoke tests for the public cpnx API surface (imported from package root)."""
 
 import time
 
-from petriq import (
+from cpnx import (
     InputArc,
     OutputArc,
     PacedResourcePlace,

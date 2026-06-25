@@ -1,7 +1,7 @@
 import pytest
 
-from petriq.places import Place, ResourcePlace
-from petriq.tokens import Token
+from cpnx.places import Place, ResourcePlace
+from cpnx.tokens import Token
 
 
 class TestPlace:

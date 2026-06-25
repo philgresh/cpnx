@@ -1,11 +1,11 @@
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
 
-from petriq.sandbox import verify_callable_purity
-from petriq.tokens import Token
+from cpnx.sandbox import verify_callable_purity
+from cpnx.tokens import Token
 
 if TYPE_CHECKING:
-    from petriq.engine import PetriNet
+    from cpnx.engine import PetriNet
 
 
 @dataclass

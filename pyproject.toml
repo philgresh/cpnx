@@ -1,12 +1,12 @@
 [project]
-name = "petriq"
+name = "cpnx"
 version = "0.1.0"
-description = "Lightweight Petri net executor for concurrent Python pipelines"
+description = "Coloured Petri Net executor for concurrent Python pipelines"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = []
-keywords = ["petri-net", "pipeline", "concurrency", "orchestration", "workflow"]
+keywords = ["petri-net", "coloured-petri-net", "colored-petri-net", "cpn", "pipeline", "concurrency", "orchestration", "workflow"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -14,6 +14,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 
 [project.optional-dependencies]
@@ -23,8 +24,8 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/philgresh/petriq"
-Documentation = "https://github.com/philgresh/petriq#readme"
+Repository = "https://github.com/philgresh/cpnx"
+Documentation = "https://github.com/philgresh/cpnx#readme"
 
 [build-system]
 requires = ["hatchling"]

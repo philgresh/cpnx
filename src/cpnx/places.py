@@ -1,4 +1,4 @@
-"""Place types for the petriq Petri net executor.
+"""Place types for the cpnx Petri net executor.
 
 All place classes are thread-safe. Choose the right type for your use case:
 
@@ -17,7 +17,7 @@ import threading
 import time
 from collections import deque
 
-from petriq.tokens import Token
+from cpnx.tokens import Token
 
 
 class Place:
@@ -121,7 +121,7 @@ class Place:
     def retrieve_specific(self, tokens: list[Token], model_time: float | None = None) -> list[Token]:
         """Remove and return exactly the tokens in *tokens* (matched by ``id``).
 
-        Used by the engine when an :class:`~petriq.transitions.InputArc` has an
+        Used by the engine when an :class:`~cpnx.transitions.InputArc` has an
         ``expression`` that selects a specific subset of tokens to consume.
         Uses an O(n) deque rebuild.
 

@@ -1,4 +1,4 @@
-from petriq.tokens import Token
+from cpnx.tokens import Token
 
 
 class TestToken:
@@ -41,7 +41,7 @@ class TestToken:
     def test_frozen_dict_backdoor_blocked(self):
         import pytest
 
-        from petriq.tokens import FrozenDict
+        from cpnx.tokens import FrozenDict
 
         fd = FrozenDict({"x": 1})
         with pytest.raises(TypeError):

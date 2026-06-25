@@ -1,7 +1,7 @@
-"""examples/etl_pipeline.py — Multi-stage ETL pipeline using petriq."""
+"""examples/etl_pipeline.py — Multi-stage ETL pipeline using cpnx."""
 
 import time
-from petriq import InputArc, OutputArc, PetriNet, Place, ResourcePlace, ThresholdPlace, Token, Transition
+from cpnx import InputArc, OutputArc, PetriNet, Place, ResourcePlace, ThresholdPlace, Token, Transition
 
 
 # Stage 1: Transform action (takes 3 extracted tokens, batches them, produces 1 batch token)

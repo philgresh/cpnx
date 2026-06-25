@@ -1,7 +1,7 @@
-"""examples/gpu_pipeline.py — GPU slot management with petriq."""
+"""examples/gpu_pipeline.py — GPU slot management with cpnx."""
 
 import time
-from petriq import InputArc, OutputArc, PetriNet, Place, ResourcePlace, Token, Transition
+from cpnx import InputArc, OutputArc, PetriNet, Place, ResourcePlace, Token, Transition
 
 
 def train_model(tokens: list[Token]) -> list[Token]:

@@ -7,11 +7,11 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
-from petriq.places import PacedResourcePlace, Place, ResourcePlace
-from petriq.sandbox import SandboxEvaluator
-from petriq.tokens import Token
-from petriq.transitions import SubstitutionTransition, Transition
-from petriq.visualization import snapshot, to_dot
+from cpnx.places import PacedResourcePlace, Place, ResourcePlace
+from cpnx.sandbox import SandboxEvaluator
+from cpnx.tokens import Token
+from cpnx.transitions import SubstitutionTransition, Transition
+from cpnx.visualization import snapshot, to_dot
 
 
 class PetriNet:
@@ -63,9 +63,9 @@ class PetriNet:
             error_place: Name of the place that receives data tokens from failed
                          transitions. Created automatically — do not register a
                          place with this name manually.
-            places: Optional list of :class:`~petriq.places.Place` instances to
+            places: Optional list of :class:`~cpnx.places.Place` instances to
                     register at construction time.
-            transitions: Optional list of :class:`~petriq.transitions.Transition`
+            transitions: Optional list of :class:`~cpnx.transitions.Transition`
                          instances to register at construction time.
             cooldown_interval: Cooldown check polling interval in seconds.
             timeout_secs: Maximum allowed execution time in seconds for transition
@@ -162,10 +162,10 @@ class PetriNet:
         and before :meth:`run` or :meth:`step` is invoked.
 
         Args:
-            place: A :class:`~petriq.places.Place`,
-                   :class:`~petriq.places.ResourcePlace`,
-                   :class:`~petriq.places.PacedResourcePlace`, or
-                   :class:`~petriq.places.ThresholdPlace` instance.
+            place: A :class:`~cpnx.places.Place`,
+                   :class:`~cpnx.places.ResourcePlace`,
+                   :class:`~cpnx.places.PacedResourcePlace`, or
+                   :class:`~cpnx.places.ThresholdPlace` instance.
         """
         with self._lock:
             if place.name in self.transitions:
@@ -182,7 +182,7 @@ class PetriNet:
         fires — referencing an undeclared name raises :exc:`KeyError` at fire time.
 
         Args:
-            transition: The :class:`~petriq.transitions.Transition` to register.
+            transition: The :class:`~cpnx.transitions.Transition` to register.
         """
         with self._lock:
             if transition.name in self.places:
@@ -204,9 +204,9 @@ class PetriNet:
         sources (data loaders, scheduled events, API responses, etc.).
 
         Note:
-            Auto-creation always produces a bare :class:`~petriq.places.Place`.
-            If you need a :class:`~petriq.places.ResourcePlace` or
-            :class:`~petriq.places.ThresholdPlace`, call :meth:`add_place` first.
+            Auto-creation always produces a bare :class:`~cpnx.places.Place`.
+            If you need a :class:`~cpnx.places.ResourcePlace` or
+            :class:`~cpnx.places.ThresholdPlace`, call :meth:`add_place` first.
 
         Args:
             place_name: Name of the target place.
@@ -346,7 +346,7 @@ class PetriNet:
         A net is quiescent when ``_running_count == 0`` and every transition is
         blocked (insufficient tokens, guards False, etc.).
 
-        For :class:`~petriq.places.PacedResourcePlace`, tokens in cooldown are
+        For :class:`~cpnx.places.PacedResourcePlace`, tokens in cooldown are
         counted as *present* — the net is not considered quiescent while tokens
         are merely cooling down, since they will become available once the
         cooldown expires.
@@ -365,7 +365,7 @@ class PetriNet:
 
         In CPN formalism the *marking* ``M`` is a function from places to
         multisets of colour values. This property returns a tuple of live
-        :class:`~petriq.tokens.Token` objects currently in each place.
+        :class:`~cpnx.tokens.Token` objects currently in each place.
 
         Returns:
             Dict mapping place name → tuple of tokens currently in that place.
@@ -446,7 +446,7 @@ class PetriNet:
 
         Unlike the public :meth:`deposit`, this method does NOT auto-create missing
         places — it raises :exc:`KeyError` so typos in arc names are caught loudly
-        rather than silently creating a bare :class:`~petriq.places.Place` with the
+        rather than silently creating a bare :class:`~cpnx.places.Place` with the
         wrong type. Callbacks are NOT fired here; callers collect deposits and fire
         them after releasing the lock.
 
@@ -530,7 +530,7 @@ class PetriNet:
         """Return ``True`` if *transition* could fire given current token counts, ignoring timing.
 
         Unlike :meth:`_is_transition_enabled`, this ignores cooldown timers on
-        :class:`~petriq.places.PacedResourcePlace` (tokens in cooldown are counted
+        :class:`~cpnx.places.PacedResourcePlace` (tokens in cooldown are counted
         as present) and settle windows. Used by :meth:`is_quiescent` to distinguish
         "no work possible" from "work temporarily blocked by timing".
         """

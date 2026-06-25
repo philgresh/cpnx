@@ -1,7 +1,7 @@
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from petriq.engine import PetriNet
+    from cpnx.engine import PetriNet
 
 
 def snapshot(net: "PetriNet") -> dict[str, Any]:

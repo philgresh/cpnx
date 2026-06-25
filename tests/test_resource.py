@@ -2,10 +2,10 @@ import time
 
 import pytest
 
-from petriq.engine import PetriNet
-from petriq.places import PacedResourcePlace, Place, ResourcePlace
-from petriq.tokens import Token
-from petriq.transitions import InputArc, OutputArc, Transition
+from cpnx.engine import PetriNet
+from cpnx.places import PacedResourcePlace, Place, ResourcePlace
+from cpnx.tokens import Token
+from cpnx.transitions import InputArc, OutputArc, Transition
 
 
 class TestResourcePlace:

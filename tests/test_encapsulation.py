@@ -1,9 +1,9 @@
 import time
 
-from petriq.engine import PetriNet
-from petriq.places import Place
-from petriq.tokens import Token
-from petriq.transitions import InputArc, OutputArc, SubstitutionTransition, Transition
+from cpnx.engine import PetriNet
+from cpnx.places import Place
+from cpnx.tokens import Token
+from cpnx.transitions import InputArc, OutputArc, SubstitutionTransition, Transition
 
 
 def test_substitution_transition_execution():

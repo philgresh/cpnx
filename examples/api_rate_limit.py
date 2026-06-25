@@ -1,7 +1,7 @@
 """examples/api_rate_limit.py — Rate-limited API with pacing."""
 
 import time
-from petriq import InputArc, OutputArc, PacedResourcePlace, PetriNet, Place, Token, Transition
+from cpnx import InputArc, OutputArc, PacedResourcePlace, PetriNet, Place, Token, Transition
 
 
 def call_api(tokens: list[Token]) -> list[Token]:
