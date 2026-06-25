@@ -214,6 +214,14 @@ Yes, Petri nets are mathematically analyzer-friendly. By expressing your orchest
 
 ---
 
+## Sandboxing & Pure Evaluation
+
+For safety and mathematical purity, `petriq` supports two ways of expressing guards and arc expressions:
+1. **String Expressions**: These are evaluated via `SandboxEvaluator` which performs static AST analysis to enforce a strict allowlist of mathematical and comparison operations. This provides a hermetic sandbox.
+2. **Callable Expressions**: Python callable objects (e.g. lambdas or functions) can also be used. While these are executed within a separate thread pool (`cpnx-expr`) and constrained by a timeout (`timeout_secs`), they are **not** I/O-isolated. In-memory closures can capture external modules or mutable states. Full hermetic sandboxing requires using string expressions.
+
+---
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

@@ -109,3 +109,26 @@ def test_arc_expression_sandbox():
     # Deposit token with val=42 (so guard evaluates to True)
     net.deposit("in", Token(payload={"val": 42}))
     assert net.step() is True
+
+
+def test_callable_expression_timeout():
+    import time
+
+    def slow_expression(tokens):
+        time.sleep(0.5)
+        return tokens
+
+    with PetriNet(timeout_secs=0.1) as net:
+        p_in = Place("in")
+        net.add_place(p_in)
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[InputArc("in", expression=slow_expression)],
+                outputs=[],
+                action=lambda tokens: tokens,
+            )
+        )
+        net.deposit("in", Token())
+        with pytest.raises(RuntimeError, match="exceeded 0.1s"):
+            net.step()

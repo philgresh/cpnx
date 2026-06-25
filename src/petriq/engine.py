@@ -53,6 +53,7 @@ class PetriNet:
         places: list[Place] | None = None,
         transitions: list[Transition] | None = None,
         cooldown_interval: float = 0.05,
+        timeout_secs: float = 1.0,
     ) -> None:
         """Initialise the executor.
 
@@ -65,10 +66,13 @@ class PetriNet:
                     register at construction time.
             transitions: Optional list of :class:`~petriq.transitions.Transition`
                          instances to register at construction time.
+            cooldown_interval: Cooldown check polling interval in seconds.
+            timeout_secs: Maximum allowed execution time in seconds for user-provided callable expressions or guards.
         """
         self.max_workers = max_workers
         self.error_place = error_place
         self.cooldown_interval = cooldown_interval
+        self.timeout_secs = timeout_secs
         self._has_timed_features = False
         self._model_time: float | None = None
         self.places: dict[str, Place] = {}
@@ -76,6 +80,7 @@ class PetriNet:
         self._lock = threading.Lock()
         self._running_count = 0
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._expr_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cpnx-expr")
         # Signalled whenever tokens are deposited; wakes run() without busy-waiting.
         self._work_available = threading.Event()
 
@@ -103,6 +108,15 @@ class PetriNet:
             self.add_place(p)
         for t in transitions or []:
             self.add_transition(t)
+
+    def _call_expr(self, fn, *args):
+        from concurrent.futures import TimeoutError as FuturesTimeout
+
+        fut = self._expr_executor.submit(fn, *args)
+        try:
+            return fut.result(timeout=self.timeout_secs)
+        except FuturesTimeout as exc:
+            raise RuntimeError(f"Expression {fn!r} exceeded {self.timeout_secs}s — possible I/O call") from exc
 
     def _get_model_time_under_lock(self) -> float:
         """Internal helper to get the model time without acquiring the engine lock."""
@@ -225,7 +239,7 @@ class PetriNet:
                     if isinstance(arc.expression, str):
                         ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
                     else:
-                        ordered = arc.expression(available)
+                        ordered = self._call_expr(arc.expression, available)
                     tokens = place.retrieve_specific(ordered[: arc.count], model_time=m_time)
                 else:
                     tokens = place.retrieve(arc.count, model_time=m_time)
@@ -363,10 +377,15 @@ class PetriNet:
     def __exit__(self, *_: object) -> None:
         """Shut down the thread pool, waiting for in-flight transitions to finish."""
         self._executor.shutdown(wait=True)
+        self._expr_executor.shutdown(wait=True)
 
     def __del__(self) -> None:
         try:
             self._executor.shutdown(wait=False)
+        except Exception:
+            pass
+        try:
+            self._expr_executor.shutdown(wait=False)
         except Exception:
             pass
 
@@ -424,7 +443,7 @@ class PetriNet:
                 if isinstance(arc.expression, str):
                     ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
                 else:
-                    ordered = arc.expression(available)
+                    ordered = self._call_expr(arc.expression, available)
                 tokens = ordered[: arc.count]
             else:
                 tokens = available[: arc.count]
@@ -446,7 +465,7 @@ class PetriNet:
                     if not SandboxEvaluator.evaluate(transition.guard, {"tokens": candidate_tokens}):
                         return False
                 else:
-                    if not transition.guard(candidate_tokens):
+                    if not self._call_expr(transition.guard, candidate_tokens):
                         return False
             except Exception:
                 return False
@@ -476,7 +495,7 @@ class PetriNet:
                 if isinstance(arc.expression, str):
                     ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
                 else:
-                    ordered = arc.expression(available)
+                    ordered = self._call_expr(arc.expression, available)
                 tokens = ordered[: arc.count]
             else:
                 tokens = available[: arc.count]
@@ -488,7 +507,7 @@ class PetriNet:
                     if not SandboxEvaluator.evaluate(transition.guard, {"tokens": candidate_tokens}):
                         return False
                 else:
-                    if not transition.guard(candidate_tokens):
+                    if not self._call_expr(transition.guard, candidate_tokens):
                         return False
             except Exception:
                 return False
@@ -548,7 +567,7 @@ class PetriNet:
                         elif isinstance(arc.expression, str):
                             if SandboxEvaluator.evaluate(arc.expression, {"tokens": output_tokens_data}):
                                 active_outputs.append((arc, is_res))  # type: ignore[arg-type]
-                        elif arc.expression(output_tokens_data):
+                        elif self._call_expr(arc.expression, output_tokens_data):
                             active_outputs.append((arc, is_res))  # type: ignore[arg-type]
 
                     # Pass 2: pre-flight — validate supply against active arcs only so that
