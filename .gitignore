@@ -1,7 +1,34 @@
+# Python
 .venv/
-.pytest_cache/
 __pycache__/
-*.pyc
-src/petriq.egg-info/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
 dist/
 build/
+.eggs/
+*.so
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+htmlcov/
+.coverage
+coverage.xml
+*.cover
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

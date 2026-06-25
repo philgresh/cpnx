@@ -6,44 +6,112 @@ from petriq.tokens import Token
 from petriq.transitions import InputArc, OutputArc, Transition
 
 
-def test_batch_settling():
-    net = PetriNet(max_workers=2)
-    net.add_place(Place("input"))
-    net.add_place(Place("output"))
+class TestSettlingBatch:
+    def test_fires_after_settle(self):
+        net = PetriNet(max_workers=2)
+        net.add_place(Place("input"))
+        net.add_place(Place("output"))
 
-    received_tokens = []
+        received = []
 
-    def action(tokens):
-        nonlocal received_tokens
-        received_tokens = list(tokens)
-        return tokens
+        def action(tokens):
+            received.extend(tokens)
+            return tokens
 
-    net.add_transition(
-        Transition(
-            name="batch_t",
-            inputs=[InputArc("input", consume_all=True, settle_secs=0.2)],
-            outputs=[OutputArc("output")],
-            action=action,
+        net.add_transition(
+            Transition(
+                name="batch_t",
+                inputs=[InputArc("input", consume_all=True, settle_secs=0.15)],
+                outputs=[OutputArc("output", count=5)],
+                action=action,
+            )
         )
-    )
 
-    # Deposit 7 tokens with small delays, less than settle_secs (0.2s)
-    for i in range(7):
-        net.deposit("input", Token(payload={"idx": i}))
-        time.sleep(0.04)
+        for i in range(5):
+            net.deposit("input", Token(payload={"i": i}))
+            time.sleep(0.02)
 
-    # Immediately after the last deposit, it should not have settled yet
-    fired = net.step()
-    assert not fired
-    assert len(received_tokens) == 0
+        # Should not fire immediately
+        assert not net.step()
 
-    # Wait for the settling time to elapse (0.2s)
-    time.sleep(0.22)
+        time.sleep(0.18)
+        assert net.step()
+        net.run(deadline=time.monotonic() + 1.0)
+        assert len(received) == 5
 
-    # Now it should be settled and fire
-    fired = net.step()
-    assert fired
+    def test_does_not_fire_while_tokens_still_arriving(self):
+        net = PetriNet(max_workers=2)
+        net.add_place(Place("input"))
+        net.add_place(Place("output"))
 
-    net.run(deadline=time.monotonic() + 1.0)
-    assert len(received_tokens) == 7
-    assert [t.payload["idx"] for t in received_tokens] == list(range(7))
+        net.add_transition(
+            Transition(
+                name="batch_t",
+                inputs=[InputArc("input", consume_all=True, settle_secs=0.3)],
+                outputs=[OutputArc("output", count=5)],
+                action=lambda tokens: tokens,
+            )
+        )
+
+        # Deposit first batch
+        for _ in range(3):
+            net.deposit("input", Token())
+        time.sleep(0.25)
+
+        # Deposit more — resets settle clock
+        for _ in range(3):
+            net.deposit("input", Token())
+
+        # Not settled yet
+        assert not net.step()
+
+    def test_consume_all_drains_entire_place(self):
+        net = PetriNet(max_workers=2)
+        net.add_place(Place("input"))
+        net.add_place(Place("output"))
+
+        consumed_count = [0]
+
+        def action(tokens):
+            consumed_count[0] = len(tokens)
+            return tokens
+
+        net.add_transition(
+            Transition(
+                name="drain",
+                inputs=[InputArc("input", consume_all=True, settle_secs=0.05)],
+                outputs=[OutputArc("output", count=5)],
+                action=action,
+            )
+        )
+
+        for _ in range(10):
+            net.deposit("input", Token())
+
+        time.sleep(0.08)
+        net.run(deadline=time.monotonic() + 1.0)
+        assert consumed_count[0] == 10
+        assert len(net.places["input"].tokens) == 0
+
+    def test_batch_preserves_payload(self):
+        net = PetriNet(max_workers=2)
+        net.add_place(Place("input"))
+        net.add_place(Place("output"))
+
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[InputArc("input", consume_all=True, settle_secs=0.05)],
+                outputs=[OutputArc("output", count=5)],
+                action=lambda tokens: tokens,
+            )
+        )
+
+        payloads = [{"k": i} for i in range(5)]
+        for p in payloads:
+            net.deposit("input", Token(payload=p))
+
+        time.sleep(0.08)
+        net.run(deadline=time.monotonic() + 1.0)
+        got_payloads = [t.payload for t in net.places["output"].tokens]
+        assert sorted(got_payloads, key=lambda x: x["k"]) == payloads
