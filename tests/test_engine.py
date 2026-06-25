@@ -1,5 +1,7 @@
 import time
 
+import pytest
+
 from petriq.engine import PetriNet
 from petriq.places import Place
 from petriq.tokens import Token
@@ -186,3 +188,51 @@ def test_basexception_does_not_leak_running_count():
 
     with net._lock:
         assert net._running_count == 0
+
+
+def test_bipartite_add_transition_rejects_transition_target():
+    net = PetriNet()
+    net.add_transition(
+        Transition(
+            name="t1",
+            inputs=[],
+            outputs=[],
+            action=lambda tokens: tokens,
+        )
+    )
+
+    with pytest.raises(TypeError, match="Arc target .* is a Transition, not a Place"):
+        net.add_transition(
+            Transition(
+                name="t2",
+                inputs=[InputArc("t1")],
+                outputs=[],
+                action=lambda tokens: tokens,
+            )
+        )
+
+
+def test_name_overlap_raises():
+    net = PetriNet()
+    net.add_place(Place("shared_name"))
+    with pytest.raises(ValueError, match="already registered as a Place"):
+        net.add_transition(
+            Transition(
+                name="shared_name",
+                inputs=[],
+                outputs=[],
+                action=lambda tokens: tokens,
+            )
+        )
+
+    net2 = PetriNet()
+    net2.add_transition(
+        Transition(
+            name="shared_name",
+            inputs=[],
+            outputs=[],
+            action=lambda tokens: tokens,
+        )
+    )
+    with pytest.raises(ValueError, match="already registered as a Transition"):
+        net2.add_place(Place("shared_name"))

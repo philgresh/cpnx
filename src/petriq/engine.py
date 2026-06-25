@@ -159,6 +159,8 @@ class PetriNet:
                    :class:`~petriq.places.ThresholdPlace` instance.
         """
         with self._lock:
+            if place.name in self.transitions:
+                raise ValueError(f"Name overlap: '{place.name}' is already registered as a Transition.")
             self.places[place.name] = place
             if isinstance(place, PacedResourcePlace):
                 self._has_timed_features = True
@@ -174,6 +176,14 @@ class PetriNet:
             transition: The :class:`~petriq.transitions.Transition` to register.
         """
         with self._lock:
+            if transition.name in self.places:
+                raise ValueError(f"Name overlap: '{transition.name}' is already registered as a Place.")
+            for arc in transition.inputs + transition.outputs:
+                if arc.place == transition.name or arc.place in self.transitions:
+                    raise TypeError(
+                        f"Arc target '{arc.place}' is a Transition, not a Place. "
+                        "Arcs must connect Places↔Transitions only."
+                    )
             self.transitions[transition.name] = transition
             if any(arc.settle_secs > 0.0 for arc in transition.inputs):
                 self._has_timed_features = True
@@ -261,6 +271,28 @@ class PetriNet:
 
         return True
 
+    def validate(self) -> None:
+        """Validate the structural topology of the Petri net.
+
+        Checks for name overlaps between places and transitions, and verifies
+        that all transition arcs connect to valid places and not transitions.
+        """
+        with self._lock:
+            # Check overlap between place names and transition names
+            overlaps = set(self.places.keys()) & set(self.transitions.keys())
+            if overlaps:
+                raise ValueError(f"Name overlap: '{list(overlaps)[0]}' is registered as both a Place and a Transition.")
+
+            for name, transition in self.transitions.items():
+                for arc in transition.inputs + transition.outputs:
+                    if arc.place in self.transitions:
+                        raise TypeError(
+                            f"Arc target '{arc.place}' in transition '{name}' is a Transition, not a Place. "
+                            f"Arcs must connect Places↔Transitions only."
+                        )
+                    if arc.place not in self.places:
+                        raise KeyError(f"Place '{arc.place}' referenced by transition '{name}' is not registered.")
+
     def run(self, deadline: float) -> None:
         """Fire enabled transitions until the net is quiescent or the deadline passes.
 
@@ -280,6 +312,7 @@ class PetriNet:
 
             net.run(deadline=time.monotonic() + 30)  # run for up to 30 seconds
         """
+        self.validate()
         while not self.is_quiescent():
             if time.monotonic() > deadline:
                 break
