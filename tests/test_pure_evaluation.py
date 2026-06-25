@@ -66,17 +66,18 @@ def test_callable_purity_verification_invalid():
 
 
 def test_transition_purity_checks():
-    # Transition instantiation should trigger purity check and raise on impure actions/guards
-    def impure_action(tokens):
+    # Transition instantiation should trigger purity check and raise on impure guards
+    def impure_guard(tokens):
         print("impure")
-        return tokens
+        return True
 
     with pytest.raises(PermissionError):
         Transition(
             name="t",
             inputs=[InputArc("in")],
             outputs=[],
-            action=impure_action,
+            action=lambda tokens: tokens,
+            guard=impure_guard,
         )
 
 

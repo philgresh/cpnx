@@ -98,8 +98,8 @@ class Transition:
     priority: int = 10
 
     def __post_init__(self):
-        if callable(self.action):
-            verify_callable_purity(self.action)
+        # Actions are explicitly allowed side effects (e.g., database writes,
+        # API calls, I/O), so they are not subject to purity verification.
         if callable(self.guard):
             verify_callable_purity(self.guard)
 
