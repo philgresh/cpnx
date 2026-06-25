@@ -32,3 +32,6 @@ coverage.xml
 *.swp
 *.swo
 *~
+
+# Env vars
+.env

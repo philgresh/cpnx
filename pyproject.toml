@@ -2,6 +2,9 @@
 name = "cpnx"
 version = "0.1.0"
 description = "Coloured Petri Net executor for concurrent Python pipelines"
+authors = [
+  { name = "Phil Gresham", email = "phil@gresham.dev" },
+]
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
