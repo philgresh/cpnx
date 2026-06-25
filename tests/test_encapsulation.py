@@ -103,3 +103,35 @@ def test_substitution_transition_requires_predeclared_ports():
                 "child_port_in": "parent_socket_in",
             },
         )
+
+
+def test_substitution_transition_subnet_sharing_raises():
+    import pytest
+
+    child = PetriNet()
+    child.add_place(Place("child_port_in"))
+
+    # Map once
+    SubstitutionTransition(
+        name="sub1",
+        inputs=[InputArc("parent_socket_in")],
+        outputs=[],
+        action=None,  # type: ignore[assignment]
+        subnet=child,
+        port_socket_map={
+            "child_port_in": "parent_socket_in",
+        },
+    )
+
+    # Attempting to map same child instance again should raise ValueError
+    with pytest.raises(ValueError, match="child subnet is already mapped"):
+        SubstitutionTransition(
+            name="sub2",
+            inputs=[InputArc("parent_socket_in")],
+            outputs=[],
+            action=None,  # type: ignore[assignment]
+            subnet=child,
+            port_socket_map={
+                "child_port_in": "parent_socket_in",
+            },
+        )

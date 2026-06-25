@@ -133,3 +133,10 @@ class SubstitutionTransition(Transition):
                 f"SubstitutionTransition '{self.name}': subnet has no places for ports {missing}. "
                 "Pre-declare port places in the subnet before wrapping it."
             )
+
+        if getattr(self.subnet, "_parent_transition", None) is not None:
+            raise ValueError(
+                f"SubstitutionTransition '{self.name}': child subnet is already mapped to "
+                f"transition '{self.subnet._parent_transition}'."
+            )
+        self.subnet._parent_transition = self.name
