@@ -195,6 +195,15 @@ class Place:
         with self._lock:
             return list(self._tokens)
 
+    def __len__(self) -> int:
+        """Return the number of tokens currently in the place."""
+        with self._lock:
+            return len(self._tokens)
+
+    def __bool__(self) -> bool:
+        """A Place is always truthy, even when it contains no tokens."""
+        return True
+
 
 class ResourcePlace(Place):
     """A bounded resource-permit pool pre-filled with *capacity* resource tokens.
@@ -325,6 +334,34 @@ class PacedResourcePlace(ResourcePlace):
             now = time.monotonic()
             available = [t for t in self._tokens if self._cooldowns.get(t.id, 0.0) <= now]
             return available[:count]
+
+    def retrieve_all(self) -> list[Token]:
+        """Remove and return every token currently in the place, clearing their cooldown tracking.
+
+        Returns:
+            All tokens in FIFO order.
+        """
+        with self._lock:
+            ret = list(self._tokens)
+            self._tokens.clear()
+            self._cooldowns.clear()
+            return ret
+
+    def retrieve_specific(self, tokens: list[Token]) -> list[Token]:
+        """Remove and return exactly the specified tokens, clearing their cooldown tracking."""
+        with self._lock:
+            remove_ids = {t.id for t in tokens}
+            present_ids = {t.id for t in self._tokens}
+            missing = remove_ids - present_ids
+            if missing:
+                raise ValueError(
+                    f"Place '{self.name}': token id(s) {missing} not found — "
+                    f"cannot retrieve_specific tokens that are not present."
+                )
+            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
+            for t in tokens:
+                self._cooldowns.pop(t.id, None)
+            return tokens
 
 
 class ThresholdPlace(Place):

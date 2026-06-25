@@ -113,7 +113,7 @@ graph LR
 ```python
 @dataclass
 class Token:
-    id: str = ...          # Unique 8-character ID
+    id: str = ...          # Unique 16-character ID
     payload: dict = ...    # User payload dict
     created_at: float = ... # Monotonic creation time
     is_resource: bool = False # Flag identifying resource tokens

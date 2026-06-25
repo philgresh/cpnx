@@ -1,3 +1,4 @@
+import copy
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -21,7 +22,7 @@ def snapshot(net: "PetriNet") -> dict[str, Any]:
                 tokens_list.append(
                     {
                         "id": t.id,
-                        "payload": t.payload,
+                        "payload": copy.deepcopy(t.payload),
                         "created_at": t.created_at,
                         "color": t.color,
                     }
@@ -45,7 +46,7 @@ def to_dot(net: "PetriNet") -> str:
 
         # Nodes: Places
         for name, place in net.places.items():
-            token_count = len(place.tokens)
+            token_count = len(place)
             label = f"{name}\\n({token_count})"
             lines.append(f'  "{name}" [shape=circle, label="{label}"];')
 

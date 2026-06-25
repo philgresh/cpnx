@@ -13,7 +13,7 @@ class Token:
     string for domain-specific colours.
 
     Attributes:
-        id: Unique identifier (8-char hex). Auto-generated.
+        id: Unique identifier (16-char hex). Auto-generated.
         payload: Mutable dict accumulating enrichment data as the token traverses
                  the net. Not used for resource tokens.
         created_at: Monotonic timestamp set at construction.
@@ -22,7 +22,7 @@ class Token:
                any other string = user-defined colour.
     """
 
-    id: str = field(default_factory=lambda: uuid4().hex[:8])
+    id: str = field(default_factory=lambda: uuid4().hex[:16])
     payload: dict = field(default_factory=dict)
     created_at: float = field(default_factory=time.monotonic)
     color: str | None = None

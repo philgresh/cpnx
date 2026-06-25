@@ -50,6 +50,7 @@ class PetriNet:
         error_place: str = "failed",
         places: list[Place] | None = None,
         transitions: list[Transition] | None = None,
+        cooldown_interval: float = 0.05,
     ) -> None:
         """Initialise the executor.
 
@@ -65,6 +66,8 @@ class PetriNet:
         """
         self.max_workers = max_workers
         self.error_place = error_place
+        self.cooldown_interval = cooldown_interval
+        self._has_timed_features = False
         self.places: dict[str, Place] = {}
         self.transitions: dict[str, Transition] = {}
         self._lock = threading.Lock()
@@ -116,6 +119,8 @@ class PetriNet:
         """
         with self._lock:
             self.places[place.name] = place
+            if isinstance(place, PacedResourcePlace):
+                self._has_timed_features = True
 
     def add_transition(self, transition: Transition) -> None:
         """Register a transition with the net.
@@ -129,6 +134,8 @@ class PetriNet:
         """
         with self._lock:
             self.transitions[transition.name] = transition
+            if any(arc.settle_secs > 0.0 for arc in transition.inputs):
+                self._has_timed_features = True
 
     def deposit(self, place_name: str, token: Token) -> None:
         """Deposit *token* into *place_name*, creating the place if it does not exist.
@@ -199,6 +206,9 @@ class PetriNet:
                 # submit() failed (e.g. executor shut down) — undo the increment so
                 # is_quiescent() doesn't permanently block.
                 self._running_count -= 1
+                # Return consumed tokens back to their source places
+                for src_name, t in token_sources:
+                    self._deposit_under_lock(src_name, t)
                 raise
 
         return True
@@ -229,8 +239,9 @@ class PetriNet:
             if not self.step():
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
-                    # Cap at 50 ms so paced-resource cooldowns are checked promptly.
-                    self._work_available.wait(timeout=min(remaining, 0.05))
+                    # Cap at cooldown_interval if timed features are active.
+                    timeout = min(remaining, self.cooldown_interval) if self._has_timed_features else remaining
+                    self._work_available.wait(timeout=timeout)
 
     def is_quiescent(self) -> bool:
         """Return ``True`` if no transitions are running and none can currently fire.
@@ -264,7 +275,7 @@ class PetriNet:
             Dict mapping place name → list of tokens currently in that place.
         """
         with self._lock:
-            return {name: list(place._tokens) for name, place in self.places.items()}
+            return {name: place.tokens for name, place in self.places.items()}
 
     def is_dead(self) -> bool:
         """Return ``True`` if no transition is currently enabled (CPN dead state).
@@ -359,7 +370,7 @@ class PetriNet:
         """
         for arc in transition.inputs:
             place = self.places.get(arc.place)
-            if not place:
+            if place is None:
                 return False
             if not place.can_retrieve(arc.count):
                 return False
@@ -375,7 +386,7 @@ class PetriNet:
             if arc.expression is not None:
                 continue
             place = self.places.get(arc.place)
-            if place and not place.can_deposit(arc.count):
+            if place is not None and not place.can_deposit(arc.count):
                 return False
 
         if transition.guard is not None:
@@ -396,12 +407,11 @@ class PetriNet:
         """
         for arc in transition.inputs:
             place = self.places.get(arc.place)
-            if not place:
+            if place is None:
                 return False
             if isinstance(place, PacedResourcePlace):
-                with place._lock:
-                    if len(place._tokens) < arc.count:
-                        return False
+                if len(place) < arc.count:
+                    return False
             else:
                 if not place.can_retrieve(arc.count):
                     return False
@@ -487,6 +497,15 @@ class PetriNet:
                         t = res_deque.popleft() if is_res_place else out_deque.popleft()
                         self._deposit_under_lock(arc.place, t)  # type: ignore[attr-defined]
                         deposited.append((arc.place, t))  # type: ignore[attr-defined]
+
+                # Return any leftover resource tokens to their original source places
+                while res_deque:
+                    leftover_token = res_deque.popleft()
+                    for src_name, t in token_sources:
+                        if t.id == leftover_token.id:
+                            self._deposit_under_lock(src_name, leftover_token)
+                            deposited.append((src_name, leftover_token))
+                            break
 
             if not success:
                 # Return all resource tokens to their source places.

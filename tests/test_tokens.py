@@ -5,7 +5,7 @@ class TestToken:
     def test_default_fields(self):
         t = Token()
         assert isinstance(t.id, str)
-        assert len(t.id) == 8
+        assert len(t.id) == 16
         assert t.payload == {}
         assert t.is_resource is False
         assert t.created_at > 0
