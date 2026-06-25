@@ -126,3 +126,10 @@ class SubstitutionTransition(Transition):
         for port, socket in self.port_socket_map.items():
             if not isinstance(port, str) or not isinstance(socket, str):
                 raise TypeError("Port and socket mapping names must be strings.")
+
+        missing = [p for p in self.port_socket_map if p not in self.subnet.places]
+        if missing:
+            raise ValueError(
+                f"SubstitutionTransition '{self.name}': subnet has no places for ports {missing}. "
+                "Pre-declare port places in the subnet before wrapping it."
+            )

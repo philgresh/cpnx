@@ -84,3 +84,22 @@ def test_strict_port_socket_boundary_violation():
     # Token should be routed to failed (error_place) due to boundary violation
     failed_tokens = parent.places["failed"].tokens
     assert len(failed_tokens) == 1
+
+
+def test_substitution_transition_requires_predeclared_ports():
+    import pytest
+
+    child = PetriNet()
+    # child_port_in is missing from child places!
+
+    with pytest.raises(ValueError, match="subnet has no places for ports"):
+        SubstitutionTransition(
+            name="sub_net_transition",
+            inputs=[InputArc("parent_socket_in")],
+            outputs=[],
+            action=None,  # type: ignore[assignment]
+            subnet=child,
+            port_socket_map={
+                "child_port_in": "parent_socket_in",
+            },
+        )

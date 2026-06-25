@@ -719,8 +719,6 @@ class PetriNet:
         # Deposit consumed tokens into the corresponding subnet port places
         for socket_name, token in token_sources:
             for port_name in socket_to_ports[socket_name]:
-                if port_name not in subnet.places:
-                    subnet.add_place(Place(port_name))
                 subnet.deposit(port_name, token)
 
         # Sync logical clock if active
