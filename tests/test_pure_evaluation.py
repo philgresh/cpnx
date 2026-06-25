@@ -136,7 +136,10 @@ def test_callable_expression_timeout():
     import time
 
     def slow_expression(tokens):
-        time.sleep(0.5)
+        # Busy-wait: time.sleep is on the purity denylist, so use a spin loop instead.
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            pass
         return tokens
 
     with PetriNet(timeout_secs=0.1) as net:

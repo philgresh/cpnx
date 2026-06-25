@@ -235,19 +235,22 @@ class TestM2ExprTimeoutDoesNotStallEngineLock:
         assert net.expr_timeout_secs == 0.05
 
     def test_slow_expression_times_out_with_expr_timeout(self):
-        """Expression that sleeps past expr_timeout_secs disables the transition (W1 path)."""
+        """Expression that busy-waits past expr_timeout_secs disables the transition (W1 path)."""
+
+        def slow_expr(tokens):
+            # Busy-wait without calling time.sleep (which is on the purity denylist)
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                pass
+            return tokens
+
         net = PetriNet(
             expr_timeout_secs=0.05,
             places=[Place("p"), Place("out")],
             transitions=[
                 Transition(
                     name="t",
-                    inputs=[
-                        InputArc(
-                            "p",
-                            expression=lambda tokens: (time.sleep(0.5), tokens)[1],
-                        )
-                    ],
+                    inputs=[InputArc("p", expression=slow_expr)],
                     outputs=[OutputArc("out")],
                     action=lambda tokens: tokens,
                 )
@@ -280,6 +283,57 @@ class TestM2ExprTimeoutDoesNotStallEngineLock:
         net.deposit("p", Token())
         net.run(deadline=time.monotonic() + 2.0)
         assert len(net.places["out"].tokens) == 1
+
+
+class TestM1AttributeCallDenylistInVerifyCallablePurity:
+    """M1: verify_callable_purity must block unambiguously dangerous attribute calls
+    (time.sleep, os.system, etc.) while still allowing normal dict/string methods."""
+
+    def test_time_sleep_blocked(self):
+        import time as _time
+
+        from petriq.sandbox import verify_callable_purity
+
+        # Import at module/test scope so the function body only shows t.sleep(1),
+        # not an in-function import (which would be caught by the imports check first).
+        _t = _time
+
+        def bad(tokens):
+            _t.sleep(1)
+            return tokens
+
+        with pytest.raises(PermissionError, match=r"\.sleep"):
+            verify_callable_purity(bad)
+
+    def test_os_system_blocked(self):
+        from petriq.sandbox import verify_callable_purity
+
+        def bad(tokens):
+            import os
+
+            os.system("rm -rf /")
+            return tokens
+
+        with pytest.raises(PermissionError):
+            verify_callable_purity(bad)
+
+    def test_dict_get_allowed(self):
+        """payload.get() is a legitimate pure operation and must not be blocked."""
+        from petriq.sandbox import verify_callable_purity
+
+        def pure(tokens):
+            return [t for t in tokens if t.payload.get("ok")]
+
+        # Must not raise
+        verify_callable_purity(pure)
+
+    def test_string_methods_allowed(self):
+        from petriq.sandbox import verify_callable_purity
+
+        def pure(tokens):
+            return [t for t in tokens if t.payload.get("name", "").startswith("X")]
+
+        verify_callable_purity(pure)
 
 
 class TestM3FrozenDictUnhashableError:

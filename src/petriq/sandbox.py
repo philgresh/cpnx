@@ -105,6 +105,15 @@ def verify_callable_purity(func: Callable) -> None:
                             "sleep",
                         }:
                             raise PermissionError(f"Forbidden function call '{node.func.id}' inside CPN callable.")
+                        elif isinstance(node.func, ast.Attribute) and node.func.attr in {
+                            "sleep",
+                            "system",
+                            "popen",
+                            "urlopen",
+                        }:
+                            raise PermissionError(
+                                f"Forbidden attribute call '.{node.func.attr}' inside CPN callable."
+                            )
                     elif isinstance(node, (ast.Import, ast.ImportFrom)):
                         raise PermissionError("Imports are forbidden inside CPN callables.")
                     elif isinstance(node, (ast.Global, ast.Nonlocal)):
@@ -139,6 +148,19 @@ def verify_callable_purity(func: Callable) -> None:
                     "sleep",
                 }:
                     raise PermissionError(f"Forbidden function call '{node.func.id}' inside CPN callable.")
+                elif isinstance(node.func, ast.Attribute) and node.func.attr in {
+                    "sleep",
+                    "system",
+                    "popen",
+                    "get",
+                    "post",
+                    "request",
+                    "urlopen",
+                    "connect",
+                }:
+                    raise PermissionError(
+                        f"Forbidden attribute call '.{node.func.attr}' inside CPN callable."
+                    )
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 raise PermissionError("Imports are forbidden inside CPN callables.")
             elif isinstance(node, (ast.Global, ast.Nonlocal)):
