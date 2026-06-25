@@ -115,6 +115,7 @@ class SubstitutionTransition(Transition):
 
     subnet: "PetriNet" = field(default=None)  # type: ignore[assignment]
     port_socket_map: dict[str, str] = field(default_factory=dict)
+    subnet_deadline_secs: float = 30.0
 
     def __post_init__(self):
         super().__post_init__()

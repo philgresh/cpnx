@@ -765,7 +765,7 @@ class PetriNet:
             subnet.advance_time(self._model_time)
 
         # Run subnet
-        subnet.run(deadline=time.monotonic() + 30.0)
+        subnet.run(deadline=time.monotonic() + transition.subnet_deadline_secs)
 
         # Retrieve output tokens from mapped child ports that correspond to parent output sockets
         parent_outputs = [arc.place for arc in transition.outputs]

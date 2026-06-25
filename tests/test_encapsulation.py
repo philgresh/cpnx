@@ -176,3 +176,50 @@ def test_substitution_transition_evolves_tokens_on_deposit():
     assert len(out_tokens) == 1
     assert out_tokens[0].payload["val"] == 42
     assert out_tokens[0].id != t.id
+
+
+def test_substitution_transition_deadline():
+    child = PetriNet()
+    child.add_place(Place("child_port_in"))
+    child.add_place(Place("child_port_out"))
+
+    def slow_action(tokens):
+        time.sleep(0.5)
+        return tokens
+
+    child.add_transition(
+        Transition(
+            "child_t",
+            [InputArc("child_port_in")],
+            [OutputArc("child_port_out")],
+            action=slow_action,
+        )
+    )
+
+    parent = PetriNet()
+    parent.add_place(Place("parent_socket_in"))
+    parent.add_place(Place("parent_socket_out"))
+
+    sub_t = SubstitutionTransition(
+        name="sub_net_transition",
+        inputs=[InputArc("parent_socket_in")],
+        outputs=[OutputArc("parent_socket_out")],
+        action=None,  # type: ignore[assignment]
+        subnet=child,
+        port_socket_map={
+            "child_port_in": "parent_socket_in",
+            "child_port_out": "parent_socket_out",
+        },
+        subnet_deadline_secs=0.1,
+    )
+    parent.add_transition(sub_t)
+
+    parent.deposit("parent_socket_in", Token())
+    assert parent.step() is True
+
+    # Run parent. Since subnet_deadline_secs is 0.1 and child_t takes 0.5s, the child subnet will not complete.
+    parent.run(deadline=time.monotonic() + 1.0)
+
+    # The token should not have reached parent_socket_out because the subnet execution deadline was exceeded.
+    out_tokens = parent.places["parent_socket_out"].tokens
+    assert len(out_tokens) == 0
