@@ -23,7 +23,14 @@ class FrozenDict(Mapping):
         # wrap in MappingProxyType to make it truly read-only
         self._data = types.MappingProxyType(temp)
         # Eagerly compute the hash to avoid post-construction mutation (M1)
-        self._hash = hash(frozenset(self._data.items()))
+        try:
+            self._hash = hash(frozenset(self._data.items()))
+        except TypeError as exc:
+            raise TypeError(
+                f"FrozenDict payload contains an unhashable value. "
+                f"Wrap sets and arrays before passing to Token(payload=...). "
+                f"Detail: {exc}"
+            ) from exc
 
     def _freeze(self, val: Any) -> Any:
         if isinstance(val, (dict, Mapping)):
@@ -48,7 +55,22 @@ class FrozenDict(Mapping):
         return f"FrozenDict({dict(self._data)!r})"
 
     def as_dict(self) -> dict:
-        return dict(self._data)
+        """Return a deep plain-dict copy suitable for JSON serialisation.
+
+        Nested :class:`FrozenDict` values are recursively converted to ``dict``,
+        and ``tuple`` values (frozen from ``list``) are converted back to ``list``
+        with any nested :class:`FrozenDict` items also unwrapped.
+        """
+        return {k: FrozenDict._thaw(v) for k, v in self._data.items()}
+
+    @staticmethod
+    def _thaw(v: Any) -> Any:
+        """Recursively convert FrozenDict/tuple to dict/list."""
+        if isinstance(v, FrozenDict):
+            return v.as_dict()
+        if isinstance(v, tuple):
+            return [FrozenDict._thaw(item) for item in v]
+        return v
 
     def set(self, key: Any, value: Any) -> "FrozenDict":
         """Functional update: return a new FrozenDict with key=value."""

@@ -1,4 +1,4 @@
-"""Tests for deep-review findings: C1, W1, W2."""
+"""Tests for deep-review findings: C1, W1, W2, M2, M3, M4."""
 
 import time
 
@@ -6,7 +6,7 @@ import pytest
 
 from petriq.engine import PetriNet
 from petriq.places import Place
-from petriq.tokens import Token
+from petriq.tokens import FrozenDict, Token
 from petriq.transitions import InputArc, OutputArc, Transition
 
 
@@ -280,3 +280,57 @@ class TestM2ExprTimeoutDoesNotStallEngineLock:
         net.deposit("p", Token())
         net.run(deadline=time.monotonic() + 2.0)
         assert len(net.places["out"].tokens) == 1
+
+
+class TestM3FrozenDictUnhashableError:
+    """M3: FrozenDict must raise a clear TypeError for unhashable payload values."""
+
+    def test_set_value_raises_clear_error(self):
+        with pytest.raises(TypeError, match="unhashable value"):
+            FrozenDict({"bad": {1, 2, 3}})  # set is unhashable
+
+    def test_error_message_includes_actionable_hint(self):
+        with pytest.raises(TypeError, match="Wrap sets and arrays"):
+            FrozenDict({"x": {1, 2}})
+
+    def test_hashable_values_work_fine(self):
+        fd = FrozenDict({"a": 1, "b": "two", "c": (3, 4)})
+        assert hash(fd) == hash(fd)  # stable and present
+
+    def test_nested_unhashable_raises_with_context(self):
+        with pytest.raises(TypeError, match="unhashable value"):
+            FrozenDict({"outer": {"inner": {1, 2}}})
+
+
+class TestM4FrozenDictAsDict:
+    """M4: as_dict() must return a fully plain-dict structure for json.dumps compatibility."""
+
+    def test_nested_frozen_dict_is_unwrapped(self):
+        import json
+
+        fd = FrozenDict({"outer": {"inner": 42}})
+        plain = fd.as_dict()
+        assert isinstance(plain["outer"], dict), "nested FrozenDict must be unwrapped"
+        assert plain["outer"]["inner"] == 42
+        # Must be JSON-serializable
+        json.dumps(plain)
+
+    def test_tuple_restored_to_list(self):
+        fd = FrozenDict({"items": [1, 2, 3]})
+        plain = fd.as_dict()
+        assert isinstance(plain["items"], list)
+        assert plain["items"] == [1, 2, 3]
+
+    def test_scalar_values_unchanged(self):
+        fd = FrozenDict({"n": 1, "s": "hello", "f": 3.14})
+        plain = fd.as_dict()
+        assert plain == {"n": 1, "s": "hello", "f": 3.14}
+        assert type(plain) is dict
+
+    def test_deeply_nested_structure(self):
+        import json
+
+        fd = FrozenDict({"a": {"b": {"c": [1, 2, {"d": 4}]}}})
+        plain = fd.as_dict()
+        json.dumps(plain)  # must not raise
+        assert plain["a"]["b"]["c"][2]["d"] == 4
