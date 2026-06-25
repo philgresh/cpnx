@@ -759,7 +759,7 @@ class PetriNet:
         # Deposit consumed tokens into the corresponding subnet port places
         for socket_name, token in token_sources:
             for port_name in socket_to_ports[socket_name]:
-                subnet.deposit(port_name, token)
+                subnet.deposit(port_name, token.evolve())
 
         # Sync logical clock if active
         if self._model_time is not None:

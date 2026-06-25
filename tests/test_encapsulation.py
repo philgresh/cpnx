@@ -135,3 +135,44 @@ def test_substitution_transition_subnet_sharing_raises():
                 "child_port_in": "parent_socket_in",
             },
         )
+
+
+def test_substitution_transition_evolves_tokens_on_deposit():
+    child = PetriNet()
+    child.add_place(Place("child_port_in"))
+    child.add_place(Place("child_port_out"))
+    child.add_transition(
+        Transition(
+            "child_t",
+            [InputArc("child_port_in")],
+            [OutputArc("child_port_out")],
+            action=lambda tokens: tokens,
+        )
+    )
+
+    parent = PetriNet()
+    parent.add_place(Place("parent_socket_in"))
+    parent.add_place(Place("parent_socket_out"))
+
+    sub_t = SubstitutionTransition(
+        name="sub_net_transition",
+        inputs=[InputArc("parent_socket_in")],
+        outputs=[OutputArc("parent_socket_out")],
+        action=None,  # type: ignore[assignment]
+        subnet=child,
+        port_socket_map={
+            "child_port_in": "parent_socket_in",
+            "child_port_out": "parent_socket_out",
+        },
+    )
+    parent.add_transition(sub_t)
+
+    t = Token(payload={"val": 42})
+    parent.deposit("parent_socket_in", t)
+    assert parent.step() is True
+    parent.run(deadline=time.monotonic() + 2.0)
+
+    out_tokens = parent.places["parent_socket_out"].tokens
+    assert len(out_tokens) == 1
+    assert out_tokens[0].payload["val"] == 42
+    assert out_tokens[0].id != t.id
