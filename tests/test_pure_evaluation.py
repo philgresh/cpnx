@@ -80,6 +80,18 @@ def test_transition_purity_checks():
         )
 
 
+def test_verify_callable_purity_raises_on_uninspectable():
+    import functools
+
+    def my_fn(tokens):
+        return tokens
+
+    partial_fn = functools.partial(my_fn, val=42)
+
+    with pytest.raises(PermissionError, match="source unavailable"):
+        verify_callable_purity(partial_fn)
+
+
 def test_arc_expression_sandbox():
     # Test that engine evaluates string expressions in InputArc, OutputArc, and guards
     net = PetriNet()

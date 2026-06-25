@@ -129,6 +129,11 @@ def verify_callable_purity(func: Callable) -> None:
                 raise PermissionError("Global/nonlocal mutations are forbidden inside CPN callables.")
     except PermissionError:
         raise
+    except (OSError, TypeError) as exc:
+        raise PermissionError(
+            f"Cannot verify purity of {func!r}: source unavailable. "
+            "Use a plain lambda or def-statement function instead."
+        ) from exc
     except Exception:
         # If we absolutely cannot retrieve or parse source (e.g. compiled built-in or REPL), allow with caution
         pass
