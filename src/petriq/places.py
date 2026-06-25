@@ -62,17 +62,14 @@ class Place:
             self._tokens.append(token)
             self.last_deposit_time = time.monotonic()
 
-    def deposit(self, token: Token) -> None:
+    def deposit(self, token: Token, model_time: float | None = None) -> None:
         """Append *token* to the tail of the queue.
 
         Updates :attr:`last_deposit_time` and calls :meth:`_on_deposit`.
 
         Args:
             token: The token to deposit.
-
-        Raises:
-            TypeError: If the place has a ``color_set`` and the token's colour
-                       is not in it.
+            model_time: Optional logical clock timestamp.
         """
         with self._lock:
             if self.color_set is not None and token.color not in self.color_set:
@@ -93,43 +90,56 @@ class Place:
             token: The token that was just deposited.
         """
 
-    def retrieve(self, count: int = 1) -> list[Token]:
+    def retrieve(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Remove and return *count* tokens from the head of the queue (FIFO order).
 
         Args:
             count: Number of tokens to retrieve. Must be ≥ 1.
+            model_time: Optional logical clock timestamp to filter available tokens.
 
         Returns:
             List of retrieved tokens in FIFO order.
 
         Raises:
-            ValueError: If fewer than *count* tokens are present.
+            ValueError: If fewer than *count* tokens are available.
         """
         with self._lock:
-            if len(self._tokens) < count:
+            t_limit = model_time if model_time is not None else time.monotonic()
+            available = [t for t in self._tokens if t.available_at <= t_limit]
+            if len(available) < count:
                 raise ValueError(
-                    f"Place '{self.name}': cannot retrieve {count} token(s) — only {len(self._tokens)} available."
+                    f"Place '{self.name}': cannot retrieve {count} token(s) — only {len(available)} available."
                 )
-            return [self._tokens.popleft() for _ in range(count)]
+            to_return = available[:count]
+            remove_ids = {t.id for t in to_return}
+            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
+            return to_return
 
-    def retrieve_specific(self, tokens: list[Token]) -> list[Token]:
+    def retrieve_specific(self, tokens: list[Token], model_time: float | None = None) -> list[Token]:
         """Remove and return exactly the tokens in *tokens* (matched by ``id``).
 
         Used by the engine when an :class:`~petriq.transitions.InputArc` has an
         ``expression`` that selects a specific subset of tokens to consume.
-        Uses an O(n) deque rebuild — same pattern as
-        :meth:`PacedResourcePlace.retrieve`.
+        Uses an O(n) deque rebuild.
 
         Args:
             tokens: Tokens to remove. Each must be present in this place.
+            model_time: Optional logical clock timestamp to filter available tokens.
 
         Returns:
             The removed tokens in the order given by *tokens*.
 
         Raises:
-            ValueError: If any token id in *tokens* is not found in this place.
+            ValueError: If any token id in *tokens* is not found in this place or is not available.
         """
         with self._lock:
+            t_limit = model_time if model_time is not None else time.monotonic()
+            for t in tokens:
+                if t.available_at > t_limit:
+                    raise ValueError(
+                        f"Place '{self.name}': token {t.id} is not yet available at {t_limit} "
+                        f"(available_at={t.available_at})."
+                    )
             remove_ids = {t.id for t in tokens}
             present_ids = {t.id for t in self._tokens}
             missing = remove_ids - present_ids
@@ -141,38 +151,49 @@ class Place:
             self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
             return tokens
 
-    def retrieve_all(self) -> list[Token]:
+    def retrieve_all(self, model_time: float | None = None) -> list[Token]:
         """Remove and return every token currently in the place.
+
+        Args:
+            model_time: Optional logical clock timestamp to filter available tokens.
 
         Returns:
             All tokens in FIFO order; empty list if the place is empty.
         """
         with self._lock:
-            ret = list(self._tokens)
-            self._tokens.clear()
-            return ret
+            t_limit = model_time if model_time is not None else time.monotonic()
+            available = [t for t in self._tokens if t.available_at <= t_limit]
+            remove_ids = {t.id for t in available}
+            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
+            return available
 
-    def peek(self, count: int = 1) -> list[Token]:
+    def peek(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Return up to *count* tokens from the head without removing them.
 
         Args:
             count: Maximum number of tokens to inspect.
+            model_time: Optional logical clock timestamp to filter available tokens.
 
         Returns:
             List of up to *count* tokens; may be shorter than requested if fewer
             are present. Does not modify the queue.
         """
         with self._lock:
-            return list(self._tokens)[:count]
+            t_limit = model_time if model_time is not None else time.monotonic()
+            available = [t for t in self._tokens if t.available_at <= t_limit]
+            return available[:count]
 
-    def can_retrieve(self, count: int = 1) -> bool:
+    def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
         """Return ``True`` if at least *count* tokens are available for retrieval.
 
         Args:
             count: Number of tokens needed.
+            model_time: Optional logical clock timestamp to filter available tokens.
         """
         with self._lock:
-            return len(self._tokens) >= count
+            t_limit = model_time if model_time is not None else time.monotonic()
+            available = sum(1 for t in self._tokens if t.available_at <= t_limit)
+            return available >= count
 
     def can_deposit(self, count: int = 1) -> bool:
         """Return ``True`` if the place can accept *count* more tokens without exceeding its bound.
@@ -262,39 +283,43 @@ class PacedResourcePlace(ResourcePlace):
         self.pacing_secs = pacing_secs
         super().__init__(name, capacity)
 
-    def deposit(self, token: Token) -> None:
+    def deposit(self, token: Token, model_time: float | None = None) -> None:
         """Return a resource token to the pool, starting its cooldown timer.
 
         The token will not be retrievable until ``pacing_secs`` have elapsed.
 
         Args:
             token: The resource token being returned. Must have ``color="resource"``.
+            model_time: Optional logical clock timestamp.
         """
         with self._lock:
+            ref_time = model_time if model_time is not None else time.monotonic()
             # Create a new token with updated availability timestamp (stateless place cooldown)
-            timed_token = token.evolve(available_at=time.monotonic() + self.pacing_secs)
+            timed_token = token.evolve(available_at=ref_time + self.pacing_secs)
             self._tokens.append(timed_token)
             self.last_deposit_time = time.monotonic()
             self._on_deposit(timed_token)
 
-    def can_retrieve(self, count: int = 1) -> bool:
+    def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
         """Return ``True`` if at least *count* tokens have completed their cooldown.
 
         Args:
             count: Number of cooled-down tokens needed.
+            model_time: Optional logical clock timestamp to filter available tokens.
         """
         with self._lock:
-            now = time.monotonic()
-            available = sum(1 for t in self._tokens if t.available_at <= now)
+            t_limit = model_time if model_time is not None else time.monotonic()
+            available = sum(1 for t in self._tokens if t.available_at <= t_limit)
             return available >= count
 
-    def retrieve(self, count: int = 1) -> list[Token]:
+    def retrieve(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Remove and return *count* tokens whose cooldown has expired.
 
         Uses an O(n) rebuild rather than O(n²) indexed deletion.
 
         Args:
             count: Number of cooled-down tokens to retrieve.
+            model_time: Optional logical clock timestamp to filter available tokens.
 
         Returns:
             List of retrieved resource tokens in cooldown-expiry order.
@@ -304,8 +329,8 @@ class PacedResourcePlace(ResourcePlace):
                         a message indicating how many are ready vs still cooling down.
         """
         with self._lock:
-            now = time.monotonic()
-            available = [t for t in self._tokens if t.available_at <= now]
+            t_limit = model_time if model_time is not None else time.monotonic()
+            available = [t for t in self._tokens if t.available_at <= t_limit]
             if len(available) < count:
                 cooling = len(self._tokens) - len(available)
                 raise ValueError(
@@ -319,15 +344,16 @@ class PacedResourcePlace(ResourcePlace):
             self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
             return to_return
 
-    def peek(self, count: int = 1) -> list[Token]:
+    def peek(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Return up to *count* cooled-down tokens without removing them.
 
         Args:
             count: Maximum number of tokens to inspect.
+            model_time: Optional logical clock timestamp to filter available tokens.
         """
         with self._lock:
-            now = time.monotonic()
-            available = [t for t in self._tokens if t.available_at <= now]
+            t_limit = model_time if model_time is not None else time.monotonic()
+            available = [t for t in self._tokens if t.available_at <= t_limit]
             return available[:count]
 
 
@@ -358,7 +384,7 @@ class ThresholdPlace(Place):
         super().__init__(name)
         self.threshold = threshold
 
-    def can_retrieve(self, count: int = 1) -> bool:
+    def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
         """Return ``True`` if the threshold is met AND at least *count* tokens are present.
 
         Both conditions must hold: the queue must have reached its threshold AND
@@ -366,15 +392,19 @@ class ThresholdPlace(Place):
 
         Args:
             count: Number of tokens needed by the requesting transition arc.
+            model_time: Optional logical clock timestamp to filter available tokens.
         """
         with self._lock:
-            return len(self._tokens) >= self.threshold and len(self._tokens) >= count
+            t_limit = model_time if model_time is not None else time.monotonic()
+            available = [t for t in self._tokens if t.available_at <= t_limit]
+            return len(available) >= self.threshold and len(available) >= count
 
-    def retrieve(self, count: int = 1) -> list[Token]:
+    def retrieve(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Remove and return *count* tokens if the threshold has been met.
 
         Args:
             count: Number of tokens to retrieve.
+            model_time: Optional logical clock timestamp to filter available tokens.
 
         Returns:
             List of retrieved tokens in FIFO order.
@@ -386,20 +416,28 @@ class ThresholdPlace(Place):
                         available.
         """
         with self._lock:
-            if len(self._tokens) < self.threshold:
+            t_limit = model_time if model_time is not None else time.monotonic()
+            available = [t for t in self._tokens if t.available_at <= t_limit]
+            if len(available) < self.threshold:
                 raise ValueError(
                     f"ThresholdPlace '{self.name}': threshold of {self.threshold} not met "
-                    f"({len(self._tokens)} token(s) present — need {self.threshold - len(self._tokens)} more)."
+                    f"({len(available)} token(s) available — need {self.threshold - len(available)} more)."
                 )
-            if len(self._tokens) < count:
+            if len(available) < count:
                 raise ValueError(
-                    f"ThresholdPlace '{self.name}': threshold met but only {len(self._tokens)} "
+                    f"ThresholdPlace '{self.name}': threshold met but only {len(available)} "
                     f"token(s) available, {count} requested."
                 )
-            return [self._tokens.popleft() for _ in range(count)]
+            to_return = available[:count]
+            remove_ids = {t.id for t in to_return}
+            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
+            return to_return
 
-    def retrieve_all(self) -> list[Token]:
+    def retrieve_all(self, model_time: float | None = None) -> list[Token]:
         """Remove and return all tokens if the threshold has been met.
+
+        Args:
+            model_time: Optional logical clock timestamp to filter available tokens.
 
         Returns:
             All tokens in FIFO order.
@@ -408,11 +446,13 @@ class ThresholdPlace(Place):
             ValueError: If the threshold is not yet met.
         """
         with self._lock:
-            if len(self._tokens) < self.threshold:
+            t_limit = model_time if model_time is not None else time.monotonic()
+            available = [t for t in self._tokens if t.available_at <= t_limit]
+            if len(available) < self.threshold:
                 raise ValueError(
                     f"ThresholdPlace '{self.name}': threshold of {self.threshold} not met "
-                    f"({len(self._tokens)} token(s) present — need {self.threshold - len(self._tokens)} more)."
+                    f"({len(available)} token(s) available — need {self.threshold - len(available)} more)."
                 )
-            ret = list(self._tokens)
-            self._tokens.clear()
-            return ret
+            remove_ids = {t.id for t in available}
+            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
+            return available
