@@ -108,8 +108,7 @@ class Place:
         with self._lock:
             if len(self._tokens) < count:
                 raise ValueError(
-                    f"Place '{self.name}': cannot retrieve {count} token(s) — "
-                    f"only {len(self._tokens)} available."
+                    f"Place '{self.name}': cannot retrieve {count} token(s) — only {len(self._tokens)} available."
                 )
             return [self._tokens.popleft() for _ in range(count)]
 

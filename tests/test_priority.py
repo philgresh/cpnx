@@ -81,6 +81,7 @@ class TestTransitionPriority:
             def action(tokens):
                 order.append(label)
                 return tokens
+
             return action
 
         net.add_transition(

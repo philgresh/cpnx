@@ -45,9 +45,7 @@ class TestInputArcExpression:
                         InputArc(
                             "leads",
                             count=1,
-                            expression=lambda tokens: sorted(
-                                tokens, key=lambda t: -t.payload.get("score", 0)
-                            ),
+                            expression=lambda tokens: sorted(tokens, key=lambda t: -t.payload.get("score", 0)),
                         )
                     ],
                     outputs=[OutputArc("processed")],
@@ -110,9 +108,7 @@ class TestInputArcExpression:
                         InputArc(
                             "input",
                             count=2,
-                            expression=lambda tokens: sorted(
-                                tokens, key=lambda t: -t.payload.get("score", 0)
-                            ),
+                            expression=lambda tokens: sorted(tokens, key=lambda t: -t.payload.get("score", 0)),
                         )
                     ],
                     outputs=[OutputArc("output", count=2)],

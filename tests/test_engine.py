@@ -25,9 +25,7 @@ class TestEngineSetup:
         net = PetriNet()
         net.add_place(Place("a"))
         net.add_place(Place("b"))
-        net.add_transition(
-            Transition("t", [InputArc("a")], [OutputArc("b")], action=lambda t: t)
-        )
+        net.add_transition(Transition("t", [InputArc("a")], [OutputArc("b")], action=lambda t: t))
         assert "t" in net.transitions
 
     def test_deposit_to_unknown_place_auto_creates_it(self):
@@ -55,9 +53,7 @@ class TestEngineCallbacks:
         events = []
         net.on_transition_fired = lambda name, dur: events.append((name, dur))
 
-        net.add_transition(
-            Transition("t", [InputArc("input")], [OutputArc("output")], action=lambda t: t)
-        )
+        net.add_transition(Transition("t", [InputArc("input")], [OutputArc("output")], action=lambda t: t))
         net.deposit("input", Token())
         net.run(deadline=time.monotonic() + 1.0)
 
@@ -75,9 +71,7 @@ class TestEngineCallbacks:
 
         net.on_transition_fired = bad_callback
 
-        net.add_transition(
-            Transition("t", [InputArc("input")], [OutputArc("output")], action=lambda t: t)
-        )
+        net.add_transition(Transition("t", [InputArc("input")], [OutputArc("output")], action=lambda t: t))
         net.deposit("input", Token())
         # Should not raise
         net.run(deadline=time.monotonic() + 1.0)
@@ -93,9 +87,7 @@ class TestEngineQuiescence:
         net = PetriNet(max_workers=2)
         net.add_place(Place("input"))
         net.add_place(Place("output"))
-        net.add_transition(
-            Transition("t", [InputArc("input")], [OutputArc("output")], action=lambda t: t)
-        )
+        net.add_transition(Transition("t", [InputArc("input")], [OutputArc("output")], action=lambda t: t))
         net.deposit("input", Token())
         assert not net.is_quiescent()
 
@@ -103,9 +95,7 @@ class TestEngineQuiescence:
         net = PetriNet(max_workers=2)
         net.add_place(Place("input"))
         net.add_place(Place("output"))
-        net.add_transition(
-            Transition("t", [InputArc("input")], [OutputArc("output")], action=lambda t: t)
-        )
+        net.add_transition(Transition("t", [InputArc("input")], [OutputArc("output")], action=lambda t: t))
         net.deposit("input", Token())
         net.run(deadline=time.monotonic() + 2.0)
         assert net.is_quiescent()
@@ -114,9 +104,7 @@ class TestEngineQuiescence:
         net = PetriNet(max_workers=2)
         net.add_place(Place("input"))
         net.add_place(Place("output"))
-        net.add_transition(
-            Transition("t", [InputArc("input")], [OutputArc("output")], action=lambda t: t)
-        )
+        net.add_transition(Transition("t", [InputArc("input")], [OutputArc("output")], action=lambda t: t))
         # No tokens — step should return False
         assert not net.step()
 

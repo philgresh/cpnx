@@ -194,9 +194,7 @@ class PetriNet:
 
             self._running_count += 1
             try:
-                self._executor.submit(
-                    self._execute_transition, selected, consumed_tokens, token_sources
-                )
+                self._executor.submit(self._execute_transition, selected, consumed_tokens, token_sources)
             except Exception:
                 # submit() failed (e.g. executor shut down) — undo the increment so
                 # is_quiescent() doesn't permanently block.
@@ -251,9 +249,7 @@ class PetriNet:
         with self._lock:
             if self._running_count > 0:
                 return False
-            return not any(
-                self._is_transition_potentially_enabled(t) for t in self.transitions.values()
-            )
+            return not any(self._is_transition_potentially_enabled(t) for t in self.transitions.values())
 
     @property
     def marking(self) -> dict[str, list[Token]]:
@@ -351,8 +347,7 @@ class PetriNet:
         """
         if place_name not in self.places:
             raise KeyError(
-                f"Place '{place_name}' is not registered. "
-                f"Call add_place() before referencing it in a Transition arc."
+                f"Place '{place_name}' is not registered. Call add_place() before referencing it in a Transition arc."
             )
         self.places[place_name].deposit(token)
 
@@ -446,9 +441,10 @@ class PetriNet:
             error = exc
 
         deposited: list[tuple[str, Token]] = []
+        duration = 0.0
+        data_tokens: list[Token] = []
 
         with self._lock:
-            self._running_count -= 1
             duration = time.monotonic() - start_time
 
             if success:
@@ -459,16 +455,16 @@ class PetriNet:
                 # Guards receive the non-resource output tokens (CPN arc guard semantics).
                 # Resource arcs are never guarded — resources must always return to a place.
                 output_tokens_data = list(out_deque)
-                active_outputs: list[tuple] = []
+                active_outputs: list[tuple[Transition, bool]] = []  # type: ignore[type-arg]
                 for arc in transition.outputs:
                     is_res = isinstance(self.places.get(arc.place), (ResourcePlace, PacedResourcePlace))
                     if arc.expression is None or (not is_res and arc.expression(output_tokens_data)):
-                        active_outputs.append((arc, is_res))
+                        active_outputs.append((arc, is_res))  # type: ignore[arg-type]
 
                 # Pass 2: pre-flight — validate supply against active arcs only so that
                 # guarded-out arcs don't inflate the demand count and cause spurious failures.
-                resource_demand = sum(arc.count for arc, is_res in active_outputs if is_res)
-                data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)
+                resource_demand = sum(arc.count for arc, is_res in active_outputs if is_res)  # type: ignore[attr-defined]
+                data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)  # type: ignore[attr-defined]
                 if len(res_deque) < resource_demand:
                     success = False
                     error = ValueError(
@@ -486,17 +482,11 @@ class PetriNet:
                     )
 
             if success:
-                for arc, is_res_place in active_outputs:
-                    for _ in range(arc.count):
+                for arc, is_res_place in active_outputs:  # type: ignore[typing-target]
+                    for _ in range(arc.count):  # type: ignore[attr-defined]
                         t = res_deque.popleft() if is_res_place else out_deque.popleft()
-                        self._deposit_under_lock(arc.place, t)
-                        deposited.append((arc.place, t))
-
-                if self.on_transition_fired:
-                    try:
-                        self.on_transition_fired(transition.name, duration)
-                    except Exception:
-                        pass
+                        self._deposit_under_lock(arc.place, t)  # type: ignore[attr-defined]
+                        deposited.append((arc.place, t))  # type: ignore[attr-defined]
 
             if not success:
                 # Return all resource tokens to their source places.
@@ -511,20 +501,31 @@ class PetriNet:
                     self._deposit_under_lock(self.error_place, dt)
                     deposited.append((self.error_place, dt))
 
-                if self.on_error and error:
-                    # Unified dispatch: if there are no data tokens, call once with None.
-                    for dt in (data_tokens or [None]):  # type: ignore[list-item]
-                        try:
-                            self.on_error(transition.name, error, dt)
-                        except Exception:
-                            pass
+        # --- OUTSIDE THE LOCK ---
+        if success:
+            if self.on_transition_fired:
+                try:
+                    self.on_transition_fired(transition.name, duration)
+                except Exception:
+                    pass
+        else:
+            if self.on_error and error:
+                # Unified dispatch: if there are no data tokens, call once with None.
+                dispatch_tokens: list[Token | None] = list(data_tokens) if data_tokens else [None]
+                for dt in dispatch_tokens:
+                    try:
+                        self.on_error(transition.name, error, dt)
+                    except Exception:
+                        pass
 
-        # Signal and fire callbacks outside the lock to prevent re-entrant deadlocks
-        # if a callback calls net.deposit() or net.step().
-        self._work_available.set()
         if self.on_token_deposited:
             for pname, tok in deposited:
                 try:
                     self.on_token_deposited(pname, tok)
                 except Exception:
                     pass
+
+        # Decrement running count and signal work available under lock
+        with self._lock:
+            self._running_count -= 1
+        self._work_available.set()

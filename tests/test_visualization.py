@@ -97,9 +97,7 @@ class TestToDot:
         net = PetriNet()
         net.add_place(Place("a"))
         net.add_place(Place("b"))
-        net.add_transition(
-            Transition("t", [InputArc("a")], [OutputArc("b")], action=lambda t: t)
-        )
+        net.add_transition(Transition("t", [InputArc("a")], [OutputArc("b")], action=lambda t: t))
         dot = net.to_dot()
         assert "shape=box" in dot
 

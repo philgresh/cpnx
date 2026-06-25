@@ -1,7 +1,18 @@
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from petriq.engine import PetriNet
 
 
-def snapshot(net: Any) -> dict:
+def snapshot(net: "PetriNet") -> dict[str, Any]:
+    """Return a JSON-serialisable snapshot of the current markings of a PetriNet.
+
+    Args:
+        net: The PetriNet instance to snapshot.
+
+    Returns:
+        A dictionary containing the places marking and the number of running transitions.
+    """
     with net._lock:
         places_snapshot = {}
         for name, place in net.places.items():
@@ -20,7 +31,15 @@ def snapshot(net: Any) -> dict:
         return {"places": places_snapshot, "running_count": net._running_count}
 
 
-def to_dot(net: Any) -> str:
+def to_dot(net: "PetriNet") -> str:
+    """Generate a Graphviz DOT representation of the PetriNet.
+
+    Args:
+        net: The PetriNet instance to export.
+
+    Returns:
+        A string representing the net in Graphviz DOT format.
+    """
     with net._lock:
         lines = ["digraph PetriNet {", "  rankdir=LR;"]
 
