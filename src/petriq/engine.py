@@ -344,16 +344,15 @@ class PetriNet:
             return not any(self._is_transition_potentially_enabled(t) for t in self.transitions.values())
 
     @property
-    def marking(self) -> dict[str, list[Token]]:
-        """Current marking: maps each place name to its live token list.
+    def marking(self) -> dict[str, tuple[Token, ...]]:
+        """Current marking: maps each place name to its live token tuple.
 
         In CPN formalism the *marking* ``M`` is a function from places to
-        multisets of colour values. This property returns live
-        :class:`~petriq.tokens.Token` objects — mutating them affects the net.
-        For a JSON-serialisable snapshot use :meth:`snapshot` instead.
+        multisets of colour values. This property returns a tuple of live
+        :class:`~petriq.tokens.Token` objects currently in each place.
 
         Returns:
-            Dict mapping place name → list of tokens currently in that place.
+            Dict mapping place name → tuple of tokens currently in that place.
         """
         with self._lock:
             return {name: place.tokens for name, place in self.places.items()}
