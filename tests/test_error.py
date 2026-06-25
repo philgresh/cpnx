@@ -164,3 +164,93 @@ class TestResourceReturnOnFailure:
         # Should not raise
         net.step()
         net.run(deadline=time.monotonic() + 1.0)
+
+
+class TestTokenMintingFix:
+    """Regression tests for the fixed token-minting bug."""
+
+    def test_resource_arc_mismatch_routes_to_error_not_mint(self):
+        """Transition with 2 resource outputs but only 1 resource input must error, not mint."""
+        net = PetriNet(max_workers=2)
+        net.add_place(Place("input"))
+        net.add_place(Place("output"))
+        net.add_place(ResourcePlace("gpu", capacity=1))
+        net.add_place(ResourcePlace("gpu2", capacity=0))  # separate pool, starts empty
+
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[InputArc("input"), InputArc("gpu")],
+                # Two resource outputs but only one resource token consumed
+                outputs=[OutputArc("output"), OutputArc("gpu"), OutputArc("gpu2")],
+                action=lambda tokens: [t for t in tokens if not t.is_resource],
+            )
+        )
+
+        net.deposit("input", Token())
+        net.step()
+        net.run(deadline=time.monotonic() + 1.0)
+
+        # Must NOT have minted a new gpu2 token
+        assert len(net.places["gpu2"].tokens) == 0
+        # Must have returned the original gpu token
+        assert len(net.places["gpu"].tokens) == 1
+        # Data token sent to error place
+        assert len(net.places["failed"].tokens) == 1
+
+    def test_data_arc_mismatch_routes_to_error_not_mint(self):
+        """Transition whose action returns 0 tokens but arc.count=2 must error, not mint."""
+        net = PetriNet(max_workers=2)
+        net.add_place(Place("input"))
+        net.add_place(Place("output"))
+
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[InputArc("input")],
+                outputs=[OutputArc("output", count=2)],
+                action=lambda tokens: [],  # returns nothing
+            )
+        )
+
+        t = Token()
+        net.deposit("input", t)
+        net.step()
+        net.run(deadline=time.monotonic() + 1.0)
+
+        # Must NOT have minted 2 synthetic tokens
+        assert len(net.places["output"].tokens) == 0
+        # Data token routed to error place
+        assert len(net.places["failed"].tokens) == 1
+
+
+class TestCallbackDeadlockFix:
+    """Regression: on_token_deposited must fire outside the engine lock."""
+
+    def test_callback_can_call_deposit_without_deadlock(self):
+        net = PetriNet(max_workers=2)
+        net.add_place(Place("input"))
+        net.add_place(Place("log"))
+        net.add_place(Place("output"))
+
+        # This would deadlock in the old code (callback held engine lock → re-entered deposit)
+        def on_deposited(place_name, token):
+            if place_name == "output":
+                net.deposit("log", Token(payload={"logged": token.id}))
+
+        net.on_token_deposited = on_deposited
+
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[InputArc("input")],
+                outputs=[OutputArc("output")],
+                action=lambda tokens: tokens,
+            )
+        )
+
+        net.deposit("input", Token())
+        net.run(deadline=time.monotonic() + 2.0)
+
+        assert len(net.places["output"].tokens) == 1
+        assert len(net.places["log"].tokens) == 1
