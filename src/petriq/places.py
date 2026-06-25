@@ -190,10 +190,10 @@ class Place:
             return len(self._tokens) + count <= self.bound
 
     @property
-    def tokens(self) -> list[Token]:
-        """Snapshot of current tokens as a list copy (does not consume them)."""
+    def tokens(self) -> tuple[Token, ...]:
+        """Snapshot of current tokens as an immutable tuple (does not consume them)."""
         with self._lock:
-            return list(self._tokens)
+            return tuple(self._tokens)
 
     def __len__(self) -> int:
         """Return the number of tokens currently in the place."""
@@ -260,11 +260,7 @@ class PacedResourcePlace(ResourcePlace):
                          it becomes available again.
         """
         self.pacing_secs = pacing_secs
-        self._cooldowns: dict[str, float] = {}  # token_id → monotonic timestamp when available
         super().__init__(name, capacity)
-        # All tokens available immediately at construction
-        for t in self._tokens:
-            self._cooldowns[t.id] = 0.0
 
     def deposit(self, token: Token) -> None:
         """Return a resource token to the pool, starting its cooldown timer.
@@ -275,10 +271,11 @@ class PacedResourcePlace(ResourcePlace):
             token: The resource token being returned. Must have ``color="resource"``.
         """
         with self._lock:
-            self._tokens.append(token)
+            # Create a new token with updated availability timestamp (stateless place cooldown)
+            timed_token = token.evolve(available_at=time.monotonic() + self.pacing_secs)
+            self._tokens.append(timed_token)
             self.last_deposit_time = time.monotonic()
-            self._cooldowns[token.id] = self.last_deposit_time + self.pacing_secs
-            self._on_deposit(token)
+            self._on_deposit(timed_token)
 
     def can_retrieve(self, count: int = 1) -> bool:
         """Return ``True`` if at least *count* tokens have completed their cooldown.
@@ -288,7 +285,7 @@ class PacedResourcePlace(ResourcePlace):
         """
         with self._lock:
             now = time.monotonic()
-            available = sum(1 for t in self._tokens if self._cooldowns.get(t.id, 0.0) <= now)
+            available = sum(1 for t in self._tokens if t.available_at <= now)
             return available >= count
 
     def retrieve(self, count: int = 1) -> list[Token]:
@@ -308,7 +305,7 @@ class PacedResourcePlace(ResourcePlace):
         """
         with self._lock:
             now = time.monotonic()
-            available = [t for t in self._tokens if self._cooldowns.get(t.id, 0.0) <= now]
+            available = [t for t in self._tokens if t.available_at <= now]
             if len(available) < count:
                 cooling = len(self._tokens) - len(available)
                 raise ValueError(
@@ -320,8 +317,6 @@ class PacedResourcePlace(ResourcePlace):
             remove_ids = {t.id for t in to_return}
             # O(n) rebuild instead of O(n²) indexed deletion on deque
             self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
-            for t in to_return:
-                self._cooldowns.pop(t.id, None)
             return to_return
 
     def peek(self, count: int = 1) -> list[Token]:
@@ -332,36 +327,8 @@ class PacedResourcePlace(ResourcePlace):
         """
         with self._lock:
             now = time.monotonic()
-            available = [t for t in self._tokens if self._cooldowns.get(t.id, 0.0) <= now]
+            available = [t for t in self._tokens if t.available_at <= now]
             return available[:count]
-
-    def retrieve_all(self) -> list[Token]:
-        """Remove and return every token currently in the place, clearing their cooldown tracking.
-
-        Returns:
-            All tokens in FIFO order.
-        """
-        with self._lock:
-            ret = list(self._tokens)
-            self._tokens.clear()
-            self._cooldowns.clear()
-            return ret
-
-    def retrieve_specific(self, tokens: list[Token]) -> list[Token]:
-        """Remove and return exactly the specified tokens, clearing their cooldown tracking."""
-        with self._lock:
-            remove_ids = {t.id for t in tokens}
-            present_ids = {t.id for t in self._tokens}
-            missing = remove_ids - present_ids
-            if missing:
-                raise ValueError(
-                    f"Place '{self.name}': token id(s) {missing} not found — "
-                    f"cannot retrieve_specific tokens that are not present."
-                )
-            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
-            for t in tokens:
-                self._cooldowns.pop(t.id, None)
-            return tokens
 
 
 class ThresholdPlace(Place):

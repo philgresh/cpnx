@@ -1,4 +1,3 @@
-import copy
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -22,7 +21,7 @@ def snapshot(net: "PetriNet") -> dict[str, Any]:
                 tokens_list.append(
                     {
                         "id": t.id,
-                        "payload": copy.deepcopy(t.payload),
+                        "payload": dict(t.payload),
                         "created_at": t.created_at,
                         "color": t.color,
                     }

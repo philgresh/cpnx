@@ -22,10 +22,12 @@ class TestToken:
         t = Token(color="resource")
         assert t.is_resource is True
 
-    def test_payload_is_mutable(self):
+    def test_payload_is_immutable(self):
         t = Token(payload={"count": 0})
-        t.payload["count"] += 1
-        assert t.payload["count"] == 1
+        import pytest
+
+        with pytest.raises(TypeError):
+            t.payload["count"] += 1
 
     def test_two_tokens_not_equal(self):
         t1 = Token()

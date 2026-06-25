@@ -7,8 +7,7 @@ from petriq import InputArc, OutputArc, PacedResourcePlace, PetriNet, Place, Tok
 def call_api(tokens: list[Token]) -> list[Token]:
     data = tokens[0]
     time.sleep(0.05)  # Simulate network latency
-    data.payload["response"] = {"status": "ok"}
-    return [data]
+    return [data.evolve(payload_updates={"response": {"status": "ok"}})]
 
 
 net = PetriNet(max_workers=10)

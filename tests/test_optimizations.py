@@ -67,36 +67,18 @@ def test_leftover_resource_tokens_returned():
     assert len(net.places["output"]) == 1
 
 
-def test_paced_resource_retrieve_all_clears_cooldowns():
-    """Ensure PacedResourcePlace retrieve_all clears token cooldown tracking to prevent dictionary leaks."""
+def test_paced_resource_cooldown_on_tokens():
+    """Ensure PacedResourcePlace sets token cooldown timestamps (available_at) upon deposit."""
     place = PacedResourcePlace("gpu", capacity=2, pacing_secs=5.0)
-    token = place.tokens[0]
 
     # Retrieve one token and deposit it back to start cooldown
-    place.retrieve(1)
-    place.deposit(token)
-    assert token.id in place._cooldowns
+    retrieved = place.retrieve(1)[0]
+    assert retrieved.available_at == 0.0
+    place.deposit(retrieved)
 
-    # Call retrieve_all which clears the tokens
-    place.retrieve_all()
-
-    # The cooldown tracker should be empty for that token
-    assert token.id not in place._cooldowns
-
-
-def test_paced_resource_retrieve_specific_clears_cooldowns():
-    """Ensure PacedResourcePlace retrieve_specific clears token cooldown tracking to prevent dictionary leaks."""
-    place = PacedResourcePlace("gpu", capacity=2, pacing_secs=5.0)
-    token = place.tokens[0]
-
-    place.retrieve(1)
-    place.deposit(token)
-    assert token.id in place._cooldowns
-
-    # Retrieve specifically
-    place.retrieve_specific([token])
-
-    assert token.id not in place._cooldowns
+    # Cooldown timestamp is stored directly on the deposited token in the place
+    deposited = [t for t in place.tokens if t.id == retrieved.id][0]
+    assert deposited.available_at > time.monotonic()
 
 
 def test_dynamic_sleep_and_configurable_cooldown():
@@ -113,16 +95,14 @@ def test_dynamic_sleep_and_configurable_cooldown():
 
 
 def test_snapshot_payload_copy():
-    """Ensure snapshot payloads are deep-copied to prevent concurrent mutation issues."""
+    """Ensure token payloads are immutable and raise TypeError on mutation attempts."""
     net = PetriNet()
     net.add_place(Place("input"))
 
     token = Token(payload={"nested": {"value": 1}})
     net.deposit("input", token)
 
-    snap = net.snapshot()
-    # Mutate the original token's payload
-    token.payload["nested"]["value"] = 99
+    import pytest
 
-    # The snapshot payload should remain isolated (original value 1)
-    assert snap["places"]["input"][0]["payload"]["nested"]["value"] == 1
+    with pytest.raises(TypeError):
+        token.payload["nested"]["value"] = 99

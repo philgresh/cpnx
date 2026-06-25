@@ -61,12 +61,16 @@ class TestPlace:
         assert p.can_retrieve(3)
         assert not p.can_retrieve(4)
 
-    def test_tokens_property_returns_copy(self):
+    def test_tokens_property_returns_tuple_copy(self):
         p = Place("p")
         t = Token()
         p.deposit(t)
         snapshot = p.tokens
-        snapshot.clear()
+        assert isinstance(snapshot, tuple)
+        import pytest
+
+        with pytest.raises(AttributeError):
+            snapshot.clear()
         assert len(p.tokens) == 1
 
     def test_last_deposit_time_updated(self):

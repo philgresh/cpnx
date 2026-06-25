@@ -7,8 +7,7 @@ from petriq import InputArc, OutputArc, PetriNet, Place, ResourcePlace, Token, T
 def train_model(tokens: list[Token]) -> list[Token]:
     data = tokens[0]
     time.sleep(0.5)  # simulate GPU work
-    data.payload["trained"] = True
-    return [data]
+    return [data.evolve(payload_updates={"trained": True})]
 
 
 net = PetriNet(max_workers=4)
