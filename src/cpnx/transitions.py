@@ -67,6 +67,12 @@ class OutputArc:
         if callable(self.expression):
             verify_callable_purity(self.expression)
 
+    @classmethod
+    def on_color(cls, color: str, place: str, count: int = 1) -> "OutputArc":
+        """Create an OutputArc that only fires if the first returned token has the given color."""
+        expr_str = f"bool(tokens and tokens[0].color == {color!r})"
+        return cls(place=place, count=count, expression=expr_str)
+
 
 @dataclass
 class Transition:
@@ -104,6 +110,11 @@ class Transition:
                ``httpx`` client timeouts) to prevent zombie thread accumulation.
                ``action_timeout_secs`` is defense-in-depth, not a substitute for proper
                I/O timeout discipline.
+        max_retries: Maximum number of times to retry the transition action on failure
+               before dead-lettering the data tokens.
+               ``None`` -> infinite retry (today's behavior; forfeits the quiescence guarantee).
+               ``0`` -> route data token(s) to ``error_place`` on the first failure.
+               ``N > 0`` -> retry up to ``N`` times, then route to ``error_place``. Default is 5.
     """
 
     name: str
@@ -113,6 +124,7 @@ class Transition:
     guard: Callable[[list[Token]], bool] | str | None = None
     priority: int = 10
     action_timeout_secs: float | None = None
+    max_retries: int | None = 5
 
     def __post_init__(self):
         # Actions are explicitly allowed side effects (e.g., database writes,

@@ -119,9 +119,7 @@ def test_substitution_transition_no_parent_mutation():
         port_socket_map={"child_port_in": "child_port_in"},
     )
 
-    assert not hasattr(child, "_parent_transition"), (
-        "Subnet must not carry a back-reference to its parent transition"
-    )
+    assert not hasattr(child, "_parent_transition"), "Subnet must not carry a back-reference to its parent transition"
 
 
 def test_substitution_transition_subnet_sharing_raises():

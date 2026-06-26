@@ -64,8 +64,9 @@ class SandboxEvaluator:
                     raise PermissionError(f"Access to private/dunder attribute '{node.attr}' is forbidden in sandbox.")
             elif isinstance(node, (ast.Global, ast.Nonlocal)):
                 raise PermissionError("Global/nonlocal mutations are forbidden in sandbox.")
-            elif isinstance(node, (ast.While, ast.For, ast.AsyncFor,
-                                   ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp)):
+            elif isinstance(
+                node, (ast.While, ast.For, ast.AsyncFor, ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp)
+            ):
                 raise PermissionError("Unbounded iteration is forbidden in sandbox expressions.")
 
         # 2. Parse and compile in eval mode for execution
@@ -132,9 +133,7 @@ def verify_callable_purity(func: Callable) -> None:
                             "popen",
                             "urlopen",
                         }:
-                            raise PermissionError(
-                                f"Forbidden attribute call '.{node.func.attr}' inside CPN callable."
-                            )
+                            raise PermissionError(f"Forbidden attribute call '.{node.func.attr}' inside CPN callable.")
                     elif isinstance(node, (ast.Import, ast.ImportFrom)):
                         raise PermissionError("Imports are forbidden inside CPN callables.")
                     elif isinstance(node, (ast.Global, ast.Nonlocal)):
@@ -185,9 +184,7 @@ def verify_callable_purity(func: Callable) -> None:
                     "urlopen",
                     "connect",
                 }:
-                    raise PermissionError(
-                        f"Forbidden attribute call '.{node.func.attr}' inside CPN callable."
-                    )
+                    raise PermissionError(f"Forbidden attribute call '.{node.func.attr}' inside CPN callable.")
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 raise PermissionError("Imports are forbidden inside CPN callables.")
             elif isinstance(node, (ast.Global, ast.Nonlocal)):

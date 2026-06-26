@@ -24,3 +24,8 @@ These project-scoped guidelines apply to all AI agents working on the `cpnx` cod
 *   **Testing Requirement**: Always run `make test` and ensure all unit tests pass before concluding a task. Add new tests for any modified or new behavior.
 *   **Python Target**: Code should align with Python 3.10+ conventions (Union typing `A | B` rather than `Union[A, B]`).
 *   **Docstring Guidelines**: Follow PEP 257 docstring conventions for all public classes, methods, and functions.
+
+---
+
+## 4. Git & Commits Rules
+*   **Conventional Commits**: When asked to commit something, always construct commit messages using the Conventional Commits specification (e.g. `feat: ...`, `fix: ...`, `docs: ...`, `chore: ...`).

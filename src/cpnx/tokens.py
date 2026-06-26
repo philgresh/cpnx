@@ -6,6 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 AVAILABLE_NOW: float = 0.0
+ERROR_COLOR: str = "error"
 
 
 class FrozenDict(Mapping):
@@ -98,6 +99,7 @@ class Token:
                any other string = user-defined colour.
         available_at: Monotonic timestamp after which the token is available (timed CPNs).
                       Defaults to ``AVAILABLE_NOW`` (0.0) which denotes immediate availability.
+        attempts: Number of failed firings this token has been rolled back from.
     """
 
     id: str = field(default_factory=lambda: uuid4().hex[:16])
@@ -105,6 +107,7 @@ class Token:
     created_at: float = field(default_factory=time.monotonic)
     color: str | None = None
     available_at: float = AVAILABLE_NOW
+    attempts: int = 0
 
     def __post_init__(self):
         if not isinstance(self.payload, FrozenDict):

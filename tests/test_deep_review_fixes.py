@@ -268,7 +268,7 @@ class TestM2ExprTimeoutDoesNotStallEngineLock:
     def test_fast_expression_uses_expr_timeout_not_action_timeout(self):
         """A fast expression is not penalised by the larger action timeout_secs."""
         net = PetriNet(
-            timeout_secs=10.0,   # large action timeout
+            timeout_secs=10.0,  # large action timeout
             expr_timeout_secs=0.1,
             places=[Place("p"), Place("out")],
             transitions=[
