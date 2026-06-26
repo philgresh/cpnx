@@ -478,6 +478,12 @@ class SinkPlace(Place):
 
     Useful for streaming pipelines to avoid accumulating memory indefinitely.
     Can optionally keep the most recent N tokens in a ring buffer for inspection.
+
+    .. warning::
+       Avoid setting a restrictive `color_set` if this place is used as an `error_place`.
+       Dead-lettered tokens preserve their original colours, and depositing a rejected
+       colour will raise a `TypeError` inside the locked transition failure branch,
+       causing the token to be lost rather than successfully dead-lettered.
     """
 
     def __init__(self, name: str, *, keep_last: int = 0, color_set: set[str] | None = None) -> None:
@@ -488,6 +494,7 @@ class SinkPlace(Place):
             keep_last: Number of most recent tokens to keep in a ring buffer.
                        Default is 0 (retain nothing).
             color_set: Set of accepted token colours. None (default) accepts any colour.
+                       Do not use a restrictive color_set if used as an error_place.
         """
         super().__init__(name, bound=None, color_set=color_set)
         self.keep_last = keep_last
@@ -563,7 +570,7 @@ class SinkPlace(Place):
             }
 
     def drain_stats(self) -> dict:
-        """Return a snapshot of current stats and reset absorbed/by_color counters atomically.
+        """Return a snapshot of current stats and reset absorbed/by_color/time counters atomically.
 
         Returns:
             Snapshot dictionary before reset.
@@ -579,4 +586,5 @@ class SinkPlace(Place):
             }
             self._absorbed = 0
             self._by_color = {}
+            self._first_deposit_time = None
             return snapshot

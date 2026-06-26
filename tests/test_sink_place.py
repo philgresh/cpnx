@@ -133,6 +133,11 @@ def test_by_color_tallies_and_drain_stats():
     assert stats_after["by_color"] == {}
     assert stats_after["kept"] == 4  # ring buffer is NOT cleared
     assert len(sink) == 4
+    assert stats_after["first_deposit_time"] is None
+
+    # Re-deposit sets first_deposit_time again
+    sink.deposit(Token(color="red"))
+    assert sink.stats()["first_deposit_time"] is not None
 
 
 def test_color_set_enforcement():
@@ -241,20 +246,20 @@ def test_concurrency_no_lost_counts():
 
 def test_visualization_with_sink_place():
     net = PetriNet()
-    sink = SinkPlace("sink", keep_last=3)
+    sink = SinkPlace("sink", keep_last=1)
     net.add_place(sink)
 
     net.deposit("sink", Token(color="red"))
     net.deposit("sink", Token(color="blue"))
 
-    # len() returns 2 (kept size)
-    assert len(sink) == 2
+    # len() returns 1 (kept size)
+    assert len(sink) == 1
 
     # snapshot includes absorbed count
     snap = net.snapshot()
     assert snap["places"]["sink"]["absorbed"] == 2
-    assert len(snap["places"]["sink"]["tokens"]) == 2
+    assert len(snap["places"]["sink"]["tokens"]) == 1
 
-    # to_dot includes absorbed count (2), not len (2 is also kept but here it represents absorbed)
+    # to_dot includes absorbed count (2), not len (1)
     dot = net.to_dot()
     assert "sink\\n(2)" in dot

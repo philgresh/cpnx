@@ -125,7 +125,7 @@ class PetriNet:
         #: within this callback.
         self.on_token_deposited: Callable[[str, Token], None] | None = None
 
-        #: Called when a data token is dead-lettered to the error place due to exhausted retries.
+        #: Called when a data token is dead-lettered to the error place (due to exhausted retries or immediate failure).
         #: Signature: ``(transition_name: str, token: Token) -> None``.
         #: Fires outside the engine lock.
         self.on_token_dead_lettered: Callable[[str, Token], None] | None = None
