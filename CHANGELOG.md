@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.1.2] — 2026-06-26
+
+### Added
+
+- **`action_timeout_secs`** — New optional field on `Transition`. When set, the engine
+  enforces a wall-clock deadline on the action callable. Timed-out actions trigger
+  atomic rollback (all consumed tokens returned to source; data tokens with a one-second
+  `available_at` delay to prevent livelock) and fire the `on_error` callback with a
+  descriptive `RuntimeError`. Uses a dedicated secondary executor (`cpnx-action`) to
+  avoid nested-future deadlock. The underlying OS thread is not killed; callers must
+  apply native I/O timeouts inside their actions to prevent zombie thread accumulation.
+
 ### Fixed
 
 - **Encapsulation** — `SubstitutionTransition` no longer writes a `_parent_transition`
