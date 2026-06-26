@@ -35,3 +35,6 @@ coverage.xml
 
 # Env vars
 .env
+
+# uv lockfile — library has no runtime deps; lockfile only pins dev toolchain
+uv.lock
