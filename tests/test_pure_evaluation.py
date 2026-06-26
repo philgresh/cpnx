@@ -159,3 +159,95 @@ def test_callable_expression_timeout():
         result = net.step()
         assert result is False
         assert len(net.places["in"].tokens) == 1
+
+
+# --- Audit remediation tests ---
+
+# Module-level helper: set literal default (inspectable by verify_callable_purity)
+def _guard_with_set_literal_default(tokens, s={1, 2}):  # noqa: B006
+    return True
+
+
+class TestSandboxIterationBlocking:
+    """Task 4: SandboxEvaluator must block all unbounded iteration forms."""
+
+    def test_while_loop_blocked(self):
+        assert SandboxEvaluator.evaluate("1 if True else 0", {}) == 1  # baseline passes
+        with pytest.raises(PermissionError, match="Unbounded iteration"):
+            SandboxEvaluator.evaluate("while True: pass", {})
+
+    def test_for_loop_blocked(self):
+        with pytest.raises(PermissionError, match="Unbounded iteration"):
+            SandboxEvaluator.evaluate("for x in []: pass", {})
+
+    def test_list_comprehension_blocked(self):
+        with pytest.raises(PermissionError, match="Unbounded iteration"):
+            SandboxEvaluator.evaluate("[x for x in range(10)]", {})
+
+    def test_dict_comprehension_blocked(self):
+        with pytest.raises(PermissionError, match="Unbounded iteration"):
+            SandboxEvaluator.evaluate("{k: k for k in []}", {})
+
+    def test_set_comprehension_blocked(self):
+        with pytest.raises(PermissionError, match="Unbounded iteration"):
+            SandboxEvaluator.evaluate("{x for x in []}", {})
+
+    def test_generator_expression_blocked(self):
+        with pytest.raises(PermissionError, match="Unbounded iteration"):
+            SandboxEvaluator.evaluate("(x for x in [])", {})
+
+
+class TestMutableDefaultArgDetection:
+    """Task 3: verify_callable_purity must reject mutable default arguments."""
+
+    def test_list_default_rejected(self):
+        def guard_with_list_default(tokens, memory=[]):  # noqa: B006
+            return True
+
+        with pytest.raises(PermissionError, match="Mutable default argument"):
+            verify_callable_purity(guard_with_list_default)
+
+    def test_dict_default_rejected(self):
+        def guard_with_dict_default(tokens, cache={}):  # noqa: B006
+            return bool(tokens)
+
+        with pytest.raises(PermissionError, match="Mutable default argument"):
+            verify_callable_purity(guard_with_dict_default)
+
+    def test_set_default_rejected(self):
+        # ast.Set literal default — must be caught
+        with pytest.raises(PermissionError, match="Mutable default argument"):
+            verify_callable_purity(_guard_with_set_literal_default)
+
+    def test_immutable_default_allowed(self):
+        def guard_with_int_default(tokens, threshold=0):
+            return len(tokens) > threshold
+
+        verify_callable_purity(guard_with_int_default)  # must not raise
+
+
+class TestAtomicRollback:
+    """Task 2: failed transitions must return all tokens to source, not DLQ."""
+
+    def test_data_token_returned_to_source_not_error_place(self):
+        import time as _time
+
+        net = PetriNet(max_workers=1, error_place="dlq")
+        net.add_place(Place("source"))
+        net.add_place(Place("output"))
+
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[InputArc("source")],
+                outputs=[OutputArc("output")],
+                action=lambda tokens: (_ for _ in ()).throw(RuntimeError("fail")),
+            )
+        )
+
+        net.deposit("source", Token())
+        net.step()
+        net.run(deadline=_time.monotonic() + 0.5)
+
+        assert len(net.places["dlq"].tokens) == 0, "DLQ must be empty — rollback is atomic"
+        assert len(net.places["source"].tokens) == 1, "Token must be returned to source place"

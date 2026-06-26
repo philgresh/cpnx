@@ -6,7 +6,14 @@ from typing import Any, Callable
 class SandboxEvaluator:
     """A safe evaluator for string-based guard/arc expressions.
 
-    Strictly validates allowed callables using an AST allowlist.
+    Validates expressions via static AST analysis before execution:
+
+    - Only whitelisted built-in functions and methods are permitted.
+    - All iteration constructs are forbidden (``while``, ``for``, list/dict/set
+      comprehensions, generator expressions) to prevent lock-hogging inside the
+      engine's critical section.
+    - Imports, ``global``/``nonlocal`` statements, and private/dunder attribute
+      access are blocked.
     """
 
     ALLOWED_BUILTINS = {
@@ -57,6 +64,9 @@ class SandboxEvaluator:
                     raise PermissionError(f"Access to private/dunder attribute '{node.attr}' is forbidden in sandbox.")
             elif isinstance(node, (ast.Global, ast.Nonlocal)):
                 raise PermissionError("Global/nonlocal mutations are forbidden in sandbox.")
+            elif isinstance(node, (ast.While, ast.For, ast.AsyncFor,
+                                   ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp)):
+                raise PermissionError("Unbounded iteration is forbidden in sandbox expressions.")
 
         # 2. Parse and compile in eval mode for execution
         tree = ast.parse(expression_str, mode="eval")
@@ -66,7 +76,18 @@ class SandboxEvaluator:
 
 
 def verify_callable_purity(func: Callable) -> None:
-    """Verify that a callable is pure by inspecting its AST for disallowed nodes (I/O, global mutations)."""
+    """Verify that a callable is pure by inspecting its AST for disallowed patterns.
+
+    Raises :exc:`PermissionError` if the callable contains any of:
+
+    - I/O calls: ``open``, ``print``, ``eval``, ``exec``, ``__import__``,
+      ``time.sleep``, ``os.system``, ``os.popen``, ``urllib.urlopen``.
+    - Import statements.
+    - ``global`` or ``nonlocal`` mutations.
+    - Mutable default arguments (``list``, ``dict``, or ``set`` literals as
+      parameter defaults), which would introduce hidden persistent state between
+      transition firings.
+    """
     # 1. Try file-level AST parsing to find the exact node (very robust for nested lambdas/functions)
     try:
         file_path = inspect.getsourcefile(func)
@@ -118,6 +139,12 @@ def verify_callable_purity(func: Callable) -> None:
                         raise PermissionError("Imports are forbidden inside CPN callables.")
                     elif isinstance(node, (ast.Global, ast.Nonlocal)):
                         raise PermissionError("Global/nonlocal mutations are forbidden inside CPN callables.")
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        for default in node.args.defaults + node.args.kw_defaults:
+                            if default is not None and isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                                raise PermissionError(
+                                    "Mutable default argument in CPN callable introduces hidden state between firings."
+                                )
                 return
     except PermissionError:
         raise
@@ -165,6 +192,12 @@ def verify_callable_purity(func: Callable) -> None:
                 raise PermissionError("Imports are forbidden inside CPN callables.")
             elif isinstance(node, (ast.Global, ast.Nonlocal)):
                 raise PermissionError("Global/nonlocal mutations are forbidden inside CPN callables.")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for default in node.args.defaults + node.args.kw_defaults:
+                    if default is not None and isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                        raise PermissionError(
+                            "Mutable default argument in CPN callable introduces hidden state between firings."
+                        )
     except PermissionError:
         raise
     except (OSError, TypeError) as exc:

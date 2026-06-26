@@ -30,7 +30,7 @@ class TestResourceReturnOnFailure:
         assert len(net.places["gpu"].tokens) == 1
         assert net.places["gpu"].tokens[0].is_resource
 
-    def test_data_token_sent_to_error_place(self):
+    def test_data_token_rolled_back_to_source_on_failure(self):
         net = PetriNet(max_workers=2, error_place="dead_letter")
         net.add_place(Place("input"))
         net.add_place(Place("output"))
@@ -47,10 +47,11 @@ class TestResourceReturnOnFailure:
         data_token = Token(payload={"job": 1})
         net.deposit("input", data_token)
         net.step()
-        net.run(deadline=time.monotonic() + 1.0)
+        net.run(deadline=time.monotonic() + 0.5)
 
-        assert len(net.places["dead_letter"].tokens) == 1
-        assert net.places["dead_letter"].tokens[0] == data_token
+        # Atomic rollback: token returned to source, not sent to dead_letter
+        assert len(net.places["dead_letter"].tokens) == 0
+        assert len(net.places["input"].tokens) == 1
         assert len(net.places["output"].tokens) == 0
 
     def test_on_error_callback_fires(self):
@@ -136,10 +137,14 @@ class TestResourceReturnOnFailure:
         for _ in range(3):
             net.deposit("bad_input", Token())
 
-        net.run(deadline=time.monotonic() + 2.0)
+        # Short deadline: good tokens process immediately; bad tokens roll back to source with
+        # a 1-second delay so they are not re-consumed within this window.
+        net.run(deadline=time.monotonic() + 0.5)
 
         assert len(net.places["output"].tokens) == 5
-        assert len(net.places["failed"].tokens) == 3
+        # Bad tokens rolled back to bad_input, not sent to error sink
+        assert len(net.places["bad_input"].tokens) == 3
+        assert len(net.places["failed"].tokens) == 0
 
     def test_error_callback_exception_does_not_crash_engine(self):
         net = PetriNet(max_workers=2)
@@ -195,8 +200,9 @@ class TestTokenMintingFix:
         assert len(net.places["gpu2"].tokens) == 0
         # Must have returned the original gpu token
         assert len(net.places["gpu"].tokens) == 1
-        # Data token sent to error place
-        assert len(net.places["failed"].tokens) == 1
+        # Data token rolled back to source, not sent to error place
+        assert len(net.places["input"].tokens) == 1
+        assert len(net.places["failed"].tokens) == 0
 
     def test_data_arc_mismatch_routes_to_error_not_mint(self):
         """Transition whose action returns 0 tokens but arc.count=2 must error, not mint."""
@@ -220,8 +226,9 @@ class TestTokenMintingFix:
 
         # Must NOT have minted 2 synthetic tokens
         assert len(net.places["output"].tokens) == 0
-        # Data token routed to error place
-        assert len(net.places["failed"].tokens) == 1
+        # Data token rolled back to source, not sent to error place
+        assert len(net.places["input"].tokens) == 1
+        assert len(net.places["failed"].tokens) == 0
 
 
 class TestCallbackDeadlockFix:
@@ -279,4 +286,6 @@ def test_partial_deposit_rollback():
     # Rolled back successfully
     assert len(net.places["output_ok"].tokens) == 0
     assert len(net.places["output_restricted"].tokens) == 0
-    assert len(net.places["failed"].tokens) == 1
+    # Data token rolled back to source, not sent to error place
+    assert len(net.places["input"].tokens) == 1
+    assert len(net.places["failed"].tokens) == 0

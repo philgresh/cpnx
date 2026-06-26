@@ -81,9 +81,9 @@ def test_strict_port_socket_boundary_violation():
     # Wait for parent execution. The transition execution should fail and route the token to error place
     parent.run(deadline=time.monotonic() + 1.0)
 
-    # Token should be routed to failed (error_place) due to boundary violation
-    failed_tokens = parent.places["failed"].tokens
-    assert len(failed_tokens) == 1
+    # Token rolled back to source (atomic rollback), not sent to error_place
+    assert len(parent.places["unmapped_place"].tokens) == 1
+    assert len(parent.places["failed"].tokens) == 0
 
 
 def test_substitution_transition_requires_predeclared_ports():
@@ -103,6 +103,25 @@ def test_substitution_transition_requires_predeclared_ports():
                 "child_port_in": "parent_socket_in",
             },
         )
+
+
+def test_substitution_transition_no_parent_mutation():
+    """Subnet must remain unaware of its parent — no _parent_transition attribute written."""
+    child = PetriNet()
+    child.add_place(Place("child_port_in"))
+
+    SubstitutionTransition(
+        name="sub1",
+        inputs=[],
+        outputs=[],
+        action=None,  # type: ignore[assignment]
+        subnet=child,
+        port_socket_map={"child_port_in": "child_port_in"},
+    )
+
+    assert not hasattr(child, "_parent_transition"), (
+        "Subnet must not carry a back-reference to its parent transition"
+    )
 
 
 def test_substitution_transition_subnet_sharing_raises():

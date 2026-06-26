@@ -1,5 +1,6 @@
+import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, ClassVar
 
 from cpnx.sandbox import verify_callable_purity
 from cpnx.tokens import Token
@@ -109,9 +110,16 @@ class SubstitutionTransition(Transition):
     """A transition that encapsulates an entire sub-PetriNet (Hierarchical CPN).
 
     In CPNs, a substitution transition abstracts a subnet. The child subnet
-    is insulated from the parent net. Communication occurs strictly via Ports in
-    the subnet mapped to Sockets in the parent net.
+    is fully insulated from the parent net — it carries no reference to its
+    parent. Communication occurs strictly through the ``port_socket_map``:
+    named port places in the subnet are bound to named socket places in the
+    parent at construction time.
+
+    A subnet instance may only be wrapped by one ``SubstitutionTransition`` at a
+    time. Attempting to wrap the same subnet twice raises :exc:`ValueError`.
     """
+
+    _mapped_subnets: ClassVar[weakref.WeakSet] = weakref.WeakSet()
 
     subnet: "PetriNet" = field(default=None)  # type: ignore[assignment]
     port_socket_map: dict[str, str] = field(default_factory=dict)
@@ -135,9 +143,8 @@ class SubstitutionTransition(Transition):
                 "Pre-declare port places in the subnet before wrapping it."
             )
 
-        if getattr(self.subnet, "_parent_transition", None) is not None:
+        if self.subnet in SubstitutionTransition._mapped_subnets:
             raise ValueError(
-                f"SubstitutionTransition '{self.name}': child subnet is already mapped to "
-                f"transition '{self.subnet._parent_transition}'."
+                f"SubstitutionTransition '{self.name}': child subnet is already mapped to another transition."
             )
-        self.subnet._parent_transition = self.name
+        SubstitutionTransition._mapped_subnets.add(self.subnet)
