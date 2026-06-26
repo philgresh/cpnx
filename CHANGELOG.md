@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.0] — 2026-06-26
+
+### Added
+
+- **`SinkPlace`** — A new terminal place type that counts and observes tokens without retaining them, resolving potential memory leak issues in long-lived, high-throughput pipelines. Supports an optional ring buffer to retain the most recent N tokens for inspection/debugging.
+- **`on_token_dead_lettered`** — A new lifecycle callback invoked when a data token is dead-lettered to the error place after exhausting retries or failing immediately.
+- **Pull Request Template** — A standardized GitHub PR template including general and project-specific guidelines (concurrency, memory-safety, styling).
+
+### Changed
+
+- **Error Handling & Dead-lettering Redesign** — Restored and cleaned up the dead-lettering behavior. When a transition's action fails, the data token is dead-lettered to the `error_place` once `max_retries` are exhausted (or immediately if `max_retries=0`). Surplus resource tokens are returned to their source places on success. Added try-except wrapper to executor submit calls to prevent token leaks.
+- **Window-First statistics in `SinkPlace`** — Calling `drain_stats()` on a `SinkPlace` now resets `_first_deposit_time` to `None` in addition to resetting counters, supporting window-first throughput calculations.
+
+---
+
 ## [0.1.2] — 2026-06-26
 
 ### Added
