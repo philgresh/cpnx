@@ -1,5 +1,6 @@
+import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, ClassVar
 
 from cpnx.sandbox import verify_callable_purity
 from cpnx.tokens import Token
@@ -113,6 +114,8 @@ class SubstitutionTransition(Transition):
     the subnet mapped to Sockets in the parent net.
     """
 
+    _mapped_subnets: ClassVar[weakref.WeakSet] = weakref.WeakSet()
+
     subnet: "PetriNet" = field(default=None)  # type: ignore[assignment]
     port_socket_map: dict[str, str] = field(default_factory=dict)
     subnet_deadline_secs: float = 30.0
@@ -135,9 +138,8 @@ class SubstitutionTransition(Transition):
                 "Pre-declare port places in the subnet before wrapping it."
             )
 
-        if getattr(self.subnet, "_parent_transition", None) is not None:
+        if self.subnet in SubstitutionTransition._mapped_subnets:
             raise ValueError(
-                f"SubstitutionTransition '{self.name}': child subnet is already mapped to "
-                f"transition '{self.subnet._parent_transition}'."
+                f"SubstitutionTransition '{self.name}': child subnet is already mapped to another transition."
             )
-        self.subnet._parent_transition = self.name
+        SubstitutionTransition._mapped_subnets.add(self.subnet)

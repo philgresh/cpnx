@@ -581,14 +581,13 @@ class PetriNet:
 
         Runs on the thread pool. Guarantees:
 
-        - Resource tokens always return to their source places, even on failure.
-        - Data tokens from a failed transition are routed to :attr:`error_place`.
+        - On failure, ALL consumed tokens (resource and data) are returned to their
+          original source places, preserving the formal Marking (atomic rollback).
+        - Returned data tokens carry a 1-second ``available_at`` delay to prevent
+          livelock when the action raises persistently.
         - Callbacks (:attr:`on_token_deposited`, :attr:`on_error`) fire **outside**
           the engine lock to prevent re-entrant deadlocks.
         - :attr:`_running_count` is always decremented exactly once.
-        - Supply failures (where the action returns too few tokens to satisfy active non-resource
-          output arcs) are terminal for the data tokens — they are routed to :attr:`error_place`
-          rather than returned to their sources for retry.
         """
         try:
             start_time = time.monotonic()
@@ -709,17 +708,16 @@ class PetriNet:
                                 break
 
                 if not success:
-                    # Return all resource tokens to their source places.
-                    for src_name, t in token_sources:
-                        if t.is_resource:
-                            self._deposit_under_lock(src_name, t)
-                            deposited.append((src_name, t))
-
-                    # Route data tokens to the error sink.
+                    # Roll back all tokens to their original source places (atomic).
+                    # Data tokens carry a 1-second delay to prevent livelock when an
+                    # action raises persistently. Original token refs are kept for the
+                    # on_error callback; the deposited copies carry the delay.
+                    retry_at = time.monotonic() + 1.0
                     data_tokens = [t for _, t in token_sources if not t.is_resource]
-                    for dt in data_tokens:
-                        self._deposit_under_lock(self.error_place, dt)
-                        deposited.append((self.error_place, dt))
+                    for src_name, t in token_sources:
+                        rollback_t = t.evolve(available_at=retry_at) if not t.is_resource else t
+                        self._deposit_under_lock(src_name, rollback_t)
+                        deposited.append((src_name, rollback_t))
 
             # --- OUTSIDE THE LOCK ---
             if success:

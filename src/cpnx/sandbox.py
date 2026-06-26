@@ -57,6 +57,9 @@ class SandboxEvaluator:
                     raise PermissionError(f"Access to private/dunder attribute '{node.attr}' is forbidden in sandbox.")
             elif isinstance(node, (ast.Global, ast.Nonlocal)):
                 raise PermissionError("Global/nonlocal mutations are forbidden in sandbox.")
+            elif isinstance(node, (ast.While, ast.For, ast.AsyncFor,
+                                   ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp)):
+                raise PermissionError("Unbounded iteration is forbidden in sandbox expressions.")
 
         # 2. Parse and compile in eval mode for execution
         tree = ast.parse(expression_str, mode="eval")
@@ -118,6 +121,12 @@ def verify_callable_purity(func: Callable) -> None:
                         raise PermissionError("Imports are forbidden inside CPN callables.")
                     elif isinstance(node, (ast.Global, ast.Nonlocal)):
                         raise PermissionError("Global/nonlocal mutations are forbidden inside CPN callables.")
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        for default in node.args.defaults + node.args.kw_defaults:
+                            if default is not None and isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                                raise PermissionError(
+                                    "Mutable default argument in CPN callable introduces hidden state between firings."
+                                )
                 return
     except PermissionError:
         raise
@@ -165,6 +174,12 @@ def verify_callable_purity(func: Callable) -> None:
                 raise PermissionError("Imports are forbidden inside CPN callables.")
             elif isinstance(node, (ast.Global, ast.Nonlocal)):
                 raise PermissionError("Global/nonlocal mutations are forbidden inside CPN callables.")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for default in node.args.defaults + node.args.kw_defaults:
+                    if default is not None and isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                        raise PermissionError(
+                            "Mutable default argument in CPN callable introduces hidden state between firings."
+                        )
     except PermissionError:
         raise
     except (OSError, TypeError) as exc:
