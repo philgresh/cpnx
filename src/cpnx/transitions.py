@@ -110,8 +110,13 @@ class SubstitutionTransition(Transition):
     """A transition that encapsulates an entire sub-PetriNet (Hierarchical CPN).
 
     In CPNs, a substitution transition abstracts a subnet. The child subnet
-    is insulated from the parent net. Communication occurs strictly via Ports in
-    the subnet mapped to Sockets in the parent net.
+    is fully insulated from the parent net — it carries no reference to its
+    parent. Communication occurs strictly through the ``port_socket_map``:
+    named port places in the subnet are bound to named socket places in the
+    parent at construction time.
+
+    A subnet instance may only be wrapped by one ``SubstitutionTransition`` at a
+    time. Attempting to wrap the same subnet twice raises :exc:`ValueError`.
     """
 
     _mapped_subnets: ClassVar[weakref.WeakSet] = weakref.WeakSet()

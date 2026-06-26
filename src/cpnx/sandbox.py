@@ -6,7 +6,14 @@ from typing import Any, Callable
 class SandboxEvaluator:
     """A safe evaluator for string-based guard/arc expressions.
 
-    Strictly validates allowed callables using an AST allowlist.
+    Validates expressions via static AST analysis before execution:
+
+    - Only whitelisted built-in functions and methods are permitted.
+    - All iteration constructs are forbidden (``while``, ``for``, list/dict/set
+      comprehensions, generator expressions) to prevent lock-hogging inside the
+      engine's critical section.
+    - Imports, ``global``/``nonlocal`` statements, and private/dunder attribute
+      access are blocked.
     """
 
     ALLOWED_BUILTINS = {
@@ -69,7 +76,18 @@ class SandboxEvaluator:
 
 
 def verify_callable_purity(func: Callable) -> None:
-    """Verify that a callable is pure by inspecting its AST for disallowed nodes (I/O, global mutations)."""
+    """Verify that a callable is pure by inspecting its AST for disallowed patterns.
+
+    Raises :exc:`PermissionError` if the callable contains any of:
+
+    - I/O calls: ``open``, ``print``, ``eval``, ``exec``, ``__import__``,
+      ``time.sleep``, ``os.system``, ``os.popen``, ``urllib.urlopen``.
+    - Import statements.
+    - ``global`` or ``nonlocal`` mutations.
+    - Mutable default arguments (``list``, ``dict``, or ``set`` literals as
+      parameter defaults), which would introduce hidden persistent state between
+      transition firings.
+    """
     # 1. Try file-level AST parsing to find the exact node (very robust for nested lambdas/functions)
     try:
         file_path = inspect.getsourcefile(func)

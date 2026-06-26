@@ -113,7 +113,7 @@ All places are thread-safe.
 
 A transition is **enabled** when all input places contain sufficient tokens and any guard expression evaluates to `True`. When fired, it consumes input tokens, executes the action on a thread pool, and deposits output tokens.
 
-**Resource Return Invariant:** if a transition action raises, the engine catches the exception, routes the data token to the `error_place` (default: `"failed"`), and atomically returns all resource tokens to their source places. Deadlocks from failed actions are structurally impossible.
+**Atomic Rollback:** if a transition action raises, the engine catches the exception and returns **all** consumed tokens — both resource and data — to their original source places, preserving the formal Marking exactly. Data tokens receive a one-second `available_at` delay before being returned, preventing livelock when an action raises persistently. The `on_error` callback fires with the original token for observability. Deadlocks from failed actions are structurally impossible.
 
 ### Arc Expressions
 
