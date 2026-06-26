@@ -113,7 +113,41 @@ All places are thread-safe.
 
 A transition is **enabled** when all input places contain sufficient tokens and any guard expression evaluates to `True`. When fired, it consumes input tokens, executes the action on a thread pool, and deposits output tokens.
 
-**Atomic Rollback:** if a transition action raises, the engine catches the exception and returns **all** consumed tokens — both resource and data — to their original source places, preserving the formal Marking exactly. Data tokens receive a one-second `available_at` delay before being returned, preventing livelock when an action raises persistently. The `on_error` callback fires with the original token for observability. Deadlocks from failed actions are structurally impossible.
+**Atomic Rollback & Bounded Retry:** if a transition action raises, the engine catches the exception. Resource tokens are returned to their original source places immediately. Data tokens are rolled back to their source places (with a delay and incremented `attempts` counter) up to `max_retries` times (default 5). Once the retry limit is exhausted, data tokens are routed to `error_place` (default `"failed"`), allowing the net to safely quiesce. Callbacks (`on_error`, `on_token_dead_lettered`) fire for observability.
+
+### Canonical Error Handling (Colour Routing)
+
+The most robust and mathematically sound way to handle errors in Coloured Petri Nets is to catch exceptions inside the action and return an **error-coloured token**. Output arcs can then use expression guards to route success tokens to normal places and error tokens to an error sink. This preserves token conservation (1-in-1-out) and keeps the firing rules pure.
+
+```python
+from cpnx import PetriNet, Place, Token, Transition, InputArc, OutputArc, ERROR_COLOR
+
+def process_job(tokens: list[Token]) -> list[Token]:
+    data = tokens[0]
+    try:
+        # Perform fragile work
+        if data.payload.get("should_fail"):
+            raise ValueError("fragile operation failed")
+        return [data.evolve(color="success")]
+    except Exception as exc:
+        # Catch and return an error-coloured token
+        return [data.evolve(color=ERROR_COLOR, payload_updates={"error": str(exc)})]
+
+net = PetriNet()
+net.add_place(Place("jobs"))
+net.add_place(Place("completed"))
+net.add_place(Place("failed"))  # Custom error destination
+
+net.add_transition(Transition(
+    name="process",
+    inputs=[InputArc("jobs")],
+    outputs=[
+        OutputArc.on_color("success", "completed"),
+        OutputArc.on_color(ERROR_COLOR, "failed"),
+    ],
+    action=process_job,
+))
+```
 
 ### Arc Expressions
 
@@ -152,6 +186,7 @@ class Token:
     created_at: float    # monotonic creation timestamp
     color: str | None    # CPN colour; None = uncoloured, "resource" = permit token
     available_at: float  # timed CPN: earliest time this token may be consumed
+    attempts: int        # number of failed firings this token has been rolled back from
 
     def evolve(self, payload_updates: dict | None = None, **field_updates) -> Token: ...
     @property
@@ -192,7 +227,10 @@ InputArc(place: str, count: int = 1, consume_all: bool = False,
          expression: Callable[[list[Token]], list[Token]] | None = None)
 
 OutputArc(place: str, count: int = 1,
-          expression: Callable[[list[Token]], bool] | None = None)
+          expression: Callable[[list[Token]], bool] | str | None = None)
+
+# Helper for color-routed error handling
+OutputArc.on_color(color: str, place: str, count: int = 1) -> OutputArc
 ```
 
 ### `Transition`
@@ -204,25 +242,28 @@ class Transition:
     inputs: list[InputArc]
     outputs: list[OutputArc]
     action: Callable[[list[Token]], list[Token]]
-    guard: Callable[[], bool] | str | None = None  # transition guard (CPN standard)
+    guard: Callable[[list[Token]], bool] | str | None = None  # transition guard
     priority: int = 10  # lower fires first among equally-enabled transitions
+    action_timeout_secs: float | None = None
+    max_retries: int | None = 5  # default 5. None = infinite retry.
 ```
 
 ### `PetriNet`
 
 ```python
 class PetriNet:
-    def __init__(self, max_workers: int = 4, timeout_secs: float = 30.0,
-                 expr_timeout_secs: float = 0.1, error_place: str = "failed",
+    def __init__(self, max_workers: int = 4, error_place: str = "failed",
                  places: list[Place] | None = None,
-                 transitions: list[Transition] | None = None): ...
+                 transitions: list[Transition] | None = None,
+                 cooldown_interval: float = 0.05, timeout_secs: float = 1.0,
+                 expr_timeout_secs: float = 0.1, retry_delay: float = 1.0): ...
 
     def add_place(self, place: Place) -> None: ...
     def add_transition(self, transition: Transition) -> None: ...
     def deposit(self, place_name: str, token: Token) -> None: ...
 
     def step(self) -> bool: ...                  # fire one enabled transition; False if none
-    def run(self, deadline: float) -> None: ...  # loop until quiescent or deadline
+    def run(self, deadline: float | None = None, *, stop_event: threading.Event | None = None) -> None: ...
 
     @property
     def marking(self) -> dict[str, list[Token]]: ...  # current CPN marking
@@ -235,6 +276,7 @@ class PetriNet:
     # Callback hooks
     on_transition_fired: Callable[[str, float], None] | None         # (name, duration_secs)
     on_token_deposited: Callable[[str, Token], None] | None          # (place_name, token)
+    on_token_dead_lettered: Callable[[str, Token], None] | None      # (transition_name, token)
     on_error: Callable[[str, Exception, Token | None], None] | None  # (name, exc, token)
 ```
 

@@ -163,6 +163,7 @@ def test_callable_expression_timeout():
 
 # --- Audit remediation tests ---
 
+
 # Module-level helper: set literal default (inspectable by verify_callable_purity)
 def _guard_with_set_literal_default(tokens, s={1, 2}):  # noqa: B006
     return True

@@ -20,8 +20,19 @@ class PetriNet:
 
     Manages places, transitions, and a thread pool for firing transitions
     concurrently. Resource tokens are guaranteed to be returned to their source
-    places even when a transition's action raises — data tokens are routed to
-    :attr:`error_place` instead.
+    places even when a transition's action raises. For data tokens, the net supports
+    three error handling dispositions:
+
+    A. **Colour-routed error (primary/canonical)**: The action catches its own exception,
+       returns an error-coloured token, and output-arc expressions (e.g. using
+       ``OutputArc.expression``) route success vs error tokens to different places.
+       This preserves firing rules and token conservation (1-in-1-out).
+    B. **Bounded atomic-retry**: On action failure/exception, the data token is rolled back
+       to its source place with a delay and an incremented ``attempts`` counter, retrying
+       up to ``max_retries`` times (default 5). Once exhausted, it is dead-lettered to
+       ``error_place``.
+    C. **Immediate dead-letter**: By setting ``max_retries=0`` on a transition, any action
+       failure immediately routes the data token to ``error_place``.
 
     Typical usage::
 
@@ -38,13 +49,13 @@ class PetriNet:
             ],
         )
         net.deposit("source", Token(payload={"job_id": 1}))
-        net.run(deadline=time.monotonic() + 30)
+        net.run()  # runs to quiescence
 
     Use as a context manager to ensure the thread pool shuts down cleanly::
 
         with PetriNet(max_workers=4) as net:
             ...
-            net.run(deadline=time.monotonic() + 30)
+            net.run()
     """
 
     def __init__(
@@ -56,6 +67,7 @@ class PetriNet:
         cooldown_interval: float = 0.05,
         timeout_secs: float = 1.0,
         expr_timeout_secs: float = 0.1,
+        retry_delay: float = 1.0,
     ) -> None:
         """Initialise the executor.
 
@@ -76,12 +88,15 @@ class PetriNet:
                                while holding the engine lock, so this value directly
                                caps how long concurrent ``deposit()`` and ``step()``
                                calls will block. Keep well under 1 s (default: 0.1 s).
+            retry_delay: Delay in seconds to apply to data tokens when rolling them
+                         back to their source places on transient failure.
         """
         self.max_workers = max_workers
         self.error_place = error_place
         self.cooldown_interval = cooldown_interval
         self.timeout_secs = timeout_secs
         self.expr_timeout_secs = expr_timeout_secs
+        self.retry_delay = retry_delay
         self._has_timed_features = False
         self._model_time: float | None = None
         self.places: dict[str, Place] = {}
@@ -106,10 +121,15 @@ class PetriNet:
         #: within this callback.
         self.on_token_deposited: Callable[[str, Token], None] | None = None
 
+        #: Called when a data token is dead-lettered to the error place due to exhausted retries.
+        #: Signature: ``(transition_name: str, token: Token) -> None``.
+        #: Fires outside the engine lock.
+        self.on_token_dead_lettered: Callable[[str, Token], None] | None = None
+
         #: Called when a transition's action raises an exception.
         #: Signature: ``(transition_name: str, exc: Exception, token: Token | None) -> None``.
-        #: *token* is the data token that was routed to the error place, or ``None``
-        #: if the transition had no data inputs.
+        #: *token* is the data token that was routed to the error place or rolled back,
+        #: or ``None`` if the transition had no data inputs.
         #: Fires outside the engine lock.
         self.on_error: Callable[[str, Exception, Token | None], None] | None = None
 
@@ -311,7 +331,12 @@ class PetriNet:
                     if arc.place not in self.places:
                         raise KeyError(f"Place '{arc.place}' referenced by transition '{name}' is not registered.")
 
-    def run(self, deadline: float) -> None:
+    def run(
+        self,
+        deadline: float | None = None,
+        *,
+        stop_event: threading.Event | None = None,
+    ) -> None:
         """Fire enabled transitions until the net is quiescent or the deadline passes.
 
         Sleeps efficiently on a :class:`threading.Event` rather than busy-waiting,
@@ -320,6 +345,9 @@ class PetriNet:
         Args:
             deadline: **Absolute** monotonic timestamp after which the loop exits.
                       Always construct this as ``time.monotonic() + <seconds>``.
+                      If ``None`` (default), runs until the net is quiescent.
+            stop_event: Optional :class:`threading.Event`. If set, the loop exits
+                        promptly.
 
         Warning:
             Passing a raw duration (e.g. ``run(30)``) instead of an absolute
@@ -329,17 +357,28 @@ class PetriNet:
         Example::
 
             net.run(deadline=time.monotonic() + 30)  # run for up to 30 seconds
+            net.run()  # run to quiescence
         """
         self.validate()
         while not self.is_quiescent():
-            if time.monotonic() > deadline:
+            if stop_event is not None and stop_event.is_set():
+                break
+            if deadline is not None and time.monotonic() > deadline:
                 break
             self._work_available.clear()
             if not self.step():
-                remaining = deadline - time.monotonic()
-                if remaining > 0:
-                    # Cap at cooldown_interval if timed features are active.
-                    timeout = min(remaining, self.cooldown_interval) if self._has_timed_features else remaining
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    timeout = min(remaining, self.cooldown_interval)
+                    if stop_event is not None:
+                        timeout = min(timeout, 0.1)
+                    self._work_available.wait(timeout=timeout)
+                else:
+                    timeout = self.cooldown_interval
+                    if stop_event is not None:
+                        timeout = min(timeout, 0.1)
                     self._work_available.wait(timeout=timeout)
 
     def is_quiescent(self) -> bool:
@@ -589,12 +628,12 @@ class PetriNet:
 
         Runs on the thread pool. Guarantees:
 
-        - On failure, ALL consumed tokens (resource and data) are returned to their
-          original source places, preserving the formal Marking (atomic rollback).
-        - Returned data tokens carry a 1-second ``available_at`` delay to prevent
-          livelock when the action raises persistently.
-        - Callbacks (:attr:`on_token_deposited`, :attr:`on_error`) fire **outside**
-          the engine lock to prevent re-entrant deadlocks.
+        - On failure, resource tokens are returned to their source places.
+        - Data tokens are retried (returned to source with a delay and an incremented
+          ``attempts`` counter) up to ``max_retries`` times, or dead-lettered to
+          ``error_place`` when exhausted.
+        - Callbacks (:attr:`on_token_deposited`, :attr:`on_error`, :attr:`on_token_dead_lettered`)
+          fire **outside** the engine lock to prevent re-entrant deadlocks.
         - :attr:`_running_count` is always decremented exactly once.
         """
         try:
@@ -727,16 +766,30 @@ class PetriNet:
                                 break
 
                 if not success:
-                    # Roll back all tokens to their original source places (atomic).
-                    # Data tokens carry a 1-second delay to prevent livelock when an
-                    # action raises persistently. Original token refs are kept for the
-                    # on_error callback; the deposited copies carry the delay.
-                    retry_at = time.monotonic() + 1.0
+                    # Roll back all tokens (atomic).
+                    # Resource tokens are returned to source place.
+                    # Data tokens are either retried (returned to source with a delay and
+                    # incremented attempts counter) or dead-lettered to error_place.
                     data_tokens = [t for _, t in token_sources if not t.is_resource]
+                    dead_lettered_data_tokens = []
                     for src_name, t in token_sources:
-                        rollback_t = t.evolve(available_at=retry_at) if not t.is_resource else t
-                        self._deposit_under_lock(src_name, rollback_t)
-                        deposited.append((src_name, rollback_t))
+                        if t.is_resource:
+                            self._deposit_under_lock(src_name, t)
+                            deposited.append((src_name, t))
+                        else:
+                            max_retries = transition.max_retries
+                            if max_retries is None or t.attempts < max_retries:
+                                # Retry path
+                                retry_at = time.monotonic() + self.retry_delay
+                                rollback_t = t.evolve(available_at=retry_at, attempts=t.attempts + 1)
+                                self._deposit_under_lock(src_name, rollback_t)
+                                deposited.append((src_name, rollback_t))
+                            else:
+                                # Exhausted path -> route to error_place
+                                rollback_t = t.evolve(available_at=0.0)
+                                self._deposit_under_lock(self.error_place, rollback_t)
+                                deposited.append((self.error_place, rollback_t))
+                                dead_lettered_data_tokens.append(rollback_t)
 
             # --- OUTSIDE THE LOCK ---
             if success:
@@ -752,6 +805,12 @@ class PetriNet:
                     for dt in dispatch_tokens:
                         try:
                             self.on_error(transition.name, error, dt)
+                        except Exception:
+                            pass
+                if self.on_token_dead_lettered and dead_lettered_data_tokens:
+                    for dt in dead_lettered_data_tokens:
+                        try:
+                            self.on_token_dead_lettered(transition.name, dt)
                         except Exception:
                             pass
 
