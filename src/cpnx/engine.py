@@ -4,6 +4,7 @@ import random
 import threading
 import time
 from collections import deque
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
@@ -88,6 +89,7 @@ class PetriNet:
         self._lock = threading.Lock()
         self._running_count = 0
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._action_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cpnx-action")
         self._expr_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cpnx-expr")
         # Signalled whenever tokens are deposited; wakes run() without busy-waiting.
         self._work_available = threading.Event()
@@ -425,11 +427,17 @@ class PetriNet:
     def __exit__(self, *_: object) -> None:
         """Shut down the thread pool, waiting for in-flight transitions to finish."""
         self._executor.shutdown(wait=True)
+        # Zombie action threads may still be running after a timeout — don't wait.
+        self._action_executor.shutdown(wait=False, cancel_futures=True)
         self._expr_executor.shutdown(wait=True)
 
     def __del__(self) -> None:
         try:
             self._executor.shutdown(wait=False)
+        except Exception:
+            pass
+        try:
+            self._action_executor.shutdown(wait=False)
         except Exception:
             pass
         try:
@@ -598,8 +606,19 @@ class PetriNet:
             try:
                 if isinstance(transition, SubstitutionTransition):
                     output_tokens = self._execute_substitution_transition(transition, consumed_tokens, token_sources)
-                else:
+                elif transition.action_timeout_secs is None:
                     output_tokens = transition.action(consumed_tokens)
+                else:
+                    fut = self._action_executor.submit(transition.action, consumed_tokens)
+                    try:
+                        output_tokens = fut.result(timeout=transition.action_timeout_secs)
+                    except concurrent.futures.TimeoutError:
+                        raise RuntimeError(
+                            f"Transition '{transition.name}' action exceeded "
+                            f"{transition.action_timeout_secs}s timeout — tokens rolled back. "
+                            f"The action thread is still running in the background; "
+                            f"use native I/O timeouts inside your action to prevent zombie accumulation."
+                        )
                 success = True
             except BaseException as exc:
                 error = exc
