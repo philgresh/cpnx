@@ -1,7 +1,5 @@
 import time
 
-import pytest
-
 from cpnx.engine import PetriNet
 from cpnx.places import Place, ResourcePlace
 from cpnx.tokens import Token

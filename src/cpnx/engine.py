@@ -1,10 +1,10 @@
 """Concurrent Petri net executor."""
 
+import concurrent.futures
 import random
 import threading
 import time
 from collections import deque
-import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
@@ -618,7 +618,7 @@ class PetriNet:
                             f"{transition.action_timeout_secs}s timeout — tokens rolled back. "
                             f"The action thread is still running in the background; "
                             f"use native I/O timeouts inside your action to prevent zombie accumulation."
-                        )
+                        ) from None
                 success = True
             except BaseException as exc:
                 error = exc
