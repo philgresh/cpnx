@@ -1,6 +1,6 @@
 [project]
 name = "cpnx"
-version = "0.1.2"
+version = "0.2.0"
 description = "Coloured Petri Net executor for concurrent Python pipelines"
 authors = [
   { name = "Phil Gresham", email = "phil@gresham.dev" },
