@@ -89,6 +89,21 @@ class Transition:
                Evaluated while holding the engine lock; return ``False`` to block firing.
                ``None`` (default) = always enabled.
         priority: Lower value fires first when multiple transitions are enabled.
+        action_timeout_secs: Maximum wall-clock seconds the action may run. When ``None``
+               (default), the action runs without a deadline — fully backward compatible.
+               When set, the engine triggers atomic rollback if the action does not return
+               within this duration: all consumed tokens are returned to their source places
+               (data tokens with a 1-second ``available_at`` delay to prevent livelock), and
+               the ``on_error`` callback fires with a ``RuntimeError`` that names the
+               transition and the elapsed timeout.
+
+               **This does not kill the underlying OS thread.** The timed-out action
+               continues running in the background until it completes or the process exits;
+               its return value is silently discarded. Callers must apply native I/O
+               timeouts inside their actions (e.g. ``requests.get(timeout=...)``,
+               ``httpx`` client timeouts) to prevent zombie thread accumulation.
+               ``action_timeout_secs`` is defense-in-depth, not a substitute for proper
+               I/O timeout discipline.
     """
 
     name: str
@@ -97,6 +112,7 @@ class Transition:
     action: Callable[[list[Token]], list[Token]]
     guard: Callable[[list[Token]], bool] | str | None = None
     priority: int = 10
+    action_timeout_secs: float | None = None
 
     def __post_init__(self):
         # Actions are explicitly allowed side effects (e.g., database writes,
