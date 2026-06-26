@@ -201,14 +201,14 @@ class TestMutableDefaultArgDetection:
     """Task 3: verify_callable_purity must reject mutable default arguments."""
 
     def test_list_default_rejected(self):
-        def guard_with_list_default(tokens, memory=[]):
+        def guard_with_list_default(tokens, memory=[]):  # noqa: B006
             return True
 
         with pytest.raises(PermissionError, match="Mutable default argument"):
             verify_callable_purity(guard_with_list_default)
 
     def test_dict_default_rejected(self):
-        def guard_with_dict_default(tokens, cache={}):
+        def guard_with_dict_default(tokens, cache={}):  # noqa: B006
             return bool(tokens)
 
         with pytest.raises(PermissionError, match="Mutable default argument"):
