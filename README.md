@@ -108,12 +108,13 @@ All places are thread-safe.
 | `ResourcePlace(capacity)` | Pre-filled bounded pool of `"resource"` permit tokens; returned on transition completion or failure |
 | `PacedResourcePlace(capacity, pacing_secs)` | Like `ResourcePlace`, but returned tokens cool down for `pacing_secs` before becoming reusable (rate-limiting) |
 | `ThresholdPlace(threshold)` | Tokens only consumable once the queue depth reaches `threshold` (batch accumulation) |
+| `SinkPlace(keep_last)` | Absorbing terminal place; counts stats and evicts oldest tokens (streaming-native terminus) |
 
 ### Transitions
 
 A transition is **enabled** when all input places contain sufficient tokens and any guard expression evaluates to `True`. When fired, it consumes input tokens, executes the action on a thread pool, and deposits output tokens.
 
-**Atomic Rollback & Bounded Retry:** if a transition action raises, the engine catches the exception. Resource tokens are returned to their original source places immediately. Data tokens are rolled back to their source places (with a delay and incremented `attempts` counter) up to `max_retries` times (default 5). Once the retry limit is exhausted, data tokens are routed to `error_place` (default `"failed"`), allowing the net to safely quiesce. Callbacks (`on_error`, `on_token_dead_lettered`) fire for observability.
+**Atomic Rollback & Bounded Retry:** if a transition action raises, the engine catches the exception. Resource tokens are returned to their original source places immediately. Data tokens are rolled back to their source places (with a delay and incremented `attempts` counter) up to `max_retries` times (default 5). Once the retry limit is exhausted, data tokens are routed to `error_place` (default `"failed"`), allowing the net to safely quiesce. Callbacks (`on_error`, `on_token_dead_lettered`) fire for observability. The `error_place` can be configured as a `SinkPlace` to avoid memory leaks from failure accumulation in long-lived streaming nets.
 
 ### Canonical Error Handling (Colour Routing)
 
@@ -213,11 +214,13 @@ Place(name: str, bound: int | None = None, color_set: set[str] | None = None,
 ResourcePlace(name: str, capacity: int)
 PacedResourcePlace(name: str, capacity: int, pacing_secs: float)
 ThresholdPlace(name: str, threshold: int)
+SinkPlace(name: str, *, keep_last: int = 0, color_set: set[str] | None = None)
 ```
 
 - `bound` — k-bounded place; raises if a deposit would exceed capacity (standard CPN)
 - `color_set` — if set, `deposit()` rejects tokens whose `color` is not in the set
 - `initial_marking` — tokens deposited at construction time
+- `keep_last` — number of most recent tokens to keep in a ring buffer for inspection (defaults to `0`)
 
 ### Arcs
 

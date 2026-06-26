@@ -471,3 +471,120 @@ class ThresholdPlace(Place):
             remove_ids = {t.id for t in available}
             self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
             return available
+
+
+class SinkPlace(Place):
+    """An absorbing terminal place that counts and observes tokens but does not retain them.
+
+    Useful for streaming pipelines to avoid accumulating memory indefinitely.
+    Can optionally keep the most recent N tokens in a ring buffer for inspection.
+
+    .. warning::
+       Avoid setting a restrictive `color_set` if this place is used as an `error_place`.
+       Dead-lettered tokens preserve their original colours, and depositing a rejected
+       colour will raise a `TypeError` inside the locked transition failure branch,
+       causing the token to be lost rather than successfully dead-lettered.
+    """
+
+    def __init__(self, name: str, *, keep_last: int = 0, color_set: set[str] | None = None) -> None:
+        """Create a new SinkPlace.
+
+        Args:
+            name: Unique identifier for this place within a :class:`PetriNet`.
+            keep_last: Number of most recent tokens to keep in a ring buffer.
+                       Default is 0 (retain nothing).
+            color_set: Set of accepted token colours. None (default) accepts any colour.
+                       Do not use a restrictive color_set if used as an error_place.
+        """
+        super().__init__(name, bound=None, color_set=color_set)
+        self.keep_last = keep_last
+        self._tokens = deque(maxlen=keep_last)
+        self._absorbed = 0
+        self._by_color: dict[str | None, int] = {}
+        self._first_deposit_time: float | None = None
+
+    def deposit(self, token: Token, model_time: float | None = None) -> None:
+        """Absorb the token, incrementing counters and updating timestamps.
+
+        Args:
+            token: The token to absorb.
+            model_time: Optional logical clock timestamp.
+        """
+        with self._lock:
+            if self.color_set is not None and token.color not in self.color_set:
+                raise TypeError(
+                    f"Place '{self.name}' has color_set {self.color_set!r} — "
+                    f"cannot deposit token with color {token.color!r}."
+                )
+            self._tokens.append(token)
+            now = time.monotonic()
+            self.last_deposit_time = now
+            if self._first_deposit_time is None:
+                self._first_deposit_time = now
+            if model_time is not None:
+                self.last_deposit_time_model = model_time
+
+            self._absorbed += 1
+            self._by_color[token.color] = self._by_color.get(token.color, 0) + 1
+
+            self._on_deposit(token)
+
+    def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
+        """SinkPlace is terminal — returns False always."""
+        return False
+
+    def retrieve(self, count: int = 1, model_time: float | None = None) -> list[Token]:
+        """SinkPlace is terminal — raises ValueError."""
+        raise ValueError("SinkPlace is terminal — tokens are absorbed, not retrievable")
+
+    def retrieve_specific(self, tokens: list[Token], model_time: float | None = None) -> list[Token]:
+        """SinkPlace is terminal — raises ValueError."""
+        raise ValueError("SinkPlace is terminal — tokens are absorbed, not retrievable")
+
+    def retrieve_all(self, model_time: float | None = None) -> list[Token]:
+        """SinkPlace is terminal — raises ValueError."""
+        raise ValueError("SinkPlace is terminal — tokens are absorbed, not retrievable")
+
+    def peek(self, count: int = 1, model_time: float | None = None) -> list[Token]:
+        """SinkPlace is terminal — raises ValueError."""
+        raise ValueError("SinkPlace is terminal — tokens are absorbed, not retrievable")
+
+    def can_deposit(self, count: int = 1) -> bool:
+        """SinkPlace has infinite capacity — returns True always."""
+        return True
+
+    def stats(self) -> dict:
+        """Return cumulative statistics of absorbed tokens.
+
+        Returns:
+            Dictionary with name, absorbed, by_color, kept, first_deposit_time, last_deposit_time.
+        """
+        with self._lock:
+            return {
+                "name": self.name,
+                "absorbed": self._absorbed,
+                "by_color": dict(self._by_color),
+                "kept": len(self._tokens),
+                "first_deposit_time": self._first_deposit_time,
+                "last_deposit_time": self.last_deposit_time,
+            }
+
+    def drain_stats(self) -> dict:
+        """Return a snapshot of current stats and reset absorbed/by_color/time counters atomically.
+
+        Returns:
+            Snapshot dictionary before reset.
+        """
+        with self._lock:
+            snapshot = {
+                "name": self.name,
+                "absorbed": self._absorbed,
+                "by_color": dict(self._by_color),
+                "kept": len(self._tokens),
+                "first_deposit_time": self._first_deposit_time,
+                "last_deposit_time": self.last_deposit_time,
+            }
+            self._absorbed = 0
+            self._by_color = {}
+            self._first_deposit_time = None
+            return snapshot

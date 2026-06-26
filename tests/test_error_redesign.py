@@ -7,6 +7,10 @@ from cpnx.tokens import ERROR_COLOR, Token
 from cpnx.transitions import InputArc, OutputArc, Transition
 
 
+def action_boom(tokens):
+    raise ValueError("boom")
+
+
 def test_termination_on_persistent_failure():
     """A transition whose action always raises, max_retries=3:
 
@@ -134,7 +138,7 @@ def test_max_retries_zero():
             name="t",
             inputs=[InputArc("input")],
             outputs=[],
-            action=lambda tokens: exec('raise(ValueError("boom"))'),
+            action=action_boom,
             max_retries=0,
         )
     )
@@ -322,7 +326,7 @@ def test_on_token_dead_lettered_callback():
             name="t",
             inputs=[InputArc("input")],
             outputs=[],
-            action=lambda tokens: exec('raise(ValueError("boom"))'),
+            action=action_boom,
             max_retries=1,
         )
     )

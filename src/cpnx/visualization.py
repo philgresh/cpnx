@@ -13,6 +13,8 @@ def snapshot(net: "PetriNet") -> dict[str, Any]:
     Returns:
         A dictionary containing the places marking and the number of running transitions.
     """
+    from cpnx.places import SinkPlace
+
     with net._lock:
         places_snapshot = {}
         for name, place in net.places.items():
@@ -26,7 +28,13 @@ def snapshot(net: "PetriNet") -> dict[str, Any]:
                         "color": t.color,
                     }
                 )
-            places_snapshot[name] = tokens_list
+            if isinstance(place, SinkPlace):
+                places_snapshot[name] = {
+                    "tokens": tokens_list,
+                    "absorbed": place.stats()["absorbed"],
+                }
+            else:
+                places_snapshot[name] = tokens_list
 
         return {"places": places_snapshot, "running_count": net._running_count}
 
@@ -40,12 +48,17 @@ def to_dot(net: "PetriNet") -> str:
     Returns:
         A string representing the net in Graphviz DOT format.
     """
+    from cpnx.places import SinkPlace
+
     with net._lock:
         lines = ["digraph PetriNet {", "  rankdir=LR;"]
 
         # Nodes: Places
         for name, place in net.places.items():
-            token_count = len(place)
+            if isinstance(place, SinkPlace):
+                token_count = place.stats()["absorbed"]
+            else:
+                token_count = len(place)
             label = f"{name}\\n({token_count})"
             lines.append(f'  "{name}" [shape=circle, label="{label}"];')
 
