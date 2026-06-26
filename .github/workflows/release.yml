@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write  # create GitHub Release
+  id-token: write  # PyPI Trusted Publisher (OIDC)
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+
+    environment:
+      name: pypi
+      url: https://pypi.org/project/cpnx/
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run tests
+        run: |
+          pip install -e ".[dev]"
+          ruff check src/ tests/
+          pytest tests/ -v
+
+      - name: Build
+        run: |
+          pip install build
+          python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # Uses OIDC Trusted Publisher — no API token needed.
+        # One-time setup: add this repo as a Trusted Publisher on
+        # https://pypi.org/manage/project/cpnx/settings/publishing/
+        # Environment name: pypi  Workflow: release.yml
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Pull the block between this version's heading and the next
+          NOTES=$(awk "/^## \[$VERSION\]/{found=1; next} found && /^## /{exit} found{print}" CHANGELOG.md)
+          # Write to a file to safely pass multi-line content to the next step
+          echo "$NOTES" > release_notes.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release_notes.txt
+          files: dist/*
