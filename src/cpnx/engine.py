@@ -34,6 +34,9 @@ class PetriNet:
     C. **Immediate dead-letter**: By setting ``max_retries=0`` on a transition, any action
        failure immediately routes the data token to ``error_place``.
 
+    Note that ``error_place`` can be configured as a ``SinkPlace`` (e.g. ``SinkPlace("failed", keep_last=10)``)
+    to keep only the last N failures for diagnostics, preventing unbounded memory growth in long-running streaming nets.
+
     Typical usage::
 
         net = PetriNet(
@@ -74,8 +77,9 @@ class PetriNet:
         Args:
             max_workers: Maximum number of transitions that may fire concurrently.
             error_place: Name of the place that receives data tokens from failed
-                         transitions. Created automatically — do not register a
-                         place with this name manually.
+                         transitions. Created automatically as a standard Place,
+                         but can be overridden by registering a custom place (like a
+                         SinkPlace) with the same name.
             places: Optional list of :class:`~cpnx.places.Place` instances to
                     register at construction time.
             transitions: Optional list of :class:`~cpnx.transitions.Transition`
