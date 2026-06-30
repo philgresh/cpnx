@@ -55,6 +55,16 @@ class SandboxEvaluator:
         return _compile_cached(expression_str)
 
     @classmethod
+    def maybe_compile(cls, value):
+        """Compile *value* if it is a string expression, else return ``None``.
+
+        Strings are validated and compiled via :meth:`compile_expression` (cached); any
+        other value (a callable or ``None``) yields ``None``. Centralizes the
+        string-vs-callable rule so arc/guard constructors don't each re-implement it.
+        """
+        return cls.compile_expression(value) if isinstance(value, str) else None
+
+    @classmethod
     def evaluate_compiled(cls, compiled_code, context_dict: dict[str, Any]) -> Any:
         """Evaluate a pre-compiled code object (from :meth:`compile_expression`) safely."""
         safe_globals = {"__builtins__": cls.ALLOWED_BUILTINS}

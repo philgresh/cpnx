@@ -36,13 +36,16 @@ class InputArc:
     settle_secs: float = 0.0
     expression: Callable[[list[Token]], list[Token]] | str | None = field(default=None, compare=False)
 
-    def __post_init__(self):
-        #: Pre-compiled code object for a string ``expression`` (``None`` for callables).
-        self._compiled_expression = (
-            SandboxEvaluator.compile_expression(self.expression) if isinstance(self.expression, str) else None
-        )
-        if callable(self.expression):
-            verify_callable_purity(self.expression)
+    def __setattr__(self, name, value):
+        # Keep the pre-compiled code object in sync with ``expression``, including
+        # post-construction reassignment. Compile/verify before mutating so a bad
+        # value leaves the arc in its previous valid state.
+        if name == "expression":
+            compiled = SandboxEvaluator.maybe_compile(value)
+            if callable(value):
+                verify_callable_purity(value)
+            super().__setattr__("_compiled_expression", compiled)
+        super().__setattr__(name, value)
 
 
 @dataclass
@@ -67,13 +70,16 @@ class OutputArc:
     count: int = 1
     expression: Callable[[list[Token]], bool] | str | None = field(default=None, compare=False)
 
-    def __post_init__(self):
-        #: Pre-compiled code object for a string ``expression`` (``None`` for callables).
-        self._compiled_expression = (
-            SandboxEvaluator.compile_expression(self.expression) if isinstance(self.expression, str) else None
-        )
-        if callable(self.expression):
-            verify_callable_purity(self.expression)
+    def __setattr__(self, name, value):
+        # Keep the pre-compiled code object in sync with ``expression``, including
+        # post-construction reassignment. Compile/verify before mutating so a bad
+        # value leaves the arc in its previous valid state.
+        if name == "expression":
+            compiled = SandboxEvaluator.maybe_compile(value)
+            if callable(value):
+                verify_callable_purity(value)
+            super().__setattr__("_compiled_expression", compiled)
+        super().__setattr__(name, value)
 
     @classmethod
     def on_color(cls, color: str, place: str, count: int = 1) -> "OutputArc":
@@ -134,15 +140,16 @@ class Transition:
     action_timeout_secs: float | None = None
     max_retries: int | None = 5
 
-    def __post_init__(self):
-        # Actions are explicitly allowed side effects (e.g., database writes,
-        # API calls, I/O), so they are not subject to purity verification.
-        #: Pre-compiled code object for a string ``guard`` (``None`` for callables).
-        self._compiled_guard = (
-            SandboxEvaluator.compile_expression(self.guard) if isinstance(self.guard, str) else None
-        )
-        if callable(self.guard):
-            verify_callable_purity(self.guard)
+    def __setattr__(self, name, value):
+        # Keep the pre-compiled guard in sync with ``guard``, including
+        # post-construction reassignment. Actions are explicitly allowed side effects
+        # (DB writes, API calls, I/O), so only guards are purity-verified.
+        if name == "guard":
+            compiled = SandboxEvaluator.maybe_compile(value)
+            if callable(value):
+                verify_callable_purity(value)
+            super().__setattr__("_compiled_guard", compiled)
+        super().__setattr__(name, value)
 
 
 @dataclass
@@ -166,7 +173,8 @@ class SubstitutionTransition(Transition):
     subnet_deadline_secs: float = 30.0
 
     def __post_init__(self):
-        super().__post_init__()
+        # Guard compilation/purity is handled by Transition.__setattr__ during field
+        # assignment; here we only validate the substitution-specific structure.
         # Validate that the ports and sockets are structurally valid mapping names
         if not isinstance(self.port_socket_map, dict):
             raise TypeError("port_socket_map must be a dictionary.")
