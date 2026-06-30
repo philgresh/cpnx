@@ -301,6 +301,10 @@ cpnx supports two forms of guard and arc expressions:
 
 2. **Callable expressions** — Python functions or lambdas. Executed in a separate thread pool (`cpnx-expr`) bounded by `expr_timeout_secs` (default 100 ms). Not I/O-isolated, but `verify_callable_purity` performs AST analysis at construction time to block common I/O calls (`open`, `print`, `time.sleep`, `os.system`, etc.). Full hermetic isolation requires string expressions.
 
+### Performance: compile-once string expressions
+
+String guards and arc expressions are parsed, security-checked, and compiled once at construction time, then reused on every enablement check. Since the engine re-evaluates enablement for every transition on each `step()`, this keeps the hot path free of repeated `ast.parse()`/`compile()` work. One consequence worth knowing: a malformed or forbidden string expression raises `PermissionError` when you build the `Transition`/`InputArc`/`OutputArc`, not later at run time. See `benchmarks/bench_enablement.py` for a representative measurement.
+
 ---
 
 ## FAQ

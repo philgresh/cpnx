@@ -1,4 +1,5 @@
 import ast
+import functools
 import inspect
 from typing import Any, Callable
 
@@ -43,37 +44,67 @@ class SandboxEvaluator:
     }
 
     @classmethod
-    def evaluate(cls, expression_str: str, context_dict: dict[str, Any]) -> Any:
-        """Parse and evaluate expression_str safely without access to dangerous builtins."""
-        # 1. Parse in exec mode first to ensure safety against statement-level imports or assignments
-        exec_tree = ast.parse(expression_str, mode="exec")
-        for node in ast.walk(exec_tree):
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name):
-                    if node.func.id not in cls.ALLOWED_BUILTINS:
-                        raise PermissionError(f"Forbidden call to '{node.func.id}' in sandbox.")
-                elif isinstance(node.func, ast.Attribute):
-                    if node.func.attr not in cls.ALLOWED_METHODS:
-                        raise PermissionError(f"Forbidden call to method '{node.func.attr}' in sandbox.")
-                else:
-                    raise PermissionError("Forbidden complex call in sandbox.")
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                raise PermissionError("Imports are forbidden in sandbox.")
-            elif isinstance(node, ast.Attribute):
-                if node.attr.startswith("_"):
-                    raise PermissionError(f"Access to private/dunder attribute '{node.attr}' is forbidden in sandbox.")
-            elif isinstance(node, (ast.Global, ast.Nonlocal)):
-                raise PermissionError("Global/nonlocal mutations are forbidden in sandbox.")
-            elif isinstance(
-                node, (ast.While, ast.For, ast.AsyncFor, ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp)
-            ):
-                raise PermissionError("Unbounded iteration is forbidden in sandbox expressions.")
+    def compile_expression(cls, expression_str: str):
+        """Validate and compile *expression_str*, returning an ``eval``-mode code object.
 
-        # 2. Parse and compile in eval mode for execution
-        tree = ast.parse(expression_str, mode="eval")
-        code = compile(tree, "<sandbox>", "eval")
+        Runs the static AST security walk (imports, forbidden calls, private attribute
+        access, unbounded iteration) before compiling. Raises :exc:`PermissionError` on
+        any violation. Results are cached by source text, so an identical expression is
+        parsed and compiled at most once -- callers may invoke this in a hot loop.
+        """
+        return _compile_cached(expression_str)
+
+    @classmethod
+    def evaluate_compiled(cls, compiled_code, context_dict: dict[str, Any]) -> Any:
+        """Evaluate a pre-compiled code object (from :meth:`compile_expression`) safely."""
         safe_globals = {"__builtins__": cls.ALLOWED_BUILTINS}
-        return eval(code, safe_globals, context_dict)
+        return eval(compiled_code, safe_globals, context_dict)
+
+    @classmethod
+    def evaluate(cls, expression_str: str, context_dict: dict[str, Any]) -> Any:
+        """Parse and evaluate expression_str safely without access to dangerous builtins.
+
+        Thin wrapper over :meth:`compile_expression` + :meth:`evaluate_compiled`; the
+        compilation step is cached, so repeated calls with the same expression skip
+        re-parsing and re-compiling.
+        """
+        return cls.evaluate_compiled(cls.compile_expression(expression_str), context_dict)
+
+
+@functools.lru_cache(maxsize=256)
+def _compile_cached(expression_str: str):
+    """Validate (exec-mode security walk) and compile (eval-mode) an expression once.
+
+    Cached by source text. Kept module-level so the cache is shared process-wide across
+    all transitions/arcs that reference the same expression string.
+    """
+    # 1. Parse in exec mode first to ensure safety against statement-level imports or assignments
+    exec_tree = ast.parse(expression_str, mode="exec")
+    for node in ast.walk(exec_tree):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id not in SandboxEvaluator.ALLOWED_BUILTINS:
+                    raise PermissionError(f"Forbidden call to '{node.func.id}' in sandbox.")
+            elif isinstance(node.func, ast.Attribute):
+                if node.func.attr not in SandboxEvaluator.ALLOWED_METHODS:
+                    raise PermissionError(f"Forbidden call to method '{node.func.attr}' in sandbox.")
+            else:
+                raise PermissionError("Forbidden complex call in sandbox.")
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            raise PermissionError("Imports are forbidden in sandbox.")
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("_"):
+                raise PermissionError(f"Access to private/dunder attribute '{node.attr}' is forbidden in sandbox.")
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            raise PermissionError("Global/nonlocal mutations are forbidden in sandbox.")
+        elif isinstance(
+            node, (ast.While, ast.For, ast.AsyncFor, ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp)
+        ):
+            raise PermissionError("Unbounded iteration is forbidden in sandbox expressions.")
+
+    # 2. Parse and compile in eval mode for execution
+    tree = ast.parse(expression_str, mode="eval")
+    return compile(tree, "<sandbox>", "eval")
 
 
 def verify_callable_purity(func: Callable) -> None:

@@ -2,7 +2,7 @@ import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, ClassVar
 
-from cpnx.sandbox import verify_callable_purity
+from cpnx.sandbox import SandboxEvaluator, verify_callable_purity
 from cpnx.tokens import Token
 
 if TYPE_CHECKING:
@@ -37,6 +37,10 @@ class InputArc:
     expression: Callable[[list[Token]], list[Token]] | str | None = field(default=None, compare=False)
 
     def __post_init__(self):
+        #: Pre-compiled code object for a string ``expression`` (``None`` for callables).
+        self._compiled_expression = (
+            SandboxEvaluator.compile_expression(self.expression) if isinstance(self.expression, str) else None
+        )
         if callable(self.expression):
             verify_callable_purity(self.expression)
 
@@ -64,6 +68,10 @@ class OutputArc:
     expression: Callable[[list[Token]], bool] | str | None = field(default=None, compare=False)
 
     def __post_init__(self):
+        #: Pre-compiled code object for a string ``expression`` (``None`` for callables).
+        self._compiled_expression = (
+            SandboxEvaluator.compile_expression(self.expression) if isinstance(self.expression, str) else None
+        )
         if callable(self.expression):
             verify_callable_purity(self.expression)
 
@@ -129,6 +137,10 @@ class Transition:
     def __post_init__(self):
         # Actions are explicitly allowed side effects (e.g., database writes,
         # API calls, I/O), so they are not subject to purity verification.
+        #: Pre-compiled code object for a string ``guard`` (``None`` for callables).
+        self._compiled_guard = (
+            SandboxEvaluator.compile_expression(self.guard) if isinstance(self.guard, str) else None
+        )
         if callable(self.guard):
             verify_callable_purity(self.guard)
 

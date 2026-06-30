@@ -283,7 +283,9 @@ class PetriNet:
                     elif arc.expression is not None:
                         available = place.peek(len(place), model_time=m_time)
                         if isinstance(arc.expression, str):
-                            ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
+                            ordered = SandboxEvaluator.evaluate_compiled(
+                                arc._compiled_expression, {"tokens": available}
+                            )
                         else:
                             ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
                         tokens = place.retrieve_specific(ordered[: arc.count], model_time=m_time)
@@ -545,7 +547,7 @@ class PetriNet:
             elif arc.expression is not None:
                 try:
                     if isinstance(arc.expression, str):
-                        ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
+                        ordered = SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": available})
                     else:
                         ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
                     tokens = ordered[: arc.count]
@@ -568,7 +570,7 @@ class PetriNet:
         if transition.guard is not None:
             try:
                 if isinstance(transition.guard, str):
-                    if not SandboxEvaluator.evaluate(transition.guard, {"tokens": candidate_tokens}):
+                    if not SandboxEvaluator.evaluate_compiled(transition._compiled_guard, {"tokens": candidate_tokens}):
                         return False
                 else:
                     if not self._call_expr(transition.guard, candidate_tokens, timeout=self.expr_timeout_secs):
@@ -600,7 +602,7 @@ class PetriNet:
             elif arc.expression is not None:
                 try:
                     if isinstance(arc.expression, str):
-                        ordered = SandboxEvaluator.evaluate(arc.expression, {"tokens": available})
+                        ordered = SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": available})
                     else:
                         ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
                     tokens = ordered[: arc.count]
@@ -613,7 +615,7 @@ class PetriNet:
         if transition.guard is not None:
             try:
                 if isinstance(transition.guard, str):
-                    if not SandboxEvaluator.evaluate(transition.guard, {"tokens": candidate_tokens}):
+                    if not SandboxEvaluator.evaluate_compiled(transition._compiled_guard, {"tokens": candidate_tokens}):
                         return False
                 else:
                     if not self._call_expr(transition.guard, candidate_tokens, timeout=self.expr_timeout_secs):
@@ -687,7 +689,9 @@ class PetriNet:
                         if arc.expression is None:
                             active_outputs.append((arc, is_res))  # type: ignore[arg-type]
                         elif isinstance(arc.expression, str):
-                            if SandboxEvaluator.evaluate(arc.expression, {"tokens": output_tokens_data}):
+                            if SandboxEvaluator.evaluate_compiled(
+                                arc._compiled_expression, {"tokens": output_tokens_data}
+                            ):
                                 active_outputs.append((arc, is_res))  # type: ignore[arg-type]
                         elif self._call_expr(arc.expression, output_tokens_data, timeout=self.expr_timeout_secs):
                             active_outputs.append((arc, is_res))  # type: ignore[arg-type]
