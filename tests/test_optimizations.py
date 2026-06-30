@@ -5,6 +5,7 @@ import pytest
 
 from cpnx.engine import PetriNet
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace
+from cpnx.sandbox import SandboxEvaluator
 from cpnx.tokens import Token
 from cpnx.transitions import InputArc, OutputArc, Transition
 
@@ -106,3 +107,84 @@ def test_snapshot_payload_copy():
 
     with pytest.raises(TypeError):
         token.payload["nested"]["value"] = 99
+
+
+def _make_net(guard):
+    """A two-place net whose single transition carries *guard* and fires one token."""
+    net = PetriNet()
+    net.add_place(Place("input"))
+    net.add_place(Place("output"))
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("input")],
+            outputs=[OutputArc("output")],
+            action=lambda tokens: tokens,
+            guard=guard,
+        )
+    )
+    return net
+
+
+def test_string_guard_recompiles_on_reassignment():
+    """A string guard reassigned after construction must evaluate the *new* predicate.
+
+    Regression: the precompiled guard code object was cached in __post_init__ and not
+    refreshed on mutation, so the engine silently kept evaluating the original predicate.
+    """
+    net = _make_net("len(tokens) >= 5")
+    transition = net.transitions["t"]
+    net.deposit("input", Token(payload={"i": 0}))
+
+    # Original guard requires >= 5 tokens; with one token the transition is blocked.
+    assert net._is_transition_enabled(transition) is False
+
+    # Loosen the guard. The compiled object must track the live source.
+    transition.guard = "len(tokens) >= 1"
+    assert SandboxEvaluator.evaluate_compiled(transition._compiled_guard, {"tokens": [object()]}) is True
+    assert net._is_transition_enabled(transition) is True
+
+
+def test_callable_guard_swapped_to_string_recompiles():
+    """Swapping a callable guard to a string must compile it, not leave a stale ``None``.
+
+    Regression: callable guards stored ``_compiled_guard = None``; reassigning a string
+    left it ``None``, so the engine's string branch called ``eval(None, ...)`` -> TypeError.
+    """
+    net = _make_net(lambda tokens: False)
+    transition = net.transitions["t"]
+    assert transition._compiled_guard is None  # callable -> no compiled object
+
+    transition.guard = "len(tokens) >= 1"
+    assert transition._compiled_guard is not None
+
+    net.deposit("input", Token(payload={"i": 0}))
+    # Must not raise TypeError from eval(None, ...); the new string predicate enables it.
+    assert net._is_transition_enabled(transition) is True
+
+
+def test_string_guard_mutation_to_forbidden_expression_fails_fast():
+    """Reassigning a guard to a forbidden expression raises eagerly and leaves prior state."""
+    net = _make_net("len(tokens) >= 1")
+    transition = net.transitions["t"]
+
+    with pytest.raises(PermissionError):
+        transition.guard = "__import__('os').system('echo hi')"
+
+    # The bad assignment did not corrupt the previously-valid compiled guard.
+    assert SandboxEvaluator.evaluate_compiled(transition._compiled_guard, {"tokens": [object()]}) is True
+
+
+def test_arc_expression_recompiles_on_reassignment():
+    """A string arc expression reassigned after construction must use the new source."""
+    arc = OutputArc(place="output", expression="bool(tokens)")
+    assert arc._compiled_expression is not None
+
+    # Swap to a callable: compiled object must clear so the engine uses the callable path.
+    arc.expression = lambda tokens: True
+    assert arc._compiled_expression is None
+
+    # Swap back to a different string: compiled object must track the new source.
+    arc.expression = "bool(tokens and tokens[0].color == 'data')"
+    ctx = {"tokens": [Token(color="data")]}
+    assert SandboxEvaluator.evaluate_compiled(arc._compiled_expression, ctx) is True
