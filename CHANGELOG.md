@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] — 2026-06-30
+
+### Added
+
+- **`SandboxEvaluator.compile_expression`** — Validates a string expression via the static AST security walk and returns a compiled `eval`-mode code object. Results are cached by source text, so an identical expression is parsed and compiled at most once.
+- **`SandboxEvaluator.evaluate_compiled`** — Evaluates a pre-compiled code object against a context dictionary, skipping the parse/compile step.
+- **`SandboxEvaluator.maybe_compile`** — Compiles a value if it is a string expression, otherwise returns `None` (for callables/`None`), centralizing the string-vs-callable rule.
+- **Benchmarks** — `benchmarks/bench_enablement.py` (native stdlib, no dependencies) plus a `benchmarks/README.md` documenting methodology for pre/post performance comparison.
+
+### Changed
+
+- **Compile-once string expressions** — Guard and arc string expressions are now parsed, security-walked, and compiled once at `Transition`/`InputArc`/`OutputArc` construction time and reused on every enablement check, instead of re-parsing/re-compiling on every `SandboxEvaluator.evaluate()` call. The engine's `_is_transition_enabled` hot path reuses the compiled object via `evaluate_compiled`. End-to-end enablement checks on the string-guard path improved roughly 7–8×; the isolated compile path is ~215× faster. `SandboxEvaluator.evaluate()` is preserved as a thin, cached wrapper — the public API and `PermissionError` semantics are unchanged.
+- **Eager validation of string expressions** — A malformed or forbidden **string** guard/arc expression now raises `PermissionError` at `Transition`/`InputArc`/`OutputArc` construction (and on reassignment) rather than being silently treated as a disabled transition at run time. Compiled objects stay in sync with the live `guard`/`expression`, so post-construction reassignment recompiles rather than evaluating a stale predicate.
+
+### Notes
+
+- Lazy `itertools.product` binding enumeration (a commonly suggested optimization) was intentionally **not** implemented: the engine resolves a single deterministic binding per transition (no Cartesian product across input places), so there is no combinatorial explosion to short-circuit.
+
+---
+
 ## [0.2.0] — 2026-06-26
 
 ### Added
