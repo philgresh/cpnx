@@ -696,7 +696,7 @@ def test_wait_for_work():
         with patch("time.monotonic", return_value=0.0):
             net._wait_for_work(deadline=5.0, stop_event=stop_event)
             mock_wait.assert_called_once()
-            # wait timeout should be capped at 0.1 because stop_event is present
+            # timeout is min(cooldown_interval=0.05, 0.1) = 0.05
             assert mock_wait.call_args[1]["timeout"] == 0.05
 
 
@@ -814,3 +814,88 @@ def test_is_place_ready():
     tok = Token()
     p.deposit(tok)
     assert net._is_place_ready(arc, p, None)
+
+
+def test_filter_highest_priority():
+    t1 = Transition("t1", inputs=[], outputs=[], action=lambda t: t, priority=1)
+    t2 = Transition("t2", inputs=[], outputs=[], action=lambda t: t, priority=2)
+    t3 = Transition("t3", inputs=[], outputs=[], action=lambda t: t, priority=1)
+
+    assert PetriNet._filter_highest_priority([]) == []
+    result = PetriNet._filter_highest_priority([t1, t2, t3])
+    assert set(t.name for t in result) == {"t1", "t3"}
+    assert t2 not in result
+
+
+def test_select_transition_to_fire_equal_priority():
+    net = PetriNet()
+    t1 = Transition("t1", inputs=[], outputs=[], action=lambda t: t)
+    t2 = Transition("t2", inputs=[], outputs=[], action=lambda t: t)
+    net.add_transition(t1)
+    net.add_transition(t2)
+
+    # Both have equal priority — random.choice means either can be selected.
+    # Run many times and confirm both are returned at some point.
+    seen = set()
+    for _ in range(50):
+        selected = net._select_transition_to_fire()
+        assert selected is not None
+        seen.add(selected.name)
+    assert seen == {"t1", "t2"}
+
+
+def test_should_stop_run():
+    import threading
+
+    stop = threading.Event()
+
+    # Neither condition met
+    with patch("time.monotonic", return_value=1.0):
+        assert not PetriNet._should_stop_run(deadline=5.0, stop_event=stop)
+
+    # Deadline exceeded
+    with patch("time.monotonic", return_value=10.0):
+        assert PetriNet._should_stop_run(deadline=5.0, stop_event=None)
+
+    # Stop event set
+    stop.set()
+    with patch("time.monotonic", return_value=1.0):
+        assert PetriNet._should_stop_run(deadline=5.0, stop_event=stop)
+
+    # No deadline, no event
+    assert not PetriNet._should_stop_run(deadline=None, stop_event=None)
+
+
+def test_create_token_deques():
+    r = Token(color="resource")
+    d1, d2 = Token(), Token()
+    res_deque, out_deque = PetriNet._create_token_deques([r, d1, d2], [d1, r])
+
+    assert list(res_deque) == [r]
+    assert list(out_deque) == [d1]
+
+
+def test_get_deposit_counts():
+    t1, t2 = Token(), Token()
+    counts = PetriNet._get_deposit_counts([("p1", t1), ("p1", t2), ("p2", t1)])
+    assert counts == {"p1": 2, "p2": 1}
+    assert PetriNet._get_deposit_counts([]) == {}
+
+
+def test_check_arc_preconditions_consume_all():
+    """consume_all arcs must return ALL available tokens, not just arc.count."""
+    from cpnx.transitions import InputArc
+
+    net = PetriNet()
+    p = Place("p")
+    net.add_place(p)
+
+    t1, t2, t3 = Token(), Token(), Token()
+    for t in (t1, t2, t3):
+        p.deposit(t)
+
+    arc = InputArc("p", consume_all=True)
+    result = net._check_arc_preconditions(arc, p, None)
+
+    assert result is not None
+    assert len(result) == 3  # all three, not just arc.count (default 1)

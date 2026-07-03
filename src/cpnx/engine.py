@@ -352,7 +352,8 @@ class PetriNet:
             except Exception:
                 pass
 
-    def _filter_highest_priority(self, transitions: list[Transition]) -> list[Transition]:
+    @staticmethod
+    def _filter_highest_priority(transitions: list[Transition]) -> list[Transition]:
         if not transitions:
             return []
         min_priority = min(t.priority for t in transitions)
@@ -472,7 +473,8 @@ class PetriNet:
 
         self._work_available.wait(timeout=timeout)
 
-    def _should_stop_run(self, deadline: float | None, stop_event: threading.Event | None) -> bool:
+    @staticmethod
+    def _should_stop_run(deadline: float | None, stop_event: threading.Event | None) -> bool:
         if stop_event is not None and stop_event.is_set():
             return True
         return deadline is not None and time.monotonic() > deadline
@@ -670,7 +672,8 @@ class PetriNet:
         resolved = self._resolve_input_tokens(arc, available)
         if resolved is None or len(resolved) < arc.count:
             return None
-        return resolved[: arc.count]
+        # consume_all returns every available token; otherwise slice to the arc's count.
+        return resolved if arc.consume_all else resolved[: arc.count]
 
     def _check_input_preconditions(self, transition: Transition, m_time: float | None) -> tuple[bool, list[Token]]:
         tokens_for_guard: list[Token] = []
@@ -813,8 +816,9 @@ class PetriNet:
                 self._running_count -= 1
             self._work_available.set()
 
+    @staticmethod
     def _create_token_deques(
-        self, consumed_tokens: list[Token], output_tokens: list[Token]
+        consumed_tokens: list[Token], output_tokens: list[Token]
     ) -> tuple[deque[Token], deque[Token]]:
         res_deque: deque[Token] = deque(t for t in consumed_tokens if t.is_resource)
         out_deque: deque[Token] = deque(t for t in output_tokens if not t.is_resource)
@@ -945,7 +949,8 @@ class PetriNet:
                 planned_deposits.append((arc.place, t))
         return planned_deposits
 
-    def _get_deposit_counts(self, planned_deposits: list[tuple[str, Token]]) -> dict[str, int]:
+    @staticmethod
+    def _get_deposit_counts(planned_deposits: list[tuple[str, Token]]) -> dict[str, int]:
         counts: dict[str, int] = {}
         for place_name, _ in planned_deposits:
             counts[place_name] = counts.get(place_name, 0) + 1
