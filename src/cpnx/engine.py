@@ -334,6 +334,48 @@ class PetriNet:
             except Exception:
                 pass
 
+    def _select_transition_to_fire(self) -> Transition | None:
+        enabled = [t for t in self.transitions.values() if self._is_transition_enabled(t)]
+        if not enabled:
+            return None
+
+        min_priority = min(t.priority for t in enabled)
+        candidates = [t for t in enabled if t.priority == min_priority]
+        return random.choice(candidates)
+
+    def _retrieve_consumed_tokens(
+        self, transition: Transition, m_time: float | None
+    ) -> tuple[list[Token], list[tuple[str, Token]]]:
+        consumed_tokens: list[Token] = []
+        token_sources: list[tuple[str, Token]] = []
+        try:
+            for arc in transition.inputs:
+                place = self.places[arc.place]
+                if arc.consume_all:
+                    tokens = place.retrieve_all(model_time=m_time)
+                elif arc.expression is not None:
+                    available = place.peek(len(place), model_time=m_time)
+                    if isinstance(arc.expression, str):
+                        ordered = SandboxEvaluator.evaluate_compiled(
+                            arc._compiled_expression,
+                            {"tokens": available},  # type: ignore[attr-defined]
+                        )
+                    else:
+                        ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
+                    tokens = place.retrieve_specific(ordered[: arc.count], model_time=m_time)
+                else:
+                    tokens = place.retrieve(arc.count, model_time=m_time)
+                consumed_tokens.extend(tokens)
+                for t in tokens:
+                    token_sources.append((arc.place, t))
+        except Exception:
+            # Expression raised mid-loop — return already-consumed tokens to their
+            # source places so they are not silently lost.
+            for src_name, t in token_sources:
+                self._deposit_under_lock(src_name, t)
+            raise
+        return consumed_tokens, token_sources
+
     def step(self) -> bool:
         """Fire the highest-priority enabled transition, scheduling its action asynchronously.
 
@@ -349,43 +391,12 @@ class PetriNet:
                           a ``with`` block).
         """
         with self._lock:
-            enabled = [t for t in self.transitions.values() if self._is_transition_enabled(t)]
-            if not enabled:
+            selected = self._select_transition_to_fire()
+            if not selected:
                 return False
 
-            min_priority = min(t.priority for t in enabled)
-            candidates = [t for t in enabled if t.priority == min_priority]
-            selected = random.choice(candidates)
-
-            consumed_tokens: list[Token] = []
-            token_sources: list[tuple[str, Token]] = []
             m_time = self._get_model_time_under_lock()
-            try:
-                for arc in selected.inputs:
-                    place = self.places[arc.place]
-                    if arc.consume_all:
-                        tokens = place.retrieve_all(model_time=m_time)
-                    elif arc.expression is not None:
-                        available = place.peek(len(place), model_time=m_time)
-                        if isinstance(arc.expression, str):
-                            ordered = SandboxEvaluator.evaluate_compiled(
-                                arc._compiled_expression,
-                                {"tokens": available},  # type: ignore[attr-defined]
-                            )
-                        else:
-                            ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
-                        tokens = place.retrieve_specific(ordered[: arc.count], model_time=m_time)
-                    else:
-                        tokens = place.retrieve(arc.count, model_time=m_time)
-                    consumed_tokens.extend(tokens)
-                    for t in tokens:
-                        token_sources.append((arc.place, t))
-            except Exception:
-                # Expression raised mid-loop — return already-consumed tokens to their
-                # source places so they are not silently lost.
-                for src_name, t in token_sources:
-                    self._deposit_under_lock(src_name, t)
-                raise
+            consumed_tokens, token_sources = self._retrieve_consumed_tokens(selected, m_time)
 
             self._running_count += 1
             try:

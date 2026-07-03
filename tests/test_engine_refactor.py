@@ -625,3 +625,58 @@ def test_dispatch_callbacks_none_handlers():
     net._dispatch_transition_error("t", Exception(), [Token()])
     net._dispatch_dead_letters("t", [Token()])
     net._dispatch_deposits([("p", Token())])
+
+
+def test_select_transition_to_fire():
+    net = PetriNet()
+    assert net._select_transition_to_fire() is None
+
+    t1 = Transition("t1", inputs=[], outputs=[], action=lambda t: t, priority=1)
+    t2 = Transition("t2", inputs=[], outputs=[], action=lambda t: t, priority=2)
+    net.add_transition(t1)
+    net.add_transition(t2)
+
+    # Priority 1 should be selected over priority 2 (lower number = higher precedence)
+    assert net._select_transition_to_fire() == t1
+
+
+def test_retrieve_consumed_tokens():
+    net = PetriNet()
+    p = Place("p")
+    net.add_place(p)
+    t = Token()
+    p.deposit(t)
+
+    from cpnx.transitions import InputArc
+
+    arc = InputArc("p", count=1)
+    trans = Transition("trans", inputs=[arc], outputs=[], action=lambda t: t)
+    net.add_transition(trans)
+
+    consumed, sources = net._retrieve_consumed_tokens(trans, None)
+    assert consumed == [t]
+    assert sources == [("p", t)]
+
+
+def test_retrieve_consumed_tokens_rollback_on_error():
+    net = PetriNet()
+    p1 = Place("p1")
+    p2 = Place("p2")
+    net.add_place(p1)
+    net.add_place(p2)
+    t1 = Token()
+    p1.deposit(t1)
+
+    from cpnx.transitions import InputArc
+
+    arc1 = InputArc("p1", count=1)
+    # This arc will raise an exception because the string expression divides by zero
+    arc2 = InputArc("p2", count=1, expression="1/0")
+
+    trans = Transition("trans", inputs=[arc1, arc2], outputs=[], action=lambda t: t)
+
+    with pytest.raises(ZeroDivisionError):
+        net._retrieve_consumed_tokens(trans, None)
+
+    # t1 should be returned to p1 after the rollback
+    assert len(p1) == 1
