@@ -669,11 +669,9 @@ class PetriNet:
         if not self._is_place_ready(arc, place, m_time):
             return None
         available = place.peek(len(place), model_time=m_time)  # type: ignore[union-attr]
-        resolved = self._resolve_input_tokens(arc, available)
-        if resolved is None or len(resolved) < arc.count:
-            return None
-        # consume_all returns every available token; otherwise slice to the arc's count.
-        return resolved if arc.consume_all else resolved[: arc.count]
+        # _resolve_input_tokens enforces the multiplicity rule (returns None if fewer
+        # than arc.count tokens are eligible) and already slices to arc.count.
+        return self._resolve_input_tokens(arc, available)
 
     def _check_input_preconditions(self, transition: Transition, m_time: float | None) -> tuple[bool, list[Token]]:
         tokens_for_guard: list[Token] = []
@@ -694,18 +692,36 @@ class PetriNet:
         return elapsed >= arc.settle_secs
 
     def _resolve_input_tokens(self, arc: InputArc, available: list[Token]) -> list[Token] | None:
+        """Resolve which tokens input *arc* would consume from *available*.
+
+        Returns the selected tokens, or ``None`` if the arc cannot be satisfied —
+        either its selection expression raised, or fewer than ``arc.count`` tokens
+        are eligible. In CPN semantics arc multiplicity is all-or-nothing: an arc
+        demanding ``count`` tokens is not enabled unless at least ``count`` are
+        resolved, so a selection that yields fewer (or none) disables the
+        transition rather than firing with a short or zero-length token list.
+
+        Shared by the firing check (via :meth:`_check_arc_preconditions`) and the
+        timing-agnostic :meth:`_is_transition_potentially_enabled` so both apply
+        the identical multiplicity rule; callers differ only in how *available*
+        is computed (real/model time vs. ignoring timing).
+        """
         if arc.consume_all:
-            return available
-        if arc.expression is not None:
+            tokens = available
+        elif arc.expression is not None:
             try:
                 if isinstance(arc.expression, str):
                     ordered = SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": available})  # type: ignore[attr-defined]
                 else:
                     ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
-                return ordered[: arc.count]
+                tokens = ordered[: arc.count]
             except Exception:
                 return None
-        return available[: arc.count]
+        else:
+            tokens = available[: arc.count]
+        if len(tokens) < arc.count:
+            return None
+        return tokens
 
     def _check_output_capacity(self, transition: Transition) -> bool:
         # Back-pressure: refuse to fire if an unguarded output arc's target place is full.
