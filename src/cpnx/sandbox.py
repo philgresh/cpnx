@@ -158,8 +158,19 @@ def _find_target_node(tree: ast.AST, start_line: int) -> ast.AST | None:
 
 
 _FORBIDDEN_FUNCS = frozenset({"open", "print", "eval", "exec", "__import__", "sleep"})
+
+# Two deliberately different attribute denylists, keyed on how precisely we could
+# locate the callable's source:
+#   * _FORBIDDEN_ATTRS — used when we parsed the whole source file and isolated the
+#     exact function/lambda node (_try_verify_via_sourcefile). Precise context, so a
+#     tight denylist suffices.
+#   * _FALLBACK_FORBIDDEN_ATTRS — used when we could only recover a mangled source
+#     snippet via inspect.getsource (_try_verify_via_getsource). Less certainty about
+#     what we're looking at, so we additionally ban common network I/O method names
+#     (get/post/request/connect). Keep this a SUPERSET of _FORBIDDEN_ATTRS; do not
+#     collapse the two — the fallback is intentionally stricter.
 _FORBIDDEN_ATTRS = frozenset({"sleep", "system", "popen", "urlopen"})
-_FALLBACK_FORBIDDEN_ATTRS = frozenset({"sleep", "system", "popen", "urlopen", "get", "post", "request", "connect"})
+_FALLBACK_FORBIDDEN_ATTRS = _FORBIDDEN_ATTRS | frozenset({"get", "post", "request", "connect"})
 
 
 def _verify_function_defaults(args: ast.arguments) -> None:

@@ -368,14 +368,12 @@ class PetriNet:
         if arc.consume_all:
             return place.retrieve_all(model_time=m_time)
         if arc.expression is not None:
+            # Consumption uses the same string-vs-callable dispatch as enabling, but must let
+            # a raising expression propagate so _retrieve_consumed_tokens can roll back the
+            # tokens already consumed from earlier arcs (unlike the enable check, which treats
+            # a raising expression as "not enabled").
             available = place.peek(len(place), model_time=m_time)
-            if isinstance(arc.expression, str):
-                ordered = SandboxEvaluator.evaluate_compiled(
-                    arc._compiled_expression,
-                    {"tokens": available},  # type: ignore[attr-defined]
-                )
-            else:
-                ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
+            ordered = self._eval_expression(arc.expression, arc._compiled_expression, available)  # type: ignore[attr-defined]
             return place.retrieve_specific(ordered[: arc.count], model_time=m_time)
         return place.retrieve(arc.count, model_time=m_time)
 
@@ -691,6 +689,18 @@ class PetriNet:
             elapsed = time.monotonic() - place.last_deposit_time
         return elapsed >= arc.settle_secs
 
+    def _eval_expression(self, expression, compiled, tokens: list[Token]):
+        """Evaluate a string (precompiled, sandboxed) or callable *expression* over *tokens*.
+
+        Centralizes the string-vs-callable dispatch shared by input-arc selection
+        (:meth:`_resolve_input_tokens`), output-arc guards (:meth:`_is_arc_active`),
+        and transition guards (:meth:`_check_transition_guard`). Callers are
+        responsible for coercing/bounding the result and for exception handling.
+        """
+        if isinstance(expression, str):
+            return SandboxEvaluator.evaluate_compiled(compiled, {"tokens": tokens})
+        return self._call_expr(expression, tokens, timeout=self.expr_timeout_secs)
+
     def _resolve_input_tokens(self, arc: InputArc, available: list[Token]) -> list[Token] | None:
         """Resolve which tokens input *arc* would consume from *available*.
 
@@ -710,10 +720,7 @@ class PetriNet:
             tokens = available
         elif arc.expression is not None:
             try:
-                if isinstance(arc.expression, str):
-                    ordered = SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": available})  # type: ignore[attr-defined]
-                else:
-                    ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
+                ordered = self._eval_expression(arc.expression, arc._compiled_expression, available)  # type: ignore[attr-defined]
                 tokens = ordered[: arc.count]
             except Exception:
                 return None
@@ -739,12 +746,7 @@ class PetriNet:
         if transition.guard is None:
             return True
         try:
-            if isinstance(transition.guard, str):
-                return bool(
-                    SandboxEvaluator.evaluate_compiled(transition._compiled_guard, {"tokens": candidate_tokens})
-                )  # type: ignore[attr-defined]
-            else:
-                return bool(self._call_expr(transition.guard, candidate_tokens, timeout=self.expr_timeout_secs))
+            return bool(self._eval_expression(transition.guard, transition._compiled_guard, candidate_tokens))  # type: ignore[attr-defined]
         except Exception:
             return False
 
@@ -832,14 +834,6 @@ class PetriNet:
                 self._running_count -= 1
             self._work_available.set()
 
-    @staticmethod
-    def _create_token_deques(
-        consumed_tokens: list[Token], output_tokens: list[Token]
-    ) -> tuple[deque[Token], deque[Token]]:
-        res_deque: deque[Token] = deque(t for t in consumed_tokens if t.is_resource)
-        out_deque: deque[Token] = deque(t for t in output_tokens if not t.is_resource)
-        return res_deque, out_deque
-
     def _try_commit_transition(
         self,
         transition: Transition,
@@ -847,7 +841,8 @@ class PetriNet:
         output_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
     ) -> tuple[bool, BaseException | None, list[Token], list[Token], list[tuple[str, Token]]]:
-        res_deque, out_deque = self._create_token_deques(consumed_tokens, output_tokens)
+        res_deque: deque[Token] = deque(t for t in consumed_tokens if t.is_resource)
+        out_deque: deque[Token] = deque(t for t in output_tokens if not t.is_resource)
         active_outputs = self._evaluate_output_guards(transition, list(out_deque))
 
         planned_deposits, plan_error = self._plan_and_validate_deposits(
@@ -906,9 +901,7 @@ class PetriNet:
     def _is_arc_active(self, arc: OutputArc, output_tokens_data: list[Token]) -> bool:
         if arc.expression is None:
             return True
-        if isinstance(arc.expression, str):
-            return bool(SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": output_tokens_data}))  # type: ignore[attr-defined]
-        return bool(self._call_expr(arc.expression, output_tokens_data, timeout=self.expr_timeout_secs))
+        return bool(self._eval_expression(arc.expression, arc._compiled_expression, output_tokens_data))  # type: ignore[attr-defined]
 
     def _evaluate_output_guards(
         self, transition: Transition, output_tokens_data: list[Token]
@@ -921,19 +914,14 @@ class PetriNet:
         return active_outputs
 
     @staticmethod
-    def _calculate_demand(active_outputs: list[tuple[OutputArc, bool]]) -> tuple[int, int]:
-        resource_demand = sum(arc.count for arc, is_res in active_outputs if is_res)
-        data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)
-        return resource_demand, data_demand
-
-    @staticmethod
     def _verify_token_demand(
         transition_name: str,
         active_outputs: list[tuple[OutputArc, bool]],
         res_count: int,
         out_count: int,
     ) -> ValueError | None:
-        resource_demand, data_demand = PetriNet._calculate_demand(active_outputs)
+        resource_demand = sum(arc.count for arc, is_res in active_outputs if is_res)
+        data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)
 
         if res_count < resource_demand:
             return ValueError(
@@ -1023,24 +1011,21 @@ class PetriNet:
             except Exception:
                 pass
 
-    def _do_dispatch_error(self, transition_name: str, error: Exception, data_tokens: list[Token]) -> None:
-        if not self.on_error:
-            return
-        dispatch_tokens: list[Token | None] = list(data_tokens) if data_tokens else [None]
-        for dt in dispatch_tokens:
-            try:
-                self.on_error(transition_name, error, dt)
-            except Exception:
-                pass
-
     def _dispatch_transition_error(
         self, transition_name: str, error: BaseException | None, data_tokens: list[Token]
     ) -> None:
         # We explicitly check for Exception (ignoring BaseException like SystemExit/KeyboardInterrupt)
         # because on_error is meant for business logic/execution errors. Fatal process signals
         # should bubble up without triggering user-defined monitoring hooks.
-        if isinstance(error, Exception):
-            self._do_dispatch_error(transition_name, error, data_tokens)
+        if not (self.on_error and isinstance(error, Exception)):
+            return
+        # When the firing consumed no data tokens, still notify once with None.
+        dispatch_tokens: list[Token | None] = list(data_tokens) if data_tokens else [None]
+        for dt in dispatch_tokens:
+            try:
+                self.on_error(transition_name, error, dt)
+            except Exception:
+                pass
 
     def _dispatch_dead_letters(self, transition_name: str, dead_lettered_data_tokens: list[Token]) -> None:
         if self.on_token_dead_lettered and dead_lettered_data_tokens:

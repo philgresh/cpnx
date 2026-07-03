@@ -866,15 +866,6 @@ def test_should_stop_run():
     assert not PetriNet._should_stop_run(deadline=None, stop_event=None)
 
 
-def test_create_token_deques():
-    r = Token(color="resource")
-    d1, d2 = Token(), Token()
-    res_deque, out_deque = PetriNet._create_token_deques([r, d1, d2], [d1, r])
-
-    assert list(res_deque) == [r]
-    assert list(out_deque) == [d1]
-
-
 def test_get_deposit_counts():
     t1, t2 = Token(), Token()
     counts = PetriNet._get_deposit_counts([("p1", t1), ("p1", t2), ("p2", t1)])
