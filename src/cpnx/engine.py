@@ -650,9 +650,13 @@ class PetriNet:
             with self._lock:
                 duration = time.monotonic() - start_time
                 if success:
-                    success, error, data_tokens, dl_data, deposited = self._try_commit_transition(
-                        transition, consumed_tokens, output_tokens, token_sources
-                    )
+                    try:
+                        success, error, data_tokens, dl_data, deposited = self._try_commit_transition(
+                            transition, consumed_tokens, output_tokens, token_sources
+                        )
+                    except BaseException as exc:
+                        success = False
+                        error = exc
 
                 if not success:
                     deposited, dl_data, data_tokens = self._rollback_failed_transition(transition, token_sources)
@@ -860,6 +864,9 @@ class PetriNet:
                 except Exception:
                     pass
         else:
+            # We explicitly check for Exception (ignoring BaseException like SystemExit/KeyboardInterrupt)
+            # because on_error is meant for business logic/execution errors. Fatal process signals
+            # should bubble up without triggering user-defined monitoring hooks.
             if self.on_error and error and isinstance(error, Exception):
                 dispatch_tokens: list[Token | None] = list(data_tokens) if data_tokens else [None]
                 for dt in dispatch_tokens:

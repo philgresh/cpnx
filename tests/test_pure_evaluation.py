@@ -74,6 +74,19 @@ def test_callable_purity_verification_invalid():
     with pytest.raises(PermissionError, match="Global/nonlocal mutations are forbidden"):
         verify_callable_purity(global_action)
 
+    def nonlocal_action_creator():
+        some_local = 1
+
+        def nonlocal_action(tokens):
+            nonlocal some_local
+            some_local = 123
+            return tokens
+
+        return nonlocal_action
+
+    with pytest.raises(PermissionError, match="Global/nonlocal mutations are forbidden"):
+        verify_callable_purity(nonlocal_action_creator())
+
     def import_action(tokens):
         import os  # noqa: F401
 
@@ -82,22 +95,21 @@ def test_callable_purity_verification_invalid():
     with pytest.raises(PermissionError, match="Imports are forbidden inside CPN callables"):
         verify_callable_purity(import_action)
 
-    def system_action(tokens):
-        import sys  # even if already imported outside, calling it inside is bad
+    def import_sys_action(tokens):
+        import sys  # noqa: F401
 
-        sys.system("rm -rf /")
         return tokens
 
     with pytest.raises(PermissionError, match="Imports are forbidden"):
-        verify_callable_purity(system_action)
+        verify_callable_purity(import_sys_action)
 
-    def system_action_no_import(tokens):
+    def system_action(tokens):
         # assuming os is available
         os.system("rm -rf /")
         return tokens
 
     with pytest.raises(PermissionError, match="Forbidden attribute call '.system'"):
-        verify_callable_purity(system_action_no_import)
+        verify_callable_purity(system_action)
 
 
 def test_transition_purity_checks():
@@ -126,6 +138,18 @@ def test_verify_callable_purity_raises_on_uninspectable():
 
     with pytest.raises(PermissionError, match="source unavailable"):
         verify_callable_purity(partial_fn)
+
+
+def test_find_target_node_outside_span():
+    import ast
+
+    from cpnx.sandbox import _find_target_node
+
+    source = "def foo():\n    pass\n"
+    tree = ast.parse(source)
+    # Provide a start_line that does not match any function in the AST
+    node = _find_target_node(tree, 10)
+    assert node is None
 
 
 def test_arc_expression_sandbox():
@@ -252,6 +276,13 @@ class TestMutableDefaultArgDetection:
             return len(tokens) > threshold
 
         verify_callable_purity(guard_with_int_default)  # must not raise
+
+    def test_kw_only_dict_default_rejected(self):
+        def guard_with_kw_only_dict(*, cache={}):  # noqa: B006
+            return True
+
+        with pytest.raises(PermissionError, match="Mutable default argument"):
+            verify_callable_purity(guard_with_kw_only_dict)
 
 
 class TestAtomicRollback:

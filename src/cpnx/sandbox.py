@@ -145,14 +145,16 @@ def _find_target_node(tree: ast.AST, start_line: int) -> ast.AST | None:
 
 _FORBIDDEN_FUNCS = frozenset({"open", "print", "eval", "exec", "__import__", "sleep"})
 _FORBIDDEN_ATTRS = frozenset({"sleep", "system", "popen", "urlopen"})
+_FALLBACK_FORBIDDEN_ATTRS = frozenset({"sleep", "system", "popen", "urlopen", "get", "post", "request", "connect"})
 
 
-def _verify_ast_purity(tree: ast.AST) -> None:
+def _verify_ast_purity(tree: ast.AST, is_fallback: bool = False) -> None:
+    forbidden_attrs = _FALLBACK_FORBIDDEN_ATTRS if is_fallback else _FORBIDDEN_ATTRS
     for node in ast.walk(tree):
         match node:
             case ast.Call(func=ast.Name(id=name)) if name in _FORBIDDEN_FUNCS:
                 raise PermissionError(f"Forbidden function call '{name}' inside CPN callable.")
-            case ast.Call(func=ast.Attribute(attr=attr)) if attr in _FORBIDDEN_ATTRS:
+            case ast.Call(func=ast.Attribute(attr=attr)) if attr in forbidden_attrs:
                 raise PermissionError(f"Forbidden attribute call '.{attr}' inside CPN callable.")
             case ast.Import() | ast.ImportFrom():
                 raise PermissionError("Imports are forbidden inside CPN callables.")
@@ -212,7 +214,7 @@ def verify_callable_purity(func: Callable) -> None:
                 source = parts[1].strip()
 
         tree = ast.parse(source)
-        _verify_ast_purity(tree)
+        _verify_ast_purity(tree, is_fallback=True)
     except PermissionError:
         raise
     except (OSError, TypeError) as exc:
