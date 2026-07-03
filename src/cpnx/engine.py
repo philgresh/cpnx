@@ -11,7 +11,7 @@ from typing import Callable
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace
 from cpnx.sandbox import SandboxEvaluator
 from cpnx.tokens import Token
-from cpnx.transitions import OutputArc, SubstitutionTransition, Transition
+from cpnx.transitions import InputArc, OutputArc, SubstitutionTransition, Transition
 from cpnx.visualization import snapshot, to_dot
 
 
@@ -284,7 +284,8 @@ class PetriNet:
                         available = place.peek(len(place), model_time=m_time)
                         if isinstance(arc.expression, str):
                             ordered = SandboxEvaluator.evaluate_compiled(
-                                arc._compiled_expression, {"tokens": available}
+                                arc._compiled_expression,
+                                {"tokens": available},  # type: ignore[attr-defined]
                             )
                         else:
                             ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
@@ -522,41 +523,59 @@ class PetriNet:
         Checks token availability (including cooldowns and thresholds), settle
         windows, and the user-supplied guard. Called while holding ``self._lock``.
         """
-        candidate_tokens: list[Token] = []
         m_time = self._get_model_time_under_lock()
+        ok, candidate_tokens = self._check_input_preconditions(transition, m_time)
+        if not ok:
+            return False
+
+        if not self._check_output_capacity(transition):
+            return False
+
+        return self._check_transition_guard(transition, candidate_tokens)
+
+    def _check_input_preconditions(self, transition: Transition, m_time: float) -> tuple[bool, list[Token]]:
+        candidate_tokens: list[Token] = []
         for arc in transition.inputs:
             place = self.places.get(arc.place)
-            if place is None:
-                return False
-            if not place.can_retrieve(arc.count, model_time=m_time):
-                return False
-            if arc.settle_secs > 0.0:
-                # last_deposit_time is only written while self._lock is held, so
-                # reading it here (also under self._lock) is safe without place._lock.
-                if self._model_time is not None:
-                    elapsed = self._model_time - place.last_deposit_time_model
-                else:
-                    elapsed = time.monotonic() - place.last_deposit_time
-                if elapsed < arc.settle_secs:
-                    return False
+            if place is None or not place.can_retrieve(arc.count, model_time=m_time):
+                return False, []
+
+            if not self._is_settle_time_met(place, arc):
+                return False, []
 
             # Speculatively resolve candidate tokens
             available = place.peek(len(place), model_time=m_time)
-            if arc.consume_all:
-                tokens = available
-            elif arc.expression is not None:
-                try:
-                    if isinstance(arc.expression, str):
-                        ordered = SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": available})
-                    else:
-                        ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
-                    tokens = ordered[: arc.count]
-                except Exception:
-                    return False
-            else:
-                tokens = available[: arc.count]
+            tokens = self._resolve_input_tokens(arc, available)
+            if tokens is None:
+                return False, []
             candidate_tokens.extend(tokens)
 
+        return True, candidate_tokens
+
+    def _is_settle_time_met(self, place: Place, arc: InputArc) -> bool:
+        if arc.settle_secs <= 0.0:
+            return True
+        if self._model_time is not None:
+            elapsed = self._model_time - place.last_deposit_time_model
+        else:
+            elapsed = time.monotonic() - place.last_deposit_time
+        return elapsed >= arc.settle_secs
+
+    def _resolve_input_tokens(self, arc: InputArc, available: list[Token]) -> list[Token] | None:
+        if arc.consume_all:
+            return available
+        if arc.expression is not None:
+            try:
+                if isinstance(arc.expression, str):
+                    ordered = SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": available})  # type: ignore[attr-defined]
+                else:
+                    ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
+                return ordered[: arc.count]
+            except Exception:
+                return None
+        return available[: arc.count]
+
+    def _check_output_capacity(self, transition: Transition) -> bool:
         # Back-pressure: refuse to fire if an unguarded output arc's target place is full.
         # Guarded arcs are skipped — their target may never receive a token, so checking
         # capacity speculatively would cause spurious blocking.
@@ -566,18 +585,20 @@ class PetriNet:
             place = self.places.get(arc.place)
             if place is not None and not place.can_deposit(arc.count):
                 return False
-
-        if transition.guard is not None:
-            try:
-                if isinstance(transition.guard, str):
-                    if not SandboxEvaluator.evaluate_compiled(transition._compiled_guard, {"tokens": candidate_tokens}):
-                        return False
-                else:
-                    if not self._call_expr(transition.guard, candidate_tokens, timeout=self.expr_timeout_secs):
-                        return False
-            except Exception:
-                return False
         return True
+
+    def _check_transition_guard(self, transition: Transition, candidate_tokens: list[Token]) -> bool:
+        if transition.guard is None:
+            return True
+        try:
+            if isinstance(transition.guard, str):
+                return bool(
+                    SandboxEvaluator.evaluate_compiled(transition._compiled_guard, {"tokens": candidate_tokens})
+                )  # type: ignore[attr-defined]
+            else:
+                return bool(self._call_expr(transition.guard, candidate_tokens, timeout=self.expr_timeout_secs))
+        except Exception:
+            return False
 
     def _is_transition_potentially_enabled(self, transition: Transition) -> bool:
         """Return ``True`` if *transition* could fire given current token counts, ignoring timing.
@@ -597,32 +618,12 @@ class PetriNet:
                 return False
             # Speculatively resolve candidate tokens ignoring timing
             available = place.peek(len(place), model_time=float("inf"))
-            if arc.consume_all:
-                tokens = available
-            elif arc.expression is not None:
-                try:
-                    if isinstance(arc.expression, str):
-                        ordered = SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": available})
-                    else:
-                        ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
-                    tokens = ordered[: arc.count]
-                except Exception:
-                    return False
-            else:
-                tokens = available[: arc.count]
+            tokens = self._resolve_input_tokens(arc, available)
+            if tokens is None:
+                return False
             candidate_tokens.extend(tokens)
 
-        if transition.guard is not None:
-            try:
-                if isinstance(transition.guard, str):
-                    if not SandboxEvaluator.evaluate_compiled(transition._compiled_guard, {"tokens": candidate_tokens}):
-                        return False
-                else:
-                    if not self._call_expr(transition.guard, candidate_tokens, timeout=self.expr_timeout_secs):
-                        return False
-            except Exception:
-                return False
-        return True
+        return self._check_transition_guard(transition, candidate_tokens)
 
     def _execute_transition(
         self,
@@ -767,7 +768,7 @@ class PetriNet:
             if arc.expression is None:
                 active_outputs.append((arc, is_res))
             elif isinstance(arc.expression, str):
-                if SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": output_tokens_data}):
+                if SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": output_tokens_data}):  # type: ignore[attr-defined]
                     active_outputs.append((arc, is_res))
             elif self._call_expr(arc.expression, output_tokens_data, timeout=self.expr_timeout_secs):
                 active_outputs.append((arc, is_res))
