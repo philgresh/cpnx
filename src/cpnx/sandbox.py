@@ -213,7 +213,9 @@ def _clean_fallback_source(source: str) -> str:
         source = source[:-1]
     if "=" in source and not source.startswith("def "):
         parts = source.split("=", 1)
-        if not parts[0].strip().endswith((">=", "<=", "!=", "==")):
+        # After splitting on the first "=", the comparison-operator char (>, <, !)
+        # is the last char of parts[0].  A bare "=" (for "==") also stays.
+        if not parts[0].rstrip().endswith((">", "<", "!", "=")):
             source = parts[1].strip()
     return source
 
@@ -234,6 +236,7 @@ def _try_verify_via_getsource(func: Callable) -> None:
             "Use a plain lambda or def-statement function instead."
         ) from exc
     except Exception:
+        # Source cannot be retrieved or parsed (e.g. compiled built-in, REPL lambda) — allow with caution.
         pass
 
 

@@ -1,10 +1,19 @@
+import ast
 import os
 
 import pytest
 
 from cpnx.engine import PetriNet
 from cpnx.places import Place
-from cpnx.sandbox import SandboxEvaluator, verify_callable_purity
+from cpnx.sandbox import (
+    SandboxEvaluator,
+    _check_expression_node_call,
+    _clean_fallback_source,
+    _is_more_specific_node,
+    _node_contains_line,
+    _verify_function_defaults,
+    verify_callable_purity,
+)
 from cpnx.tokens import Token
 from cpnx.transitions import InputArc, OutputArc, Transition
 
@@ -310,3 +319,134 @@ class TestAtomicRollback:
 
         assert len(net.places["dlq"].tokens) == 0, "DLQ must be empty — rollback is atomic"
         assert len(net.places["source"].tokens) == 1, "Token must be returned to source place"
+
+
+# ---------------------------------------------------------------------------
+# Direct unit tests for extracted sandbox helpers
+# ---------------------------------------------------------------------------
+
+
+class TestCleanFallbackSource:
+    def test_trailing_comma_stripped(self):
+        assert _clean_fallback_source("lambda t: t,") == "lambda t: t"
+
+    def test_no_trailing_comma_unchanged(self):
+        assert _clean_fallback_source("lambda t: t") == "lambda t: t"
+
+    def test_assignment_lhs_stripped(self):
+        assert _clean_fallback_source("action = lambda t: t") == "lambda t: t"
+
+    def test_def_prefix_not_stripped(self):
+        src = "def f(x):\n    return x"
+        assert _clean_fallback_source(src) == src
+
+    def test_comparison_operators_not_treated_as_assignment(self):
+        # >, <, ! before the = are preserved (the original bug: endswith(">=") failed
+        # because split on "=" leaves only the first char of the operator).
+        for expr in ("x >= 1", "x <= 1", "x != 1"):
+            assert _clean_fallback_source(expr) == expr
+
+    def test_no_equals_sign_unchanged(self):
+        assert _clean_fallback_source("len(tokens)") == "len(tokens)"
+
+
+class TestNodeContainsLine:
+    def _parse_func(self, source: str) -> ast.FunctionDef:
+        return ast.parse(source).body[0]
+
+    def test_line_inside_span(self):
+        node = self._parse_func("def foo():\n    pass\n")
+        assert _node_contains_line(node, 1)
+        assert _node_contains_line(node, 2)
+
+    def test_line_outside_span(self):
+        node = self._parse_func("def foo():\n    pass\n")
+        assert not _node_contains_line(node, 0)
+        assert not _node_contains_line(node, 99)
+
+    def test_non_function_node_always_false(self):
+        # A Pass statement is not a FunctionDef/Lambda
+        tree = ast.parse("def foo():\n    pass\n")
+        pass_node = tree.body[0].body[0]
+        assert not _node_contains_line(pass_node, 2)
+
+    def test_lambda_node(self):
+        tree = ast.parse("f = lambda x: x", mode="exec")
+        # Walk to find the Lambda node
+        lambda_node = next(n for n in ast.walk(tree) if isinstance(n, ast.Lambda))
+        assert _node_contains_line(lambda_node, lambda_node.lineno)
+
+
+class TestIsMoreSpecificNode:
+    def _parse_nested(self) -> tuple[ast.FunctionDef, ast.FunctionDef]:
+        source = "def outer():\n    def inner():\n        pass\n"
+        tree = ast.parse(source)
+        outer = tree.body[0]
+        inner = outer.body[0]
+        return outer, inner
+
+    def test_inner_is_more_specific_than_outer(self):
+        outer, inner = self._parse_nested()
+        assert _is_more_specific_node(inner, outer)
+
+    def test_outer_is_not_more_specific_than_inner(self):
+        outer, inner = self._parse_nested()
+        assert not _is_more_specific_node(outer, inner)
+
+
+class TestCheckExpressionNodeCall:
+    def _call_node(self, expr: str) -> ast.Call:
+        return ast.parse(expr, mode="eval").body
+
+    def test_allowed_builtin_passes(self):
+        _check_expression_node_call(self._call_node("len(tokens)"))
+
+    def test_forbidden_builtin_raises(self):
+        with pytest.raises(PermissionError, match="Forbidden call to 'print'"):
+            _check_expression_node_call(self._call_node("print(tokens)"))
+
+    def test_allowed_method_passes(self):
+        _check_expression_node_call(self._call_node("tokens.get('key')"))
+
+    def test_forbidden_method_raises(self):
+        with pytest.raises(PermissionError, match="Forbidden call to method 'system'"):
+            _check_expression_node_call(self._call_node("x.system('cmd')"))
+
+    def test_complex_call_raises(self):
+        # f()() — outer Call has func=Call, not Name or Attribute
+        outer_call = self._call_node("f()()")
+        with pytest.raises(PermissionError, match="Forbidden complex call"):
+            _check_expression_node_call(outer_call)
+
+    def test_subscript_call_raises(self):
+        # funcs[0]() — func is a Subscript, not Name or Attribute
+        subscript_call = self._call_node("funcs[0]()")
+        with pytest.raises(PermissionError, match="Forbidden complex call"):
+            _check_expression_node_call(subscript_call)
+
+
+class TestVerifyFunctionDefaults:
+    def _args(self, source: str) -> ast.arguments:
+        return ast.parse(source).body[0].args
+
+    def test_list_default_raises(self):
+        with pytest.raises(PermissionError, match="Mutable default argument"):
+            _verify_function_defaults(self._args("def f(x=[]):\n    pass"))
+
+    def test_dict_default_raises(self):
+        with pytest.raises(PermissionError, match="Mutable default argument"):
+            _verify_function_defaults(self._args("def f(x={}):\n    pass"))
+
+    def test_set_default_raises(self):
+        with pytest.raises(PermissionError, match="Mutable default argument"):
+            _verify_function_defaults(self._args("def f(x={1,2}):\n    pass"))
+
+    def test_kw_only_dict_default_raises(self):
+        with pytest.raises(PermissionError, match="Mutable default argument"):
+            _verify_function_defaults(self._args("def f(*, x={}):\n    pass"))
+
+    def test_immutable_default_passes(self):
+        _verify_function_defaults(self._args("def f(x=0):\n    pass"))
+
+    def test_no_defaults_passes(self):
+        _verify_function_defaults(self._args("def f(x):\n    pass"))
