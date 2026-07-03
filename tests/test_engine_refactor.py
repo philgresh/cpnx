@@ -680,3 +680,137 @@ def test_retrieve_consumed_tokens_rollback_on_error():
 
     # t1 should be returned to p1 after the rollback
     assert len(p1) == 1
+
+
+def test_wait_for_work():
+    import threading
+
+    net = PetriNet()
+    # Check that it returns when deadline is past
+    with patch("time.monotonic", return_value=10.0):
+        net._wait_for_work(deadline=5.0, stop_event=None)  # Should return immediately
+
+    # Check that it caps to cooldown interval or remaining time
+    stop_event = threading.Event()
+    with patch.object(net._work_available, "wait") as mock_wait:
+        with patch("time.monotonic", return_value=0.0):
+            net._wait_for_work(deadline=5.0, stop_event=stop_event)
+            mock_wait.assert_called_once()
+            # wait timeout should be capped at 0.1 because stop_event is present
+            assert mock_wait.call_args[1]["timeout"] == 0.05
+
+
+def test_validate_transition_arcs():
+    from cpnx.transitions import InputArc
+
+    net = PetriNet()
+    p1 = Place("p1")
+    net.add_place(p1)
+
+    # OK
+    t_ok = Transition("t1", inputs=[InputArc("p1")], outputs=[], action=lambda t: t)
+    net._validate_transition_arcs("t1", t_ok)
+
+    # Arc points to an unregistered place
+    t_bad_place = Transition("t2", inputs=[InputArc("p2")], outputs=[], action=lambda t: t)
+    with pytest.raises(KeyError):
+        net._validate_transition_arcs("t2", t_bad_place)
+
+    # Arc points to a transition
+    t3 = Transition("t3", inputs=[], outputs=[], action=lambda t: t)
+    net.add_transition(t3)
+    t_bad_target = Transition("t4", inputs=[InputArc("t3")], outputs=[], action=lambda t: t)
+    with pytest.raises(TypeError):
+        net._validate_transition_arcs("t4", t_bad_target)
+
+
+def test_rollback_data_token():
+    from cpnx.engine import _rollback_data_token
+
+    t = Transition("t", inputs=[], outputs=[], action=lambda x: x, max_retries=2)
+    tok = Token()
+
+    # Below retries: should evolve attempt count and schedule in future
+    with patch("time.monotonic", return_value=10.0):
+        dest, rb_tok, is_dl = _rollback_data_token(tok, "src", t, 5.0, "err")
+        assert dest == "src"
+        assert rb_tok.attempts == 1
+        assert rb_tok.available_at == 15.0
+        assert not is_dl
+
+    # Above retries: dead-lettered
+    tok2 = Token(attempts=2)
+    dest, rb_tok, is_dl = _rollback_data_token(tok2, "src", t, 5.0, "err")
+    assert dest == "err"
+    assert is_dl
+    assert rb_tok.available_at == 0.0
+
+
+def test_check_arc_preconditions():
+    from cpnx.transitions import InputArc
+
+    net = PetriNet()
+    arc = InputArc("p1", count=1)
+    assert net._check_arc_preconditions(arc, None, None) is None
+
+    p = Place("p1")
+    net.add_place(p)
+    assert net._check_arc_preconditions(arc, p, None) is None  # no tokens
+
+    tok = Token()
+    p.deposit(tok)
+    assert net._check_arc_preconditions(arc, p, None) == [tok]
+
+
+def test_is_arc_active():
+    from cpnx.transitions import OutputArc
+
+    net = PetriNet()
+    arc_none = OutputArc("p1")
+    assert net._is_arc_active(arc_none, []) is True
+
+    # SandboxEvaluator is used for string, we'll just test callable for simplicity
+    # since we don't compile strings in the test easily. Let's do callable.
+    arc_callable = OutputArc("p1", expression=lambda t: len(t) > 0)
+    assert net._is_arc_active(arc_callable, []) is False
+    assert net._is_arc_active(arc_callable, [Token()]) is True
+
+
+def test_process_rollback_token():
+    from cpnx.engine import _process_rollback_token
+    from cpnx.places import ResourcePlace
+
+    t = Transition("t", inputs=[], outputs=[], action=lambda x: x)
+
+    p = ResourcePlace("p", 1)
+    tok_res = p.retrieve(1)[0]
+
+    dest, rb_tok, is_dl = _process_rollback_token(tok_res, "src", t, 5.0, "err")
+    assert dest == "src"
+    assert rb_tok is tok_res
+    assert not is_dl
+
+    tok_data = Token(attempts=0)
+    with patch("time.monotonic", return_value=10.0):
+        dest2, rb_tok2, is_dl2 = _process_rollback_token(tok_data, "src", t, 5.0, "err")
+        assert dest2 == "src"
+        assert rb_tok2.attempts == 1
+        assert rb_tok2.available_at == 15.0
+        assert not is_dl2
+
+
+def test_is_place_ready():
+    from cpnx.transitions import InputArc
+
+    net = PetriNet()
+    arc = InputArc("p1", count=1)
+
+    assert not net._is_place_ready(arc, None, None)
+
+    p = Place("p1")
+    net.add_place(p)
+    assert not net._is_place_ready(arc, p, None)  # place empty
+
+    tok = Token()
+    p.deposit(tok)
+    assert net._is_place_ready(arc, p, None)

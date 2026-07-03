@@ -65,6 +65,32 @@ def _return_leftover_resources(
     return deposited
 
 
+def _rollback_data_token(
+    t: Token,
+    src_name: str,
+    transition: Transition,
+    retry_delay: float,
+    error_place: str,
+) -> tuple[str, Token, bool]:
+    max_retries = transition.max_retries
+    if max_retries is None or t.attempts < max_retries:
+        retry_at = time.monotonic() + retry_delay
+        return src_name, t.evolve(available_at=retry_at, attempts=t.attempts + 1), False
+    return error_place, t.evolve(available_at=0.0), True
+
+
+def _process_rollback_token(
+    t: Token,
+    src_name: str,
+    transition: Transition,
+    retry_delay: float,
+    error_place: str,
+) -> tuple[str, Token, bool]:
+    if t.is_resource:
+        return src_name, t, False
+    return _rollback_data_token(t, src_name, transition, retry_delay, error_place)
+
+
 def _rollback_failed_transition(
     transition: Transition,
     token_sources: list[tuple[str, Token]],
@@ -82,21 +108,11 @@ def _rollback_failed_transition(
     dead_lettered_data_tokens: list[Token] = []
     data_tokens = [t for _, t in token_sources if not t.is_resource]
     for src_name, t in token_sources:
-        if t.is_resource:
-            deposit(src_name, t)
-            deposited.append((src_name, t))
-        else:
-            max_retries = transition.max_retries
-            if max_retries is None or t.attempts < max_retries:
-                retry_at = time.monotonic() + retry_delay
-                rollback_t = t.evolve(available_at=retry_at, attempts=t.attempts + 1)
-                deposit(src_name, rollback_t)
-                deposited.append((src_name, rollback_t))
-            else:
-                rollback_t = t.evolve(available_at=0.0)
-                deposit(error_place, rollback_t)
-                deposited.append((error_place, rollback_t))
-                dead_lettered_data_tokens.append(rollback_t)
+        dest, rollback_t, is_dead_letter = _process_rollback_token(t, src_name, transition, retry_delay, error_place)
+        deposit(dest, rollback_t)
+        deposited.append((dest, rollback_t))
+        if is_dead_letter:
+            dead_lettered_data_tokens.append(rollback_t)
     return deposited, dead_lettered_data_tokens, data_tokens
 
 
@@ -285,6 +301,15 @@ class PetriNet:
             if isinstance(place, PacedResourcePlace):
                 self._has_timed_features = True
 
+    def _validate_new_transition(self, transition: Transition) -> None:
+        if transition.name in self.places:
+            raise ValueError(f"Name overlap: '{transition.name}' is already registered as a Place.")
+        for arc in transition.inputs + transition.outputs:
+            if arc.place == transition.name or arc.place in self.transitions:
+                raise TypeError(
+                    f"Arc target '{arc.place}' is a Transition, not a Place. Arcs must connect Places↔Transitions only."
+                )
+
     def add_transition(self, transition: Transition) -> None:
         """Register a transition with the net.
 
@@ -296,14 +321,7 @@ class PetriNet:
             transition: The :class:`~cpnx.transitions.Transition` to register.
         """
         with self._lock:
-            if transition.name in self.places:
-                raise ValueError(f"Name overlap: '{transition.name}' is already registered as a Place.")
-            for arc in transition.inputs + transition.outputs:
-                if arc.place == transition.name or arc.place in self.transitions:
-                    raise TypeError(
-                        f"Arc target '{arc.place}' is a Transition, not a Place. "
-                        "Arcs must connect Places↔Transitions only."
-                    )
+            self._validate_new_transition(transition)
             self.transitions[transition.name] = transition
             if any(arc.settle_secs > 0.0 for arc in transition.inputs):
                 self._has_timed_features = True
@@ -334,14 +352,31 @@ class PetriNet:
             except Exception:
                 pass
 
+    def _filter_highest_priority(self, transitions: list[Transition]) -> list[Transition]:
+        if not transitions:
+            return []
+        min_priority = min(t.priority for t in transitions)
+        return [t for t in transitions if t.priority == min_priority]
+
     def _select_transition_to_fire(self) -> Transition | None:
         enabled = [t for t in self.transitions.values() if self._is_transition_enabled(t)]
-        if not enabled:
-            return None
+        candidates = self._filter_highest_priority(enabled)
+        return random.choice(candidates) if candidates else None
 
-        min_priority = min(t.priority for t in enabled)
-        candidates = [t for t in enabled if t.priority == min_priority]
-        return random.choice(candidates)
+    def _retrieve_tokens_for_arc(self, arc: InputArc, place: Place, m_time: float | None) -> list[Token]:
+        if arc.consume_all:
+            return place.retrieve_all(model_time=m_time)
+        if arc.expression is not None:
+            available = place.peek(len(place), model_time=m_time)
+            if isinstance(arc.expression, str):
+                ordered = SandboxEvaluator.evaluate_compiled(
+                    arc._compiled_expression,
+                    {"tokens": available},  # type: ignore[attr-defined]
+                )
+            else:
+                ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
+            return place.retrieve_specific(ordered[: arc.count], model_time=m_time)
+        return place.retrieve(arc.count, model_time=m_time)
 
     def _retrieve_consumed_tokens(
         self, transition: Transition, m_time: float | None
@@ -351,20 +386,7 @@ class PetriNet:
         try:
             for arc in transition.inputs:
                 place = self.places[arc.place]
-                if arc.consume_all:
-                    tokens = place.retrieve_all(model_time=m_time)
-                elif arc.expression is not None:
-                    available = place.peek(len(place), model_time=m_time)
-                    if isinstance(arc.expression, str):
-                        ordered = SandboxEvaluator.evaluate_compiled(
-                            arc._compiled_expression,
-                            {"tokens": available},  # type: ignore[attr-defined]
-                        )
-                    else:
-                        ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
-                    tokens = place.retrieve_specific(ordered[: arc.count], model_time=m_time)
-                else:
-                    tokens = place.retrieve(arc.count, model_time=m_time)
+                tokens = self._retrieve_tokens_for_arc(arc, place, m_time)
                 consumed_tokens.extend(tokens)
                 for t in tokens:
                     token_sources.append((arc.place, t))
@@ -412,6 +434,16 @@ class PetriNet:
 
         return True
 
+    def _validate_transition_arcs(self, transition_name: str, transition: Transition) -> None:
+        for arc in transition.inputs + transition.outputs:
+            if arc.place in self.transitions:
+                raise TypeError(
+                    f"Arc target '{arc.place}' in transition '{transition_name}' is a Transition, not a Place. "
+                    f"Arcs must connect Places↔Transitions only."
+                )
+            if arc.place not in self.places:
+                raise KeyError(f"Place '{arc.place}' referenced by transition '{transition_name}' is not registered.")
+
     def validate(self) -> None:
         """Validate the structural topology of the Petri net.
 
@@ -425,14 +457,25 @@ class PetriNet:
                 raise ValueError(f"Name overlap: '{list(overlaps)[0]}' is registered as both a Place and a Transition.")
 
             for name, transition in self.transitions.items():
-                for arc in transition.inputs + transition.outputs:
-                    if arc.place in self.transitions:
-                        raise TypeError(
-                            f"Arc target '{arc.place}' in transition '{name}' is a Transition, not a Place. "
-                            f"Arcs must connect Places↔Transitions only."
-                        )
-                    if arc.place not in self.places:
-                        raise KeyError(f"Place '{arc.place}' referenced by transition '{name}' is not registered.")
+                self._validate_transition_arcs(name, transition)
+
+    def _wait_for_work(self, deadline: float | None, stop_event: threading.Event | None) -> None:
+        timeout = self.cooldown_interval
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            timeout = min(remaining, timeout)
+
+        if stop_event is not None:
+            timeout = min(timeout, 0.1)
+
+        self._work_available.wait(timeout=timeout)
+
+    def _should_stop_run(self, deadline: float | None, stop_event: threading.Event | None) -> bool:
+        if stop_event is not None and stop_event.is_set():
+            return True
+        return deadline is not None and time.monotonic() > deadline
 
     def run(
         self,
@@ -464,25 +507,11 @@ class PetriNet:
         """
         self.validate()
         while not self.is_quiescent():
-            if stop_event is not None and stop_event.is_set():
-                break
-            if deadline is not None and time.monotonic() > deadline:
+            if self._should_stop_run(deadline, stop_event):
                 break
             self._work_available.clear()
             if not self.step():
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    timeout = min(remaining, self.cooldown_interval)
-                    if stop_event is not None:
-                        timeout = min(timeout, 0.1)
-                    self._work_available.wait(timeout=timeout)
-                else:
-                    timeout = self.cooldown_interval
-                    if stop_event is not None:
-                        timeout = min(timeout, 0.1)
-                    self._work_available.wait(timeout=timeout)
+                self._wait_for_work(deadline, stop_event)
 
     def is_quiescent(self) -> bool:
         """Return ``True`` if no transitions are running and none can currently fire.
@@ -629,24 +658,28 @@ class PetriNet:
 
         return self._check_transition_guard(transition, candidate_tokens)
 
-    def _check_input_preconditions(self, transition: Transition, m_time: float) -> tuple[bool, list[Token]]:
-        candidate_tokens: list[Token] = []
+    def _is_place_ready(self, arc: InputArc, place: Place | None, m_time: float | None) -> bool:
+        if not place or not place.can_retrieve(arc.count, model_time=m_time):
+            return False
+        return self._is_settle_time_met(place, arc)
+
+    def _check_arc_preconditions(self, arc: InputArc, place: Place | None, m_time: float | None) -> list[Token] | None:
+        if not self._is_place_ready(arc, place, m_time):
+            return None
+        available = place.peek(len(place), model_time=m_time)  # type: ignore[union-attr]
+        resolved = self._resolve_input_tokens(arc, available)
+        if resolved is None or len(resolved) < arc.count:
+            return None
+        return resolved[: arc.count]
+
+    def _check_input_preconditions(self, transition: Transition, m_time: float | None) -> tuple[bool, list[Token]]:
+        tokens_for_guard: list[Token] = []
         for arc in transition.inputs:
-            place = self.places.get(arc.place)
-            if place is None or not place.can_retrieve(arc.count, model_time=m_time):
+            resolved = self._check_arc_preconditions(arc, self.places.get(arc.place), m_time)
+            if resolved is None:
                 return False, []
-
-            if not self._is_settle_time_met(place, arc):
-                return False, []
-
-            # Speculatively resolve candidate tokens
-            available = place.peek(len(place), model_time=m_time)
-            tokens = self._resolve_input_tokens(arc, available)
-            if tokens is None:
-                return False, []
-            candidate_tokens.extend(tokens)
-
-        return True, candidate_tokens
+            tokens_for_guard.extend(resolved)
+        return True, tokens_for_guard
 
     def _is_settle_time_met(self, place: Place, arc: InputArc) -> bool:
         if arc.settle_secs <= 0.0:
@@ -721,48 +754,52 @@ class PetriNet:
 
         return self._check_transition_guard(transition, candidate_tokens)
 
+    def _commit_or_rollback_transition(
+        self,
+        transition: Transition,
+        success: bool,
+        consumed_tokens: list[Token],
+        output_tokens: list[Token],
+        token_sources: list[tuple[str, Token]],
+        error: BaseException | None,
+    ) -> tuple[bool, BaseException | None, list[Token], list[Token], list[tuple[str, Token]]]:
+        data_tokens: list[Token] = []
+        dl_data: list[Token] = []
+        deposited: list[tuple[str, Token]] = []
+
+        if success:
+            try:
+                success, error, data_tokens, dl_data, deposited = self._try_commit_transition(
+                    transition, consumed_tokens, output_tokens, token_sources
+                )
+            except BaseException as exc:
+                success = False
+                error = exc
+
+        if not success:
+            deposited, dl_data, data_tokens = _rollback_failed_transition(
+                transition,
+                token_sources,
+                deposit=self._deposit_under_lock,
+                retry_delay=self.retry_delay,
+                error_place=self.error_place,
+            )
+        return success, error, data_tokens, dl_data, deposited
+
     def _execute_transition(
         self,
         transition: Transition,
         consumed_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
     ) -> None:
-        """Execute a transition action and distribute output tokens.
-
-        Runs on the thread pool. Guarantees:
-
-        - On failure, resource tokens are returned to their source places.
-        - Data tokens are retried (returned to source with a delay and an incremented
-          ``attempts`` counter) up to ``max_retries`` times, or dead-lettered to
-          ``error_place`` when exhausted.
-        - Callbacks (:attr:`on_token_deposited`, :attr:`on_error`, :attr:`on_token_dead_lettered`)
-          fire **outside** the engine lock to prevent re-entrant deadlocks.
-        - :attr:`_running_count` is always decremented exactly once.
-        """
+        start_time = time.monotonic()
         try:
-            start_time = time.monotonic()
             success, output_tokens, error = self._execute_transition_action(transition, consumed_tokens, token_sources)
-            duration = 0.0
-
             with self._lock:
                 duration = time.monotonic() - start_time
-                if success:
-                    try:
-                        success, error, data_tokens, dl_data, deposited = self._try_commit_transition(
-                            transition, consumed_tokens, output_tokens, token_sources
-                        )
-                    except BaseException as exc:
-                        success = False
-                        error = exc
-
-                if not success:
-                    deposited, dl_data, data_tokens = _rollback_failed_transition(
-                        transition,
-                        token_sources,
-                        deposit=self._deposit_under_lock,
-                        retry_delay=self.retry_delay,
-                        error_place=self.error_place,
-                    )
+                success, error, data_tokens, dl_data, deposited = self._commit_or_rollback_transition(
+                    transition, success, consumed_tokens, output_tokens, token_sources, error
+                )
 
             # --- OUTSIDE THE LOCK ---
             self._invoke_transition_callbacks(transition, success, duration, error, data_tokens, dl_data, deposited)
@@ -776,6 +813,13 @@ class PetriNet:
                 self._running_count -= 1
             self._work_available.set()
 
+    def _create_token_deques(
+        self, consumed_tokens: list[Token], output_tokens: list[Token]
+    ) -> tuple[deque[Token], deque[Token]]:
+        res_deque: deque[Token] = deque(t for t in consumed_tokens if t.is_resource)
+        out_deque: deque[Token] = deque(t for t in output_tokens if not t.is_resource)
+        return res_deque, out_deque
+
     def _try_commit_transition(
         self,
         transition: Transition,
@@ -783,8 +827,7 @@ class PetriNet:
         output_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
     ) -> tuple[bool, BaseException | None, list[Token], list[Token], list[tuple[str, Token]]]:
-        res_deque: deque[Token] = deque(t for t in consumed_tokens if t.is_resource)
-        out_deque: deque[Token] = deque(t for t in output_tokens if not t.is_resource)
+        res_deque, out_deque = self._create_token_deques(consumed_tokens, output_tokens)
         active_outputs = self._evaluate_output_guards(transition, list(out_deque))
 
         planned_deposits, plan_error = self._plan_and_validate_deposits(
@@ -840,20 +883,28 @@ class PetriNet:
             error = exc
         return success, output_tokens, error
 
+    def _is_arc_active(self, arc: OutputArc, output_tokens_data: list[Token]) -> bool:
+        if arc.expression is None:
+            return True
+        if isinstance(arc.expression, str):
+            return bool(SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": output_tokens_data}))  # type: ignore[attr-defined]
+        return bool(self._call_expr(arc.expression, output_tokens_data, timeout=self.expr_timeout_secs))
+
     def _evaluate_output_guards(
         self, transition: Transition, output_tokens_data: list[Token]
     ) -> list[tuple[OutputArc, bool]]:
         active_outputs: list[tuple[OutputArc, bool]] = []
         for arc in transition.outputs:
             is_res = isinstance(self.places.get(arc.place), (ResourcePlace, PacedResourcePlace))
-            if arc.expression is None:
-                active_outputs.append((arc, is_res))
-            elif isinstance(arc.expression, str):
-                if SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": output_tokens_data}):  # type: ignore[attr-defined]
-                    active_outputs.append((arc, is_res))
-            elif self._call_expr(arc.expression, output_tokens_data, timeout=self.expr_timeout_secs):
+            if self._is_arc_active(arc, output_tokens_data):
                 active_outputs.append((arc, is_res))
         return active_outputs
+
+    @staticmethod
+    def _calculate_demand(active_outputs: list[tuple[OutputArc, bool]]) -> tuple[int, int]:
+        resource_demand = sum(arc.count for arc, is_res in active_outputs if is_res)
+        data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)
+        return resource_demand, data_demand
 
     @staticmethod
     def _verify_token_demand(
@@ -862,8 +913,7 @@ class PetriNet:
         res_count: int,
         out_count: int,
     ) -> ValueError | None:
-        resource_demand = sum(arc.count for arc, is_res in active_outputs if is_res)
-        data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)
+        resource_demand, data_demand = PetriNet._calculate_demand(active_outputs)
 
         if res_count < resource_demand:
             return ValueError(
@@ -895,26 +945,36 @@ class PetriNet:
                 planned_deposits.append((arc.place, t))
         return planned_deposits
 
-    def _verify_deposit_constraints(
-        self,
-        planned_deposits: list[tuple[str, Token]],
-    ) -> Exception | None:
-        place_deposit_counts: dict[str, int] = {}
+    def _get_deposit_counts(self, planned_deposits: list[tuple[str, Token]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
         for place_name, _ in planned_deposits:
-            place_deposit_counts[place_name] = place_deposit_counts.get(place_name, 0) + 1
+            counts[place_name] = counts.get(place_name, 0) + 1
+        return counts
 
+    def _check_token_acceptance(self, planned_deposits: list[tuple[str, Token]]) -> Exception | None:
         for place_name, token in planned_deposits:
             place = self.places.get(place_name)
             if place is None:
                 return KeyError(f"Place '{place_name}' is not registered.")
             if not place.can_accept(token):
                 return TypeError(f"Place '{place_name}' cannot accept token with color '{token.color}'.")
+        return None
 
-        for place_name, count in place_deposit_counts.items():
+    def _check_capacity_bounds(self, counts: dict[str, int]) -> Exception | None:
+        for place_name, count in counts.items():
             place = self.places.get(place_name)
             if place is not None and not place.can_deposit(count):
                 return ValueError(f"Place '{place_name}' would exceed its bound of {place.bound}.")
         return None
+
+    def _verify_deposit_constraints(
+        self,
+        planned_deposits: list[tuple[str, Token]],
+    ) -> Exception | None:
+        err = self._check_token_acceptance(planned_deposits)
+        if err:
+            return err
+        return self._check_capacity_bounds(self._get_deposit_counts(planned_deposits))
 
     def _plan_and_validate_deposits(
         self,
@@ -942,19 +1002,24 @@ class PetriNet:
             except Exception:
                 pass
 
+    def _do_dispatch_error(self, transition_name: str, error: Exception, data_tokens: list[Token]) -> None:
+        if not self.on_error:
+            return
+        dispatch_tokens: list[Token | None] = list(data_tokens) if data_tokens else [None]
+        for dt in dispatch_tokens:
+            try:
+                self.on_error(transition_name, error, dt)
+            except Exception:
+                pass
+
     def _dispatch_transition_error(
         self, transition_name: str, error: BaseException | None, data_tokens: list[Token]
     ) -> None:
         # We explicitly check for Exception (ignoring BaseException like SystemExit/KeyboardInterrupt)
         # because on_error is meant for business logic/execution errors. Fatal process signals
         # should bubble up without triggering user-defined monitoring hooks.
-        if self.on_error and error and isinstance(error, Exception):
-            dispatch_tokens: list[Token | None] = list(data_tokens) if data_tokens else [None]
-            for dt in dispatch_tokens:
-                try:
-                    self.on_error(transition_name, error, dt)
-                except Exception:
-                    pass
+        if isinstance(error, Exception):
+            self._do_dispatch_error(transition_name, error, data_tokens)
 
     def _dispatch_dead_letters(self, transition_name: str, dead_lettered_data_tokens: list[Token]) -> None:
         if self.on_token_dead_lettered and dead_lettered_data_tokens:
