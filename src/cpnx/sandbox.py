@@ -81,6 +81,39 @@ class SandboxEvaluator:
         return cls.evaluate_compiled(cls.compile_expression(expression_str), context_dict)
 
 
+def _check_expression_node_call(node: ast.Call) -> None:
+    if isinstance(node.func, ast.Name):
+        if node.func.id not in SandboxEvaluator.ALLOWED_BUILTINS:
+            raise PermissionError(f"Forbidden call to '{node.func.id}' in sandbox.")
+    elif isinstance(node.func, ast.Attribute):
+        if node.func.attr not in SandboxEvaluator.ALLOWED_METHODS:
+            raise PermissionError(f"Forbidden call to method '{node.func.attr}' in sandbox.")
+    else:
+        raise PermissionError("Forbidden complex call in sandbox.")
+
+
+def _check_expression_node(node: ast.AST) -> None:
+    match node:
+        case ast.Call():
+            _check_expression_node_call(node)
+        case ast.Import() | ast.ImportFrom():
+            raise PermissionError("Imports are forbidden in sandbox.")
+        case ast.Attribute(attr=attr) if attr.startswith("_"):
+            raise PermissionError(f"Access to private/dunder attribute '{attr}' is forbidden in sandbox.")
+        case ast.Global() | ast.Nonlocal():
+            raise PermissionError("Global/nonlocal mutations are forbidden in sandbox.")
+        case (
+            ast.While()
+            | ast.For()
+            | ast.AsyncFor()
+            | ast.ListComp()
+            | ast.DictComp()
+            | ast.SetComp()
+            | ast.GeneratorExp()
+        ):
+            raise PermissionError("Unbounded iteration is forbidden in sandbox expressions.")
+
+
 @functools.lru_cache(maxsize=256)
 def _compile_cached(expression_str: str):
     """Validate (exec-mode security walk) and compile (eval-mode) an expression once.
@@ -91,30 +124,131 @@ def _compile_cached(expression_str: str):
     # 1. Parse in exec mode first to ensure safety against statement-level imports or assignments
     exec_tree = ast.parse(expression_str, mode="exec")
     for node in ast.walk(exec_tree):
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name):
-                if node.func.id not in SandboxEvaluator.ALLOWED_BUILTINS:
-                    raise PermissionError(f"Forbidden call to '{node.func.id}' in sandbox.")
-            elif isinstance(node.func, ast.Attribute):
-                if node.func.attr not in SandboxEvaluator.ALLOWED_METHODS:
-                    raise PermissionError(f"Forbidden call to method '{node.func.attr}' in sandbox.")
-            else:
-                raise PermissionError("Forbidden complex call in sandbox.")
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            raise PermissionError("Imports are forbidden in sandbox.")
-        elif isinstance(node, ast.Attribute):
-            if node.attr.startswith("_"):
-                raise PermissionError(f"Access to private/dunder attribute '{node.attr}' is forbidden in sandbox.")
-        elif isinstance(node, (ast.Global, ast.Nonlocal)):
-            raise PermissionError("Global/nonlocal mutations are forbidden in sandbox.")
-        elif isinstance(
-            node, (ast.While, ast.For, ast.AsyncFor, ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp)
-        ):
-            raise PermissionError("Unbounded iteration is forbidden in sandbox expressions.")
+        _check_expression_node(node)
 
     # 2. Parse and compile in eval mode for execution
     tree = ast.parse(expression_str, mode="eval")
     return compile(tree, "<sandbox>", "eval")
+
+
+def _node_contains_line(node: ast.AST, start_line: int) -> bool:
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        return False
+    if not hasattr(node, "lineno"):
+        return False
+    end_lineno = getattr(node, "end_lineno", node.lineno)
+    return node.lineno <= start_line <= end_lineno
+
+
+def _is_more_specific_node(new_node: ast.AST, current_target: ast.AST) -> bool:
+    target_start = current_target.lineno
+    target_end = getattr(current_target, "end_lineno", target_start)
+    new_end = getattr(new_node, "end_lineno", new_node.lineno)
+    return new_node.lineno >= target_start and new_end <= target_end
+
+
+def _find_target_node(tree: ast.AST, start_line: int) -> ast.AST | None:
+    target_node = None
+    for node in ast.walk(tree):
+        if not _node_contains_line(node, start_line):
+            continue
+        if target_node is None or _is_more_specific_node(node, target_node):
+            target_node = node
+    return target_node
+
+
+_FORBIDDEN_FUNCS = frozenset({"open", "print", "eval", "exec", "__import__", "sleep"})
+
+# Two deliberately different attribute denylists, keyed on how precisely we could
+# locate the callable's source:
+#   * _FORBIDDEN_ATTRS — used when we parsed the whole source file and isolated the
+#     exact function/lambda node (_try_verify_via_sourcefile). Precise context, so a
+#     tight denylist suffices.
+#   * _FALLBACK_FORBIDDEN_ATTRS — used when we could only recover a mangled source
+#     snippet via inspect.getsource (_try_verify_via_getsource). Less certainty about
+#     what we're looking at, so we additionally ban common network I/O method names
+#     (get/post/request/connect). Keep this a SUPERSET of _FORBIDDEN_ATTRS; do not
+#     collapse the two — the fallback is intentionally stricter.
+_FORBIDDEN_ATTRS = frozenset({"sleep", "system", "popen", "urlopen"})
+_FALLBACK_FORBIDDEN_ATTRS = _FORBIDDEN_ATTRS | frozenset({"get", "post", "request", "connect"})
+
+
+def _verify_function_defaults(args: ast.arguments) -> None:
+    for default in args.defaults + args.kw_defaults:
+        if default is not None and isinstance(default, (ast.List, ast.Dict, ast.Set)):
+            raise PermissionError("Mutable default argument in CPN callable introduces hidden state between firings.")
+
+
+def _verify_node_purity(node: ast.AST, forbidden_attrs: frozenset[str]) -> None:
+    match node:
+        case ast.Call(func=ast.Name(id=name)) if name in _FORBIDDEN_FUNCS:
+            raise PermissionError(f"Forbidden function call '{name}' inside CPN callable.")
+        case ast.Call(func=ast.Attribute(attr=attr)) if attr in forbidden_attrs:
+            raise PermissionError(f"Forbidden attribute call '.{attr}' inside CPN callable.")
+        case ast.Import() | ast.ImportFrom():
+            raise PermissionError("Imports are forbidden inside CPN callables.")
+        case ast.Global() | ast.Nonlocal():
+            raise PermissionError("Global/nonlocal mutations are forbidden inside CPN callables.")
+        case ast.FunctionDef(args=args) | ast.AsyncFunctionDef(args=args):
+            _verify_function_defaults(args)
+
+
+def _verify_ast_purity(tree: ast.AST, is_fallback: bool = False) -> None:
+    forbidden_attrs = _FALLBACK_FORBIDDEN_ATTRS if is_fallback else _FORBIDDEN_ATTRS
+    for node in ast.walk(tree):
+        _verify_node_purity(node, forbidden_attrs)
+
+
+def _try_verify_via_sourcefile(func: Callable) -> bool:
+    try:
+        file_path = inspect.getsourcefile(func)
+        lines, start_line = inspect.getsourcelines(func)
+        if file_path:
+            with open(file_path, "r", encoding="utf-8") as f:
+                file_content = f.read()
+            tree = ast.parse(file_content, filename=file_path)
+
+            target_node = _find_target_node(tree, start_line)
+            if target_node is not None:
+                _verify_ast_purity(target_node)
+                return True
+    except PermissionError:
+        raise
+    except Exception:
+        pass
+    return False
+
+
+def _clean_fallback_source(source: str) -> str:
+    if source.endswith(","):
+        source = source[:-1]
+    if "=" in source and not source.startswith("def "):
+        parts = source.split("=", 1)
+        # After splitting on the first "=", the comparison-operator char (>, <, !)
+        # is the last char of parts[0].  A bare "=" (for "==") also stays.
+        if not parts[0].rstrip().endswith((">", "<", "!", "=")):
+            source = parts[1].strip()
+    return source
+
+
+def _try_verify_via_getsource(func: Callable) -> None:
+    try:
+        import textwrap
+
+        source = textwrap.dedent(inspect.getsource(func)).strip()
+        source = _clean_fallback_source(source)
+        tree = ast.parse(source)
+        _verify_ast_purity(tree, is_fallback=True)
+    except PermissionError:
+        raise
+    except (OSError, TypeError) as exc:
+        raise PermissionError(
+            f"Cannot verify purity of {func!r}: source unavailable. "
+            "Use a plain lambda or def-statement function instead."
+        ) from exc
+    except Exception:
+        # Source cannot be retrieved or parsed (e.g. compiled built-in, REPL lambda) — allow with caution.
+        pass
 
 
 def verify_callable_purity(func: Callable) -> None:
@@ -130,119 +264,6 @@ def verify_callable_purity(func: Callable) -> None:
       parameter defaults), which would introduce hidden persistent state between
       transition firings.
     """
-    # 1. Try file-level AST parsing to find the exact node (very robust for nested lambdas/functions)
-    try:
-        file_path = inspect.getsourcefile(func)
-        lines, start_line = inspect.getsourcelines(func)
-        if file_path:
-            with open(file_path, "r", encoding="utf-8") as f:
-                file_content = f.read()
-            tree = ast.parse(file_content, filename=file_path)
-
-            # Find the most specific (innermost) FunctionDef, AsyncFunctionDef, or Lambda
-            # at start_line
-            target_node = None
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                    if hasattr(node, "lineno"):
-                        end_lineno = getattr(node, "end_lineno", node.lineno)
-                        if node.lineno <= start_line <= end_lineno:
-                            if target_node is None:
-                                target_node = node
-                            else:
-                                # Use the smaller/nested node if multiple contain start_line
-                                target_start = target_node.lineno
-                                target_end = getattr(target_node, "end_lineno", target_start)
-                                if node.lineno >= target_start and end_lineno <= target_end:
-                                    target_node = node
-
-            if target_node is not None:
-                for node in ast.walk(target_node):
-                    if isinstance(node, ast.Call):
-                        if isinstance(node.func, ast.Name) and node.func.id in {
-                            "open",
-                            "print",
-                            "eval",
-                            "exec",
-                            "__import__",
-                            "sleep",
-                        }:
-                            raise PermissionError(f"Forbidden function call '{node.func.id}' inside CPN callable.")
-                        elif isinstance(node.func, ast.Attribute) and node.func.attr in {
-                            "sleep",
-                            "system",
-                            "popen",
-                            "urlopen",
-                        }:
-                            raise PermissionError(f"Forbidden attribute call '.{node.func.attr}' inside CPN callable.")
-                    elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                        raise PermissionError("Imports are forbidden inside CPN callables.")
-                    elif isinstance(node, (ast.Global, ast.Nonlocal)):
-                        raise PermissionError("Global/nonlocal mutations are forbidden inside CPN callables.")
-                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        for default in node.args.defaults + node.args.kw_defaults:
-                            if default is not None and isinstance(default, (ast.List, ast.Dict, ast.Set)):
-                                raise PermissionError(
-                                    "Mutable default argument in CPN callable introduces hidden state between firings."
-                                )
-                return
-    except PermissionError:
-        raise
-    except Exception:
-        pass
-
-    # 2. Fall back to parsing inspect.getsource directly with cleanups
-    try:
-        import textwrap
-
-        source = textwrap.dedent(inspect.getsource(func)).strip()
-        if source.endswith(","):
-            source = source[:-1]
-        if "=" in source and not source.startswith("def "):
-            parts = source.split("=", 1)
-            if not parts[0].strip().endswith((">=", "<=", "!=", "==")):
-                source = parts[1].strip()
-
-        tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in {
-                    "open",
-                    "print",
-                    "eval",
-                    "exec",
-                    "__import__",
-                    "sleep",
-                }:
-                    raise PermissionError(f"Forbidden function call '{node.func.id}' inside CPN callable.")
-                elif isinstance(node.func, ast.Attribute) and node.func.attr in {
-                    "sleep",
-                    "system",
-                    "popen",
-                    "get",
-                    "post",
-                    "request",
-                    "urlopen",
-                    "connect",
-                }:
-                    raise PermissionError(f"Forbidden attribute call '.{node.func.attr}' inside CPN callable.")
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                raise PermissionError("Imports are forbidden inside CPN callables.")
-            elif isinstance(node, (ast.Global, ast.Nonlocal)):
-                raise PermissionError("Global/nonlocal mutations are forbidden inside CPN callables.")
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                for default in node.args.defaults + node.args.kw_defaults:
-                    if default is not None and isinstance(default, (ast.List, ast.Dict, ast.Set)):
-                        raise PermissionError(
-                            "Mutable default argument in CPN callable introduces hidden state between firings."
-                        )
-    except PermissionError:
-        raise
-    except (OSError, TypeError) as exc:
-        raise PermissionError(
-            f"Cannot verify purity of {func!r}: source unavailable. "
-            "Use a plain lambda or def-statement function instead."
-        ) from exc
-    except Exception:
-        # If we absolutely cannot retrieve or parse source (e.g. compiled built-in or REPL), allow with caution
-        pass
+    if _try_verify_via_sourcefile(func):
+        return
+    _try_verify_via_getsource(func)

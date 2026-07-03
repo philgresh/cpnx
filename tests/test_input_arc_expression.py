@@ -236,24 +236,24 @@ class TestInputArcMultiplicity:
         assert received == [2]  # fired once, consuming exactly 2
         assert len(net.places["out"]) == 2
 
-    def test_resolve_arc_tokens_multiplicity_rule(self):
+    def test_resolve_input_tokens_multiplicity_rule(self):
         """Direct unit test of the shared resolver's all-or-nothing rule."""
         net = PetriNet()
         a, b, c = Token(), Token(), Token()
 
         # default arc (no expression): count satisfied by slicing
-        assert net._resolve_arc_tokens(InputArc("p", count=2), [a, b, c]) == [a, b]
+        assert net._resolve_input_tokens(InputArc("p", count=2), [a, b, c]) == [a, b]
         # default arc under-supplied: fewer available than count -> None
-        assert net._resolve_arc_tokens(InputArc("p", count=2), [a]) is None
+        assert net._resolve_input_tokens(InputArc("p", count=2), [a]) is None
         # expression yields fewer than count -> None
-        assert net._resolve_arc_tokens(InputArc("p", count=2, expression=lambda toks: toks[:1]), [a, b]) is None
+        assert net._resolve_input_tokens(InputArc("p", count=2, expression=lambda toks: toks[:1]), [a, b]) is None
         # expression yields >= count -> first count returned
-        assert net._resolve_arc_tokens(InputArc("p", count=2, expression=lambda toks: toks), [a, b, c]) == [a, b]
+        assert net._resolve_input_tokens(InputArc("p", count=2, expression=lambda toks: toks), [a, b, c]) == [a, b]
         # empty expression result -> None (no zero-token firing)
-        assert net._resolve_arc_tokens(InputArc("p", count=1, expression=lambda toks: []), [a]) is None
+        assert net._resolve_input_tokens(InputArc("p", count=1, expression=lambda toks: []), [a]) is None
         # consume_all with tokens present -> all of them
-        assert net._resolve_arc_tokens(InputArc("p", consume_all=True), [a, b, c]) == [a, b, c]
+        assert net._resolve_input_tokens(InputArc("p", consume_all=True), [a, b, c]) == [a, b, c]
         # consume_all on empty -> None (no empty occurrence)
-        assert net._resolve_arc_tokens(InputArc("p", consume_all=True), []) is None
+        assert net._resolve_input_tokens(InputArc("p", consume_all=True), []) is None
         # expression that raises -> None (unchanged behavior)
-        assert net._resolve_arc_tokens(InputArc("p", count=1, expression=lambda toks: 1 / 0), [a]) is None
+        assert net._resolve_input_tokens(InputArc("p", count=1, expression=lambda toks: 1 / 0), [a]) is None

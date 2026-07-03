@@ -16,9 +16,9 @@ def snapshot(net: "PetriNet") -> dict[str, Any]:
     from cpnx.places import SinkPlace
 
     with net._lock:
-        places_snapshot = {}
+        places_snapshot: dict[str, Any] = {}
         for name, place in net.places.items():
-            tokens_list = []
+            tokens_list: list[dict[str, Any]] = []
             for t in place.tokens:
                 tokens_list.append(
                     {
@@ -79,9 +79,9 @@ def to_dot(net: "PetriNet") -> str:
                 lines.append(f'  "{arc.place}" -> "{name}" [label="{label}"];')
 
             # Outputs: Transition -> Place
-            for arc in trans.outputs:
-                label = f"count={arc.count}"
-                lines.append(f'  "{name}" -> "{arc.place}" [label="{label}"];')
+            for out_arc in trans.outputs:
+                label = f"count={out_arc.count}"
+                lines.append(f'  "{name}" -> "{out_arc.place}" [label="{label}"];')
 
         lines.append("}")
         return "\n".join(lines)

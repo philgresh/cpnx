@@ -6,13 +6,114 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable
+from typing import Callable, TypeAlias
 
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace
 from cpnx.sandbox import SandboxEvaluator
 from cpnx.tokens import Token
-from cpnx.transitions import InputArc, SubstitutionTransition, Transition
+from cpnx.transitions import InputArc, OutputArc, SubstitutionTransition, Transition
 from cpnx.visualization import snapshot, to_dot
+
+_DepositFn: TypeAlias = Callable[[str, Token], None]
+"""Callable that deposits a token into a named place. Must be invoked under the engine lock."""
+
+
+def _enact_planned_deposits(
+    planned_deposits: list[tuple[str, Token]],
+    active_outputs: list[tuple[OutputArc, bool]],
+    res_deque: deque[Token],
+    out_deque: deque[Token],
+    *,
+    deposit: _DepositFn,
+) -> list[tuple[str, Token]]:
+    """Commit deposits and drain consumed tokens from their deques.
+
+    ``deposit`` must be called under the engine lock.
+    """
+    deposited: list[tuple[str, Token]] = []
+    for place_name, token in planned_deposits:
+        deposit(place_name, token)
+        deposited.append((place_name, token))
+
+    for arc, is_res_place in active_outputs:
+        for _ in range(arc.count):
+            if is_res_place:
+                res_deque.popleft()
+            else:
+                out_deque.popleft()
+    return deposited
+
+
+def _return_leftover_resources(
+    res_deque: deque[Token],
+    token_sources: list[tuple[str, Token]],
+    *,
+    deposit: _DepositFn,
+) -> list[tuple[str, Token]]:
+    """Return unconsumed resource tokens to their source places.
+
+    ``deposit`` must be called under the engine lock.
+    """
+    deposited: list[tuple[str, Token]] = []
+    while res_deque:
+        leftover_token = res_deque.popleft()
+        for src_name, t in token_sources:
+            if t.id == leftover_token.id:
+                deposit(src_name, leftover_token)
+                deposited.append((src_name, leftover_token))
+                break
+    return deposited
+
+
+def _rollback_data_token(
+    t: Token,
+    src_name: str,
+    transition: Transition,
+    retry_delay: float,
+    error_place: str,
+) -> tuple[str, Token, bool]:
+    max_retries = transition.max_retries
+    if max_retries is None or t.attempts < max_retries:
+        retry_at = time.monotonic() + retry_delay
+        return src_name, t.evolve(available_at=retry_at, attempts=t.attempts + 1), False
+    return error_place, t.evolve(available_at=0.0), True
+
+
+def _process_rollback_token(
+    t: Token,
+    src_name: str,
+    transition: Transition,
+    retry_delay: float,
+    error_place: str,
+) -> tuple[str, Token, bool]:
+    if t.is_resource:
+        return src_name, t, False
+    return _rollback_data_token(t, src_name, transition, retry_delay, error_place)
+
+
+def _rollback_failed_transition(
+    transition: Transition,
+    token_sources: list[tuple[str, Token]],
+    *,
+    deposit: _DepositFn,
+    retry_delay: float,
+    error_place: str,
+) -> tuple[list[tuple[str, Token]], list[Token], list[Token]]:
+    """Return all consumed tokens to their source places after a failed firing.
+
+    ``deposit`` must be a callable that is safe to invoke under the engine lock —
+    callers are responsible for holding it before calling this function.
+    """
+    deposited: list[tuple[str, Token]] = []
+    dead_lettered_data_tokens: list[Token] = []
+    data_tokens = [t for _, t in token_sources if not t.is_resource]
+    for src_name, t in token_sources:
+        dest, rollback_t, is_dead_letter = _process_rollback_token(t, src_name, transition, retry_delay, error_place)
+        deposit(dest, rollback_t)
+        deposited.append((dest, rollback_t))
+        if is_dead_letter:
+            dead_lettered_data_tokens.append(rollback_t)
+    return deposited, dead_lettered_data_tokens, data_tokens
 
 
 class PetriNet:
@@ -200,6 +301,15 @@ class PetriNet:
             if isinstance(place, PacedResourcePlace):
                 self._has_timed_features = True
 
+    def _validate_new_transition(self, transition: Transition) -> None:
+        if transition.name in self.places:
+            raise ValueError(f"Name overlap: '{transition.name}' is already registered as a Place.")
+        for arc in transition.inputs + transition.outputs:
+            if arc.place == transition.name or arc.place in self.transitions:
+                raise TypeError(
+                    f"Arc target '{arc.place}' is a Transition, not a Place. Arcs must connect Places↔Transitions only."
+                )
+
     def add_transition(self, transition: Transition) -> None:
         """Register a transition with the net.
 
@@ -211,14 +321,7 @@ class PetriNet:
             transition: The :class:`~cpnx.transitions.Transition` to register.
         """
         with self._lock:
-            if transition.name in self.places:
-                raise ValueError(f"Name overlap: '{transition.name}' is already registered as a Place.")
-            for arc in transition.inputs + transition.outputs:
-                if arc.place == transition.name or arc.place in self.transitions:
-                    raise TypeError(
-                        f"Arc target '{arc.place}' is a Transition, not a Place. "
-                        "Arcs must connect Places↔Transitions only."
-                    )
+            self._validate_new_transition(transition)
             self.transitions[transition.name] = transition
             if any(arc.settle_secs > 0.0 for arc in transition.inputs):
                 self._has_timed_features = True
@@ -249,6 +352,51 @@ class PetriNet:
             except Exception:
                 pass
 
+    @staticmethod
+    def _filter_highest_priority(transitions: list[Transition]) -> list[Transition]:
+        if not transitions:
+            return []
+        min_priority = min(t.priority for t in transitions)
+        return [t for t in transitions if t.priority == min_priority]
+
+    def _select_transition_to_fire(self) -> Transition | None:
+        enabled = [t for t in self.transitions.values() if self._is_transition_enabled(t)]
+        candidates = self._filter_highest_priority(enabled)
+        return random.choice(candidates) if candidates else None
+
+    def _retrieve_tokens_for_arc(self, arc: InputArc, place: Place, m_time: float | None) -> list[Token]:
+        if arc.consume_all:
+            return place.retrieve_all(model_time=m_time)
+        if arc.expression is not None:
+            # Consumption uses the same string-vs-callable dispatch as enabling, but must let
+            # a raising expression propagate so _retrieve_consumed_tokens can roll back the
+            # tokens already consumed from earlier arcs (unlike the enable check, which treats
+            # a raising expression as "not enabled").
+            available = place.peek(len(place), model_time=m_time)
+            ordered = self._eval_expression(arc.expression, arc._compiled_expression, available)  # type: ignore[attr-defined]
+            return place.retrieve_specific(ordered[: arc.count], model_time=m_time)
+        return place.retrieve(arc.count, model_time=m_time)
+
+    def _retrieve_consumed_tokens(
+        self, transition: Transition, m_time: float | None
+    ) -> tuple[list[Token], list[tuple[str, Token]]]:
+        consumed_tokens: list[Token] = []
+        token_sources: list[tuple[str, Token]] = []
+        try:
+            for arc in transition.inputs:
+                place = self.places[arc.place]
+                tokens = self._retrieve_tokens_for_arc(arc, place, m_time)
+                consumed_tokens.extend(tokens)
+                for t in tokens:
+                    token_sources.append((arc.place, t))
+        except Exception:
+            # Expression raised mid-loop — return already-consumed tokens to their
+            # source places so they are not silently lost.
+            for src_name, t in token_sources:
+                self._deposit_under_lock(src_name, t)
+            raise
+        return consumed_tokens, token_sources
+
     def step(self) -> bool:
         """Fire the highest-priority enabled transition, scheduling its action asynchronously.
 
@@ -264,42 +412,12 @@ class PetriNet:
                           a ``with`` block).
         """
         with self._lock:
-            enabled = [t for t in self.transitions.values() if self._is_transition_enabled(t)]
-            if not enabled:
+            selected = self._select_transition_to_fire()
+            if not selected:
                 return False
 
-            min_priority = min(t.priority for t in enabled)
-            candidates = [t for t in enabled if t.priority == min_priority]
-            selected = random.choice(candidates)
-
-            consumed_tokens: list[Token] = []
-            token_sources: list[tuple[str, Token]] = []
             m_time = self._get_model_time_under_lock()
-            try:
-                for arc in selected.inputs:
-                    place = self.places[arc.place]
-                    if arc.consume_all:
-                        tokens = place.retrieve_all(model_time=m_time)
-                    elif arc.expression is not None:
-                        available = place.peek(len(place), model_time=m_time)
-                        if isinstance(arc.expression, str):
-                            ordered = SandboxEvaluator.evaluate_compiled(
-                                arc._compiled_expression, {"tokens": available}
-                            )
-                        else:
-                            ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
-                        tokens = place.retrieve_specific(ordered[: arc.count], model_time=m_time)
-                    else:
-                        tokens = place.retrieve(arc.count, model_time=m_time)
-                    consumed_tokens.extend(tokens)
-                    for t in tokens:
-                        token_sources.append((arc.place, t))
-            except Exception:
-                # Expression raised mid-loop — return already-consumed tokens to their
-                # source places so they are not silently lost.
-                for src_name, t in token_sources:
-                    self._deposit_under_lock(src_name, t)
-                raise
+            consumed_tokens, token_sources = self._retrieve_consumed_tokens(selected, m_time)
 
             self._running_count += 1
             try:
@@ -315,6 +433,16 @@ class PetriNet:
 
         return True
 
+    def _validate_transition_arcs(self, transition_name: str, transition: Transition) -> None:
+        for arc in transition.inputs + transition.outputs:
+            if arc.place in self.transitions:
+                raise TypeError(
+                    f"Arc target '{arc.place}' in transition '{transition_name}' is a Transition, not a Place. "
+                    f"Arcs must connect Places↔Transitions only."
+                )
+            if arc.place not in self.places:
+                raise KeyError(f"Place '{arc.place}' referenced by transition '{transition_name}' is not registered.")
+
     def validate(self) -> None:
         """Validate the structural topology of the Petri net.
 
@@ -328,14 +456,26 @@ class PetriNet:
                 raise ValueError(f"Name overlap: '{list(overlaps)[0]}' is registered as both a Place and a Transition.")
 
             for name, transition in self.transitions.items():
-                for arc in transition.inputs + transition.outputs:
-                    if arc.place in self.transitions:
-                        raise TypeError(
-                            f"Arc target '{arc.place}' in transition '{name}' is a Transition, not a Place. "
-                            f"Arcs must connect Places↔Transitions only."
-                        )
-                    if arc.place not in self.places:
-                        raise KeyError(f"Place '{arc.place}' referenced by transition '{name}' is not registered.")
+                self._validate_transition_arcs(name, transition)
+
+    def _wait_for_work(self, deadline: float | None, stop_event: threading.Event | None) -> None:
+        timeout = self.cooldown_interval
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            timeout = min(remaining, timeout)
+
+        if stop_event is not None:
+            timeout = min(timeout, 0.1)
+
+        self._work_available.wait(timeout=timeout)
+
+    @staticmethod
+    def _should_stop_run(deadline: float | None, stop_event: threading.Event | None) -> bool:
+        if stop_event is not None and stop_event.is_set():
+            return True
+        return deadline is not None and time.monotonic() > deadline
 
     def run(
         self,
@@ -367,25 +507,11 @@ class PetriNet:
         """
         self.validate()
         while not self.is_quiescent():
-            if stop_event is not None and stop_event.is_set():
-                break
-            if deadline is not None and time.monotonic() > deadline:
+            if self._should_stop_run(deadline, stop_event):
                 break
             self._work_available.clear()
             if not self.step():
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    timeout = min(remaining, self.cooldown_interval)
-                    if stop_event is not None:
-                        timeout = min(timeout, 0.1)
-                    self._work_available.wait(timeout=timeout)
-                else:
-                    timeout = self.cooldown_interval
-                    if stop_event is not None:
-                        timeout = min(timeout, 0.1)
-                    self._work_available.wait(timeout=timeout)
+                self._wait_for_work(deadline, stop_event)
 
     def is_quiescent(self) -> bool:
         """Return ``True`` if no transitions are running and none can currently fire.
@@ -516,7 +642,66 @@ class PetriNet:
             )
         self.places[place_name].deposit(token, model_time=self._get_model_time_under_lock())
 
-    def _resolve_arc_tokens(self, arc: InputArc, available: list[Token]) -> list[Token] | None:
+    def _is_transition_enabled(self, transition: Transition) -> bool:
+        """Return ``True`` if all preconditions for firing *transition* are satisfied.
+
+        Checks token availability (including cooldowns and thresholds), settle
+        windows, and the user-supplied guard. Called while holding ``self._lock``.
+        """
+        m_time = self._get_model_time_under_lock()
+        ok, candidate_tokens = self._check_input_preconditions(transition, m_time)
+        if not ok:
+            return False
+
+        if not self._check_output_capacity(transition):
+            return False
+
+        return self._check_transition_guard(transition, candidate_tokens)
+
+    def _is_place_ready(self, arc: InputArc, place: Place | None, m_time: float | None) -> bool:
+        if not place or not place.can_retrieve(arc.count, model_time=m_time):
+            return False
+        return self._is_settle_time_met(place, arc)
+
+    def _check_arc_preconditions(self, arc: InputArc, place: Place | None, m_time: float | None) -> list[Token] | None:
+        if not self._is_place_ready(arc, place, m_time):
+            return None
+        available = place.peek(len(place), model_time=m_time)  # type: ignore[union-attr]
+        # _resolve_input_tokens enforces the multiplicity rule (returns None if fewer
+        # than arc.count tokens are eligible) and already slices to arc.count.
+        return self._resolve_input_tokens(arc, available)
+
+    def _check_input_preconditions(self, transition: Transition, m_time: float | None) -> tuple[bool, list[Token]]:
+        tokens_for_guard: list[Token] = []
+        for arc in transition.inputs:
+            resolved = self._check_arc_preconditions(arc, self.places.get(arc.place), m_time)
+            if resolved is None:
+                return False, []
+            tokens_for_guard.extend(resolved)
+        return True, tokens_for_guard
+
+    def _is_settle_time_met(self, place: Place, arc: InputArc) -> bool:
+        if arc.settle_secs <= 0.0:
+            return True
+        if self._model_time is not None:
+            elapsed = self._model_time - place.last_deposit_time_model
+        else:
+            elapsed = time.monotonic() - place.last_deposit_time
+        return elapsed >= arc.settle_secs
+
+    def _eval_expression(self, expression, compiled, tokens: list[Token]):
+        """Evaluate a string (precompiled, sandboxed) or callable *expression* over *tokens*.
+
+        Centralizes the string-vs-callable dispatch shared by input-arc selection
+        (:meth:`_resolve_input_tokens`), output-arc guards (:meth:`_is_arc_active`),
+        and transition guards (:meth:`_check_transition_guard`). Callers are
+        responsible for coercing/bounding the result and for exception handling.
+        """
+        if isinstance(expression, str):
+            return SandboxEvaluator.evaluate_compiled(compiled, {"tokens": tokens})
+        return self._call_expr(expression, tokens, timeout=self.expr_timeout_secs)
+
+    def _resolve_input_tokens(self, arc: InputArc, available: list[Token]) -> list[Token] | None:
         """Resolve which tokens input *arc* would consume from *available*.
 
         Returns the selected tokens, or ``None`` if the arc cannot be satisfied —
@@ -526,19 +711,16 @@ class PetriNet:
         resolved, so a selection that yields fewer (or none) disables the
         transition rather than firing with a short or zero-length token list.
 
-        Shared by :meth:`_is_transition_enabled` and
-        :meth:`_is_transition_potentially_enabled` so both apply the identical
-        multiplicity rule; callers differ only in how *available* is computed
-        (real/model time vs. timing-agnostic).
+        Shared by the firing check (via :meth:`_check_arc_preconditions`) and the
+        timing-agnostic :meth:`_is_transition_potentially_enabled` so both apply
+        the identical multiplicity rule; callers differ only in how *available*
+        is computed (real/model time vs. ignoring timing).
         """
         if arc.consume_all:
             tokens = available
         elif arc.expression is not None:
             try:
-                if isinstance(arc.expression, str):
-                    ordered = SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": available})
-                else:
-                    ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
+                ordered = self._eval_expression(arc.expression, arc._compiled_expression, available)  # type: ignore[attr-defined]
                 tokens = ordered[: arc.count]
             except Exception:
                 return None
@@ -548,37 +730,7 @@ class PetriNet:
             return None
         return tokens
 
-    def _is_transition_enabled(self, transition: Transition) -> bool:
-        """Return ``True`` if all preconditions for firing *transition* are satisfied.
-
-        Checks token availability (including cooldowns and thresholds), settle
-        windows, and the user-supplied guard. Called while holding ``self._lock``.
-        """
-        candidate_tokens: list[Token] = []
-        m_time = self._get_model_time_under_lock()
-        for arc in transition.inputs:
-            place = self.places.get(arc.place)
-            if place is None:
-                return False
-            if not place.can_retrieve(arc.count, model_time=m_time):
-                return False
-            if arc.settle_secs > 0.0:
-                # last_deposit_time is only written while self._lock is held, so
-                # reading it here (also under self._lock) is safe without place._lock.
-                if self._model_time is not None:
-                    elapsed = self._model_time - place.last_deposit_time_model
-                else:
-                    elapsed = time.monotonic() - place.last_deposit_time
-                if elapsed < arc.settle_secs:
-                    return False
-
-            # Speculatively resolve candidate tokens
-            available = place.peek(len(place), model_time=m_time)
-            tokens = self._resolve_arc_tokens(arc, available)
-            if tokens is None:
-                return False
-            candidate_tokens.extend(tokens)
-
+    def _check_output_capacity(self, transition: Transition) -> bool:
         # Back-pressure: refuse to fire if an unguarded output arc's target place is full.
         # Guarded arcs are skipped — their target may never receive a token, so checking
         # capacity speculatively would cause spurious blocking.
@@ -588,18 +740,15 @@ class PetriNet:
             place = self.places.get(arc.place)
             if place is not None and not place.can_deposit(arc.count):
                 return False
-
-        if transition.guard is not None:
-            try:
-                if isinstance(transition.guard, str):
-                    if not SandboxEvaluator.evaluate_compiled(transition._compiled_guard, {"tokens": candidate_tokens}):
-                        return False
-                else:
-                    if not self._call_expr(transition.guard, candidate_tokens, timeout=self.expr_timeout_secs):
-                        return False
-            except Exception:
-                return False
         return True
+
+    def _check_transition_guard(self, transition: Transition, candidate_tokens: list[Token]) -> bool:
+        if transition.guard is None:
+            return True
+        try:
+            return bool(self._eval_expression(transition.guard, transition._compiled_guard, candidate_tokens))  # type: ignore[attr-defined]
+        except Exception:
+            return False
 
     def _is_transition_potentially_enabled(self, transition: Transition) -> bool:
         """Return ``True`` if *transition* could fire given current token counts, ignoring timing.
@@ -619,22 +768,44 @@ class PetriNet:
                 return False
             # Speculatively resolve candidate tokens ignoring timing
             available = place.peek(len(place), model_time=float("inf"))
-            tokens = self._resolve_arc_tokens(arc, available)
+            tokens = self._resolve_input_tokens(arc, available)
             if tokens is None:
                 return False
             candidate_tokens.extend(tokens)
 
-        if transition.guard is not None:
+        return self._check_transition_guard(transition, candidate_tokens)
+
+    def _commit_or_rollback_transition(
+        self,
+        transition: Transition,
+        success: bool,
+        consumed_tokens: list[Token],
+        output_tokens: list[Token],
+        token_sources: list[tuple[str, Token]],
+        error: BaseException | None,
+    ) -> tuple[bool, BaseException | None, list[Token], list[Token], list[tuple[str, Token]]]:
+        data_tokens: list[Token] = []
+        dl_data: list[Token] = []
+        deposited: list[tuple[str, Token]] = []
+
+        if success:
             try:
-                if isinstance(transition.guard, str):
-                    if not SandboxEvaluator.evaluate_compiled(transition._compiled_guard, {"tokens": candidate_tokens}):
-                        return False
-                else:
-                    if not self._call_expr(transition.guard, candidate_tokens, timeout=self.expr_timeout_secs):
-                        return False
-            except Exception:
-                return False
-        return True
+                success, error, data_tokens, dl_data, deposited = self._try_commit_transition(
+                    transition, consumed_tokens, output_tokens, token_sources
+                )
+            except BaseException as exc:
+                success = False
+                error = exc
+
+        if not success:
+            deposited, dl_data, data_tokens = _rollback_failed_transition(
+                transition,
+                token_sources,
+                deposit=self._deposit_under_lock,
+                retry_delay=self.retry_delay,
+                error_place=self.error_place,
+            )
+        return success, error, data_tokens, dl_data, deposited
 
     def _execute_transition(
         self,
@@ -642,204 +813,17 @@ class PetriNet:
         consumed_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
     ) -> None:
-        """Execute a transition action and distribute output tokens.
-
-        Runs on the thread pool. Guarantees:
-
-        - On failure, resource tokens are returned to their source places.
-        - Data tokens are retried (returned to source with a delay and an incremented
-          ``attempts`` counter) up to ``max_retries`` times, or dead-lettered to
-          ``error_place`` when exhausted.
-        - Callbacks (:attr:`on_token_deposited`, :attr:`on_error`, :attr:`on_token_dead_lettered`)
-          fire **outside** the engine lock to prevent re-entrant deadlocks.
-        - :attr:`_running_count` is always decremented exactly once.
-        """
+        start_time = time.monotonic()
         try:
-            start_time = time.monotonic()
-            success = False
-            output_tokens: list[Token] = []
-            error: BaseException | None = None
-
-            try:
-                if isinstance(transition, SubstitutionTransition):
-                    output_tokens = self._execute_substitution_transition(transition, consumed_tokens, token_sources)
-                elif transition.action_timeout_secs is None:
-                    output_tokens = transition.action(consumed_tokens)
-                else:
-                    fut = self._action_executor.submit(transition.action, consumed_tokens)
-                    try:
-                        output_tokens = fut.result(timeout=transition.action_timeout_secs)
-                    except concurrent.futures.TimeoutError:
-                        raise RuntimeError(
-                            f"Transition '{transition.name}' action exceeded "
-                            f"{transition.action_timeout_secs}s timeout — tokens rolled back. "
-                            f"The action thread is still running in the background; "
-                            f"use native I/O timeouts inside your action to prevent zombie accumulation."
-                        ) from None
-                success = True
-            except BaseException as exc:
-                error = exc
-
-            deposited: list[tuple[str, Token]] = []
-            duration = 0.0
-            data_tokens: list[Token] = []
-
+            success, output_tokens, error = self._execute_transition_action(transition, consumed_tokens, token_sources)
             with self._lock:
                 duration = time.monotonic() - start_time
-
-                if success:
-                    res_deque: deque[Token] = deque(t for t in consumed_tokens if t.is_resource)
-                    out_deque: deque[Token] = deque(t for t in output_tokens if not t.is_resource)
-
-                    # Pass 1: evaluate arc guards to determine which output arcs fire.
-                    # Guards receive the non-resource output tokens (CPN arc guard semantics).
-                    # Resource arcs are never guarded — resources must always return to a place.
-                    output_tokens_data = list(out_deque)
-                    active_outputs: list[tuple[Transition, bool]] = []  # type: ignore[type-arg]
-                    for arc in transition.outputs:
-                        is_res = isinstance(self.places.get(arc.place), (ResourcePlace, PacedResourcePlace))
-                        if arc.expression is None:
-                            active_outputs.append((arc, is_res))  # type: ignore[arg-type]
-                        elif isinstance(arc.expression, str):
-                            if SandboxEvaluator.evaluate_compiled(
-                                arc._compiled_expression, {"tokens": output_tokens_data}
-                            ):
-                                active_outputs.append((arc, is_res))  # type: ignore[arg-type]
-                        elif self._call_expr(arc.expression, output_tokens_data, timeout=self.expr_timeout_secs):
-                            active_outputs.append((arc, is_res))  # type: ignore[arg-type]
-
-                    # Pass 2: pre-flight — validate supply against active arcs only so that
-                    # guarded-out arcs don't inflate the demand count and cause spurious failures.
-                    resource_demand = sum(arc.count for arc, is_res in active_outputs if is_res)  # type: ignore[attr-defined]
-                    data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)  # type: ignore[attr-defined]
-                    if len(res_deque) < resource_demand:
-                        success = False
-                        error = ValueError(
-                            f"Transition '{transition.name}': active resource output arcs require "
-                            f"{resource_demand} resource token(s) but only {len(res_deque)} were consumed. "
-                            f"Ensure each ResourcePlace/PacedResourcePlace InputArc has a matching OutputArc."
-                        )
-                    elif len(out_deque) < data_demand:
-                        success = False
-                        error = ValueError(
-                            f"Transition '{transition.name}': action returned {len(out_deque)} non-resource "
-                            f"token(s) but active non-resource output arcs require {data_demand}. "
-                            f"Ensure your action returns at least as many tokens as the sum of "
-                            f"non-resource OutputArc counts (after arc guard evaluation)."
-                        )
-
-                if success:
-                    # Construct planned deposits list first
-                    planned_deposits: list[tuple[str, Token]] = []
-                    res_temp = deque(res_deque)
-                    out_temp = deque(out_deque)
-                    for arc, is_res_place in active_outputs:
-                        for _ in range(arc.count):
-                            t = res_temp.popleft() if is_res_place else out_temp.popleft()
-                            planned_deposits.append((arc.place, t))
-
-                    # Accumulate planned count per place to validate k-bound cumulatively
-                    place_deposit_counts = {}
-                    for place_name, _ in planned_deposits:
-                        place_deposit_counts[place_name] = place_deposit_counts.get(place_name, 0) + 1
-
-                    # Pre-flight checks (atomicity validation)
-                    for place_name, token in planned_deposits:
-                        place = self.places.get(place_name)
-                        if place is None:
-                            success = False
-                            error = KeyError(f"Place '{place_name}' is not registered.")
-                            break
-                        if not place.can_accept(token):
-                            success = False
-                            error = TypeError(f"Place '{place_name}' cannot accept token with color '{token.color}'.")
-                            break
-
-                    if success:
-                        for place_name, count in place_deposit_counts.items():
-                            place = self.places.get(place_name)
-                            if place is not None and not place.can_deposit(count):
-                                success = False
-                                error = ValueError(f"Place '{place_name}' would exceed its bound of {place.bound}.")
-                                break
-
-                # Only if all pre-flight checks passed, actually perform the deposits
-                if success:
-                    for place_name, token in planned_deposits:
-                        self._deposit_under_lock(place_name, token)
-                        deposited.append((place_name, token))
-
-                    for arc, is_res_place in active_outputs:
-                        for _ in range(arc.count):
-                            if is_res_place:
-                                res_deque.popleft()
-                            else:
-                                out_deque.popleft()
-
-                    # Return any leftover resource tokens to their original source places
-                    while res_deque:
-                        leftover_token = res_deque.popleft()
-                        for src_name, t in token_sources:
-                            if t.id == leftover_token.id:
-                                self._deposit_under_lock(src_name, leftover_token)
-                                deposited.append((src_name, leftover_token))
-                                break
-
-                if not success:
-                    # Roll back all tokens (atomic).
-                    # Resource tokens are returned to source place.
-                    # Data tokens are either retried (returned to source with a delay and
-                    # incremented attempts counter) or dead-lettered to error_place.
-                    data_tokens = [t for _, t in token_sources if not t.is_resource]
-                    dead_lettered_data_tokens = []
-                    for src_name, t in token_sources:
-                        if t.is_resource:
-                            self._deposit_under_lock(src_name, t)
-                            deposited.append((src_name, t))
-                        else:
-                            max_retries = transition.max_retries
-                            if max_retries is None or t.attempts < max_retries:
-                                # Retry path
-                                retry_at = time.monotonic() + self.retry_delay
-                                rollback_t = t.evolve(available_at=retry_at, attempts=t.attempts + 1)
-                                self._deposit_under_lock(src_name, rollback_t)
-                                deposited.append((src_name, rollback_t))
-                            else:
-                                # Exhausted path -> route to error_place
-                                rollback_t = t.evolve(available_at=0.0)
-                                self._deposit_under_lock(self.error_place, rollback_t)
-                                deposited.append((self.error_place, rollback_t))
-                                dead_lettered_data_tokens.append(rollback_t)
+                success, error, data_tokens, dl_data, deposited = self._commit_or_rollback_transition(
+                    transition, success, consumed_tokens, output_tokens, token_sources, error
+                )
 
             # --- OUTSIDE THE LOCK ---
-            if success:
-                if self.on_transition_fired:
-                    try:
-                        self.on_transition_fired(transition.name, duration)
-                    except Exception:
-                        pass
-            else:
-                if self.on_error and error:
-                    # Unified dispatch: if there are no data tokens, call once with None.
-                    dispatch_tokens: list[Token | None] = list(data_tokens) if data_tokens else [None]
-                    for dt in dispatch_tokens:
-                        try:
-                            self.on_error(transition.name, error, dt)
-                        except Exception:
-                            pass
-                if self.on_token_dead_lettered and dead_lettered_data_tokens:
-                    for dt in dead_lettered_data_tokens:
-                        try:
-                            self.on_token_dead_lettered(transition.name, dt)
-                        except Exception:
-                            pass
-
-            if self.on_token_deposited:
-                for pname, tok in deposited:
-                    try:
-                        self.on_token_deposited(pname, tok)
-                    except Exception:
-                        pass
+            self._invoke_transition_callbacks(transition, success, duration, error, data_tokens, dl_data, deposited)
 
             if error is not None and not isinstance(error, Exception):
                 raise error
@@ -850,22 +834,244 @@ class PetriNet:
                 self._running_count -= 1
             self._work_available.set()
 
-    def _execute_substitution_transition(
+    def _try_commit_transition(
         self,
-        transition: SubstitutionTransition,
+        transition: Transition,
+        consumed_tokens: list[Token],
+        output_tokens: list[Token],
+        token_sources: list[tuple[str, Token]],
+    ) -> tuple[bool, BaseException | None, list[Token], list[Token], list[tuple[str, Token]]]:
+        res_deque: deque[Token] = deque(t for t in consumed_tokens if t.is_resource)
+        out_deque: deque[Token] = deque(t for t in output_tokens if not t.is_resource)
+        active_outputs = self._evaluate_output_guards(transition, list(out_deque))
+
+        planned_deposits, plan_error = self._plan_and_validate_deposits(
+            transition, active_outputs, res_deque, out_deque
+        )
+
+        if plan_error is not None:
+            return False, plan_error, [], [], []
+
+        deposited = _enact_planned_deposits(
+            planned_deposits,
+            active_outputs,
+            res_deque,
+            out_deque,
+            deposit=self._deposit_under_lock,
+        )
+        deposited.extend(
+            _return_leftover_resources(
+                res_deque,
+                token_sources,
+                deposit=self._deposit_under_lock,
+            )
+        )
+        return True, None, [], [], deposited
+
+    def _execute_transition_action(
+        self,
+        transition: Transition,
         consumed_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
-    ) -> list[Token]:
-        """Run a hierarchical sub-net and return its output tokens, isolated from parent context."""
-        subnet = transition.subnet
-        port_socket_map = transition.port_socket_map
+    ) -> tuple[bool, list[Token], BaseException | None]:
+        success = False
+        output_tokens: list[Token] = []
+        error: BaseException | None = None
+        try:
+            if isinstance(transition, SubstitutionTransition):
+                output_tokens = self._execute_substitution_transition(transition, consumed_tokens, token_sources)
+            elif transition.action_timeout_secs is None:
+                output_tokens = transition.action(consumed_tokens)
+            else:
+                fut = self._action_executor.submit(transition.action, consumed_tokens)
+                try:
+                    output_tokens = fut.result(timeout=transition.action_timeout_secs)
+                except concurrent.futures.TimeoutError:
+                    raise RuntimeError(
+                        f"Transition '{transition.name}' action exceeded "
+                        f"{transition.action_timeout_secs}s timeout — tokens rolled back. "
+                        f"The action thread is still running in the background; "
+                        f"use native I/O timeouts inside your action to prevent zombie accumulation."
+                    ) from None
+            success = True
+        except BaseException as exc:
+            error = exc
+        return success, output_tokens, error
 
-        # Verify strict port/socket boundaries
+    def _is_arc_active(self, arc: OutputArc, output_tokens_data: list[Token]) -> bool:
+        if arc.expression is None:
+            return True
+        return bool(self._eval_expression(arc.expression, arc._compiled_expression, output_tokens_data))  # type: ignore[attr-defined]
+
+    def _evaluate_output_guards(
+        self, transition: Transition, output_tokens_data: list[Token]
+    ) -> list[tuple[OutputArc, bool]]:
+        active_outputs: list[tuple[OutputArc, bool]] = []
+        for arc in transition.outputs:
+            is_res = isinstance(self.places.get(arc.place), (ResourcePlace, PacedResourcePlace))
+            if self._is_arc_active(arc, output_tokens_data):
+                active_outputs.append((arc, is_res))
+        return active_outputs
+
+    @staticmethod
+    def _verify_token_demand(
+        transition_name: str,
+        active_outputs: list[tuple[OutputArc, bool]],
+        res_count: int,
+        out_count: int,
+    ) -> ValueError | None:
+        resource_demand = sum(arc.count for arc, is_res in active_outputs if is_res)
+        data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)
+
+        if res_count < resource_demand:
+            return ValueError(
+                f"Transition '{transition_name}': active resource output arcs require "
+                f"{resource_demand} resource token(s) but only {res_count} were consumed. "
+                f"Ensure each ResourcePlace/PacedResourcePlace InputArc has a matching OutputArc."
+            )
+        if out_count < data_demand:
+            return ValueError(
+                f"Transition '{transition_name}': action returned {out_count} non-resource "
+                f"token(s) but active non-resource output arcs require {data_demand}. "
+                f"Ensure your action returns at least as many tokens as the sum of "
+                f"non-resource OutputArc counts (after arc guard evaluation)."
+            )
+        return None
+
+    @staticmethod
+    def _build_deposit_plan(
+        active_outputs: list[tuple[OutputArc, bool]],
+        res_deque: deque[Token],
+        out_deque: deque[Token],
+    ) -> list[tuple[str, Token]]:
+        planned_deposits: list[tuple[str, Token]] = []
+        res_temp = deque(res_deque)
+        out_temp = deque(out_deque)
+        for arc, is_res_place in active_outputs:
+            for _ in range(arc.count):
+                t = res_temp.popleft() if is_res_place else out_temp.popleft()
+                planned_deposits.append((arc.place, t))
+        return planned_deposits
+
+    @staticmethod
+    def _get_deposit_counts(planned_deposits: list[tuple[str, Token]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for place_name, _ in planned_deposits:
+            counts[place_name] = counts.get(place_name, 0) + 1
+        return counts
+
+    def _check_token_acceptance(self, planned_deposits: list[tuple[str, Token]]) -> Exception | None:
+        for place_name, token in planned_deposits:
+            place = self.places.get(place_name)
+            if place is None:
+                return KeyError(f"Place '{place_name}' is not registered.")
+            if not place.can_accept(token):
+                return TypeError(f"Place '{place_name}' cannot accept token with color '{token.color}'.")
+        return None
+
+    def _check_capacity_bounds(self, counts: dict[str, int]) -> Exception | None:
+        for place_name, count in counts.items():
+            place = self.places.get(place_name)
+            if place is not None and not place.can_deposit(count):
+                return ValueError(f"Place '{place_name}' would exceed its bound of {place.bound}.")
+        return None
+
+    def _verify_deposit_constraints(
+        self,
+        planned_deposits: list[tuple[str, Token]],
+    ) -> Exception | None:
+        err = self._check_token_acceptance(planned_deposits)
+        if err:
+            return err
+        return self._check_capacity_bounds(self._get_deposit_counts(planned_deposits))
+
+    def _plan_and_validate_deposits(
+        self,
+        transition: Transition,
+        active_outputs: list[tuple[OutputArc, bool]],
+        res_deque: deque[Token],
+        out_deque: deque[Token],
+    ) -> tuple[list[tuple[str, Token]], Exception | None]:
+        demand_err = self._verify_token_demand(transition.name, active_outputs, len(res_deque), len(out_deque))
+        if demand_err:
+            return [], demand_err
+
+        planned_deposits = self._build_deposit_plan(active_outputs, res_deque, out_deque)
+
+        constraint_err = self._verify_deposit_constraints(planned_deposits)
+        if constraint_err:
+            return [], constraint_err
+
+        return planned_deposits, None
+
+    def _dispatch_transition_fired(self, transition_name: str, duration: float) -> None:
+        if self.on_transition_fired:
+            try:
+                self.on_transition_fired(transition_name, duration)
+            except Exception:
+                pass
+
+    def _dispatch_transition_error(
+        self, transition_name: str, error: BaseException | None, data_tokens: list[Token]
+    ) -> None:
+        # We explicitly check for Exception (ignoring BaseException like SystemExit/KeyboardInterrupt)
+        # because on_error is meant for business logic/execution errors. Fatal process signals
+        # should bubble up without triggering user-defined monitoring hooks.
+        if not (self.on_error and isinstance(error, Exception)):
+            return
+        # When the firing consumed no data tokens, still notify once with None.
+        dispatch_tokens: list[Token | None] = list(data_tokens) if data_tokens else [None]
+        for dt in dispatch_tokens:
+            try:
+                self.on_error(transition_name, error, dt)
+            except Exception:
+                pass
+
+    def _dispatch_dead_letters(self, transition_name: str, dead_lettered_data_tokens: list[Token]) -> None:
+        if self.on_token_dead_lettered and dead_lettered_data_tokens:
+            for dt in dead_lettered_data_tokens:
+                try:
+                    self.on_token_dead_lettered(transition_name, dt)
+                except Exception:
+                    pass
+
+    def _dispatch_deposits(self, deposited: list[tuple[str, Token]]) -> None:
+        if self.on_token_deposited:
+            for pname, tok in deposited:
+                try:
+                    self.on_token_deposited(pname, tok)
+                except Exception:
+                    pass
+
+    def _invoke_transition_callbacks(
+        self,
+        transition: Transition,
+        success: bool,
+        duration: float,
+        error: BaseException | None,
+        data_tokens: list[Token],
+        dead_lettered_data_tokens: list[Token],
+        deposited: list[tuple[str, Token]],
+    ) -> None:
+        if success:
+            self._dispatch_transition_fired(transition.name, duration)
+        else:
+            self._dispatch_transition_error(transition.name, error, data_tokens)
+            self._dispatch_dead_letters(transition.name, dead_lettered_data_tokens)
+
+        self._dispatch_deposits(deposited)
+
+    @staticmethod
+    def _map_sockets_to_ports(port_socket_map: dict[str, str]) -> dict[str, list[str]]:
         socket_to_ports: dict[str, list[str]] = {}
         for port, socket in port_socket_map.items():
             socket_to_ports.setdefault(socket, []).append(port)
+        return socket_to_ports
 
-        # Verify that all consumed tokens come from mapped sockets
+    @staticmethod
+    def _verify_port_socket_boundaries(
+        token_sources: list[tuple[str, Token]], socket_to_ports: dict[str, list[str]]
+    ) -> None:
         for socket_name, _ in token_sources:
             if socket_name not in socket_to_ports:
                 raise ValueError(
@@ -873,23 +1079,23 @@ class PetriNet:
                     f"is not mapped to any port, but tokens were consumed from it."
                 )
 
-        # Deposit consumed tokens into the corresponding subnet port places
+    @staticmethod
+    def _deposit_into_subnet(
+        subnet: "PetriNet", token_sources: list[tuple[str, Token]], socket_to_ports: dict[str, list[str]]
+    ) -> None:
         for socket_name, token in token_sources:
             for port_name in socket_to_ports[socket_name]:
                 subnet.deposit(port_name, token.evolve())
 
-        # Sync logical clock if active — read under lock to avoid torn reads on
-        # free-threaded Python builds where the GIL no longer protects float assignments.
+    def _sync_subnet_time(self, subnet: "PetriNet") -> None:
         with self._lock:
             current_model_time = self._model_time
         if current_model_time is not None:
             subnet.advance_time(current_model_time)
 
-        # Run subnet
-        subnet.run(deadline=time.monotonic() + transition.subnet_deadline_secs)
-
-        # Retrieve output tokens from mapped child ports that correspond to parent output sockets
-        parent_outputs = [arc.place for arc in transition.outputs]
+    def _retrieve_subnet_outputs(
+        self, subnet: "PetriNet", port_socket_map: dict[str, str], parent_outputs: list[str]
+    ) -> list[Token]:
         output_tokens = []
         for port, socket in port_socket_map.items():
             if socket in parent_outputs:
@@ -898,5 +1104,23 @@ class PetriNet:
                     # Retrieve all available tokens
                     tokens = port_place.retrieve_all(model_time=subnet.model_time)
                     output_tokens.extend(tokens)
-
         return output_tokens
+
+    def _execute_substitution_transition(
+        self,
+        transition: SubstitutionTransition,
+        consumed_tokens: list[Token],
+        token_sources: list[tuple[str, Token]],
+    ) -> list[Token]:
+        """Run a hierarchical sub-net and return its output tokens, isolated from parent context."""
+        subnet = transition.subnet
+
+        socket_to_ports = self._map_sockets_to_ports(transition.port_socket_map)
+        self._verify_port_socket_boundaries(token_sources, socket_to_ports)
+        self._deposit_into_subnet(subnet, token_sources, socket_to_ports)
+        self._sync_subnet_time(subnet)
+
+        subnet.run(deadline=time.monotonic() + transition.subnet_deadline_secs)
+
+        parent_outputs = [arc.place for arc in transition.outputs]
+        return self._retrieve_subnet_outputs(subnet, transition.port_socket_map, parent_outputs)
