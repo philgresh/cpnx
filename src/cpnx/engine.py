@@ -14,7 +14,6 @@ from cpnx.tokens import Token
 from cpnx.transitions import InputArc, OutputArc, SubstitutionTransition, Transition
 from cpnx.visualization import snapshot, to_dot
 
-
 _DepositFn: TypeAlias = Callable[[str, Token], None]
 """Callable that deposits a token into a named place. Must be invoked under the engine lock."""
 
@@ -747,7 +746,8 @@ class PetriNet:
 
                 if not success:
                     deposited, dl_data, data_tokens = _rollback_failed_transition(
-                        transition, token_sources,
+                        transition,
+                        token_sources,
                         deposit=self._deposit_under_lock,
                         retry_delay=self.retry_delay,
                         error_place=self.error_place,
@@ -784,13 +784,19 @@ class PetriNet:
             return False, plan_error, [], [], []
 
         deposited = _enact_planned_deposits(
-            planned_deposits, active_outputs, res_deque, out_deque,
+            planned_deposits,
+            active_outputs,
+            res_deque,
+            out_deque,
             deposit=self._deposit_under_lock,
         )
-        deposited.extend(_return_leftover_resources(
-            res_deque, token_sources,
-            deposit=self._deposit_under_lock,
-        ))
+        deposited.extend(
+            _return_leftover_resources(
+                res_deque,
+                token_sources,
+                deposit=self._deposit_under_lock,
+            )
+        )
         return True, None, [], [], deposited
 
     def _execute_transition_action(
@@ -838,30 +844,37 @@ class PetriNet:
                 active_outputs.append((arc, is_res))
         return active_outputs
 
-    def _plan_and_validate_deposits(
+    def _verify_token_demand(
         self,
-        transition: Transition,
+        transition_name: str,
         active_outputs: list[tuple[OutputArc, bool]],
-        res_deque: deque[Token],
-        out_deque: deque[Token],
-    ) -> tuple[list[tuple[str, Token]], Exception | None]:
+        res_count: int,
+        out_count: int,
+    ) -> ValueError | None:
         resource_demand = sum(arc.count for arc, is_res in active_outputs if is_res)
         data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)
 
-        if len(res_deque) < resource_demand:
-            return [], ValueError(
-                f"Transition '{transition.name}': active resource output arcs require "
-                f"{resource_demand} resource token(s) but only {len(res_deque)} were consumed. "
+        if res_count < resource_demand:
+            return ValueError(
+                f"Transition '{transition_name}': active resource output arcs require "
+                f"{resource_demand} resource token(s) but only {res_count} were consumed. "
                 f"Ensure each ResourcePlace/PacedResourcePlace InputArc has a matching OutputArc."
             )
-        if len(out_deque) < data_demand:
-            return [], ValueError(
-                f"Transition '{transition.name}': action returned {len(out_deque)} non-resource "
+        if out_count < data_demand:
+            return ValueError(
+                f"Transition '{transition_name}': action returned {out_count} non-resource "
                 f"token(s) but active non-resource output arcs require {data_demand}. "
                 f"Ensure your action returns at least as many tokens as the sum of "
                 f"non-resource OutputArc counts (after arc guard evaluation)."
             )
+        return None
 
+    def _build_deposit_plan(
+        self,
+        active_outputs: list[tuple[OutputArc, bool]],
+        res_deque: deque[Token],
+        out_deque: deque[Token],
+    ) -> list[tuple[str, Token]]:
         planned_deposits: list[tuple[str, Token]] = []
         res_temp = deque(res_deque)
         out_temp = deque(out_deque)
@@ -869,7 +882,12 @@ class PetriNet:
             for _ in range(arc.count):
                 t = res_temp.popleft() if is_res_place else out_temp.popleft()
                 planned_deposits.append((arc.place, t))
+        return planned_deposits
 
+    def _verify_deposit_constraints(
+        self,
+        planned_deposits: list[tuple[str, Token]],
+    ) -> Exception | None:
         place_deposit_counts: dict[str, int] = {}
         for place_name, _ in planned_deposits:
             place_deposit_counts[place_name] = place_deposit_counts.get(place_name, 0) + 1
@@ -877,16 +895,71 @@ class PetriNet:
         for place_name, token in planned_deposits:
             place = self.places.get(place_name)
             if place is None:
-                return [], KeyError(f"Place '{place_name}' is not registered.")
+                return KeyError(f"Place '{place_name}' is not registered.")
             if not place.can_accept(token):
-                return [], TypeError(f"Place '{place_name}' cannot accept token with color '{token.color}'.")
+                return TypeError(f"Place '{place_name}' cannot accept token with color '{token.color}'.")
 
         for place_name, count in place_deposit_counts.items():
             place = self.places.get(place_name)
             if place is not None and not place.can_deposit(count):
-                return [], ValueError(f"Place '{place_name}' would exceed its bound of {place.bound}.")
+                return ValueError(f"Place '{place_name}' would exceed its bound of {place.bound}.")
+        return None
+
+    def _plan_and_validate_deposits(
+        self,
+        transition: Transition,
+        active_outputs: list[tuple[OutputArc, bool]],
+        res_deque: deque[Token],
+        out_deque: deque[Token],
+    ) -> tuple[list[tuple[str, Token]], Exception | None]:
+        demand_err = self._verify_token_demand(transition.name, active_outputs, len(res_deque), len(out_deque))
+        if demand_err:
+            return [], demand_err
+
+        planned_deposits = self._build_deposit_plan(active_outputs, res_deque, out_deque)
+
+        constraint_err = self._verify_deposit_constraints(planned_deposits)
+        if constraint_err:
+            return [], constraint_err
 
         return planned_deposits, None
+
+    def _dispatch_transition_fired(self, transition_name: str, duration: float) -> None:
+        if self.on_transition_fired:
+            try:
+                self.on_transition_fired(transition_name, duration)
+            except Exception:
+                pass
+
+    def _dispatch_transition_error(
+        self, transition_name: str, error: BaseException | None, data_tokens: list[Token]
+    ) -> None:
+        # We explicitly check for Exception (ignoring BaseException like SystemExit/KeyboardInterrupt)
+        # because on_error is meant for business logic/execution errors. Fatal process signals
+        # should bubble up without triggering user-defined monitoring hooks.
+        if self.on_error and error and isinstance(error, Exception):
+            dispatch_tokens: list[Token | None] = list(data_tokens) if data_tokens else [None]
+            for dt in dispatch_tokens:
+                try:
+                    self.on_error(transition_name, error, dt)
+                except Exception:
+                    pass
+
+    def _dispatch_dead_letters(self, transition_name: str, dead_lettered_data_tokens: list[Token]) -> None:
+        if self.on_token_dead_lettered and dead_lettered_data_tokens:
+            for dt in dead_lettered_data_tokens:
+                try:
+                    self.on_token_dead_lettered(transition_name, dt)
+                except Exception:
+                    pass
+
+    def _dispatch_deposits(self, deposited: list[tuple[str, Token]]) -> None:
+        if self.on_token_deposited:
+            for pname, tok in deposited:
+                try:
+                    self.on_token_deposited(pname, tok)
+                except Exception:
+                    pass
 
     def _invoke_transition_callbacks(
         self,
@@ -899,35 +972,54 @@ class PetriNet:
         deposited: list[tuple[str, Token]],
     ) -> None:
         if success:
-            if self.on_transition_fired:
-                try:
-                    self.on_transition_fired(transition.name, duration)
-                except Exception:
-                    pass
+            self._dispatch_transition_fired(transition.name, duration)
         else:
-            # We explicitly check for Exception (ignoring BaseException like SystemExit/KeyboardInterrupt)
-            # because on_error is meant for business logic/execution errors. Fatal process signals
-            # should bubble up without triggering user-defined monitoring hooks.
-            if self.on_error and error and isinstance(error, Exception):
-                dispatch_tokens: list[Token | None] = list(data_tokens) if data_tokens else [None]
-                for dt in dispatch_tokens:
-                    try:
-                        self.on_error(transition.name, error, dt)
-                    except Exception:
-                        pass
-            if self.on_token_dead_lettered and dead_lettered_data_tokens:
-                for dt in dead_lettered_data_tokens:
-                    try:
-                        self.on_token_dead_lettered(transition.name, dt)
-                    except Exception:
-                        pass
+            self._dispatch_transition_error(transition.name, error, data_tokens)
+            self._dispatch_dead_letters(transition.name, dead_lettered_data_tokens)
 
-        if self.on_token_deposited:
-            for pname, tok in deposited:
-                try:
-                    self.on_token_deposited(pname, tok)
-                except Exception:
-                    pass
+        self._dispatch_deposits(deposited)
+
+    def _map_sockets_to_ports(self, port_socket_map: dict[str, str]) -> dict[str, list[str]]:
+        socket_to_ports: dict[str, list[str]] = {}
+        for port, socket in port_socket_map.items():
+            socket_to_ports.setdefault(socket, []).append(port)
+        return socket_to_ports
+
+    def _verify_port_socket_boundaries(
+        self, token_sources: list[tuple[str, Token]], socket_to_ports: dict[str, list[str]]
+    ) -> None:
+        for socket_name, _ in token_sources:
+            if socket_name not in socket_to_ports:
+                raise ValueError(
+                    f"Port/Socket Boundary Violation: Parent place '{socket_name}' "
+                    f"is not mapped to any port, but tokens were consumed from it."
+                )
+
+    def _deposit_into_subnet(
+        self, subnet: "PetriNet", token_sources: list[tuple[str, Token]], socket_to_ports: dict[str, list[str]]
+    ) -> None:
+        for socket_name, token in token_sources:
+            for port_name in socket_to_ports[socket_name]:
+                subnet.deposit(port_name, token.evolve())
+
+    def _sync_subnet_time(self, subnet: "PetriNet") -> None:
+        with self._lock:
+            current_model_time = self._model_time
+        if current_model_time is not None:
+            subnet.advance_time(current_model_time)
+
+    def _retrieve_subnet_outputs(
+        self, subnet: "PetriNet", port_socket_map: dict[str, str], parent_outputs: list[str]
+    ) -> list[Token]:
+        output_tokens = []
+        for port, socket in port_socket_map.items():
+            if socket in parent_outputs:
+                port_place = subnet.places.get(port)
+                if port_place:
+                    # Retrieve all available tokens
+                    tokens = port_place.retrieve_all(model_time=subnet.model_time)
+                    output_tokens.extend(tokens)
+        return output_tokens
 
     def _execute_substitution_transition(
         self,
@@ -937,45 +1029,13 @@ class PetriNet:
     ) -> list[Token]:
         """Run a hierarchical sub-net and return its output tokens, isolated from parent context."""
         subnet = transition.subnet
-        port_socket_map = transition.port_socket_map
 
-        # Verify strict port/socket boundaries
-        socket_to_ports: dict[str, list[str]] = {}
-        for port, socket in port_socket_map.items():
-            socket_to_ports.setdefault(socket, []).append(port)
+        socket_to_ports = self._map_sockets_to_ports(transition.port_socket_map)
+        self._verify_port_socket_boundaries(token_sources, socket_to_ports)
+        self._deposit_into_subnet(subnet, token_sources, socket_to_ports)
+        self._sync_subnet_time(subnet)
 
-        # Verify that all consumed tokens come from mapped sockets
-        for socket_name, _ in token_sources:
-            if socket_name not in socket_to_ports:
-                raise ValueError(
-                    f"Port/Socket Boundary Violation: Parent place '{socket_name}' "
-                    f"is not mapped to any port, but tokens were consumed from it."
-                )
-
-        # Deposit consumed tokens into the corresponding subnet port places
-        for socket_name, token in token_sources:
-            for port_name in socket_to_ports[socket_name]:
-                subnet.deposit(port_name, token.evolve())
-
-        # Sync logical clock if active — read under lock to avoid torn reads on
-        # free-threaded Python builds where the GIL no longer protects float assignments.
-        with self._lock:
-            current_model_time = self._model_time
-        if current_model_time is not None:
-            subnet.advance_time(current_model_time)
-
-        # Run subnet
         subnet.run(deadline=time.monotonic() + transition.subnet_deadline_secs)
 
-        # Retrieve output tokens from mapped child ports that correspond to parent output sockets
         parent_outputs = [arc.place for arc in transition.outputs]
-        output_tokens = []
-        for port, socket in port_socket_map.items():
-            if socket in parent_outputs:
-                port_place = subnet.places.get(port)
-                if port_place:
-                    # Retrieve all available tokens
-                    tokens = port_place.retrieve_all(model_time=subnet.model_time)
-                    output_tokens.extend(tokens)
-
-        return output_tokens
+        return self._retrieve_subnet_outputs(subnet, transition.port_socket_map, parent_outputs)

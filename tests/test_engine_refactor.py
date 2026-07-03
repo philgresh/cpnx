@@ -135,7 +135,10 @@ def test_enact_planned_deposits():
     out_deque = deque([token])
 
     deposited = _enact_planned_deposits(
-        planned, active_outputs, res_deque, out_deque,
+        planned,
+        active_outputs,
+        res_deque,
+        out_deque,
         deposit=lambda name, tok: deposited_calls.append((name, tok)),
     )
 
@@ -152,7 +155,8 @@ def test_return_leftover_resources():
     res_deque = deque([resource_token])
 
     returned = _return_leftover_resources(
-        res_deque, token_sources,
+        res_deque,
+        token_sources,
         deposit=lambda name, tok: deposited_calls.append((name, tok)),
     )
 
@@ -219,9 +223,7 @@ def test_try_commit_transition_happy_path():
     token = Token()
 
     with net._lock:
-        success, error, data_tokens, dl_data, deposited = net._try_commit_transition(
-            transition, [token], [token], []
-        )
+        success, error, data_tokens, dl_data, deposited = net._try_commit_transition(transition, [token], [token], [])
 
     assert success is True
     assert error is None
@@ -240,9 +242,7 @@ def test_try_commit_transition_planned_error():
     token = Token()
 
     with net._lock:
-        success, error, data_tokens, dl_data, deposited = net._try_commit_transition(
-            transition, [token], [token], []
-        )
+        success, error, data_tokens, dl_data, deposited = net._try_commit_transition(transition, [token], [token], [])
 
     assert success is False
     assert error is not None
@@ -439,3 +439,121 @@ def test_check_transition_guard():
     # exception in guard
     t4 = Transition("t", inputs=[], outputs=[], action=lambda t: t, guard=lambda t: 1 / 0)
     assert not net._check_transition_guard(t4, [Token()])
+
+
+def test_verify_token_demand():
+    net = PetriNet()
+    # Not enough resources
+    assert net._verify_token_demand("t", [(OutputArc("p", count=1), True)], 0, 1) is not None
+    # Not enough data
+    assert net._verify_token_demand("t", [(OutputArc("p", count=1), False)], 1, 0) is not None
+    # OK
+    assert net._verify_token_demand("t", [(OutputArc("p", count=1), False)], 0, 1) is None
+
+
+def test_build_deposit_plan():
+    net = PetriNet()
+    res_deque = deque([Token(color="resource")])
+    out_deque = deque([Token()])
+
+    plan = net._build_deposit_plan(
+        [(OutputArc("p1", count=1), True), (OutputArc("p2", count=1), False)], res_deque, out_deque
+    )
+    assert len(plan) == 2
+    assert plan[0][0] == "p1"
+    assert plan[1][0] == "p2"
+
+
+def test_verify_deposit_constraints():
+    net = PetriNet()
+    p = Place("p1", bound=1)
+    net.add_place(p)
+    # unregistered
+    assert isinstance(net._verify_deposit_constraints([("unreg", Token())]), KeyError)
+    # color violation
+    from cpnx.places import ResourcePlace
+
+    p2 = ResourcePlace("p2", capacity=0)
+    net.add_place(p2)
+    assert isinstance(net._verify_deposit_constraints([("p2", Token())]), TypeError)
+    # bound violation
+    assert isinstance(net._verify_deposit_constraints([("p1", Token()), ("p1", Token())]), ValueError)
+    # OK
+    assert net._verify_deposit_constraints([("p1", Token())]) is None
+
+
+def test_dispatch_callbacks():
+    net = PetriNet()
+    fired_called = False
+    error_called = False
+    dl_called = False
+    deposit_called = False
+
+    def on_fired(n, d):
+        nonlocal fired_called
+        fired_called = True
+
+    def on_err(n, e, t):
+        nonlocal error_called
+        error_called = True
+
+    def on_dl(n, t):
+        nonlocal dl_called
+        dl_called = True
+
+    def on_dep(n, t):
+        nonlocal deposit_called
+        deposit_called = True
+
+    net.on_transition_fired = on_fired
+    net.on_error = on_err
+    net.on_token_dead_lettered = on_dl
+    net.on_token_deposited = on_dep
+
+    net._dispatch_transition_fired("t", 0.1)
+    assert fired_called
+    net._dispatch_transition_error("t", Exception(), [Token()])
+    assert error_called
+    net._dispatch_dead_letters("t", [Token()])
+    assert dl_called
+    net._dispatch_deposits([("p", Token())])
+    assert deposit_called
+
+
+def test_map_sockets_to_ports():
+    net = PetriNet()
+    assert net._map_sockets_to_ports({"p1": "s1", "p2": "s1"}) == {"s1": ["p1", "p2"]}
+
+
+def test_verify_port_socket_boundaries():
+    net = PetriNet()
+    with pytest.raises(ValueError):
+        net._verify_port_socket_boundaries([("s2", Token())], {"s1": ["p1"]})
+    net._verify_port_socket_boundaries([("s1", Token())], {"s1": ["p1"]})
+
+
+def test_deposit_into_subnet():
+    net = PetriNet()
+    subnet = PetriNet()
+    subnet.add_place(Place("p1"))
+    net._deposit_into_subnet(subnet, [("s1", Token())], {"s1": ["p1"]})
+    assert len(subnet.places["p1"]) == 1
+
+
+def test_sync_subnet_time():
+    net = PetriNet()
+    subnet = PetriNet()
+    net._model_time = 10.0
+    net._sync_subnet_time(subnet)
+    assert subnet.model_time == 10.0
+
+
+def test_retrieve_subnet_outputs():
+    net = PetriNet()
+    subnet = PetriNet()
+    subnet.add_place(Place("p1"))
+    t = Token()
+    subnet.deposit("p1", t)
+    out = net._retrieve_subnet_outputs(subnet, {"p1": "s1"}, ["s1"])
+    assert len(out) == 1
+    assert out[0] == t
