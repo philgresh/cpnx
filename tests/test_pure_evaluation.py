@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from cpnx.engine import PetriNet
@@ -71,6 +73,31 @@ def test_callable_purity_verification_invalid():
 
     with pytest.raises(PermissionError, match="Global/nonlocal mutations are forbidden"):
         verify_callable_purity(global_action)
+
+    def import_action(tokens):
+        import os  # noqa: F401
+
+        return tokens
+
+    with pytest.raises(PermissionError, match="Imports are forbidden inside CPN callables"):
+        verify_callable_purity(import_action)
+
+    def system_action(tokens):
+        import sys  # even if already imported outside, calling it inside is bad
+
+        sys.system("rm -rf /")
+        return tokens
+
+    with pytest.raises(PermissionError, match="Imports are forbidden"):
+        verify_callable_purity(system_action)
+
+    def system_action_no_import(tokens):
+        # assuming os is available
+        os.system("rm -rf /")
+        return tokens
+
+    with pytest.raises(PermissionError, match="Forbidden attribute call '.system'"):
+        verify_callable_purity(system_action_no_import)
 
 
 def test_transition_purity_checks():

@@ -117,6 +117,55 @@ def _compile_cached(expression_str: str):
     return compile(tree, "<sandbox>", "eval")
 
 
+def _find_target_node(tree: ast.AST, start_line: int) -> ast.AST | None:
+    target_node = None
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+
+        if not hasattr(node, "lineno"):
+            continue
+
+        end_lineno = getattr(node, "end_lineno", node.lineno)
+        if not (node.lineno <= start_line <= end_lineno):
+            continue
+
+        if target_node is None:
+            target_node = node
+            continue
+
+        # Use the smaller/nested node if multiple contain start_line
+        target_start = target_node.lineno
+        target_end = getattr(target_node, "end_lineno", target_start)
+        if node.lineno >= target_start and end_lineno <= target_end:
+            target_node = node
+
+    return target_node
+
+
+_FORBIDDEN_FUNCS = frozenset({"open", "print", "eval", "exec", "__import__", "sleep"})
+_FORBIDDEN_ATTRS = frozenset({"sleep", "system", "popen", "urlopen"})
+
+
+def _verify_ast_purity(tree: ast.AST) -> None:
+    for node in ast.walk(tree):
+        match node:
+            case ast.Call(func=ast.Name(id=name)) if name in _FORBIDDEN_FUNCS:
+                raise PermissionError(f"Forbidden function call '{name}' inside CPN callable.")
+            case ast.Call(func=ast.Attribute(attr=attr)) if attr in _FORBIDDEN_ATTRS:
+                raise PermissionError(f"Forbidden attribute call '.{attr}' inside CPN callable.")
+            case ast.Import() | ast.ImportFrom():
+                raise PermissionError("Imports are forbidden inside CPN callables.")
+            case ast.Global() | ast.Nonlocal():
+                raise PermissionError("Global/nonlocal mutations are forbidden inside CPN callables.")
+            case ast.FunctionDef(args=args) | ast.AsyncFunctionDef(args=args):
+                for default in args.defaults + args.kw_defaults:
+                    if default is not None and isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                        raise PermissionError(
+                            "Mutable default argument in CPN callable introduces hidden state between firings."
+                        )
+
+
 def verify_callable_purity(func: Callable) -> None:
     """Verify that a callable is pure by inspecting its AST for disallowed patterns.
 
@@ -141,50 +190,9 @@ def verify_callable_purity(func: Callable) -> None:
 
             # Find the most specific (innermost) FunctionDef, AsyncFunctionDef, or Lambda
             # at start_line
-            target_node = None
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                    if hasattr(node, "lineno"):
-                        end_lineno = getattr(node, "end_lineno", node.lineno)
-                        if node.lineno <= start_line <= end_lineno:
-                            if target_node is None:
-                                target_node = node
-                            else:
-                                # Use the smaller/nested node if multiple contain start_line
-                                target_start = target_node.lineno
-                                target_end = getattr(target_node, "end_lineno", target_start)
-                                if node.lineno >= target_start and end_lineno <= target_end:
-                                    target_node = node
-
+            target_node = _find_target_node(tree, start_line)
             if target_node is not None:
-                for node in ast.walk(target_node):
-                    if isinstance(node, ast.Call):
-                        if isinstance(node.func, ast.Name) and node.func.id in {
-                            "open",
-                            "print",
-                            "eval",
-                            "exec",
-                            "__import__",
-                            "sleep",
-                        }:
-                            raise PermissionError(f"Forbidden function call '{node.func.id}' inside CPN callable.")
-                        elif isinstance(node.func, ast.Attribute) and node.func.attr in {
-                            "sleep",
-                            "system",
-                            "popen",
-                            "urlopen",
-                        }:
-                            raise PermissionError(f"Forbidden attribute call '.{node.func.attr}' inside CPN callable.")
-                    elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                        raise PermissionError("Imports are forbidden inside CPN callables.")
-                    elif isinstance(node, (ast.Global, ast.Nonlocal)):
-                        raise PermissionError("Global/nonlocal mutations are forbidden inside CPN callables.")
-                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        for default in node.args.defaults + node.args.kw_defaults:
-                            if default is not None and isinstance(default, (ast.List, ast.Dict, ast.Set)):
-                                raise PermissionError(
-                                    "Mutable default argument in CPN callable introduces hidden state between firings."
-                                )
+                _verify_ast_purity(target_node)
                 return
     except PermissionError:
         raise
@@ -204,38 +212,7 @@ def verify_callable_purity(func: Callable) -> None:
                 source = parts[1].strip()
 
         tree = ast.parse(source)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in {
-                    "open",
-                    "print",
-                    "eval",
-                    "exec",
-                    "__import__",
-                    "sleep",
-                }:
-                    raise PermissionError(f"Forbidden function call '{node.func.id}' inside CPN callable.")
-                elif isinstance(node.func, ast.Attribute) and node.func.attr in {
-                    "sleep",
-                    "system",
-                    "popen",
-                    "get",
-                    "post",
-                    "request",
-                    "urlopen",
-                    "connect",
-                }:
-                    raise PermissionError(f"Forbidden attribute call '.{node.func.attr}' inside CPN callable.")
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                raise PermissionError("Imports are forbidden inside CPN callables.")
-            elif isinstance(node, (ast.Global, ast.Nonlocal)):
-                raise PermissionError("Global/nonlocal mutations are forbidden inside CPN callables.")
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                for default in node.args.defaults + node.args.kw_defaults:
-                    if default is not None and isinstance(default, (ast.List, ast.Dict, ast.Set)):
-                        raise PermissionError(
-                            "Mutable default argument in CPN callable introduces hidden state between firings."
-                        )
+        _verify_ast_purity(tree)
     except PermissionError:
         raise
     except (OSError, TypeError) as exc:
