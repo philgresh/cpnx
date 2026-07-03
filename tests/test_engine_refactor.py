@@ -174,3 +174,125 @@ def test_rollback_failed_transition():
     assert deposited2[0][0] == net.error_place
     assert len(dl_data2) == 1
     assert len(data_tokens2) == 1
+
+
+def test_check_input_preconditions():
+    from cpnx.transitions import InputArc
+
+    net = PetriNet()
+    p_in = Place("p_in")
+    net.add_place(p_in)
+
+    t1 = Transition("t1", inputs=[InputArc("p_in")], outputs=[], action=lambda t: t)
+    # No tokens, should fail
+    ok, tokens = net._check_input_preconditions(t1, 0.0)
+    assert not ok
+    assert tokens == []
+
+    # Unregistered place
+    t2 = Transition("t2", inputs=[InputArc("unknown")], outputs=[], action=lambda t: t)
+    ok, tokens = net._check_input_preconditions(t2, 0.0)
+    assert not ok
+
+    # Token available
+    token = Token()
+    p_in.deposit(token)
+    ok, tokens = net._check_input_preconditions(t1, 0.0)
+    assert ok
+    assert tokens == [token]
+
+
+def test_is_settle_time_met():
+    import time
+
+    from cpnx.transitions import InputArc
+
+    net = PetriNet()
+    p = Place("p")
+    arc = InputArc("p", settle_secs=1.0)
+
+    # 0 settle time always met
+    assert net._is_settle_time_met(p, InputArc("p", settle_secs=0.0))
+
+    # Real time
+    p.last_deposit_time = 0.0
+    old_mono = time.monotonic
+    time.monotonic = lambda: 0.5
+    try:
+        assert not net._is_settle_time_met(p, arc)
+        time.monotonic = lambda: 1.5
+        assert net._is_settle_time_met(p, arc)
+    finally:
+        time.monotonic = old_mono
+
+    # Model time
+    net._model_time = 2.0
+    p.last_deposit_time_model = 1.5
+    assert not net._is_settle_time_met(p, arc)
+    net._model_time = 3.0
+    assert net._is_settle_time_met(p, arc)
+
+
+def test_resolve_input_tokens():
+    from cpnx.transitions import InputArc
+
+    net = PetriNet()
+    t1, t2 = Token(), Token()
+    available = [t1, t2]
+
+    # consume_all
+    arc = InputArc("p", consume_all=True)
+    assert net._resolve_input_tokens(arc, available) == available
+
+    # string expression
+    arc2 = InputArc("p", expression="tokens")
+    res = net._resolve_input_tokens(arc2, available)
+    assert res == available[:1]  # count is 1 by default
+
+    # exception in expression
+    arc3 = InputArc("p", expression="1/0")
+    assert net._resolve_input_tokens(arc3, available) is None
+
+
+def test_check_output_capacity():
+    from cpnx.places import Place
+
+    net = PetriNet()
+    p_out = Place("p_out", bound=1)
+    net.add_place(p_out)
+
+    t = Transition("t", inputs=[], outputs=[OutputArc("p_out")], action=lambda t: t)
+
+    # capacity OK
+    assert net._check_output_capacity(t)
+
+    # capacity full
+    p_out.deposit(Token())
+    assert not net._check_output_capacity(t)
+
+    # guarded arc ignores capacity
+    t2 = Transition("t", inputs=[], outputs=[OutputArc("p_out", expression="True")], action=lambda t: t)
+    assert net._check_output_capacity(t2)
+
+
+def test_check_transition_guard():
+
+    net = PetriNet()
+    t = Transition("t", inputs=[], outputs=[], action=lambda t: t)
+
+    # no guard
+    assert net._check_transition_guard(t, [])
+
+    # string guard
+    t2 = Transition("t", inputs=[], outputs=[], action=lambda t: t, guard="len(tokens) > 0")
+    assert not net._check_transition_guard(t2, [])
+    assert net._check_transition_guard(t2, [Token()])
+
+    # callable guard
+    t3 = Transition("t", inputs=[], outputs=[], action=lambda t: t, guard=lambda t: len(t) > 0)
+    assert not net._check_transition_guard(t3, [])
+    assert net._check_transition_guard(t3, [Token()])
+
+    # exception in guard
+    t4 = Transition("t", inputs=[], outputs=[], action=lambda t: t, guard=lambda t: 1 / 0)
+    assert not net._check_transition_guard(t4, [Token()])
