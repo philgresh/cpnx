@@ -844,8 +844,8 @@ class PetriNet:
                 active_outputs.append((arc, is_res))
         return active_outputs
 
+    @staticmethod
     def _verify_token_demand(
-        self,
         transition_name: str,
         active_outputs: list[tuple[OutputArc, bool]],
         res_count: int,
@@ -869,8 +869,8 @@ class PetriNet:
             )
         return None
 
+    @staticmethod
     def _build_deposit_plan(
-        self,
         active_outputs: list[tuple[OutputArc, bool]],
         res_deque: deque[Token],
         out_deque: deque[Token],
@@ -979,14 +979,16 @@ class PetriNet:
 
         self._dispatch_deposits(deposited)
 
-    def _map_sockets_to_ports(self, port_socket_map: dict[str, str]) -> dict[str, list[str]]:
+    @staticmethod
+    def _map_sockets_to_ports(port_socket_map: dict[str, str]) -> dict[str, list[str]]:
         socket_to_ports: dict[str, list[str]] = {}
         for port, socket in port_socket_map.items():
             socket_to_ports.setdefault(socket, []).append(port)
         return socket_to_ports
 
+    @staticmethod
     def _verify_port_socket_boundaries(
-        self, token_sources: list[tuple[str, Token]], socket_to_ports: dict[str, list[str]]
+        token_sources: list[tuple[str, Token]], socket_to_ports: dict[str, list[str]]
     ) -> None:
         for socket_name, _ in token_sources:
             if socket_name not in socket_to_ports:
@@ -995,8 +997,9 @@ class PetriNet:
                     f"is not mapped to any port, but tokens were consumed from it."
                 )
 
+    @staticmethod
     def _deposit_into_subnet(
-        self, subnet: "PetriNet", token_sources: list[tuple[str, Token]], socket_to_ports: dict[str, list[str]]
+        subnet: "PetriNet", token_sources: list[tuple[str, Token]], socket_to_ports: dict[str, list[str]]
     ) -> None:
         for socket_name, token in token_sources:
             for port_name in socket_to_ports[socket_name]:
