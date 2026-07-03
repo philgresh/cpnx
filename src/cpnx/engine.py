@@ -11,7 +11,7 @@ from typing import Callable
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace
 from cpnx.sandbox import SandboxEvaluator
 from cpnx.tokens import Token
-from cpnx.transitions import SubstitutionTransition, Transition
+from cpnx.transitions import InputArc, SubstitutionTransition, Transition
 from cpnx.visualization import snapshot, to_dot
 
 
@@ -516,6 +516,38 @@ class PetriNet:
             )
         self.places[place_name].deposit(token, model_time=self._get_model_time_under_lock())
 
+    def _resolve_arc_tokens(self, arc: InputArc, available: list[Token]) -> list[Token] | None:
+        """Resolve which tokens input *arc* would consume from *available*.
+
+        Returns the selected tokens, or ``None`` if the arc cannot be satisfied —
+        either its selection expression raised, or fewer than ``arc.count`` tokens
+        are eligible. In CPN semantics arc multiplicity is all-or-nothing: an arc
+        demanding ``count`` tokens is not enabled unless at least ``count`` are
+        resolved, so a selection that yields fewer (or none) disables the
+        transition rather than firing with a short or zero-length token list.
+
+        Shared by :meth:`_is_transition_enabled` and
+        :meth:`_is_transition_potentially_enabled` so both apply the identical
+        multiplicity rule; callers differ only in how *available* is computed
+        (real/model time vs. timing-agnostic).
+        """
+        if arc.consume_all:
+            tokens = available
+        elif arc.expression is not None:
+            try:
+                if isinstance(arc.expression, str):
+                    ordered = SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": available})
+                else:
+                    ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
+                tokens = ordered[: arc.count]
+            except Exception:
+                return None
+        else:
+            tokens = available[: arc.count]
+        if len(tokens) < arc.count:
+            return None
+        return tokens
+
     def _is_transition_enabled(self, transition: Transition) -> bool:
         """Return ``True`` if all preconditions for firing *transition* are satisfied.
 
@@ -542,19 +574,9 @@ class PetriNet:
 
             # Speculatively resolve candidate tokens
             available = place.peek(len(place), model_time=m_time)
-            if arc.consume_all:
-                tokens = available
-            elif arc.expression is not None:
-                try:
-                    if isinstance(arc.expression, str):
-                        ordered = SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": available})
-                    else:
-                        ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
-                    tokens = ordered[: arc.count]
-                except Exception:
-                    return False
-            else:
-                tokens = available[: arc.count]
+            tokens = self._resolve_arc_tokens(arc, available)
+            if tokens is None:
+                return False
             candidate_tokens.extend(tokens)
 
         # Back-pressure: refuse to fire if an unguarded output arc's target place is full.
@@ -597,19 +619,9 @@ class PetriNet:
                 return False
             # Speculatively resolve candidate tokens ignoring timing
             available = place.peek(len(place), model_time=float("inf"))
-            if arc.consume_all:
-                tokens = available
-            elif arc.expression is not None:
-                try:
-                    if isinstance(arc.expression, str):
-                        ordered = SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": available})
-                    else:
-                        ordered = self._call_expr(arc.expression, available, timeout=self.expr_timeout_secs)
-                    tokens = ordered[: arc.count]
-                except Exception:
-                    return False
-            else:
-                tokens = available[: arc.count]
+            tokens = self._resolve_arc_tokens(arc, available)
+            if tokens is None:
+                return False
             candidate_tokens.extend(tokens)
 
         if transition.guard is not None:
