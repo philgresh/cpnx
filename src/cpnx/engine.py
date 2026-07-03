@@ -6,13 +6,99 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable
+from typing import Callable, TypeAlias
 
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace
 from cpnx.sandbox import SandboxEvaluator
 from cpnx.tokens import Token
 from cpnx.transitions import InputArc, OutputArc, SubstitutionTransition, Transition
 from cpnx.visualization import snapshot, to_dot
+
+
+_DepositFn: TypeAlias = Callable[[str, Token], None]
+"""Callable that deposits a token into a named place. Must be invoked under the engine lock."""
+
+
+def _enact_planned_deposits(
+    planned_deposits: list[tuple[str, Token]],
+    active_outputs: list[tuple[OutputArc, bool]],
+    res_deque: deque[Token],
+    out_deque: deque[Token],
+    *,
+    deposit: _DepositFn,
+) -> list[tuple[str, Token]]:
+    """Commit deposits and drain consumed tokens from their deques.
+
+    ``deposit`` must be called under the engine lock.
+    """
+    deposited: list[tuple[str, Token]] = []
+    for place_name, token in planned_deposits:
+        deposit(place_name, token)
+        deposited.append((place_name, token))
+
+    for arc, is_res_place in active_outputs:
+        for _ in range(arc.count):
+            if is_res_place:
+                res_deque.popleft()
+            else:
+                out_deque.popleft()
+    return deposited
+
+
+def _return_leftover_resources(
+    res_deque: deque[Token],
+    token_sources: list[tuple[str, Token]],
+    *,
+    deposit: _DepositFn,
+) -> list[tuple[str, Token]]:
+    """Return unconsumed resource tokens to their source places.
+
+    ``deposit`` must be called under the engine lock.
+    """
+    deposited: list[tuple[str, Token]] = []
+    while res_deque:
+        leftover_token = res_deque.popleft()
+        for src_name, t in token_sources:
+            if t.id == leftover_token.id:
+                deposit(src_name, leftover_token)
+                deposited.append((src_name, leftover_token))
+                break
+    return deposited
+
+
+def _rollback_failed_transition(
+    transition: Transition,
+    token_sources: list[tuple[str, Token]],
+    *,
+    deposit: _DepositFn,
+    retry_delay: float,
+    error_place: str,
+) -> tuple[list[tuple[str, Token]], list[Token], list[Token]]:
+    """Return all consumed tokens to their source places after a failed firing.
+
+    ``deposit`` must be a callable that is safe to invoke under the engine lock —
+    callers are responsible for holding it before calling this function.
+    """
+    deposited: list[tuple[str, Token]] = []
+    dead_lettered_data_tokens: list[Token] = []
+    data_tokens = [t for _, t in token_sources if not t.is_resource]
+    for src_name, t in token_sources:
+        if t.is_resource:
+            deposit(src_name, t)
+            deposited.append((src_name, t))
+        else:
+            max_retries = transition.max_retries
+            if max_retries is None or t.attempts < max_retries:
+                retry_at = time.monotonic() + retry_delay
+                rollback_t = t.evolve(available_at=retry_at, attempts=t.attempts + 1)
+                deposit(src_name, rollback_t)
+                deposited.append((src_name, rollback_t))
+            else:
+                rollback_t = t.evolve(available_at=0.0)
+                deposit(error_place, rollback_t)
+                deposited.append((error_place, rollback_t))
+                dead_lettered_data_tokens.append(rollback_t)
+    return deposited, dead_lettered_data_tokens, data_tokens
 
 
 class PetriNet:
@@ -660,7 +746,12 @@ class PetriNet:
                         error = exc
 
                 if not success:
-                    deposited, dl_data, data_tokens = self._rollback_failed_transition(transition, token_sources)
+                    deposited, dl_data, data_tokens = _rollback_failed_transition(
+                        transition, token_sources,
+                        deposit=self._deposit_under_lock,
+                        retry_delay=self.retry_delay,
+                        error_place=self.error_place,
+                    )
 
             # --- OUTSIDE THE LOCK ---
             self._invoke_transition_callbacks(transition, success, duration, error, data_tokens, dl_data, deposited)
@@ -692,42 +783,15 @@ class PetriNet:
         if plan_error is not None:
             return False, plan_error, [], [], []
 
-        deposited = self._enact_planned_deposits(planned_deposits, active_outputs, res_deque, out_deque)
-        deposited.extend(self._return_leftover_resources(res_deque, token_sources))
+        deposited = _enact_planned_deposits(
+            planned_deposits, active_outputs, res_deque, out_deque,
+            deposit=self._deposit_under_lock,
+        )
+        deposited.extend(_return_leftover_resources(
+            res_deque, token_sources,
+            deposit=self._deposit_under_lock,
+        ))
         return True, None, [], [], deposited
-
-    def _enact_planned_deposits(
-        self,
-        planned_deposits: list[tuple[str, Token]],
-        active_outputs: list[tuple[OutputArc, bool]],
-        res_deque: deque[Token],
-        out_deque: deque[Token],
-    ) -> list[tuple[str, Token]]:
-        deposited: list[tuple[str, Token]] = []
-        for place_name, token in planned_deposits:
-            self._deposit_under_lock(place_name, token)
-            deposited.append((place_name, token))
-
-        for arc, is_res_place in active_outputs:
-            for _ in range(arc.count):
-                if is_res_place:
-                    res_deque.popleft()
-                else:
-                    out_deque.popleft()
-        return deposited
-
-    def _return_leftover_resources(
-        self, res_deque: deque[Token], token_sources: list[tuple[str, Token]]
-    ) -> list[tuple[str, Token]]:
-        deposited: list[tuple[str, Token]] = []
-        while res_deque:
-            leftover_token = res_deque.popleft()
-            for src_name, t in token_sources:
-                if t.id == leftover_token.id:
-                    self._deposit_under_lock(src_name, leftover_token)
-                    deposited.append((src_name, leftover_token))
-                    break
-        return deposited
 
     def _execute_transition_action(
         self,
@@ -823,30 +887,6 @@ class PetriNet:
                 return [], ValueError(f"Place '{place_name}' would exceed its bound of {place.bound}.")
 
         return planned_deposits, None
-
-    def _rollback_failed_transition(
-        self, transition: Transition, token_sources: list[tuple[str, Token]]
-    ) -> tuple[list[tuple[str, Token]], list[Token], list[Token]]:
-        deposited: list[tuple[str, Token]] = []
-        dead_lettered_data_tokens: list[Token] = []
-        data_tokens = [t for _, t in token_sources if not t.is_resource]
-        for src_name, t in token_sources:
-            if t.is_resource:
-                self._deposit_under_lock(src_name, t)
-                deposited.append((src_name, t))
-            else:
-                max_retries = transition.max_retries
-                if max_retries is None or t.attempts < max_retries:
-                    retry_at = time.monotonic() + self.retry_delay
-                    rollback_t = t.evolve(available_at=retry_at, attempts=t.attempts + 1)
-                    self._deposit_under_lock(src_name, rollback_t)
-                    deposited.append((src_name, rollback_t))
-                else:
-                    rollback_t = t.evolve(available_at=0.0)
-                    self._deposit_under_lock(self.error_place, rollback_t)
-                    deposited.append((self.error_place, rollback_t))
-                    dead_lettered_data_tokens.append(rollback_t)
-        return deposited, dead_lettered_data_tokens, data_tokens
 
     def _invoke_transition_callbacks(
         self,
