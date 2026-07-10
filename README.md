@@ -4,8 +4,11 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/cpnx.svg)](https://pypi.org/project/cpnx/)
 [![CI status](https://github.com/philgresh/cpnx/actions/workflows/ci.yml/badge.svg)](https://github.com/philgresh/cpnx/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Docs](https://img.shields.io/badge/docs-philgresh.github.io%2Fcpnx-blue.svg)](https://philgresh.github.io/cpnx/)
 
 **cpnx** is a Coloured Petri Net (CPN) executor for concurrent Python pipelines — zero dependencies, stdlib-only threading.
+
+📖 **Documentation:** [philgresh.github.io/cpnx](https://philgresh.github.io/cpnx/) — including the full [API reference](https://philgresh.github.io/cpnx/latest/reference/core/).
 
 ---
 
@@ -175,9 +178,14 @@ quiet = net.is_quiescent()  # True if dead AND no in-flight transitions
 
 ---
 
-## API Reference
+## API at a Glance
+
+A quick-look cheatsheet of the public surface. For the complete, auto-generated
+reference, see the [full API reference](https://philgresh.github.io/cpnx/latest/reference/core/).
 
 ### `Token`
+
+[→ Full API reference](https://philgresh.github.io/cpnx/latest/reference/tokens/#cpnx.Token)
 
 ```python
 @dataclass(frozen=True)
@@ -196,6 +204,8 @@ class Token:
 
 ### `FrozenDict`
 
+[→ Full API reference](https://philgresh.github.io/cpnx/latest/reference/tokens/#cpnx.FrozenDict)
+
 An immutable, hashable mapping. Nested dicts and lists are frozen recursively at construction time.
 
 ```python
@@ -206,6 +216,8 @@ fd.set("y", 2)   # returns a new FrozenDict — fd is unchanged
 ```
 
 ### Places
+
+[→ Full API reference](https://philgresh.github.io/cpnx/latest/reference/places/#cpnx.Place)
 
 ```python
 Place(name: str, bound: int | None = None, color_set: set[str] | None = None,
@@ -224,6 +236,8 @@ SinkPlace(name: str, *, keep_last: int = 0, color_set: set[str] | None = None)
 
 ### Arcs
 
+[→ Full API reference](https://philgresh.github.io/cpnx/latest/reference/transitions/#cpnx.InputArc)
+
 ```python
 InputArc(place: str, count: int = 1, consume_all: bool = False,
          settle_secs: float = 0.0,
@@ -237,6 +251,8 @@ OutputArc.on_color(color: str, place: str, count: int = 1) -> OutputArc
 ```
 
 ### `Transition`
+
+[→ Full API reference](https://philgresh.github.io/cpnx/latest/reference/transitions/#cpnx.Transition)
 
 ```python
 @dataclass
@@ -252,6 +268,8 @@ class Transition:
 ```
 
 ### `PetriNet`
+
+[→ Full API reference](https://philgresh.github.io/cpnx/latest/reference/core/#cpnx.PetriNet)
 
 ```python
 class PetriNet:
@@ -287,9 +305,9 @@ class PetriNet:
 
 ## Examples
 
-- [examples/gpu_pipeline.py](examples/gpu_pipeline.py) — GPU slot pool; shows concurrent throttling
-- [examples/api_rate_limit.py](examples/api_rate_limit.py) — paced resource tokens enforce external API rate limits
-- [examples/etl_pipeline.py](examples/etl_pipeline.py) — multi-stage ETL using `ThresholdPlace` for batch accumulation
+- [examples/gpu_pipeline.py](https://github.com/philgresh/cpnx/blob/main/examples/gpu_pipeline.py) — GPU slot pool; shows concurrent throttling
+- [examples/api_rate_limit.py](https://github.com/philgresh/cpnx/blob/main/examples/api_rate_limit.py) — paced resource tokens enforce external API rate limits
+- [examples/etl_pipeline.py](https://github.com/philgresh/cpnx/blob/main/examples/etl_pipeline.py) — multi-stage ETL using `ThresholdPlace` for batch accumulation
 
 ---
 
@@ -329,10 +347,10 @@ cpnx's execution model is aligned with **Coloured Petri Nets (CPNs)** as formali
 
 **References:**
 
-- Jensen, K. et al. — *CPN Group at Aarhus University* — https://cs.au.dk/cpnets  
+- Jensen, K. et al. — *CPN Group at Aarhus University* — [cs.au.dk/cpnets](https://cs.au.dk/cpnets)  
   The canonical reference for CPN theory, tools (CPN Tools), and formalism.
 
-- Winkler, T. et al. — *CPN-Py: A Python Framework for Coloured Petri Nets* (2025) — https://arxiv.org/html/2506.12238v1  
+- Winkler, T. et al. — *CPN-Py: A Python Framework for Coloured Petri Nets* (2025) — [arxiv.org/html/2506.12238v1](https://arxiv.org/html/2506.12238v1)  
   The closest Python CPN library; cpnx differs by targeting concurrent **execution** rather than sequential **simulation** and formal state-space analysis.
 
 **Where cpnx intentionally diverges from standard CPN theory:**
@@ -348,6 +366,13 @@ cpnx's execution model is aligned with **Coloured Petri Nets (CPNs)** as formali
 
 ---
 
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](https://github.com/philgresh/cpnx/blob/main/CONTRIBUTING.md)
+for development setup, the `make` targets CI runs, and the docstring/documentation conventions.
+
+---
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/philgresh/cpnx/blob/main/LICENSE).

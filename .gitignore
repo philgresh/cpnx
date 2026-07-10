@@ -11,6 +11,9 @@ build/
 .eggs/
 *.so
 
+# MkDocs build output
+site/
+
 # Test / lint caches
 .pytest_cache/
 .ruff_cache/

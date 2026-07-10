@@ -1,4 +1,4 @@
-.PHONY: format lint test
+.PHONY: format lint test docs-serve docs-build
 
 VENV = .venv
 BIN = $(VENV)/bin
@@ -12,3 +12,9 @@ lint:
 
 test:
 	$(BIN)/pytest tests/ -v
+
+docs-serve:
+	$(BIN)/mkdocs serve
+
+docs-build:
+	$(BIN)/mkdocs build --strict

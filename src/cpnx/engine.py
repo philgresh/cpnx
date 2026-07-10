@@ -117,29 +117,64 @@ def _rollback_failed_transition(
 
 
 class PetriNet:
-    """Concurrent Petri net executor.
+    """A concurrent, thread-safe executor for coloured Petri nets.
 
-    Manages places, transitions, and a thread pool for firing transitions
-    concurrently. Resource tokens are guaranteed to be returned to their source
-    places even when a transition's action raises. For data tokens, the net supports
-    three error handling dispositions:
+    A [`PetriNet`][cpnx.PetriNet] owns a collection of named
+    [`Place`][cpnx.Place] instances and [`Transition`][cpnx.Transition] instances connected by
+    arcs, plus three internal thread pools: one that selects and fires transitions
+    (`max_workers` wide), one that runs transition actions (guarded per-transition by
+    `Transition.action_timeout_secs`), and a small pool used to evaluate guard/arc-selection
+    expressions under a timeout. All mutations of places and transitions (`deposit`, firing,
+    rollback) happen while holding a single internal engine lock, so the net is safe to drive
+    from multiple threads concurrently; transition *actions* themselves run outside that lock.
 
-    A. **Colour-routed error (primary/canonical)**: The action catches its own exception,
-       returns an error-coloured token, and output-arc expressions (e.g. using
-       ``OutputArc.expression``) route success vs error tokens to different places.
-       This preserves firing rules and token conservation (1-in-1-out).
-    B. **Bounded atomic-retry**: On action failure/exception, the data token is rolled back
-       to its source place with a delay and an incremented ``attempts`` counter, retrying
-       up to ``max_retries`` times (default 5). Once exhausted, it is dead-lettered to
-       ``error_place``.
-    C. **Immediate dead-letter**: By setting ``max_retries=0`` on a transition, any action
-       failure immediately routes the data token to ``error_place``.
+    Resource tokens (`Token.is_resource`) are always returned to their source place once a
+    firing completes, whether it succeeds or fails. For data tokens, the net supports three
+    error-handling dispositions:
 
-    Note that ``error_place`` can be configured as a ``SinkPlace`` (e.g. ``SinkPlace("failed", keep_last=10)``)
-    to keep only the last N failures for diagnostics, preventing unbounded memory growth in long-running streaming nets.
+    - **A. Colour-routed error (primary/canonical)** — the action catches its own
+      exception, returns an error-coloured token, and output-arc expressions (e.g. using
+      `OutputArc.expression`) route success vs error tokens to different places. This
+      preserves firing rules and token conservation (1-in-1-out).
+    - **B. Bounded atomic-retry** — on action failure/exception, the data token is rolled
+      back to its source place with a delay (`retry_delay`) and an incremented `attempts`
+      counter, retrying up to `Transition.max_retries` times (default 5). Once exhausted,
+      it is dead-lettered to `error_place`.
+    - **C. Immediate dead-letter** — setting `max_retries=0` on a transition routes any
+      action failure immediately to `error_place`.
 
-    Typical usage::
+    Note that `error_place` can be configured as a [`SinkPlace`][cpnx.SinkPlace]
+    (e.g. `SinkPlace("failed", keep_last=10)`) to keep only the last N failures for
+    diagnostics, preventing unbounded memory growth in long-running streaming nets.
 
+    Attributes:
+        max_workers: Maximum number of transitions that may fire concurrently.
+        error_place: Name of the place that receives dead-lettered data tokens.
+        cooldown_interval: Polling interval in seconds used by [`run`][cpnx.PetriNet.run]
+            while waiting for paced/cooldown tokens to become available.
+        timeout_secs: Maximum execution time in seconds for transition action callables.
+        expr_timeout_secs: Maximum execution time in seconds for guard and arc-selection
+            expression callables.
+        retry_delay: Delay in seconds applied to data tokens rolled back on transient failure.
+        places: Mapping of registered place name to `Place` instance.
+        transitions: Mapping of registered transition name to `Transition` instance.
+        on_transition_fired: Optional callback `(transition_name: str, duration_secs: float)
+            -> None`, called after a transition's action completes successfully. Fires outside
+            the engine lock, so it is safe to call [`deposit`][cpnx.PetriNet.deposit] from here.
+        on_token_deposited: Optional callback `(place_name: str, token: Token) -> None`, called
+            after any token is deposited into any place. Fires outside the engine lock. Do
+            **not** call [`add_place`][cpnx.PetriNet.add_place] or
+            [`add_transition`][cpnx.PetriNet.add_transition] from within this callback.
+        on_token_dead_lettered: Optional callback `(transition_name: str, token: Token) -> None`,
+            called when a data token is dead-lettered to `error_place` (retries exhausted, or
+            `max_retries=0`). Fires outside the engine lock.
+        on_error: Optional callback `(transition_name: str, exc: Exception, token: Token | None)
+            -> None`, called when a transition's action raises. `token` is the data token that
+            was routed to the error place or rolled back, or `None` if the transition consumed
+            no data tokens. Fires outside the engine lock.
+
+    Example:
+        ```python
         net = PetriNet(
             max_workers=4,
             places=[Place("source"), Place("sink")],
@@ -154,12 +189,15 @@ class PetriNet:
         )
         net.deposit("source", Token(payload={"job_id": 1}))
         net.run()  # runs to quiescence
+        ```
 
-    Use as a context manager to ensure the thread pool shuts down cleanly::
+    Use as a context manager to ensure the thread pool shuts down cleanly:
 
+        ```python
         with PetriNet(max_workers=4) as net:
             ...
             net.run()
+        ```
     """
 
     def __init__(
@@ -173,28 +211,31 @@ class PetriNet:
         expr_timeout_secs: float = 0.1,
         retry_delay: float = 1.0,
     ) -> None:
-        """Initialise the executor.
+        """Construct the net, its thread pools, and register any initial places/transitions.
 
         Args:
-            max_workers: Maximum number of transitions that may fire concurrently.
+            max_workers: Maximum number of transitions that may fire concurrently
+                (default: 4). Also sizes the internal action thread pool.
             error_place: Name of the place that receives data tokens from failed
-                         transitions. Created automatically as a standard Place,
-                         but can be overridden by registering a custom place (like a
-                         SinkPlace) with the same name.
-            places: Optional list of :class:`~cpnx.places.Place` instances to
-                    register at construction time.
-            transitions: Optional list of :class:`~cpnx.transitions.Transition`
-                         instances to register at construction time.
-            cooldown_interval: Cooldown check polling interval in seconds.
+                         transitions (default: `"failed"`). Created automatically as a
+                         standard `Place`, but can be overridden by registering a custom
+                         place (like a `SinkPlace`) with the same name before it is needed.
+            places: Optional list of [`Place`][cpnx.Place] (or subclass) instances to
+                    register at construction time (default: `None`).
+            transitions: Optional list of [`Transition`][cpnx.Transition] instances to
+                         register at construction time (default: `None`).
+            cooldown_interval: Cooldown check polling interval in seconds, used by
+                               [`run`][cpnx.PetriNet.run] (default: 0.05).
             timeout_secs: Maximum allowed execution time in seconds for transition
-                          action callables (run off the engine lock).
+                          action callables that declare no per-transition timeout
+                          (run off the engine lock) (default: 1.0).
             expr_timeout_secs: Maximum allowed execution time in seconds for guard
                                and arc expression callables. These are evaluated
                                while holding the engine lock, so this value directly
-                               caps how long concurrent ``deposit()`` and ``step()``
-                               calls will block. Keep well under 1 s (default: 0.1 s).
+                               caps how long concurrent `deposit()` and `step()`
+                               calls will block. Keep well under 1 s (default: 0.1).
             retry_delay: Delay in seconds to apply to data tokens when rolling them
-                         back to their source places on transient failure.
+                         back to their source places on transient failure (default: 1.0).
         """
         self.max_workers = max_workers
         self.error_place = error_place
@@ -215,26 +256,26 @@ class PetriNet:
         self._work_available = threading.Event()
 
         #: Called after a transition completes successfully.
-        #: Signature: ``(transition_name: str, duration_secs: float) -> None``.
-        #: Fires outside the engine lock — safe to call :meth:`deposit` from here.
+        #: Signature: `(transition_name: str, duration_secs: float) -> None`.
+        #: Fires outside the engine lock — safe to call `deposit` from here.
         self.on_transition_fired: Callable[[str, float], None] | None = None
 
         #: Called after any token is deposited into any place.
-        #: Signature: ``(place_name: str, token: Token) -> None``.
-        #: Fires outside the engine lock — safe to call :meth:`deposit` from here.
-        #: Warning: do **not** call :meth:`add_place` or :meth:`add_transition` from
+        #: Signature: `(place_name: str, token: Token) -> None`.
+        #: Fires outside the engine lock — safe to call `deposit` from here.
+        #: Warning: do **not** call `add_place` or `add_transition` from
         #: within this callback.
         self.on_token_deposited: Callable[[str, Token], None] | None = None
 
         #: Called when a data token is dead-lettered to the error place (due to exhausted retries or immediate failure).
-        #: Signature: ``(transition_name: str, token: Token) -> None``.
+        #: Signature: `(transition_name: str, token: Token) -> None`.
         #: Fires outside the engine lock.
         self.on_token_dead_lettered: Callable[[str, Token], None] | None = None
 
         #: Called when a transition's action raises an exception.
-        #: Signature: ``(transition_name: str, exc: Exception, token: Token | None) -> None``.
-        #: *token* is the data token that was routed to the error place or rolled back,
-        #: or ``None`` if the transition had no data inputs.
+        #: Signature: `(transition_name: str, exc: Exception, token: Token | None) -> None`.
+        #: `token` is the data token that was routed to the error place or rolled back,
+        #: or `None` if the transition had no data inputs.
         #: Fires outside the engine lock.
         self.on_error: Callable[[str, Exception, Token | None], None] | None = None
 
@@ -262,12 +303,32 @@ class PetriNet:
 
     @property
     def model_time(self) -> float:
-        """Returns the current logical or real time of the PetriNet."""
+        """Current time used for settle windows, cooldowns, and thresholds.
+
+        Returns the logical clock set via [`advance_time`][cpnx.PetriNet.advance_time], if one
+        has ever been set; otherwise returns the real wall-clock time (`time.monotonic()`).
+        A net that never calls `advance_time` runs entirely on real time.
+
+        Returns:
+            The current logical clock value, or `time.monotonic()` if no logical clock is set.
+        """
         with self._lock:
             return self._get_model_time_under_lock()
 
     def advance_time(self, new_time: float) -> None:
-        """Advance the logical clock of the net. Must be strictly monotonic."""
+        """Advance the net's logical clock to `new_time` and wake any waiting `run` loop.
+
+        Once called, the net switches from real (`time.monotonic()`) to logical time for all
+        settle-window, cooldown, and threshold checks. Subsequent calls must strictly increase
+        the clock.
+
+        Args:
+            new_time: The new logical timestamp. Must be strictly greater than the current
+                model time (if one has already been set).
+
+        Raises:
+            ValueError: If `new_time` is less than or equal to the current model time.
+        """
         with self._lock:
             if self._model_time is not None and new_time <= self._model_time:
                 raise ValueError(
@@ -283,16 +344,18 @@ class PetriNet:
     # ------------------------------------------------------------------
 
     def add_place(self, place: Place) -> None:
-        """Register a place with the net.
+        """Register `place` with the net under its `place.name`.
 
         Must be called before any transition arc references this place by name
-        and before :meth:`run` or :meth:`step` is invoked.
+        and before [`run`][cpnx.PetriNet.run] or [`step`][cpnx.PetriNet.step] is invoked.
 
         Args:
-            place: A :class:`~cpnx.places.Place`,
-                   :class:`~cpnx.places.ResourcePlace`,
-                   :class:`~cpnx.places.PacedResourcePlace`, or
-                   :class:`~cpnx.places.ThresholdPlace` instance.
+            place: A [`Place`][cpnx.Place], [`ResourcePlace`][cpnx.ResourcePlace],
+                   [`PacedResourcePlace`][cpnx.PacedResourcePlace], or
+                   `ThresholdPlace`/`SinkPlace` instance.
+
+        Raises:
+            ValueError: If `place.name` is already registered as a transition name.
         """
         with self._lock:
             if place.name in self.transitions:
@@ -311,14 +374,20 @@ class PetriNet:
                 )
 
     def add_transition(self, transition: Transition) -> None:
-        """Register a transition with the net.
+        """Register `transition` with the net under its `transition.name`.
 
         All places referenced by the transition's input and output arcs must be
-        registered via :meth:`add_place` before the first time the transition
-        fires — referencing an undeclared name raises :exc:`KeyError` at fire time.
+        registered via [`add_place`][cpnx.PetriNet.add_place] before the first time the
+        transition fires — referencing an undeclared name raises `KeyError` at fire time.
 
         Args:
-            transition: The :class:`~cpnx.transitions.Transition` to register.
+            transition: The [`Transition`][cpnx.Transition] (or
+                [`SubstitutionTransition`][cpnx.SubstitutionTransition]) to register.
+
+        Raises:
+            ValueError: If `transition.name` is already registered as a place name.
+            TypeError: If one of the transition's arcs targets another transition's name
+                instead of a place.
         """
         with self._lock:
             self._validate_new_transition(transition)
@@ -327,15 +396,17 @@ class PetriNet:
                 self._has_timed_features = True
 
     def deposit(self, place_name: str, token: Token) -> None:
-        """Deposit *token* into *place_name*, creating the place if it does not exist.
+        """Deposit `token` into `place_name`, auto-creating a bare place if it does not exist.
 
         This is the primary entry point for injecting work items from external
-        sources (data loaders, scheduled events, API responses, etc.).
+        sources (data loaders, scheduled events, API responses, etc.). Also wakes any
+        thread blocked in [`run`][cpnx.PetriNet.run] and invokes `on_token_deposited`
+        (if set) outside the engine lock.
 
         Note:
-            Auto-creation always produces a bare :class:`~cpnx.places.Place`.
-            If you need a :class:`~cpnx.places.ResourcePlace` or
-            :class:`~cpnx.places.ThresholdPlace`, call :meth:`add_place` first.
+            Auto-creation always produces a bare [`Place`][cpnx.Place].
+            If you need a [`ResourcePlace`][cpnx.ResourcePlace] or
+            `ThresholdPlace`, call [`add_place`][cpnx.PetriNet.add_place] first.
 
         Args:
             place_name: Name of the target place.
@@ -398,18 +469,25 @@ class PetriNet:
         return consumed_tokens, token_sources
 
     def step(self) -> bool:
-        """Fire the highest-priority enabled transition, scheduling its action asynchronously.
+        """Fire one enabled transition and return immediately, without waiting for it to finish.
 
-        Atomically selects and enables the transition, consumes its input tokens,
-        and submits the action to the thread pool. Returns before the action completes.
+        Selects the highest-priority enabled transition (ties broken at random among
+        transitions sharing the lowest `priority` value), consumes its input tokens, and
+        submits its action to the thread pool — all atomically under the engine lock. Returns
+        before the action completes; the transition's effects are committed later, from a
+        worker thread, once the action finishes.
 
         Returns:
-            ``True`` if a transition was fired; ``False`` if no transition is
-            currently enabled (net may still have in-flight transitions).
+            `True` if a transition was selected and its action was scheduled; `False` if no
+            transition is currently enabled. A `False` return does not mean the net is
+            finished — transitions may still be in flight, or may become enabled once
+            in-flight transitions or cooldowns complete. Use
+            [`is_quiescent`][cpnx.PetriNet.is_quiescent] to check for that.
 
         Raises:
-            RuntimeError: If the executor has been shut down (e.g. after exiting
-                          a ``with`` block).
+            RuntimeError: If submitting to the internal thread pool fails (e.g. the pool has
+                already been shut down, such as after exiting a `with` block). Any tokens
+                already consumed from input places are returned before the error propagates.
         """
         with self._lock:
             selected = self._select_transition_to_fire()
@@ -444,10 +522,17 @@ class PetriNet:
                 raise KeyError(f"Place '{arc.place}' referenced by transition '{transition_name}' is not registered.")
 
     def validate(self) -> None:
-        """Validate the structural topology of the Petri net.
+        """Check the net's structural topology and raise on the first problem found.
 
         Checks for name overlaps between places and transitions, and verifies
-        that all transition arcs connect to valid places and not transitions.
+        that all transition arcs connect to valid, registered places rather than
+        transitions. Called automatically at the start of [`run`][cpnx.PetriNet.run].
+
+        Raises:
+            ValueError: If a name is registered as both a place and a transition.
+            TypeError: If a transition's arc targets another transition's name.
+            KeyError: If a transition's arc references a place that has not been
+                registered via [`add_place`][cpnx.PetriNet.add_place].
         """
         with self._lock:
             # Check overlap between place names and transition names
@@ -483,27 +568,36 @@ class PetriNet:
         *,
         stop_event: threading.Event | None = None,
     ) -> None:
-        """Fire enabled transitions until the net is quiescent or the deadline passes.
+        """Repeatedly call `step` until the net is quiescent, the deadline passes, or stopped.
 
-        Sleeps efficiently on a :class:`threading.Event` rather than busy-waiting,
-        waking immediately when new tokens become available.
+        Validates the net first (see [`validate`][cpnx.PetriNet.validate]), then loops:
+        clear the work-available signal, try to fire a transition via
+        [`step`][cpnx.PetriNet.step], and if nothing fired, sleep on an internal
+        `threading.Event` (bounded by `cooldown_interval`, or by 0.1s when `stop_event` is
+        given) rather than busy-waiting — the event wakes immediately when new tokens are
+        deposited, a transition completes, or the clock advances. The loop checks
+        `stop_event`/`deadline` before each firing attempt, so it exits promptly rather than
+        only between full sleep cycles.
 
         Args:
-            deadline: **Absolute** monotonic timestamp after which the loop exits.
-                      Always construct this as ``time.monotonic() + <seconds>``.
-                      If ``None`` (default), runs until the net is quiescent.
-            stop_event: Optional :class:`threading.Event`. If set, the loop exits
-                        promptly.
+            deadline: **Absolute** monotonic timestamp after which the loop exits, even if
+                the net is not yet quiescent. Always construct this as
+                `time.monotonic() + <seconds>`. If `None` (default), runs until the net is
+                quiescent, with no time limit.
+            stop_event: Optional `threading.Event`. If set (by another thread) at any point
+                during the loop, `run` exits promptly, leaving any in-flight transitions
+                running in the background.
 
         Warning:
-            Passing a raw duration (e.g. ``run(30)``) instead of an absolute
-            deadline causes immediate exit because ``time.monotonic()`` is always
-            much larger than small floats. Use ``run(deadline=time.monotonic() + 30)``.
+            Passing a raw duration (e.g. `run(30)`) instead of an absolute
+            deadline causes immediate exit because `time.monotonic()` is always
+            much larger than small floats. Use `run(deadline=time.monotonic() + 30)`.
 
-        Example::
-
+        Example:
+            ```python
             net.run(deadline=time.monotonic() + 30)  # run for up to 30 seconds
             net.run()  # run to quiescence
+            ```
         """
         self.validate()
         while not self.is_quiescent():
@@ -514,18 +608,21 @@ class PetriNet:
                 self._wait_for_work(deadline, stop_event)
 
     def is_quiescent(self) -> bool:
-        """Return ``True`` if no transitions are running and none can currently fire.
+        """Return `True` if there is no in-flight work and nothing could become enabled soon.
 
-        A net is quiescent when ``_running_count == 0`` and every transition is
-        blocked (insufficient tokens, guards False, etc.).
-
-        For :class:`~cpnx.places.PacedResourcePlace`, tokens in cooldown are
-        counted as *present* — the net is not considered quiescent while tokens
-        are merely cooling down, since they will become available once the
-        cooldown expires.
+        A net is quiescent when no transition is currently running (in the middle of an
+        action) *and* no transition could possibly fire even once currently-cooling-down or
+        not-yet-settled tokens become available. Unlike [`is_dead`][cpnx.PetriNet.is_dead],
+        which is a pure snapshot of the current marking, `is_quiescent` also accounts for
+        in-flight transitions and treats time-gated tokens (cooldowns, settle windows) as if
+        they were already present — so the net is not considered quiescent merely because
+        work is temporarily blocked by timing. This is the condition [`run`][cpnx.PetriNet.run]
+        loops until.
 
         Returns:
-            ``True`` if the net has no pending or in-flight work.
+            `True` if the net has no pending or in-flight work; `False` if a transition is
+            running or could eventually fire (including after a cooldown or settle window
+            elapses).
         """
         with self._lock:
             if self._running_count > 0:
@@ -534,53 +631,62 @@ class PetriNet:
 
     @property
     def marking(self) -> dict[str, tuple[Token, ...]]:
-        """Current marking: maps each place name to its live token tuple.
+        """Snapshot the current marking: every place name mapped to its live tokens.
 
-        In CPN formalism the *marking* ``M`` is a function from places to
-        multisets of colour values. This property returns a tuple of live
-        :class:`~cpnx.tokens.Token` objects currently in each place.
+        In CPN formalism the *marking* `M` is a function from places to
+        multisets of colour values. This property returns, for each registered place, a
+        tuple of the [`Token`][cpnx.Token] objects currently held there (taken under the
+        engine lock, so it reflects a single consistent instant).
 
         Returns:
-            Dict mapping place name → tuple of tokens currently in that place.
+            Dict mapping place name to a tuple of tokens currently in that place.
         """
         with self._lock:
             return {name: place.tokens for name, place in self.places.items()}
 
     def is_dead(self) -> bool:
-        """Return ``True`` if no transition is currently enabled (CPN dead state).
+        """Return `True` if the current marking enables no transition right now (CPN dead state).
 
         In CPN theory a *dead marking* is one in which no transition can fire
-        given the current token distribution. Unlike :meth:`is_quiescent`, this
-        does not check for in-flight transitions — it is a pure marking-level
-        check.
+        given the current token distribution. This checks each transition's full enabling
+        condition — token availability, cooldowns, settle windows, output capacity, and the
+        guard — exactly as of this instant. Unlike [`is_quiescent`][cpnx.PetriNet.is_quiescent],
+        it does **not** account for in-flight transitions, nor does it treat cooling-down or
+        not-yet-settled tokens as available; a net can be dead right now yet become enabled
+        moments later once a cooldown expires or an in-flight transition deposits a token.
 
         Returns:
-            ``True`` if every transition's enabling condition fails.
+            `True` if every transition's enabling condition currently fails.
         """
         with self._lock:
             return not any(self._is_transition_enabled(t) for t in self.transitions.values())
 
     def snapshot(self) -> dict:
-        """Return a JSON-serialisable snapshot of current place markings.
+        """Return a JSON-serialisable snapshot of current place markings and running count.
+
+        Delegates to the module-level [`snapshot`][cpnx.snapshot] function.
 
         Returns:
-            Dict with ``"places"`` (mapping place name → list of token dicts with
-            keys ``id``, ``payload``, ``created_at``, ``is_resource``) and
-            ``"running_count"`` (number of transitions currently executing).
+            Dict with `"places"` (mapping place name to a list of token dicts with
+            keys `id`, `payload`, `created_at`, `is_resource`) and
+            `"running_count"` (number of transitions currently executing).
 
-        Example::
-
+        Example:
+            ```python
             import json
             print(json.dumps(net.snapshot(), indent=2))
+            ```
         """
         return snapshot(self)
 
     def to_dot(self) -> str:
-        """Generate a Graphviz DOT string of the net topology.
+        """Render the net's places, transitions, and arcs as a Graphviz DOT string.
+
+        Delegates to the module-level [`to_dot`][cpnx.to_dot] function.
 
         Place nodes are circles annotated with current token counts.
-        Transition nodes are boxes. Arc labels include ``count``,
-        ``consume_all``, and ``settle_secs`` where non-default.
+        Transition nodes are boxes. Arc labels include `count`,
+        `consume_all`, and `settle_secs` where non-default.
 
         Returns:
             A DOT language string. Render with Graphviz or paste into
@@ -621,11 +727,11 @@ class PetriNet:
     # ------------------------------------------------------------------
 
     def _deposit_under_lock(self, place_name: str, token: Token) -> None:
-        """Deposit *token* into an already-registered place (caller holds ``self._lock``).
+        """Deposit `token` into an already-registered place (caller holds `self._lock`).
 
-        Unlike the public :meth:`deposit`, this method does NOT auto-create missing
-        places — it raises :exc:`KeyError` so typos in arc names are caught loudly
-        rather than silently creating a bare :class:`~cpnx.places.Place` with the
+        Unlike the public `deposit`, this method does NOT auto-create missing
+        places — it raises `KeyError` so typos in arc names are caught loudly
+        rather than silently creating a bare `Place` with the
         wrong type. Callbacks are NOT fired here; callers collect deposits and fire
         them after releasing the lock.
 
@@ -634,7 +740,7 @@ class PetriNet:
             token: The token to deposit.
 
         Raises:
-            KeyError: If *place_name* has not been registered with :meth:`add_place`.
+            KeyError: If `place_name` has not been registered with `add_place`.
         """
         if place_name not in self.places:
             raise KeyError(
@@ -690,11 +796,11 @@ class PetriNet:
         return elapsed >= arc.settle_secs
 
     def _eval_expression(self, expression, compiled, tokens: list[Token]):
-        """Evaluate a string (precompiled, sandboxed) or callable *expression* over *tokens*.
+        """Evaluate a string (precompiled, sandboxed) or callable `expression` over `tokens`.
 
         Centralizes the string-vs-callable dispatch shared by input-arc selection
-        (:meth:`_resolve_input_tokens`), output-arc guards (:meth:`_is_arc_active`),
-        and transition guards (:meth:`_check_transition_guard`). Callers are
+        (`_resolve_input_tokens`), output-arc guards (`_is_arc_active`),
+        and transition guards (`_check_transition_guard`). Callers are
         responsible for coercing/bounding the result and for exception handling.
         """
         if isinstance(expression, str):
@@ -702,18 +808,18 @@ class PetriNet:
         return self._call_expr(expression, tokens, timeout=self.expr_timeout_secs)
 
     def _resolve_input_tokens(self, arc: InputArc, available: list[Token]) -> list[Token] | None:
-        """Resolve which tokens input *arc* would consume from *available*.
+        """Resolve which tokens input `arc` would consume from `available`.
 
-        Returns the selected tokens, or ``None`` if the arc cannot be satisfied —
-        either its selection expression raised, or fewer than ``arc.count`` tokens
+        Returns the selected tokens, or `None` if the arc cannot be satisfied —
+        either its selection expression raised, or fewer than `arc.count` tokens
         are eligible. In CPN semantics arc multiplicity is all-or-nothing: an arc
-        demanding ``count`` tokens is not enabled unless at least ``count`` are
+        demanding `count` tokens is not enabled unless at least `count` are
         resolved, so a selection that yields fewer (or none) disables the
         transition rather than firing with a short or zero-length token list.
 
-        Shared by the firing check (via :meth:`_check_arc_preconditions`) and the
-        timing-agnostic :meth:`_is_transition_potentially_enabled` so both apply
-        the identical multiplicity rule; callers differ only in how *available*
+        Shared by the firing check (via `_check_arc_preconditions`) and the
+        timing-agnostic `_is_transition_potentially_enabled` so both apply
+        the identical multiplicity rule; callers differ only in how `available`
         is computed (real/model time vs. ignoring timing).
         """
         if arc.consume_all:
@@ -751,12 +857,12 @@ class PetriNet:
             return False
 
     def _is_transition_potentially_enabled(self, transition: Transition) -> bool:
-        """Return ``True`` if *transition* could fire given current token counts, ignoring timing.
+        """Return `True` if `transition` could fire given current token counts, ignoring timing.
 
-        Unlike :meth:`_is_transition_enabled`, this ignores cooldown timers on
-        :class:`~cpnx.places.PacedResourcePlace` (tokens in cooldown are counted
-        as present) and settle windows. Used by :meth:`is_quiescent` to distinguish
-        "no work possible" from "work temporarily blocked by timing".
+        Unlike `_is_transition_enabled`, this ignores cooldown timers on
+        `PacedResourcePlace` (tokens in cooldown are counted
+        as present) and settle windows. Used by [`is_quiescent`][cpnx.PetriNet.is_quiescent] to
+        distinguish "no work possible" from "work temporarily blocked by timing".
         """
         candidate_tokens: list[Token] = []
         for arc in transition.inputs:

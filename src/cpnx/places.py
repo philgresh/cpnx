@@ -2,15 +2,15 @@
 
 All place classes are thread-safe. Choose the right type for your use case:
 
-- :class:`Place`              — unbounded FIFO queue for data / work tokens
-- :class:`ResourcePlace`      — bounded permit pool (GPU slots, DB connections)
-- :class:`PacedResourcePlace` — permit pool with per-token cooldown (API rate limits)
-- :class:`ThresholdPlace`     — accumulates tokens until a batch threshold is met
+- [`Place`][cpnx.Place]              — unbounded FIFO queue for data / work tokens
+- [`ResourcePlace`][cpnx.ResourcePlace]      — bounded permit pool (GPU slots, DB connections)
+- [`PacedResourcePlace`][cpnx.PacedResourcePlace] — permit pool with per-token cooldown (API rate limits)
+- [`ThresholdPlace`][cpnx.ThresholdPlace]     — accumulates tokens until a batch threshold is met
 
 **CPN alignment:** In Coloured Petri Net theory a place has a *colour set* —
-the type of tokens it accepts. :attr:`Place.color_set` exposes this directly.
-:class:`ResourcePlace` and :class:`PacedResourcePlace` are Python shorthands for
-a place whose colour set is ``{"resource"}`` with a pre-filled initial marking.
+the type of tokens it accepts. `color_set` exposes this directly.
+[`ResourcePlace`][cpnx.ResourcePlace] and [`PacedResourcePlace`][cpnx.PacedResourcePlace] are Python
+shorthands for a place whose colour set is ``{"resource"}`` with a pre-filled initial marking.
 """
 
 import threading
@@ -27,7 +27,7 @@ class Place:
     colour) and no initial marking. Set ``color_set`` to restrict accepted
     colours; set ``initial_marking`` to pre-fill with tokens at construction.
 
-    All operations are thread-safe via an internal :class:`threading.Lock`.
+    All operations are thread-safe via an internal `threading.Lock`.
     """
 
     def __init__(
@@ -40,7 +40,7 @@ class Place:
         """Create a new Place.
 
         Args:
-            name: Unique identifier for this place within a :class:`PetriNet`.
+            name: Unique identifier for this place within a [`PetriNet`][cpnx.PetriNet].
             bound: Optional k-bound (capacity constraint). The engine will not
                    fire a transition whose unguarded output arc targets this place
                    if doing so would exceed the bound. ``None`` (default) means
@@ -64,13 +64,18 @@ class Place:
             self.last_deposit_time = time.monotonic()
 
     def deposit(self, token: Token, model_time: float | None = None) -> None:
-        """Append *token* to the tail of the queue.
+        """Append *token* to the tail of the FIFO queue, enforcing the place's colour set.
 
-        Updates :attr:`last_deposit_time` and calls :meth:`_on_deposit`.
+        Updates `last_deposit_time` (and `last_deposit_time_model` if *model_time* is given),
+        then calls `_on_deposit`.
 
         Args:
             token: The token to deposit.
-            model_time: Optional logical clock timestamp.
+            model_time: Optional logical clock timestamp recorded alongside the deposit.
+                        Does not affect wall-clock availability checks.
+
+        Raises:
+            TypeError: If `color_set` is set and *token*'s colour is not in it.
         """
         with self._lock:
             if self.color_set is not None and token.color not in self.color_set:
@@ -94,11 +99,16 @@ class Place:
         """
 
     def retrieve(self, count: int = 1, model_time: float | None = None) -> list[Token]:
-        """Remove and return *count* tokens from the head of the queue (FIFO order).
+        """Remove and return *count* tokens from the head of the queue, in FIFO order.
+
+        A token is only eligible if its `available_at` timestamp is at or before the
+        effective time (`model_time` if given, else `time.monotonic()`); tokens still
+        in the future (e.g. cooling down) are skipped.
 
         Args:
-            count: Number of tokens to retrieve. Must be ≥ 1.
-            model_time: Optional logical clock timestamp to filter available tokens.
+            count: Number of tokens to retrieve. Must be >= 1.
+            model_time: Optional logical clock timestamp used instead of wall-clock time
+                        to determine which tokens are available.
 
         Returns:
             List of retrieved tokens in FIFO order.
@@ -119,21 +129,24 @@ class Place:
             return to_return
 
     def retrieve_specific(self, tokens: list[Token], model_time: float | None = None) -> list[Token]:
-        """Remove and return exactly the tokens in *tokens* (matched by ``id``).
+        """Remove and return exactly the given *tokens*, matched by ``id`` rather than FIFO order.
 
-        Used by the engine when an :class:`~cpnx.transitions.InputArc` has an
-        ``expression`` that selects a specific subset of tokens to consume.
-        Uses an O(n) deque rebuild.
+        Used by the engine when an [`InputArc`][cpnx.InputArc] has an ``expression`` that
+        selects a specific subset of tokens to consume rather than the head of the queue.
+        Rebuilds the internal deque in O(n) rather than removing tokens one at a time.
 
         Args:
-            tokens: Tokens to remove. Each must be present in this place.
-            model_time: Optional logical clock timestamp to filter available tokens.
+            tokens: Tokens to remove, identified by their ``id``. Each must currently be
+                    present in this place and available at the effective time.
+            model_time: Optional logical clock timestamp used instead of wall-clock time
+                        to check token availability.
 
         Returns:
-            The removed tokens in the order given by *tokens*.
+            The removed tokens, in the same order as *tokens* (not necessarily FIFO order).
 
         Raises:
-            ValueError: If any token id in *tokens* is not found in this place or is not available.
+            ValueError: If any token in *tokens* is not yet available (its `available_at`
+                        is after the effective time) or is not found in this place.
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
@@ -155,13 +168,14 @@ class Place:
             return tokens
 
     def retrieve_all(self, model_time: float | None = None) -> list[Token]:
-        """Remove and return every token currently in the place.
+        """Remove and return every currently-available token, leaving not-yet-available tokens behind.
 
         Args:
-            model_time: Optional logical clock timestamp to filter available tokens.
+            model_time: Optional logical clock timestamp used instead of wall-clock time
+                        to determine which tokens are available.
 
         Returns:
-            All tokens in FIFO order; empty list if the place is empty.
+            All available tokens in FIFO order; empty list if none are available.
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
@@ -171,15 +185,16 @@ class Place:
             return available
 
     def peek(self, count: int = 1, model_time: float | None = None) -> list[Token]:
-        """Return up to *count* tokens from the head without removing them.
+        """Return up to *count* available tokens from the head without removing them.
 
         Args:
             count: Maximum number of tokens to inspect.
-            model_time: Optional logical clock timestamp to filter available tokens.
+            model_time: Optional logical clock timestamp used instead of wall-clock time
+                        to determine which tokens are available.
 
         Returns:
             List of up to *count* tokens; may be shorter than requested if fewer
-            are present. Does not modify the queue.
+            are present or available. Does not modify the queue.
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
@@ -187,11 +202,16 @@ class Place:
             return available[:count]
 
     def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
-        """Return ``True`` if at least *count* tokens are available for retrieval.
+        """Return ``True`` if at least *count* tokens are currently available for retrieval.
 
         Args:
-            count: Number of tokens needed.
-            model_time: Optional logical clock timestamp to filter available tokens.
+            count: Number of tokens needed. Defaults to 1.
+            model_time: Optional logical clock timestamp used instead of wall-clock time
+                        to determine which tokens are available.
+
+        Returns:
+            ``True`` if at least *count* tokens have `available_at` at or before the
+            effective time, ``False`` otherwise.
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
@@ -203,10 +223,14 @@ class Place:
 
         Implements k-bounded place semantics: a place with ``bound=k`` blocks when
         depositing would push the token count above ``k``. Unbounded places
-        (``bound=None``) always return ``True``.
+        (``bound=None``) always return ``True``. Ignores colour — use `can_accept`
+        to check colour compatibility.
 
         Args:
-            count: Number of tokens to be deposited.
+            count: Number of tokens to be deposited. Defaults to 1.
+
+        Returns:
+            ``True`` if depositing *count* tokens would not exceed `bound`, ``False`` otherwise.
         """
         with self._lock:
             if self.bound is None:
@@ -214,9 +238,16 @@ class Place:
             return len(self._tokens) + count <= self.bound
 
     def can_accept(self, token: Token) -> bool:
-        """Return ``True`` if the place can accept the token without violating colour sets.
+        """Return ``True`` if *token*'s colour is compatible with this place's colour set.
 
-        This is a non-mutating pre-flight check that does not modify the place's tokens.
+        This is a non-mutating pre-flight check that does not modify the place's tokens
+        and does not consider capacity — use `can_deposit` for bound checks.
+
+        Args:
+            token: The token to check for colour compatibility.
+
+        Returns:
+            ``True`` if `color_set` is ``None`` or contains *token*'s colour, ``False`` otherwise.
         """
         with self._lock:
             if self.color_set is not None and token.color not in self.color_set:
@@ -225,7 +256,10 @@ class Place:
 
     @property
     def tokens(self) -> tuple[Token, ...]:
-        """Snapshot of current tokens as an immutable tuple (does not consume them)."""
+        """Snapshot of all current tokens (including not-yet-available ones) as an immutable tuple.
+
+        Does not filter by `available_at` and does not consume or remove any tokens.
+        """
         with self._lock:
             return tuple(self._tokens)
 
@@ -240,22 +274,29 @@ class Place:
 
 
 class ResourcePlace(Place):
-    """A bounded resource-permit pool pre-filled with *capacity* resource tokens.
+    """A [`Place`][cpnx.Place] pre-filled with *capacity* resource tokens, for modelling finite permits.
 
     **CPN equivalent:** ``Place(color_set={"resource"}, initial_marking=[Token(color="resource")] * capacity)``.
     This class is a Python shorthand — it sets the colour set and initial marking
-    automatically and documents the resource-return invariant explicitly.
+    automatically and documents the resource-return invariant explicitly. It does not
+    otherwise change [`Place`][cpnx.Place]'s behavior: all inherited methods (`deposit`,
+    `retrieve`, etc.) work exactly as on the base class.
 
     Resource tokens (``color="resource"``) are consumed when a transition fires
     and must be returned via a matching output arc. This models finite resources
     such as GPU slots, database connections, or thread-pool permits.
+
+    Example:
+        ```python
+        gpu_pool = ResourcePlace("gpu_slots", capacity=4)
+        ```
     """
 
     def __init__(self, name: str, capacity: int) -> None:
         """Create a ResourcePlace pre-filled with *capacity* resource tokens.
 
         Args:
-            name: Unique identifier for this place within a :class:`PetriNet`.
+            name: Unique identifier for this place within a [`PetriNet`][cpnx.PetriNet].
             capacity: Number of resource permits in the pool. ``0`` is valid
                       (creates an empty, permanently-blocking place).
         """
@@ -268,27 +309,28 @@ class ResourcePlace(Place):
 
 
 class PacedResourcePlace(ResourcePlace):
-    """A resource pool where returned tokens must cool down before becoming reusable.
+    """A [`ResourcePlace`][cpnx.ResourcePlace] where returned tokens must cool down before becoming reusable.
 
-    **CPN equivalent:** a Timed CPN :class:`ResourcePlace` where returned tokens
+    **CPN equivalent:** a Timed CPN [`ResourcePlace`][cpnx.ResourcePlace] where returned tokens
     carry a timestamp that prevents re-use until ``pacing_secs`` have elapsed.
     This is a pragmatic extension — standard Timed CPNs put timestamps on tokens,
     not cooldown windows on places.
 
     Useful for enforcing API rate limits or minimum inter-request intervals.
     Tokens are available immediately at construction; after each return via
-    :meth:`deposit`, they are unavailable for *pacing_secs* seconds.
+    [`deposit`][cpnx.PacedResourcePlace.deposit], they are unavailable for *pacing_secs* seconds.
 
-    Example — 10 Serper requests per second::
-
+    Example — 10 Serper requests per second:
+        ```python
         serper = PacedResourcePlace("serper", capacity=10, pacing_secs=0.1)
+        ```
     """
 
     def __init__(self, name: str, capacity: int, pacing_secs: float) -> None:
         """Create a PacedResourcePlace.
 
         Args:
-            name: Unique identifier for this place within a :class:`PetriNet`.
+            name: Unique identifier for this place within a [`PetriNet`][cpnx.PetriNet].
             capacity: Number of resource permits in the pool.
             pacing_secs: Seconds a token must wait after being returned before
                          it becomes available again.
@@ -297,13 +339,18 @@ class PacedResourcePlace(ResourcePlace):
         super().__init__(name, capacity)
 
     def deposit(self, token: Token, model_time: float | None = None) -> None:
-        """Return a resource token to the pool, starting its cooldown timer.
+        """Return a resource token to the pool, replacing its `available_at` to start a cooldown timer.
 
-        The token will not be retrievable until ``pacing_secs`` have elapsed.
+        Differs from [`Place.deposit`][cpnx.Place.deposit]: instead of appending *token* unchanged,
+        this creates a copy of *token* with `available_at` set to the effective time plus
+        `pacing_secs`, so the token cannot be retrieved again until the cooldown elapses.
+        Does not validate `color_set` (unlike the base class).
 
         Args:
             token: The resource token being returned. Must have ``color="resource"``.
-            model_time: Optional logical clock timestamp.
+            model_time: Optional logical clock timestamp used instead of wall-clock time
+                        as the cooldown's start reference, and recorded in
+                        `last_deposit_time_model`.
         """
         with self._lock:
             ref_time = model_time if model_time is not None else time.monotonic()
@@ -316,11 +363,19 @@ class PacedResourcePlace(ResourcePlace):
             self._on_deposit(timed_token)
 
     def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
-        """Return ``True`` if at least *count* tokens have completed their cooldown.
+        """Return ``True`` if at least *count* tokens have completed their cooldown and are usable.
+
+        Behaves identically to [`Place.can_retrieve`][cpnx.Place.can_retrieve]; documented
+        separately here because "available" specifically means "cooldown has expired"
+        for this class.
 
         Args:
-            count: Number of cooled-down tokens needed.
-            model_time: Optional logical clock timestamp to filter available tokens.
+            count: Number of cooled-down tokens needed. Defaults to 1.
+            model_time: Optional logical clock timestamp used instead of wall-clock time
+                        to determine which tokens have finished cooling down.
+
+        Returns:
+            ``True`` if at least *count* tokens are past their cooldown, ``False`` otherwise.
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
@@ -328,13 +383,16 @@ class PacedResourcePlace(ResourcePlace):
             return available >= count
 
     def retrieve(self, count: int = 1, model_time: float | None = None) -> list[Token]:
-        """Remove and return *count* tokens whose cooldown has expired.
+        """Remove and return *count* tokens whose cooldown has expired, in expiry order.
 
-        Uses an O(n) rebuild rather than O(n²) indexed deletion.
+        Behaves like [`Place.retrieve`][cpnx.Place.retrieve] but the error message reports
+        how many tokens are still cooling down, which is specific to this class's semantics.
+        Uses an O(n) rebuild rather than O(n^2) indexed deletion.
 
         Args:
-            count: Number of cooled-down tokens to retrieve.
-            model_time: Optional logical clock timestamp to filter available tokens.
+            count: Number of cooled-down tokens to retrieve. Defaults to 1.
+            model_time: Optional logical clock timestamp used instead of wall-clock time
+                        to determine which tokens have finished cooling down.
 
         Returns:
             List of retrieved resource tokens in cooldown-expiry order.
@@ -362,9 +420,17 @@ class PacedResourcePlace(ResourcePlace):
     def peek(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Return up to *count* cooled-down tokens without removing them.
 
+        Behaves identically to [`Place.peek`][cpnx.Place.peek]; "available" specifically
+        means "cooldown has expired" for this class.
+
         Args:
-            count: Maximum number of tokens to inspect.
-            model_time: Optional logical clock timestamp to filter available tokens.
+            count: Maximum number of tokens to inspect. Defaults to 1.
+            model_time: Optional logical clock timestamp used instead of wall-clock time
+                        to determine which tokens have finished cooling down.
+
+        Returns:
+            List of up to *count* cooled-down tokens; may be shorter than requested.
+            Does not modify the pool.
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
@@ -373,41 +439,49 @@ class PacedResourcePlace(ResourcePlace):
 
 
 class ThresholdPlace(Place):
-    """A FIFO place where tokens are only retrievable once the queue depth reaches *threshold*.
+    """A [`Place`][cpnx.Place] where tokens are only retrievable once the queue depth reaches *threshold*.
 
-    **CPN equivalent:** a plain :class:`Place` whose associated transition has a
+    **CPN equivalent:** a plain [`Place`][cpnx.Place] whose associated transition has a
     guard requiring ``|M(p)| >= threshold`` before firing. This class is a Python
     shorthand that encodes the threshold directly on the place rather than
     duplicating it in every downstream transition's guard.
 
     Useful for batch processing: tokens accumulate until enough are present,
     then they are released in groups matching the transition's ``arc.count``.
+    `deposit` and `peek` are inherited unchanged from [`Place`][cpnx.Place].
 
-    Example — convene a committee once 6 validated leads are ready::
-
+    Example — convene a committee once 6 validated leads are ready:
+        ```python
         validated = ThresholdPlace("validated_leads", threshold=6)
+        ```
     """
 
     def __init__(self, name: str, threshold: int) -> None:
         """Create a ThresholdPlace.
 
         Args:
-            name: Unique identifier for this place within a :class:`PetriNet`.
+            name: Unique identifier for this place within a [`PetriNet`][cpnx.PetriNet].
             threshold: Minimum queue depth required before any retrieval is
-                       permitted. Must be ≥ 1.
+                       permitted. Must be >= 1.
         """
         super().__init__(name)
         self.threshold = threshold
 
     def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
-        """Return ``True`` if the threshold is met AND at least *count* tokens are present.
+        """Return ``True`` only if the batch threshold is met AND at least *count* tokens are present.
 
-        Both conditions must hold: the queue must have reached its threshold AND
-        contain at least *count* tokens (count may exceed the threshold).
+        Differs from [`Place.can_retrieve`][cpnx.Place.can_retrieve]: adds a gating condition
+        on top of the plain count check — the queue must have reached `threshold` regardless
+        of *count*, and separately contain at least *count* available tokens (*count* may
+        exceed `threshold`).
 
         Args:
-            count: Number of tokens needed by the requesting transition arc.
-            model_time: Optional logical clock timestamp to filter available tokens.
+            count: Number of tokens needed by the requesting transition arc. Defaults to 1.
+            model_time: Optional logical clock timestamp used instead of wall-clock time
+                        to determine which tokens are available.
+
+        Returns:
+            ``True`` if both the threshold and *count* conditions hold, ``False`` otherwise.
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
@@ -415,11 +489,16 @@ class ThresholdPlace(Place):
             return len(available) >= self.threshold and len(available) >= count
 
     def retrieve(self, count: int = 1, model_time: float | None = None) -> list[Token]:
-        """Remove and return *count* tokens if the threshold has been met.
+        """Remove and return *count* tokens from the head of the queue, but only if the threshold is met.
+
+        Differs from [`Place.retrieve`][cpnx.Place.retrieve]: first checks that the queue
+        has reached `threshold` available tokens (raising if not) before applying the
+        usual *count* check, gating retrieval behind the batch threshold.
 
         Args:
-            count: Number of tokens to retrieve.
-            model_time: Optional logical clock timestamp to filter available tokens.
+            count: Number of tokens to retrieve. Defaults to 1.
+            model_time: Optional logical clock timestamp used instead of wall-clock time
+                        to determine which tokens are available.
 
         Returns:
             List of retrieved tokens in FIFO order.
@@ -449,16 +528,21 @@ class ThresholdPlace(Place):
             return to_return
 
     def retrieve_all(self, model_time: float | None = None) -> list[Token]:
-        """Remove and return all tokens if the threshold has been met.
+        """Remove and return every available token, but only if the threshold has been met.
+
+        Differs from [`Place.retrieve_all`][cpnx.Place.retrieve_all]: raises instead of
+        returning an empty list when fewer than `threshold` tokens are available.
 
         Args:
-            model_time: Optional logical clock timestamp to filter available tokens.
+            model_time: Optional logical clock timestamp used instead of wall-clock time
+                        to determine which tokens are available.
 
         Returns:
-            All tokens in FIFO order.
+            All available tokens in FIFO order.
 
         Raises:
-            ValueError: If the threshold is not yet met.
+            ValueError: If the threshold is not yet met, with a message showing
+                        current depth vs required threshold.
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
@@ -474,26 +558,29 @@ class ThresholdPlace(Place):
 
 
 class SinkPlace(Place):
-    """An absorbing terminal place that counts and observes tokens but does not retain them.
+    """A terminal place that counts and optionally samples tokens but never retains them for retrieval.
 
-    Useful for streaming pipelines to avoid accumulating memory indefinitely.
-    Can optionally keep the most recent N tokens in a ring buffer for inspection.
+    Deposited tokens are absorbed: their colour and cumulative counts are recorded, and up
+    to `keep_last` of the most recent tokens are kept in a ring buffer purely for inspection
+    via `tokens`/`stats`/`drain_stats` — but they can never be consumed onward by a transition.
+    Useful for streaming pipelines (e.g. logging sinks, dead-letter/error places) to avoid
+    accumulating memory indefinitely while still exposing aggregate statistics.
 
-    .. warning::
-       Avoid setting a restrictive `color_set` if this place is used as an `error_place`.
-       Dead-lettered tokens preserve their original colours, and depositing a rejected
-       colour will raise a `TypeError` inside the locked transition failure branch,
-       causing the token to be lost rather than successfully dead-lettered.
+    Warning:
+        Avoid setting a restrictive `color_set` if this place is used as an `error_place`.
+        Dead-lettered tokens preserve their original colours, and depositing a rejected
+        colour will raise a `TypeError` inside the locked transition failure branch,
+        causing the token to be lost rather than successfully dead-lettered.
     """
 
     def __init__(self, name: str, *, keep_last: int = 0, color_set: set[str] | None = None) -> None:
         """Create a new SinkPlace.
 
         Args:
-            name: Unique identifier for this place within a :class:`PetriNet`.
-            keep_last: Number of most recent tokens to keep in a ring buffer.
-                       Default is 0 (retain nothing).
-            color_set: Set of accepted token colours. None (default) accepts any colour.
+            name: Unique identifier for this place within a [`PetriNet`][cpnx.PetriNet].
+            keep_last: Number of most recent tokens to keep in a ring buffer for inspection.
+                       Default is 0 (retain nothing beyond the aggregate counters).
+            color_set: Set of accepted token colours. ``None`` (default) accepts any colour.
                        Do not use a restrictive color_set if used as an error_place.
         """
         super().__init__(name, bound=None, color_set=color_set)
@@ -504,11 +591,20 @@ class SinkPlace(Place):
         self._first_deposit_time: float | None = None
 
     def deposit(self, token: Token, model_time: float | None = None) -> None:
-        """Absorb the token, incrementing counters and updating timestamps.
+        """Absorb *token*: append it to the ring buffer and update cumulative counters and timestamps.
+
+        Differs from [`Place.deposit`][cpnx.Place.deposit]: the internal deque has
+        `maxlen=keep_last`, so once full, appending silently evicts the oldest kept
+        token — this is a sampling buffer, not the full token history. Also increments
+        the `_absorbed` count and the per-colour tally, and records `_first_deposit_time`
+        on the very first deposit.
 
         Args:
             token: The token to absorb.
-            model_time: Optional logical clock timestamp.
+            model_time: Optional logical clock timestamp recorded in `last_deposit_time_model`.
+
+        Raises:
+            TypeError: If `color_set` is set and *token*'s colour is not in it.
         """
         with self._lock:
             if self.color_set is not None and token.color not in self.color_set:
@@ -530,34 +626,123 @@ class SinkPlace(Place):
             self._on_deposit(token)
 
     def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
-        """SinkPlace is terminal — returns False always."""
+        """Always return ``False``: a sink is a terminal place, so nothing is ever retrievable.
+
+        Differs from [`Place.can_retrieve`][cpnx.Place.can_retrieve]: arriving tokens are
+        absorbed for inspection/counting only and can never be consumed onward by a
+        transition, so this unconditionally reports nothing is retrievable. *count* and
+        *model_time* are accepted for interface compatibility but ignored.
+
+        Args:
+            count: Ignored.
+            model_time: Ignored.
+
+        Returns:
+            ``False``, always.
+        """
         return False
 
     def retrieve(self, count: int = 1, model_time: float | None = None) -> list[Token]:
-        """SinkPlace is terminal — raises ValueError."""
+        """Always raise: a sink is terminal, so tokens cannot be retrieved by any means.
+
+        Differs from [`Place.retrieve`][cpnx.Place.retrieve]: never returns tokens, since
+        absorbed tokens are only for inspection, not downstream consumption. *count* and
+        *model_time* are accepted for interface compatibility but ignored.
+
+        Args:
+            count: Ignored.
+            model_time: Ignored.
+
+        Raises:
+            ValueError: Always, with message "SinkPlace is terminal — tokens are absorbed,
+                        not retrievable".
+        """
         raise ValueError("SinkPlace is terminal — tokens are absorbed, not retrievable")
 
     def retrieve_specific(self, tokens: list[Token], model_time: float | None = None) -> list[Token]:
-        """SinkPlace is terminal — raises ValueError."""
+        """Always raise: a sink is terminal, so no tokens — specific or otherwise — can be retrieved.
+
+        Differs from [`Place.retrieve_specific`][cpnx.Place.retrieve_specific]: never
+        returns tokens, since absorbed tokens are only for inspection. *tokens* and
+        *model_time* are accepted for interface compatibility but ignored.
+
+        Args:
+            tokens: Ignored.
+            model_time: Ignored.
+
+        Raises:
+            ValueError: Always, with message "SinkPlace is terminal — tokens are absorbed,
+                        not retrievable".
+        """
         raise ValueError("SinkPlace is terminal — tokens are absorbed, not retrievable")
 
     def retrieve_all(self, model_time: float | None = None) -> list[Token]:
-        """SinkPlace is terminal — raises ValueError."""
+        """Always raise: a sink is terminal, so its absorbed tokens can never be drained via retrieval.
+
+        Differs from [`Place.retrieve_all`][cpnx.Place.retrieve_all]: never returns tokens.
+        Use `drain_stats` to reset the aggregate counters instead. *model_time* is accepted
+        for interface compatibility but ignored.
+
+        Args:
+            model_time: Ignored.
+
+        Raises:
+            ValueError: Always, with message "SinkPlace is terminal — tokens are absorbed,
+                        not retrievable".
+        """
         raise ValueError("SinkPlace is terminal — tokens are absorbed, not retrievable")
 
     def peek(self, count: int = 1, model_time: float | None = None) -> list[Token]:
-        """SinkPlace is terminal — raises ValueError."""
+        """Always raise: use the `tokens` property to inspect a sink's ring buffer instead.
+
+        Differs from [`Place.peek`][cpnx.Place.peek]: rather than returning a possibly-empty
+        list, this raises, since a sink's kept tokens are only meant to be read via `tokens`
+        or `stats`. *count* and *model_time* are accepted for interface compatibility but
+        ignored.
+
+        Args:
+            count: Ignored.
+            model_time: Ignored.
+
+        Raises:
+            ValueError: Always, with message "SinkPlace is terminal — tokens are absorbed,
+                        not retrievable".
+        """
         raise ValueError("SinkPlace is terminal — tokens are absorbed, not retrievable")
 
     def can_deposit(self, count: int = 1) -> bool:
-        """SinkPlace has infinite capacity — returns True always."""
+        """Always return ``True``: a sink has unbounded capacity and absorbs every token offered.
+
+        Differs from [`Place.can_deposit`][cpnx.Place.can_deposit]: ignores `bound`
+        entirely (a `SinkPlace` is constructed with ``bound=None`` and never rejects
+        on capacity grounds — only `color_set` can reject a deposit).
+
+        Args:
+            count: Ignored.
+
+        Returns:
+            ``True``, always.
+        """
         return True
 
     def stats(self) -> dict:
-        """Return cumulative statistics of absorbed tokens.
+        """Return a snapshot of cumulative statistics of absorbed tokens, without resetting any counters.
+
+        Example:
+            ```python
+            sink = SinkPlace("errors", keep_last=10)
+            sink.deposit(Token(color="error"))
+            sink.stats()
+            # {"name": "errors", "absorbed": 1, "by_color": {"error": 1}, "kept": 1,
+            #  "first_deposit_time": ..., "last_deposit_time": ...}
+            ```
 
         Returns:
-            Dictionary with name, absorbed, by_color, kept, first_deposit_time, last_deposit_time.
+            Dictionary with keys ``name`` (str), ``absorbed`` (total tokens ever deposited,
+            int), ``by_color`` (dict mapping colour to count), ``kept`` (number of tokens
+            currently in the ring buffer), ``first_deposit_time`` (float or ``None`` if
+            nothing has been deposited), and ``last_deposit_time`` (float, ``0.0`` if
+            nothing has been deposited).
         """
         with self._lock:
             return {
@@ -570,10 +755,17 @@ class SinkPlace(Place):
             }
 
     def drain_stats(self) -> dict:
-        """Return a snapshot of current stats and reset absorbed/by_color/time counters atomically.
+        """Atomically return the current stats snapshot and reset the cumulative counters to zero.
+
+        Differs from `stats`: after returning the snapshot, resets `_absorbed` to 0,
+        `_by_color` to an empty dict, and `_first_deposit_time` to ``None`` (the ring buffer
+        of kept tokens and `last_deposit_time` are left untouched). Useful for periodic
+        reporting where each report should cover only the interval since the last drain.
 
         Returns:
-            Snapshot dictionary before reset.
+            The stats dictionary as it was immediately before the reset — same shape as
+            `stats` (``name``, ``absorbed``, ``by_color``, ``kept``, ``first_deposit_time``,
+            ``last_deposit_time``).
         """
         with self._lock:
             snapshot = {
