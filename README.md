@@ -4,8 +4,11 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/cpnx.svg)](https://pypi.org/project/cpnx/)
 [![CI status](https://github.com/philgresh/cpnx/actions/workflows/ci.yml/badge.svg)](https://github.com/philgresh/cpnx/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Docs](https://img.shields.io/badge/docs-philgresh.github.io%2Fcpnx-blue.svg)](https://philgresh.github.io/cpnx/)
 
 **cpnx** is a Coloured Petri Net (CPN) executor for concurrent Python pipelines — zero dependencies, stdlib-only threading.
+
+📖 **Documentation:** [philgresh.github.io/cpnx](https://philgresh.github.io/cpnx/) — including the full [API reference](https://philgresh.github.io/cpnx/latest/reference/core/).
 
 ---
 
@@ -287,9 +290,9 @@ class PetriNet:
 
 ## Examples
 
-- [examples/gpu_pipeline.py](examples/gpu_pipeline.py) — GPU slot pool; shows concurrent throttling
-- [examples/api_rate_limit.py](examples/api_rate_limit.py) — paced resource tokens enforce external API rate limits
-- [examples/etl_pipeline.py](examples/etl_pipeline.py) — multi-stage ETL using `ThresholdPlace` for batch accumulation
+- [examples/gpu_pipeline.py](https://github.com/philgresh/cpnx/blob/main/examples/gpu_pipeline.py) — GPU slot pool; shows concurrent throttling
+- [examples/api_rate_limit.py](https://github.com/philgresh/cpnx/blob/main/examples/api_rate_limit.py) — paced resource tokens enforce external API rate limits
+- [examples/etl_pipeline.py](https://github.com/philgresh/cpnx/blob/main/examples/etl_pipeline.py) — multi-stage ETL using `ThresholdPlace` for batch accumulation
 
 ---
 
@@ -350,4 +353,4 @@ cpnx's execution model is aligned with **Coloured Petri Nets (CPNs)** as formali
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/philgresh/cpnx/blob/main/LICENSE).
