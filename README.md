@@ -178,9 +178,14 @@ quiet = net.is_quiescent()  # True if dead AND no in-flight transitions
 
 ---
 
-## API Reference
+## API at a Glance
+
+A quick-look cheatsheet of the public surface. For the complete, auto-generated
+reference, see the [full API reference](https://philgresh.github.io/cpnx/latest/reference/core/).
 
 ### `Token`
+
+[→ Full API reference](https://philgresh.github.io/cpnx/latest/reference/tokens/#cpnx.Token)
 
 ```python
 @dataclass(frozen=True)
@@ -199,6 +204,8 @@ class Token:
 
 ### `FrozenDict`
 
+[→ Full API reference](https://philgresh.github.io/cpnx/latest/reference/tokens/#cpnx.FrozenDict)
+
 An immutable, hashable mapping. Nested dicts and lists are frozen recursively at construction time.
 
 ```python
@@ -209,6 +216,8 @@ fd.set("y", 2)   # returns a new FrozenDict — fd is unchanged
 ```
 
 ### Places
+
+[→ Full API reference](https://philgresh.github.io/cpnx/latest/reference/places/#cpnx.Place)
 
 ```python
 Place(name: str, bound: int | None = None, color_set: set[str] | None = None,
@@ -227,6 +236,8 @@ SinkPlace(name: str, *, keep_last: int = 0, color_set: set[str] | None = None)
 
 ### Arcs
 
+[→ Full API reference](https://philgresh.github.io/cpnx/latest/reference/transitions/#cpnx.InputArc)
+
 ```python
 InputArc(place: str, count: int = 1, consume_all: bool = False,
          settle_secs: float = 0.0,
@@ -240,6 +251,8 @@ OutputArc.on_color(color: str, place: str, count: int = 1) -> OutputArc
 ```
 
 ### `Transition`
+
+[→ Full API reference](https://philgresh.github.io/cpnx/latest/reference/transitions/#cpnx.Transition)
 
 ```python
 @dataclass
@@ -255,6 +268,8 @@ class Transition:
 ```
 
 ### `PetriNet`
+
+[→ Full API reference](https://philgresh.github.io/cpnx/latest/reference/core/#cpnx.PetriNet)
 
 ```python
 class PetriNet:
@@ -332,10 +347,10 @@ cpnx's execution model is aligned with **Coloured Petri Nets (CPNs)** as formali
 
 **References:**
 
-- Jensen, K. et al. — *CPN Group at Aarhus University* — https://cs.au.dk/cpnets  
+- Jensen, K. et al. — *CPN Group at Aarhus University* — [cs.au.dk/cpnets](https://cs.au.dk/cpnets)  
   The canonical reference for CPN theory, tools (CPN Tools), and formalism.
 
-- Winkler, T. et al. — *CPN-Py: A Python Framework for Coloured Petri Nets* (2025) — https://arxiv.org/html/2506.12238v1  
+- Winkler, T. et al. — *CPN-Py: A Python Framework for Coloured Petri Nets* (2025) — [arxiv.org/html/2506.12238v1](https://arxiv.org/html/2506.12238v1)  
   The closest Python CPN library; cpnx differs by targeting concurrent **execution** rather than sequential **simulation** and formal state-space analysis.
 
 **Where cpnx intentionally diverges from standard CPN theory:**
