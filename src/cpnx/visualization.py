@@ -5,13 +5,23 @@ if TYPE_CHECKING:
 
 
 def snapshot(net: "PetriNet") -> dict[str, Any]:
-    """Return a JSON-serialisable snapshot of the current markings of a PetriNet.
+    """Capture a JSON-serialisable snapshot of a `PetriNet`'s current marking.
+
+    Acquires the net's internal lock while reading, so the snapshot reflects a
+    consistent point-in-time view. For each place, records each token's `id`,
+    `payload` (as a plain `dict`), `created_at`, and `color`. For a
+    [`SinkPlace`][cpnx.SinkPlace], the place's entry is instead a dict with a
+    `"tokens"` list (from its ring buffer, if any) and an `"absorbed"` count
+    (the cumulative number of tokens ever absorbed).
 
     Args:
-        net: The PetriNet instance to snapshot.
+        net: The [`PetriNet`][cpnx.PetriNet] instance to snapshot.
 
     Returns:
-        A dictionary containing the places marking and the number of running transitions.
+        A dict with two keys: `"places"`, mapping each place name to either a
+        list of token dicts, or (for sink places) a dict with `"tokens"` and
+        `"absorbed"`; and `"running_count"`, the number of transitions currently
+        mid-firing.
     """
     from cpnx.places import SinkPlace
 
@@ -40,13 +50,22 @@ def snapshot(net: "PetriNet") -> dict[str, Any]:
 
 
 def to_dot(net: "PetriNet") -> str:
-    """Generate a Graphviz DOT representation of the PetriNet.
+    """Render a `PetriNet`'s structure and current token counts as Graphviz DOT.
+
+    Acquires the net's internal lock while reading. Places are drawn as circles
+    labelled with their name and current token count (or, for
+    [`SinkPlace`][cpnx.SinkPlace]s, the cumulative absorbed count). Transitions
+    are drawn as boxes. Each input arc is drawn as an edge from its place to the
+    transition, labelled with its `count` and, when applicable, `consume_all`
+    and/or `settle=<settle_secs>s`. Each output arc is drawn as an edge from the
+    transition to its place, labelled with its `count`.
 
     Args:
-        net: The PetriNet instance to export.
+        net: The [`PetriNet`][cpnx.PetriNet] instance to export.
 
     Returns:
-        A string representing the net in Graphviz DOT format.
+        A string containing the full `digraph PetriNet { ... }` DOT source,
+        suitable for rendering with Graphviz (e.g. `dot -Tpng`).
     """
     from cpnx.places import SinkPlace
 

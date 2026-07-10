@@ -6,11 +6,41 @@ from typing import Any
 from uuid import uuid4
 
 AVAILABLE_NOW: float = 0.0
+"""Sentinel value for [`Token`][cpnx.Token].`available_at` meaning "available immediately".
+
+Used as the default for `available_at` so that untimed tokens are eligible for firing
+as soon as they are created, rather than after some future monotonic timestamp.
+"""
+
 ERROR_COLOR: str = "error"
+"""Reserved token colour conventionally used to mark dead-lettered/error tokens.
+
+Not enforced by [`Token`][cpnx.Token] itself; consumers (e.g. error-handling
+transitions or sink places) may use this string as the `color` value for tokens
+that represent a failure, so they can be routed or filtered distinctly.
+"""
 
 
 class FrozenDict(Mapping):
-    """An immutable dictionary wrapper that recursively freezes nested dicts and lists."""
+    """Immutable, hashable mapping that recursively freezes nested dicts and lists.
+
+    Implements `collections.abc.Mapping` over an internal `types.MappingProxyType`,
+    so instances support read-only dict-like access (`d[key]`, `len(d)`, iteration)
+    but no in-place mutation. Nested `dict`/`Mapping` values are recursively wrapped
+    in `FrozenDict`, and nested `list` values are recursively converted to `tuple`
+    (with any `FrozenDict`/`Mapping` items inside also frozen). The hash is computed
+    eagerly at construction time from `frozenset(self._data.items())`, so all values
+    (including nested ones) must be hashable.
+
+    Args:
+        data: Optional mapping to freeze. Entries are copied and recursively frozen.
+        **kwargs (Any): Additional key/value pairs to include, applied after `data`
+            and recursively frozen the same way.
+
+    Raises:
+        TypeError: If any value (at any nesting depth) is unhashable, since the
+            hash is computed eagerly during construction.
+    """
 
     __slots__ = ("_data", "_hash")
 
@@ -56,11 +86,21 @@ class FrozenDict(Mapping):
         return f"FrozenDict({dict(self._data)!r})"
 
     def as_dict(self) -> dict:
-        """Return a deep plain-dict copy suitable for JSON serialisation.
+        """Recursively convert this `FrozenDict` back to a plain, mutable `dict`.
 
-        Nested :class:`FrozenDict` values are recursively converted to ``dict``,
-        and ``tuple`` values (frozen from ``list``) are converted back to ``list``
-        with any nested :class:`FrozenDict` items also unwrapped.
+        Nested `FrozenDict` values are recursively converted to `dict`, and `tuple`
+        values (frozen from `list`) are converted back to `list`, with any nested
+        `FrozenDict` items also unwrapped. Useful for JSON serialisation.
+
+        Returns:
+            A new plain `dict` with all `FrozenDict`/`tuple` wrapping removed.
+
+        Example:
+            ```python
+            fd = FrozenDict({"a": 1, "b": [1, 2, {"c": 3}]})
+            fd.as_dict()
+            # {"a": 1, "b": [1, 2, {"c": 3}]}
+            ```
         """
         return {k: FrozenDict._thaw(v) for k, v in self._data.items()}
 
@@ -74,7 +114,25 @@ class FrozenDict(Mapping):
         return v
 
     def set(self, key: Any, value: Any) -> "FrozenDict":
-        """Functional update: return a new FrozenDict with key=value."""
+        """Return a new `FrozenDict` with `key` set to `value`, leaving this instance unchanged.
+
+        Args:
+            key: The key to set (or overwrite) in the returned copy.
+            value: The value to associate with `key`. Frozen recursively like any
+                value passed to the constructor.
+
+        Returns:
+            A new `FrozenDict` instance containing all existing entries plus the
+            given `key`/`value` pair.
+
+        Example:
+            ```python
+            fd = FrozenDict({"a": 1})
+            fd2 = fd.set("b", 2)
+            # fd is unchanged: FrozenDict({'a': 1})
+            # fd2 is FrozenDict({'a': 1, 'b': 2})
+            ```
+        """
         new_d = dict(self._data)
         new_d[key] = value
         return FrozenDict(new_d)
@@ -82,23 +140,28 @@ class FrozenDict(Mapping):
 
 @dataclass(frozen=True)
 class Token:
-    """An immutable token flowing through a Petri net.
+    """An immutable, hashable-by-identity token that flows through a Petri net.
 
     In Coloured Petri Net (CPN) theory, a token is a value drawn from its
-    place's colour set. Here, ``color`` is that colour: ``None`` for uncoloured
-    data tokens, ``"resource"`` for permit/resource tokens, or any user-defined
-    string for domain-specific colours.
+    place's colour set. Here, `color` is that colour: `None` for uncoloured
+    data tokens, `"resource"` for permit/resource tokens, or any user-defined
+    string for domain-specific colours. Being a frozen dataclass, a `Token` is
+    never mutated in place; state changes are made by creating a new instance
+    via [`evolve`][cpnx.Token.evolve].
 
     Attributes:
-        id: Unique identifier (16-char hex). Auto-generated.
+        id: Unique identifier (16-char hex string). Auto-generated from `uuid4()` at
+            construction time.
         payload: Immutable dict accumulating enrichment data as the token traverses
-                 the net. Not used for resource tokens.
-        created_at: Monotonic timestamp set at construction.
-        color: CPN colour. ``None`` = uncoloured data token;
-               ``"resource"`` = permit token (see :class:`~cpnx.places.ResourcePlace`);
-               any other string = user-defined colour.
+            the net. Coerced to a [`FrozenDict`][cpnx.FrozenDict] after construction if
+            not already one. Not used for resource tokens.
+        created_at: Monotonic timestamp (from `time.monotonic()`) set at construction.
+        color: CPN colour. `None` = uncoloured data token;
+            `"resource"` = permit token (see [`ResourcePlace`][cpnx.ResourcePlace]);
+            any other string = user-defined colour.
         available_at: Monotonic timestamp after which the token is available (timed CPNs).
-                      Defaults to ``AVAILABLE_NOW`` (0.0) which denotes immediate availability.
+            Defaults to [`AVAILABLE_NOW`][cpnx.AVAILABLE_NOW] (`0.0`), which denotes
+            immediate availability.
         attempts: Number of failed firings this token has been rolled back from.
     """
 
@@ -115,14 +178,40 @@ class Token:
 
     @property
     def is_resource(self) -> bool:
-        """True when this token's colour is ``"resource"``.
+        """Report whether this token's colour is `"resource"`.
 
-        Python-friendly shorthand for ``token.color == "resource"``.
+        Python-friendly shorthand for `token.color == "resource"`.
+
+        Returns:
+            `True` if `color` equals `"resource"`, `False` otherwise.
         """
         return self.color == "resource"
 
     def evolve(self, payload_updates: dict[str, Any] | None = None, **field_updates) -> "Token":
-        """Construct a new Token instance, merging payload updates and overriding fields."""
+        """Create a new `Token` by merging payload updates and overriding fields.
+
+        Since `Token` is immutable, this is the standard way to derive an updated
+        token as it moves through the net. A fresh `id` is generated for the new
+        token unless `id` is explicitly passed in `field_updates`.
+
+        Args:
+            payload_updates: Optional dict merged on top of the existing `payload`
+                (via `dict.update`); keys not present are left unchanged. If `None`
+                (default), `payload` is left as-is (unless overridden via `field_updates`).
+            **field_updates (Any): Additional dataclass field values (e.g. `color`,
+                `available_at`, `attempts`) to override on the new instance.
+
+        Returns:
+            A new `Token` instance with the merged payload and overridden fields;
+            the original token is left unchanged.
+
+        Example:
+            ```python
+            t = Token(payload={"count": 1})
+            t2 = t.evolve(payload_updates={"count": 2}, attempts=1)
+            # t2.payload == {"count": 2}, t2.attempts == 1, t2.id != t.id
+            ```
+        """
         new_fields = field_updates
         if payload_updates is not None:
             merged_payload = dict(self.payload)
