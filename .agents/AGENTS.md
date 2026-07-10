@@ -23,7 +23,14 @@ These project-scoped guidelines apply to all AI agents working on the `cpnx` cod
 *   **Compliance Checks**: Before proposing any change, always run `make format` and `make lint` to ensure compliance with Ruff formatting rules.
 *   **Testing Requirement**: Always run `make test` and ensure all unit tests pass before concluding a task. Add new tests for any modified or new behavior.
 *   **Python Target**: Code should align with Python 3.10+ conventions (Union typing `A | B` rather than `Union[A, B]`).
-*   **Docstring Guidelines**: Follow PEP 257 docstring conventions for all public classes, methods, and functions.
+*   **Docstring Guidelines**: Every public class, method, function, and module constant (anything in `cpnx.__all__` and their public members) is rendered on the docs site by [mkdocstrings](https://mkdocstrings.github.io/), so docstrings are API documentation — keep them accurate and complete.
+    *   **Style**: Google-style docstrings (`Args:`, `Returns:`, `Raises:`, `Attributes:`, `Example:`). The first line must be a specific, self-contained summary of *that* member in the imperative mood — not a generic restatement. Document every parameter (meaning, units, default), the return value, and anything raised. For subclass overrides, state how the behavior differs from the base method.
+    *   **Markdown, not reStructuredText**: docstring bodies are rendered as Markdown. Do **not** use Sphinx roles (`` :class:`X` ``, `` :meth:`X` ``, `` :attr:`X` ``, `` :exc:`X` `` …) — they render literally. Instead:
+        *   Cross-reference a **public** symbol with an autorefs link: `` [`PetriNet`][cpnx.PetriNet] `` or `` [`step`][cpnx.PetriNet.step] ``.
+        *   Use plain backticks (`` `last_deposit_time` ``) for instance attributes, private members (`_on_deposit`), and stdlib/builtin types. When unsure a cross-reference resolves, prefer plain backticks — a broken one fails the strict build.
+    *   **Formatting**: use valid Markdown list markers (`-` or `1.`) with a blank line before the list; `A.`/`B.`/`C.` are **not** list markers and collapse into one paragraph. Use fenced ```` ```python ```` blocks for examples.
+    *   **Verify**: run `make docs-build` (`mkdocs build --strict`) after touching docstrings — it fails on unresolved cross-references and broken rendering. Requires the docs toolchain: `pip install -e ".[docs]"`.
+    *   `sandbox.py` is not part of the public API and is not rendered, so its docstrings are exempt from the cross-reference rules.
 
 ---
 
