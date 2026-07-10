@@ -132,16 +132,16 @@ class PetriNet:
     firing completes, whether it succeeds or fails. For data tokens, the net supports three
     error-handling dispositions:
 
-    A. **Colour-routed error (primary/canonical)**: The action catches its own exception,
-       returns an error-coloured token, and output-arc expressions (e.g. using
-       `OutputArc.expression`) route success vs error tokens to different places.
-       This preserves firing rules and token conservation (1-in-1-out).
-    B. **Bounded atomic-retry**: On action failure/exception, the data token is rolled back
-       to its source place with a delay (`retry_delay`) and an incremented `attempts`
-       counter, retrying up to `Transition.max_retries` times (default 5). Once exhausted,
-       it is dead-lettered to `error_place`.
-    C. **Immediate dead-letter**: By setting `max_retries=0` on a transition, any action
-       failure immediately routes the data token to `error_place`.
+    - **A. Colour-routed error (primary/canonical)** — the action catches its own
+      exception, returns an error-coloured token, and output-arc expressions (e.g. using
+      `OutputArc.expression`) route success vs error tokens to different places. This
+      preserves firing rules and token conservation (1-in-1-out).
+    - **B. Bounded atomic-retry** — on action failure/exception, the data token is rolled
+      back to its source place with a delay (`retry_delay`) and an incremented `attempts`
+      counter, retrying up to `Transition.max_retries` times (default 5). Once exhausted,
+      it is dead-lettered to `error_place`.
+    - **C. Immediate dead-letter** — setting `max_retries=0` on a transition routes any
+      action failure immediately to `error_place`.
 
     Note that `error_place` can be configured as a [`SinkPlace`][cpnx.SinkPlace]
     (e.g. `SinkPlace("failed", keep_last=10)`) to keep only the last N failures for
