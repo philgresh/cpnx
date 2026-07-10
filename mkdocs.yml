@@ -13,6 +13,8 @@ theme:
     - navigation.instant
     - navigation.top
     - navigation.sections
+    - navigation.expand
+    - toc.integrate  # surface each page's symbols (classes, methods) in the left nav
     - search.suggest
     - content.code.copy
   palette:
