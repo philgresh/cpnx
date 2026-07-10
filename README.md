@@ -366,6 +366,13 @@ cpnx's execution model is aligned with **Coloured Petri Nets (CPNs)** as formali
 
 ---
 
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](https://github.com/philgresh/cpnx/blob/main/CONTRIBUTING.md)
+for development setup, the `make` targets CI runs, and the docstring/documentation conventions.
+
+---
+
 ## License
 
 MIT — see [LICENSE](https://github.com/philgresh/cpnx/blob/main/LICENSE).
