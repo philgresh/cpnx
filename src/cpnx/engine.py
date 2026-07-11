@@ -269,8 +269,12 @@ class PetriNet:
                          a net whose only satisfiable binding lies beyond the limit can reach
                          quiescence — and [`run`][cpnx.PetriNet.run] can return — with that
                          work still pending, signalled only via the callback; raise the limit
-                         if this is a concern. Ignored under `BindingPolicy.LEGACY` and for
-                         guard-free transitions, which never search.
+                         if this is a concern. Must be `>= 1`. Ignored under
+                         `BindingPolicy.LEGACY` and for guard-free transitions, which never
+                         search.
+
+        Raises:
+            ValueError: If `binding_search_limit < 1`.
         """
         self.max_workers = max_workers
         self.error_place = error_place
@@ -279,6 +283,8 @@ class PetriNet:
         self.expr_timeout_secs = expr_timeout_secs
         self.retry_delay = retry_delay
         self.binding_policy = binding_policy
+        if binding_search_limit < 1:
+            raise ValueError(f"binding_search_limit must be >= 1, got {binding_search_limit}.")
         self.binding_search_limit = binding_search_limit
         self._has_timed_features = False
         self._model_time: float | None = None
@@ -321,9 +327,11 @@ class PetriNet:
         #: as disabled for that check.
         #: Signature: `(transition_name: str) -> None`.
         #: Fires **outside** the engine lock — it is safe to call back into the net (e.g.
-        #: `deposit`) from here. Exhaustions detected during a single enabling pass are
-        #: de-duplicated per transition and dispatched once the lock is released, so an idle
-        #: `run()` loop polling an over-limit transition will not spam the callback.
+        #: `deposit`) from here. Exhaustions are de-duplicated *within* a single enabling pass
+        #: (so cross-thread interleavings collapse to one call), but it still fires once per
+        #: pass: a busy `run()` loop re-checks each transition on every `step()`/
+        #: `is_quiescent()` iteration, so an over-limit transition signals repeatedly while
+        #: the loop runs. Keep the callback cheap, and debounce on your side if needed.
         self.on_binding_search_exhausted: Callable[[str], None] | None = None
         #: Transition names whose binding search exhausted the limit during the current
         #: lock-holding enabling pass; drained and dispatched (de-duplicated) after the lock
@@ -561,33 +569,36 @@ class PetriNet:
                 already been shut down, such as after exiting a `with` block). Any tokens
                 already consumed from input places are returned before the error propagates.
         """
-        with self._lock:
-            selected = self._select_transition_to_fire()
-            if not selected:
-                fired = False
-            else:
-                # The binding was resolved during selection (guard evaluated once); consume
-                # exactly those tokens. Under BindingPolicy.FIRST the chosen tokens may not be
-                # at the head of their places, so consumption is by token id, not FIFO position.
-                transition, binding = selected
-                m_time = self._get_model_time_under_lock()
-                consumed_tokens, token_sources = self._consume_binding(binding, m_time)
+        try:
+            with self._lock:
+                selected = self._select_transition_to_fire()
+                if not selected:
+                    fired = False
+                else:
+                    # The binding was resolved during selection (guard evaluated once); consume
+                    # exactly those tokens. Under BindingPolicy.FIRST the chosen tokens may not
+                    # be at the head of their places, so consumption is by token id, not FIFO.
+                    transition, binding = selected
+                    m_time = self._get_model_time_under_lock()
+                    consumed_tokens, token_sources = self._consume_binding(binding, m_time)
 
-                self._running_count += 1
-                try:
-                    self._executor.submit(self._execute_transition, transition, consumed_tokens, token_sources)
-                except Exception:
-                    # submit() failed (e.g. executor shut down) — undo the increment so
-                    # is_quiescent() doesn't permanently block.
-                    self._running_count -= 1
-                    # Return consumed tokens back to their source places
-                    for src_name, t in token_sources:
-                        self._deposit_under_lock(src_name, t)
-                    raise
-                fired = True
+                    self._running_count += 1
+                    try:
+                        self._executor.submit(self._execute_transition, transition, consumed_tokens, token_sources)
+                    except Exception:
+                        # submit() failed (e.g. executor shut down) — undo the increment so
+                        # is_quiescent() doesn't permanently block.
+                        self._running_count -= 1
+                        # Return consumed tokens back to their source places
+                        for src_name, t in token_sources:
+                            self._deposit_under_lock(src_name, t)
+                        raise
+                    fired = True
+        finally:
+            # Dispatch any exhaustion callbacks accumulated during selection, off the lock —
+            # even if consume/submit raised, so buffered signals are never delayed.
+            self._flush_search_exhaustions()
 
-        # Dispatch any exhaustion callbacks accumulated during selection, off the lock.
-        self._flush_search_exhaustions()
         return fired
 
     def _validate_transition_arcs(self, transition_name: str, transition: Transition) -> None:
@@ -1020,8 +1031,8 @@ class PetriNet:
 
         Called from inside the enabling check (under the engine lock). The callback itself
         must run *outside* the lock (so it may safely call back into the net), so this only
-        buffers the transition name; [`_flush_search_exhaustions`][cpnx.PetriNet._flush_search_exhaustions]
-        drains the buffer and fires the callback once the caller has released the lock.
+        buffers the transition name; `_flush_search_exhaustions` drains the buffer and fires
+        the callback once the caller has released the lock.
         """
         self._pending_exhaustions.add(transition_name)
 

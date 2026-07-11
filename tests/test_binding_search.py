@@ -344,6 +344,40 @@ class TestExhaustionCallbackOffLock:
         assert len(net.places["signal"].tokens) >= 1
 
 
+class TestSearchLimitValidation:
+    def test_negative_limit_rejected_at_construction(self):
+        import pytest
+
+        for bad in (-2, -1, 0):
+            with pytest.raises(ValueError, match="binding_search_limit must be >= 1"):
+                PetriNet(binding_search_limit=bad)
+
+    def test_limit_one_is_head_only_search(self):
+        """limit=1 tries exactly the head binding; deeper matches exhaust immediately."""
+        net = PetriNet(
+            places=[Place("input"), Place("output")],
+            binding_search_limit=1,
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                    guard=lambda toks: toks[0].payload["sym"] == "MSFT",
+                    binding_policy=BindingPolicy.FIRST,
+                )
+            ],
+        )
+        exhausted: list[str] = []
+        net.on_binding_search_exhausted = exhausted.append
+        net.deposit("input", Token(payload={"sym": "AAPL"}))  # head fails
+        net.deposit("input", Token(payload={"sym": "MSFT"}))  # match beyond limit
+        net.run(deadline=time.monotonic() + 0.3)
+
+        assert len(net.places["output"].tokens) == 0
+        assert "t" in exhausted
+
+
 class TestConsumptionCorrectness:
     def test_exact_selected_tokens_removed_by_id(self):
         net = PetriNet(
