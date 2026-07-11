@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.2] — 2026-07-11
+
+### Added
+
+- **`BindingPolicy.RANDOM`** — Enumerates the guard-satisfying bindings and selects one **uniformly at random**. Reproducible when the net is constructed with a `seed` (and `max_workers=1`); otherwise it varies run to run. Unlike `FIRST`, a guard-free `RANDOM` transition still selects among *all* eligible token groups (there is no guard-free fast path), so it always enumerates. Phase 2 of the plan in [`docs/adr/0001-combinatorial-binding-search.md`](docs/adr/0001-combinatorial-binding-search.md).
+- **`BindingPolicy.PRIORITY`** — Enumerates the guard-satisfying bindings and selects the one **minimizing** `Transition.binding_priority_key`. Deterministic; ties fall to insertion order.
+- **`Transition.binding_priority_key`** — Optional pure `Callable[[list[Token]], object]` mapping a candidate binding (its flat token list) to a comparable sort key for `PRIORITY`. `None` (default) means oldest-first — the minimum `Token.created_at` across the binding. Purity-verified like `guard`, since it runs under the engine lock.
+- **`PetriNet(seed=...)`** — Optional integer seed for the net's internal `random.Random`. When set it makes the run reproducible, driving **both** the scheduler's tie-break among equal-priority enabled transitions **and** `RANDOM` binding selection. Pair with `max_workers=1` for strict replay.
+
+### Changed
+
+- The scheduler's tie-break among equal-priority enabled transitions now draws from the net's `random.Random(seed)` instance instead of the global `random` module. Behavior is unchanged when unseeded, but the global `random.seed()` no longer influences cpnx scheduling — seed the net instead.
+
+### Notes
+
+- **Reproducibility is probe-independent.** Enabling/quiescence checks (`is_dead`, `is_quiescent`) use an existence-only probe that never draws the RNG, so a timing-dependent number of `run()` poll iterations cannot perturb a seeded `RANDOM` run.
+- **Cost.** `RANDOM`/`PRIORITY` cannot short-circuit — they scan the whole (bounded) candidate set to sample or rank — so they are typically several times costlier than `FIRST` on the firing path. `binding_search_limit` still bounds the work; if the candidate space exceeds it, selection is over the first `limit` candidates (a **truncated prefix**) and `on_binding_search_exhausted` fires even though a binding is returned.
+- The default policy remains `BindingPolicy.LEGACY`; `LEGACY`/`FIRST` behavior is unchanged from 0.3.1.
+
+---
+
 ## [0.3.1] — 2026-07-10
 
 ### Added

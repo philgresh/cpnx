@@ -478,3 +478,199 @@ class TestLegacyParitySanity:
         assert fired == [1]
         assert [t.payload["sym"] for t in net.places["output"].tokens] == ["MSFT"]
         assert len(net.places["input"].tokens) == 0
+
+
+def _single_select_net(policy, *, seed=None, n=6, guard=None, priority_key=None):
+    """Build a net whose one transition selects a single token from `n` candidates."""
+    net = PetriNet(
+        seed=seed,
+        places=[Place("input"), Place("output")],
+        transitions=[
+            Transition(
+                name="t",
+                inputs=[InputArc("input")],
+                outputs=[OutputArc("output")],
+                action=lambda toks: toks,
+                guard=guard,
+                binding_policy=policy,
+                binding_priority_key=priority_key,
+            )
+        ],
+    )
+    for i in range(n):
+        net.deposit("input", Token(payload={"i": i}))
+    return net
+
+
+def _selected_index(net):
+    _fire_once(net)
+    out = net.places["output"].tokens
+    assert len(out) == 1
+    return out[0].payload["i"]
+
+
+class TestRandomPolicy:
+    def test_same_seed_reproduces_selection(self):
+        a = _selected_index(_single_select_net(BindingPolicy.RANDOM, seed=1234, n=8))
+        b = _selected_index(_single_select_net(BindingPolicy.RANDOM, seed=1234, n=8))
+        assert a == b
+
+    def test_varying_seed_spreads_selection(self):
+        """RANDOM (guard-free) selects across the token set, not just the head (index 0)."""
+        picks = {_selected_index(_single_select_net(BindingPolicy.RANDOM, seed=s, n=8)) for s in range(40)}
+        assert len(picks) > 1  # not degenerate to a single index
+        assert picks != {0}  # not always the head
+
+    def test_guard_free_random_is_not_head_only(self):
+        """A guard-free RANDOM transition must enumerate, not take the FIRST head fast path."""
+        picks = {_selected_index(_single_select_net(BindingPolicy.RANDOM, seed=s, n=6)) for s in range(30)}
+        assert picks - {0}  # at least one non-head selection observed
+
+    def test_random_reproducibility_is_probe_independent(self):
+        """Interleaving is_dead()/is_quiescent() probes must not perturb the seeded RNG."""
+        clean = _single_select_net(BindingPolicy.RANDOM, seed=99, n=8)
+        probed = _single_select_net(BindingPolicy.RANDOM, seed=99, n=8)
+        for _ in range(5):
+            probed.is_dead()
+            probed.is_quiescent()
+        assert _selected_index(clean) == _selected_index(probed)
+
+    def test_random_with_guard_only_samples_satisfying(self):
+        net = _single_select_net(BindingPolicy.RANDOM, seed=7, n=10, guard=lambda toks: toks[0].payload["i"] % 2 == 0)
+        picks = set()
+        for s in range(30):
+            n2 = _single_select_net(
+                BindingPolicy.RANDOM, seed=s, n=10, guard=lambda toks: toks[0].payload["i"] % 2 == 0
+            )
+            picks.add(_selected_index(n2))
+        assert picks and all(i % 2 == 0 for i in picks)  # only even indices ever chosen
+        assert _selected_index(net) % 2 == 0
+
+
+class TestPriorityPolicy:
+    def test_default_key_selects_oldest(self):
+        """Default PRIORITY key is oldest-first by created_at; the earliest token wins."""
+        net = _single_select_net(BindingPolicy.PRIORITY, n=5)
+        # tokens deposited i=0..4 in order → i=0 has the smallest created_at
+        assert _selected_index(net) == 0
+
+    def test_custom_key_selects_min_rank(self):
+        net = PetriNet(
+            places=[Place("input"), Place("output")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                    binding_policy=BindingPolicy.PRIORITY,
+                    binding_priority_key=lambda toks: toks[0].payload["rank"],
+                )
+            ],
+        )
+        for i, rank in enumerate([5, 2, 9, 2, 7]):  # min rank 2 first appears at index 1
+            net.deposit("input", Token(payload={"i": i, "rank": rank}))
+        assert _selected_index(net) == 1  # ties (rank 2 at idx 1 and 3) → insertion order
+
+    def test_priority_is_deterministic(self):
+        a = _selected_index(_single_select_net(BindingPolicy.PRIORITY, n=6))
+        b = _selected_index(_single_select_net(BindingPolicy.PRIORITY, n=6))
+        assert a == b == 0
+
+
+class TestWholeNetSeed:
+    def test_scheduler_tiebreak_is_seeded(self):
+        """Two equal-priority transitions competing for the same token: seeded choice replays."""
+
+        def build(seed):
+            net = PetriNet(
+                seed=seed,
+                places=[Place("input"), Place("a"), Place("b")],
+                transitions=[
+                    Transition(name="ta", inputs=[InputArc("input")], outputs=[OutputArc("a")], action=lambda t: t),
+                    Transition(name="tb", inputs=[InputArc("input")], outputs=[OutputArc("b")], action=lambda t: t),
+                ],
+            )
+            net.deposit("input", Token(payload={"x": 1}))
+            return net
+
+        n1, n2 = build(2024), build(2024)
+        _fire_once(n1)
+        _fire_once(n2)
+        winner1 = "a" if n1.places["a"].tokens else "b"
+        winner2 = "a" if n2.places["a"].tokens else "b"
+        assert winner1 == winner2
+
+
+class TestCountAndMultiArcSearchPolicies:
+    def test_priority_count_two_min_pair(self):
+        net = PetriNet(
+            places=[Place("input"), Place("output")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input", count=2)],
+                    outputs=[OutputArc("output", count=2)],
+                    action=lambda toks: toks,
+                    binding_policy=BindingPolicy.PRIORITY,
+                    binding_priority_key=lambda toks: sum(t.payload["v"] for t in toks),
+                )
+            ],
+        )
+        for v in [4, 1, 9, 2]:  # min-sum pair is (1,2) = 3
+            net.deposit("input", Token(payload={"v": v}))
+        _fire_once(net)
+        out = sorted(t.payload["v"] for t in net.places["output"].tokens)
+        assert out == [1, 2]
+
+    def test_random_count_two_reproducible(self):
+        def build(seed):
+            net = PetriNet(
+                seed=seed,
+                places=[Place("input"), Place("output")],
+                transitions=[
+                    Transition(
+                        name="t",
+                        inputs=[InputArc("input", count=2)],
+                        outputs=[OutputArc("output", count=2)],
+                        action=lambda toks: toks,
+                        binding_policy=BindingPolicy.RANDOM,
+                    )
+                ],
+            )
+            for v in range(6):
+                net.deposit("input", Token(payload={"v": v}))
+            return net
+
+        n1, n2 = build(555), build(555)
+        _fire_once(n1)
+        _fire_once(n2)
+        assert sorted(t.payload["v"] for t in n1.places["output"].tokens) == sorted(
+            t.payload["v"] for t in n2.places["output"].tokens
+        )
+
+
+class TestSearchPolicyExhaustion:
+    def test_random_truncated_prefix_still_selects_and_signals(self):
+        """When candidates exceed the limit, RANDOM selects from the prefix AND signals."""
+        net = PetriNet(
+            seed=1,
+            binding_search_limit=5,
+            places=[Place("input"), Place("output")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                    binding_policy=BindingPolicy.RANDOM,
+                )
+            ],
+        )
+        exhausted: list[str] = []
+        net.on_binding_search_exhausted = exhausted.append
+        for i in range(50):
+            net.deposit("input", Token(payload={"i": i}))
+        idx = _selected_index(net)
+        assert idx < 5  # only the first `limit` candidates were in the sample space
+        assert "t" in exhausted  # truncation signalled even though a binding fired

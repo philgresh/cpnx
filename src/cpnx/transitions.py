@@ -33,11 +33,22 @@ class BindingPolicy(enum.Enum):
             **and** deterministic (the same marking always yields the same binding). When
             the transition has no guard, this is identical to `LEGACY` and incurs no
             search cost.
+        RANDOM: Enumerate the satisfying combinations and select one **uniformly at
+            random**. Reproducible when the owning [`PetriNet`][cpnx.PetriNet] is
+            constructed with a `seed` (and `max_workers=1`); otherwise it varies run to
+            run. Unlike `FIRST`, a guard-free `RANDOM` transition still selects among *all*
+            eligible token groups (not just the head), so it must enumerate — there is no
+            guard-free fast path. Intended for simulation, fairness testing, and
+            CPN-flavored exploration.
+        PRIORITY: Enumerate the satisfying combinations and select the one **minimizing**
+            `Transition.binding_priority_key` (default: oldest-first, i.e. the minimum
+            `Token.created_at` across the binding). Ties fall to insertion order, so the
+            choice is deterministic. Like `RANDOM`, it enumerates even without a guard.
 
     Note:
         The search enumerates the Cartesian product of each input arc's `count`-sized token
-        combinations, varying the **last** arc in `Transition.inputs` fastest. Two
-        consequences for tuning:
+        combinations, varying the **last** arc in `Transition.inputs` fastest. Consequences
+        for tuning:
 
         - **Resource arcs inflate the space.** A `ResourcePlace`/`PacedResourcePlace` permit
           arc contributes `C(capacity, count)` interchangeable options that usually give the
@@ -45,15 +56,19 @@ class BindingPolicy(enum.Enum):
           permutations. List resource arcs **before** data arcs in `Transition.inputs` so the
           data dimension (the one that actually changes the guard result) varies first, and/or
           raise `binding_search_limit`.
-        - The first binding yielded is exactly `LEGACY`'s head selection, so `FIRST` is a
-          strict superset of `LEGACY`.
+        - For `FIRST` the first binding yielded is exactly `LEGACY`'s head selection, so
+          `FIRST` is a strict superset of `LEGACY`.
+        - `RANDOM`/`PRIORITY` must scan the whole (bounded) candidate set, so they do not
+          short-circuit and are typically costlier than `FIRST`. If the candidate space
+          exceeds `binding_search_limit`, they select over the first `limit` candidates only
+          (a truncated prefix) and fire `on_binding_search_exhausted` even though a binding
+          is returned.
     """
 
     LEGACY = "legacy"
     FIRST = "first"
-    # Phase 2 (planned): RANDOM = "random"  (seeded), PRIORITY = "priority" (token-key).
-    # Both will consume the same satisfying-binding generator used by FIRST; see
-    # docs/adr/0001-combinatorial-binding-search.md.
+    RANDOM = "random"
+    PRIORITY = "priority"
 
 
 @dataclass
@@ -201,6 +216,12 @@ class Transition:
                an unset transition behaves exactly as before. Set
                `BindingPolicy.FIRST` to enable deterministic-complete binding search
                (fixing head-of-line blocking) for this transition only.
+        binding_priority_key: Sort key used only under `BindingPolicy.PRIORITY`. A pure
+               `Callable[[list[Token]], object]` mapping a candidate binding (the flat list
+               of tokens it would consume) to a comparable value; the binding with the
+               **minimum** key is selected, ties broken by insertion order. `None` (default)
+               means oldest-first — the minimum `Token.created_at` across the binding.
+               Evaluated under the engine lock, so it is purity-verified like `guard`.
     """
 
     name: str
@@ -212,16 +233,20 @@ class Transition:
     action_timeout_secs: float | None = None
     max_retries: int | None = 5
     binding_policy: BindingPolicy | None = None
+    binding_priority_key: Callable[[list[Token]], object] | None = None
 
     def __setattr__(self, name, value):
         # Keep the pre-compiled guard in sync with ``guard``, including
         # post-construction reassignment. Actions are explicitly allowed side effects
-        # (DB writes, API calls, I/O), so only guards are purity-verified.
+        # (DB writes, API calls, I/O), so guards and the PRIORITY sort key — both evaluated
+        # under the engine lock — are purity-verified; actions are not.
         if name == "guard":
             compiled = SandboxEvaluator.maybe_compile(value)
             if callable(value):
                 verify_callable_purity(value)
             super().__setattr__("_compiled_guard", compiled)
+        elif name == "binding_priority_key" and callable(value):
+            verify_callable_purity(value)
         super().__setattr__(name, value)
 
 
