@@ -242,9 +242,14 @@ class PetriNet:
                           (run off the engine lock) (default: 1.0).
             expr_timeout_secs: Maximum allowed execution time in seconds for guard
                                and arc expression callables. These are evaluated
-                               while holding the engine lock, so this value directly
-                               caps how long concurrent `deposit()` and `step()`
-                               calls will block. Keep well under 1 s (default: 0.1).
+                               while holding the engine lock, so this value caps how long a
+                               *single* guard/expression evaluation can block concurrent
+                               `deposit()` and `step()` calls. Note that under
+                               `BindingPolicy.FIRST` one enabling check may evaluate a
+                               callable guard up to `binding_search_limit` times in sequence,
+                               so the worst-case lock-hold time is
+                               `binding_search_limit * expr_timeout_secs` — size both
+                               accordingly. Keep well under 1 s (default: 0.1).
             retry_delay: Delay in seconds to apply to data tokens when rolling them
                          back to their source places on transient failure (default: 1.0).
             binding_policy: Net-wide default strategy for resolving which input tokens
@@ -254,11 +259,18 @@ class PetriNet:
                          override this via its own `binding_policy`.
             binding_search_limit: Maximum number of input-token combinations tried per
                          enablement check when a transition uses `BindingPolicy.FIRST`
-                         (default: 1000). If exhausted without finding a guard-satisfying
-                         binding, the transition is treated as disabled and
-                         `on_binding_search_exhausted` (if set) is invoked. Ignored under
-                         `BindingPolicy.LEGACY` and for guard-free transitions, which never
-                         search.
+                         (default: 1000). Bounds both the work and the memory of a search
+                         (each arc's candidate stream is truncated to this many groups), and
+                         with a callable guard also bounds the lock-hold time to roughly
+                         `binding_search_limit * expr_timeout_secs`. If exhausted without
+                         finding a guard-satisfying binding, the transition is treated as
+                         disabled for that check and `on_binding_search_exhausted` (if set) is
+                         invoked after the lock releases. Because exhaustion means "disabled",
+                         a net whose only satisfiable binding lies beyond the limit can reach
+                         quiescence — and [`run`][cpnx.PetriNet.run] can return — with that
+                         work still pending, signalled only via the callback; raise the limit
+                         if this is a concern. Ignored under `BindingPolicy.LEGACY` and for
+                         guard-free transitions, which never search.
         """
         self.max_workers = max_workers
         self.error_place = error_place
@@ -308,9 +320,15 @@ class PetriNet:
         #: without finding a guard-satisfying binding, causing the transition to be treated
         #: as disabled for that check.
         #: Signature: `(transition_name: str) -> None`.
-        #: Fires while holding the engine lock (it is invoked from the enabling check), so it
-        #: must not call back into the net; keep it to lightweight logging/metrics.
+        #: Fires **outside** the engine lock — it is safe to call back into the net (e.g.
+        #: `deposit`) from here. Exhaustions detected during a single enabling pass are
+        #: de-duplicated per transition and dispatched once the lock is released, so an idle
+        #: `run()` loop polling an over-limit transition will not spam the callback.
         self.on_binding_search_exhausted: Callable[[str], None] | None = None
+        #: Transition names whose binding search exhausted the limit during the current
+        #: lock-holding enabling pass; drained and dispatched (de-duplicated) after the lock
+        #: is released. A `set` so repeated exhaustions in one pass collapse to one callback.
+        self._pending_exhaustions: set[str] = set()
 
         self.add_place(Place(error_place))
         for p in places or []:
@@ -546,28 +564,31 @@ class PetriNet:
         with self._lock:
             selected = self._select_transition_to_fire()
             if not selected:
-                return False
+                fired = False
+            else:
+                # The binding was resolved during selection (guard evaluated once); consume
+                # exactly those tokens. Under BindingPolicy.FIRST the chosen tokens may not be
+                # at the head of their places, so consumption is by token id, not FIFO position.
+                transition, binding = selected
+                m_time = self._get_model_time_under_lock()
+                consumed_tokens, token_sources = self._consume_binding(binding, m_time)
 
-            # The binding was resolved during selection (guard evaluated once); consume
-            # exactly those tokens. Under BindingPolicy.FIRST the chosen tokens may not be at
-            # the head of their places, so consumption is by token id, not FIFO position.
-            transition, binding = selected
-            m_time = self._get_model_time_under_lock()
-            consumed_tokens, token_sources = self._consume_binding(binding, m_time)
+                self._running_count += 1
+                try:
+                    self._executor.submit(self._execute_transition, transition, consumed_tokens, token_sources)
+                except Exception:
+                    # submit() failed (e.g. executor shut down) — undo the increment so
+                    # is_quiescent() doesn't permanently block.
+                    self._running_count -= 1
+                    # Return consumed tokens back to their source places
+                    for src_name, t in token_sources:
+                        self._deposit_under_lock(src_name, t)
+                    raise
+                fired = True
 
-            self._running_count += 1
-            try:
-                self._executor.submit(self._execute_transition, transition, consumed_tokens, token_sources)
-            except Exception:
-                # submit() failed (e.g. executor shut down) — undo the increment so
-                # is_quiescent() doesn't permanently block.
-                self._running_count -= 1
-                # Return consumed tokens back to their source places
-                for src_name, t in token_sources:
-                    self._deposit_under_lock(src_name, t)
-                raise
-
-        return True
+        # Dispatch any exhaustion callbacks accumulated during selection, off the lock.
+        self._flush_search_exhaustions()
+        return fired
 
     def _validate_transition_arcs(self, transition_name: str, transition: Transition) -> None:
         for arc in transition.inputs + transition.outputs:
@@ -651,6 +672,13 @@ class PetriNet:
             deadline causes immediate exit because `time.monotonic()` is always
             much larger than small floats. Use `run(deadline=time.monotonic() + 30)`.
 
+        Note:
+            A `BindingPolicy.FIRST` transition whose only satisfiable binding lies beyond
+            `binding_search_limit` counts as disabled, so `run` can return "quiescent" while
+            that token still sits in its place. The exhaustion is surfaced via
+            `on_binding_search_exhausted`; raise `binding_search_limit` if such tokens must be
+            processed.
+
         Example:
             ```python
             net.run(deadline=time.monotonic() + 30)  # run for up to 30 seconds
@@ -684,8 +712,11 @@ class PetriNet:
         """
         with self._lock:
             if self._running_count > 0:
-                return False
-            return not any(self._is_transition_potentially_enabled(t) for t in self.transitions.values())
+                result = False
+            else:
+                result = not any(self._is_transition_potentially_enabled(t) for t in self.transitions.values())
+        self._flush_search_exhaustions()
+        return result
 
     @property
     def marking(self) -> dict[str, tuple[Token, ...]]:
@@ -717,7 +748,9 @@ class PetriNet:
             `True` if every transition's enabling condition currently fails.
         """
         with self._lock:
-            return not any(self._is_transition_enabled(t) for t in self.transitions.values())
+            result = not any(self._is_transition_enabled(t) for t in self.transitions.values())
+        self._flush_search_exhaustions()
+        return result
 
     def snapshot(self) -> dict:
         """Return a JSON-serialisable snapshot of current place markings and running count.
@@ -828,7 +861,7 @@ class PetriNet:
 
     def _effective_policy(self, transition: Transition) -> BindingPolicy:
         """Return the binding policy in force for `transition` (its own, else the net default)."""
-        return transition.binding_policy or self.binding_policy
+        return self.binding_policy if transition.binding_policy is None else transition.binding_policy
 
     def _arc_available(
         self, arc: InputArc, place: Place | None, m_time: float | None, ignore_timing: bool
@@ -934,9 +967,19 @@ class PetriNet:
 
         Options are generated in insertion order, so the first binding yielded is the head
         selection and iteration proceeds deterministically from there.
+
+        Each per-arc option stream is truncated to `binding_search_limit + 1` groups before
+        being handed to `itertools.product`. This keeps both time and memory bounded by the
+        search limit: `product` materializes each input iterable in full before yielding, so
+        an un-truncated arc with `C(n, count)` combinations would be built eagerly (defeating
+        the bound and risking OOM). The truncation is loss-free within the limit — in
+        `product`'s lexicographic output order a candidate's overall rank is at least its
+        index in any single dimension, so any group beyond index `binding_search_limit` can
+        never appear among the first `binding_search_limit` bindings the search inspects.
         """
         arcs = [arc for arc, _ in pools]
-        option_lists = [self._arc_options(arc, available) for arc, available in pools]
+        cap = self.binding_search_limit + 1
+        option_lists = [list(itertools.islice(self._arc_options(arc, available), cap)) for arc, available in pools]
         for combo in itertools.product(*option_lists):
             yield list(zip(arcs, combo, strict=True))
 
@@ -973,10 +1016,33 @@ class PetriNet:
             return None
 
     def _signal_search_exhausted(self, transition_name: str) -> None:
-        """Invoke `on_binding_search_exhausted` (if set), swallowing any callback error."""
-        if self.on_binding_search_exhausted:
+        """Record a search exhaustion for `transition_name` to dispatch after the lock releases.
+
+        Called from inside the enabling check (under the engine lock). The callback itself
+        must run *outside* the lock (so it may safely call back into the net), so this only
+        buffers the transition name; [`_flush_search_exhaustions`][cpnx.PetriNet._flush_search_exhaustions]
+        drains the buffer and fires the callback once the caller has released the lock.
+        """
+        self._pending_exhaustions.add(transition_name)
+
+    def _flush_search_exhaustions(self) -> None:
+        """Dispatch any buffered search-exhaustion callbacks. Must be called off the lock.
+
+        Swaps out the pending set under a brief lock, then fires `on_binding_search_exhausted`
+        once per distinct transition, swallowing callback errors. Safe to call unconditionally;
+        a no-op when nothing exhausted.
+        """
+        with self._lock:
+            if not self._pending_exhaustions:
+                return
+            pending = self._pending_exhaustions
+            self._pending_exhaustions = set()
+        callback = self.on_binding_search_exhausted
+        if callback is None:
+            return
+        for name in pending:
             try:
-                self.on_binding_search_exhausted(transition_name)
+                callback(name)
             except Exception:
                 pass
 

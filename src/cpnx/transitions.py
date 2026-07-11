@@ -33,6 +33,20 @@ class BindingPolicy(enum.Enum):
             **and** deterministic (the same marking always yields the same binding). When
             the transition has no guard, this is identical to `LEGACY` and incurs no
             search cost.
+
+    Note:
+        The search enumerates the Cartesian product of each input arc's `count`-sized token
+        combinations, varying the **last** arc in `Transition.inputs` fastest. Two
+        consequences for tuning:
+
+        - **Resource arcs inflate the space.** A `ResourcePlace`/`PacedResourcePlace` permit
+          arc contributes `C(capacity, count)` interchangeable options that usually give the
+          guard the same answer, so they can consume `binding_search_limit` on redundant
+          permutations. List resource arcs **before** data arcs in `Transition.inputs` so the
+          data dimension (the one that actually changes the guard result) varies first, and/or
+          raise `binding_search_limit`.
+        - The first binding yielded is exactly `LEGACY`'s head selection, so `FIRST` is a
+          strict superset of `LEGACY`.
     """
 
     LEGACY = "legacy"

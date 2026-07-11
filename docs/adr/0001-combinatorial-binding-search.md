@@ -67,11 +67,19 @@ same marking).
 
 - **Guard-free fast path.** No guard ⇒ first `count` tokens per arc always satisfy;
   no search. This is the common case and stays O(1).
-- **Lazy short-circuit.** `itertools.product` + `next()` over per-arc candidate lists;
-  stop at the first satisfying binding.
-- **Search bound.** A cap on combinations tried per enabling check. On exhaustion the
-  transition is treated as disabled, surfaced via an **observable** signal (callback /
-  debug hook) — never a silent hang.
+- **Short-circuit.** `itertools.product` over per-arc candidate lists; stop at the first
+  satisfying binding.
+- **Search bound (time *and* memory).** A cap on combinations tried per enabling check.
+  Each arc's candidate stream is truncated to `limit + 1` groups *before* forming the
+  product (since `itertools.product` materializes each input iterable eagerly, an
+  untruncated arc would build its full `C(N, count)` list up front — unbounded memory).
+  Truncation is loss-free within the limit: in the product's lexicographic order a
+  candidate's overall rank is ≥ its index in any single dimension. On exhaustion the
+  transition is treated as disabled, surfaced via an **observable** signal — never a
+  silent hang.
+- **Callback off the lock.** Exhaustion is buffered during the (locked) enabling pass and
+  the `on_binding_search_exhausted` callback is dispatched — de-duplicated per transition —
+  after the lock releases, so it may safely call back into the net (per AGENTS.md §1).
 - **Observability.** The selected binding is exposed on transition-fired callbacks so
   users can see which tokens the engine chose.
 

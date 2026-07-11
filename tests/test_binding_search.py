@@ -3,7 +3,7 @@
 import time
 
 from cpnx.engine import PetriNet
-from cpnx.places import Place
+from cpnx.places import PacedResourcePlace, Place, ResourcePlace
 from cpnx.tokens import Token
 from cpnx.transitions import BindingPolicy, InputArc, OutputArc, Transition
 
@@ -207,6 +207,141 @@ class TestSearchLimitExhaustion:
         assert len(net.places["output"].tokens) == 0
         assert len(net.places["input"].tokens) == 20
         assert "never_matches" in exhausted
+
+
+class TestSearchIsBounded:
+    """The search limit must bound both time and memory, even for count>=2 arcs.
+
+    Regression for a bug where ``itertools.product`` eagerly materialized each arc's
+    full ``C(n, count)`` combination list before the per-candidate limit could apply,
+    making one enabling check O(C(n, count)) in time and memory.
+    """
+
+    def test_count_two_large_place_never_matching_is_fast(self):
+        eval_count = {"n": 0}
+
+        def guard(toks):
+            eval_count["n"] += 1
+            return False  # never satisfies → forces full search up to the limit
+
+        net = PetriNet(
+            places=[Place("input"), Place("output")],
+            binding_search_limit=5,
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input", count=2)],
+                    outputs=[OutputArc("output", count=2)],
+                    action=lambda toks: toks,
+                    guard=guard,
+                    binding_policy=BindingPolicy.FIRST,
+                )
+            ],
+        )
+        exhausted: list[str] = []
+        net.on_binding_search_exhausted = exhausted.append
+        # C(2000, 2) ~ 2e6 combinations; an unbounded search would materialize them all.
+        for i in range(2000):
+            net.deposit("input", Token(payload={"i": i}))
+
+        start = time.monotonic()
+        # is_dead runs one enabling check per transition; that check must be bounded.
+        assert net.is_dead() is True
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 0.5  # bounded work, not O(C(2000, 2))
+        # Guard evaluated at most limit+1 times, regardless of place size.
+        assert eval_count["n"] <= net.binding_search_limit + 1
+        assert "t" in exhausted
+
+
+class TestResourcePlaceUnderFirst:
+    """FIRST composes with ResourcePlace/PacedResourcePlace consume-by-id semantics."""
+
+    def test_resource_permit_consumed_and_returned(self):
+        net = PetriNet(
+            places=[ResourcePlace("permits", capacity=2), Place("input"), Place("output")],
+            transitions=[
+                Transition(
+                    name="t",
+                    # resource arc first so the data dimension varies fastest
+                    inputs=[InputArc("permits"), InputArc("input")],
+                    outputs=[OutputArc("permits"), OutputArc("output")],
+                    action=lambda toks: toks,
+                    guard=lambda toks: toks[1].payload["sym"] == "MSFT",
+                    binding_policy=BindingPolicy.FIRST,
+                )
+            ],
+        )
+        net.deposit("input", Token(payload={"sym": "AAPL"}))
+        net.deposit("input", Token(payload={"sym": "MSFT"}))
+        net.run(deadline=time.monotonic() + 2.0)
+
+        assert [t.payload["sym"] for t in net.places["output"].tokens] == ["MSFT"]
+        assert {t.payload["sym"] for t in net.places["input"].tokens} == {"AAPL"}
+        # Permit returned: pool back to full capacity.
+        assert len(net.places["permits"].tokens) == 2
+
+    def test_paced_resource_cooldown_respected(self):
+        net = PetriNet(
+            places=[
+                PacedResourcePlace("permits", capacity=1, pacing_secs=5.0),
+                Place("input"),
+                Place("output"),
+            ],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("permits"), InputArc("input")],
+                    outputs=[OutputArc("permits"), OutputArc("output")],
+                    action=lambda toks: toks,
+                    binding_policy=BindingPolicy.FIRST,
+                )
+            ],
+        )
+        net.deposit("input", Token(payload={"n": 1}))
+        net.deposit("input", Token(payload={"n": 2}))
+        # Only one permit; after it fires and is returned it must cool down 5s,
+        # so exactly one token should be processed within a short deadline.
+        net.run(deadline=time.monotonic() + 0.5)
+
+        assert len(net.places["output"].tokens) == 1
+        assert len(net.places["input"].tokens) == 1
+
+
+class TestExhaustionCallbackOffLock:
+    """on_binding_search_exhausted fires outside the lock (may re-enter the net)."""
+
+    def test_callback_may_deposit_without_deadlock(self):
+        net = PetriNet(
+            places=[Place("input"), Place("signal"), Place("output")],
+            binding_search_limit=3,
+            transitions=[
+                Transition(
+                    name="never",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                    guard=lambda toks: toks[0].payload["sym"] == "NOPE",
+                    binding_policy=BindingPolicy.FIRST,
+                )
+            ],
+        )
+        seen: list[str] = []
+
+        def on_exhausted(name):
+            seen.append(name)
+            # Re-entering the net from the callback must not deadlock.
+            net.deposit("signal", Token(payload={"name": name}))
+
+        net.on_binding_search_exhausted = on_exhausted
+        for i in range(10):
+            net.deposit("input", Token(payload={"sym": f"S{i}"}))
+
+        # A single enabling check that exhausts; must return and fire the callback.
+        assert net.is_dead() is True
+        assert "never" in seen
+        assert len(net.places["signal"].tokens) >= 1
 
 
 class TestConsumptionCorrectness:
