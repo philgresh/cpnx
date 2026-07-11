@@ -159,7 +159,7 @@ class TestInputArcMultiplicity:
             "t",
             inputs=[arc],
             outputs=[OutputArc("out")],
-            action=lambda toks: (received.append(len(toks)) or toks),
+            action=lambda toks: received.append(len(toks)) or toks,
         )
         net.add_transition(t)
         net.deposit("p", Token())
@@ -197,7 +197,7 @@ class TestInputArcMultiplicity:
             "t",
             inputs=[arc],
             outputs=[],
-            action=lambda toks: (fires.__setitem__("n", fires["n"] + 1) or toks),
+            action=lambda toks: fires.__setitem__("n", fires["n"] + 1) or toks,
         )
         net.add_transition(t)
         net.deposit("p", Token())
@@ -222,7 +222,7 @@ class TestInputArcMultiplicity:
             "t",
             inputs=[arc],
             outputs=[OutputArc("out", count=2)],
-            action=lambda toks: (received.append(len(toks)) or toks),
+            action=lambda toks: received.append(len(toks)) or toks,
         )
         net.add_transition(t)
         net.deposit("p", Token(payload={"ok": True}))

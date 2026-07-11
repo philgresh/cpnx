@@ -328,7 +328,8 @@ def test_evaluate_output_guards():
     assert len(net._evaluate_output_guards(t2, [])) == 1
 
 
-def test_check_input_preconditions():
+def test_resolve_binding():
+    from cpnx.engine import _flatten_binding
     from cpnx.transitions import InputArc
 
     net = PetriNet()
@@ -336,22 +337,19 @@ def test_check_input_preconditions():
     net.add_place(p_in)
 
     t1 = Transition("t1", inputs=[InputArc("p_in")], outputs=[], action=lambda t: t)
-    # No tokens, should fail
-    ok, tokens = net._check_input_preconditions(t1, 0.0)
-    assert not ok
-    assert tokens == []
+    # No tokens → not enabled
+    assert net._resolve_binding(t1, 0.0) is None
 
-    # Unregistered place
+    # Unregistered place → not enabled
     t2 = Transition("t2", inputs=[InputArc("unknown")], outputs=[], action=lambda t: t)
-    ok, tokens = net._check_input_preconditions(t2, 0.0)
-    assert not ok
+    assert net._resolve_binding(t2, 0.0) is None
 
-    # Token available
+    # Token available → binding pairs the arc with that token
     token = Token()
     p_in.deposit(token)
-    ok, tokens = net._check_input_preconditions(t1, 0.0)
-    assert ok
-    assert tokens == [token]
+    binding = net._resolve_binding(t1, 0.0)
+    assert binding is not None
+    assert _flatten_binding(binding) == [token]
 
 
 def test_is_settle_time_met():
@@ -636,11 +634,15 @@ def test_select_transition_to_fire():
     net.add_transition(t1)
     net.add_transition(t2)
 
-    # Priority 1 should be selected over priority 2 (lower number = higher precedence)
-    assert net._select_transition_to_fire() == t1
+    # Priority 1 should be selected over priority 2 (lower number = higher precedence).
+    # _select_transition_to_fire now returns a (transition, binding) pair.
+    selected = net._select_transition_to_fire()
+    assert selected is not None
+    transition, _binding = selected
+    assert transition == t1
 
 
-def test_retrieve_consumed_tokens():
+def test_consume_binding():
     net = PetriNet()
     p = Place("p")
     net.add_place(p)
@@ -653,12 +655,14 @@ def test_retrieve_consumed_tokens():
     trans = Transition("trans", inputs=[arc], outputs=[], action=lambda t: t)
     net.add_transition(trans)
 
-    consumed, sources = net._retrieve_consumed_tokens(trans, None)
+    binding = net._resolve_binding(trans, None)
+    consumed, sources = net._consume_binding(binding, None)
     assert consumed == [t]
     assert sources == [("p", t)]
+    assert len(p) == 0
 
 
-def test_retrieve_consumed_tokens_rollback_on_error():
+def test_consume_binding_rollback_on_error():
     net = PetriNet()
     p1 = Place("p1")
     p2 = Place("p2")
@@ -670,16 +674,18 @@ def test_retrieve_consumed_tokens_rollback_on_error():
     from cpnx.transitions import InputArc
 
     arc1 = InputArc("p1", count=1)
-    # This arc will raise an exception because the string expression divides by zero
-    arc2 = InputArc("p2", count=1, expression="1/0")
+    arc2 = InputArc("p2", count=1)
+    # A binding whose second arc names a token that is not actually present in p2 — the
+    # retrieve_specific for arc2 raises after arc1's token has already been consumed.
+    ghost = Token()
+    binding = [(arc1, [t1]), (arc2, [ghost])]
 
-    trans = Transition("trans", inputs=[arc1, arc2], outputs=[], action=lambda t: t)
+    with pytest.raises(ValueError):
+        net._consume_binding(binding, None)
 
-    with pytest.raises(ZeroDivisionError):
-        net._retrieve_consumed_tokens(trans, None)
-
-    # t1 should be returned to p1 after the rollback
+    # t1 (consumed from p1 before arc2 failed) must be rolled back to p1.
     assert len(p1) == 1
+    assert p1.tokens[0].id == t1.id
 
 
 def test_wait_for_work():
@@ -746,20 +752,21 @@ def test_rollback_data_token():
     assert rb_tok.available_at == 0.0
 
 
-def test_check_arc_preconditions():
+def test_arc_available():
     from cpnx.transitions import InputArc
 
     net = PetriNet()
     arc = InputArc("p1", count=1)
-    assert net._check_arc_preconditions(arc, None, None) is None
+    # Missing place → None
+    assert net._arc_available(arc, None, None, False) is None
 
     p = Place("p1")
     net.add_place(p)
-    assert net._check_arc_preconditions(arc, p, None) is None  # no tokens
+    assert net._arc_available(arc, p, None, False) is None  # no tokens
 
     tok = Token()
     p.deposit(tok)
-    assert net._check_arc_preconditions(arc, p, None) == [tok]
+    assert net._arc_available(arc, p, None, False) == [tok]
 
 
 def test_is_arc_active():
@@ -799,21 +806,22 @@ def test_process_rollback_token():
         assert not is_dl2
 
 
-def test_is_place_ready():
+def test_arc_available_requires_full_count():
     from cpnx.transitions import InputArc
 
     net = PetriNet()
-    arc = InputArc("p1", count=1)
-
-    assert not net._is_place_ready(arc, None, None)
-
     p = Place("p1")
     net.add_place(p)
-    assert not net._is_place_ready(arc, p, None)  # place empty
+    arc = InputArc("p1", count=2)
 
-    tok = Token()
-    p.deposit(tok)
-    assert net._is_place_ready(arc, p, None)
+    p.deposit(Token())
+    # Only one token present, arc demands two → unmet (multiplicity rule).
+    assert net._arc_available(arc, p, None, False) is None
+
+    p.deposit(Token())
+    result = net._arc_available(arc, p, None, False)
+    assert result is not None
+    assert len(result) == 2
 
 
 def test_filter_highest_priority():
@@ -821,10 +829,13 @@ def test_filter_highest_priority():
     t2 = Transition("t2", inputs=[], outputs=[], action=lambda t: t, priority=2)
     t3 = Transition("t3", inputs=[], outputs=[], action=lambda t: t, priority=1)
 
+    # _filter_highest_priority now operates on (transition, binding) pairs; the binding
+    # payload is irrelevant to priority filtering, so empty bindings suffice here.
     assert PetriNet._filter_highest_priority([]) == []
-    result = PetriNet._filter_highest_priority([t1, t2, t3])
-    assert set(t.name for t in result) == {"t1", "t3"}
-    assert t2 not in result
+    result = PetriNet._filter_highest_priority([(t1, []), (t2, []), (t3, [])])
+    names = {t.name for t, _ in result}
+    assert names == {"t1", "t3"}
+    assert all(t.name != "t2" for t, _ in result)
 
 
 def test_select_transition_to_fire_equal_priority():
@@ -840,7 +851,8 @@ def test_select_transition_to_fire_equal_priority():
     for _ in range(50):
         selected = net._select_transition_to_fire()
         assert selected is not None
-        seen.add(selected.name)
+        transition, _binding = selected
+        seen.add(transition.name)
     assert seen == {"t1", "t2"}
 
 
@@ -873,8 +885,9 @@ def test_get_deposit_counts():
     assert PetriNet._get_deposit_counts([]) == {}
 
 
-def test_check_arc_preconditions_consume_all():
-    """consume_all arcs must return ALL available tokens, not just arc.count."""
+def test_resolve_binding_consume_all():
+    """consume_all arcs bind ALL available tokens, not just arc.count."""
+    from cpnx.engine import _flatten_binding
     from cpnx.transitions import InputArc
 
     net = PetriNet()
@@ -886,7 +899,8 @@ def test_check_arc_preconditions_consume_all():
         p.deposit(t)
 
     arc = InputArc("p", consume_all=True)
-    result = net._check_arc_preconditions(arc, p, None)
+    trans = Transition("t", inputs=[arc], outputs=[], action=lambda x: x)
+    binding = net._resolve_binding(trans, None)
 
-    assert result is not None
-    assert len(result) == 3  # all three, not just arc.count (default 1)
+    assert binding is not None
+    assert len(_flatten_binding(binding)) == 3  # all three, not just arc.count (default 1)

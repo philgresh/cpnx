@@ -5,6 +5,14 @@ repo_url: https://github.com/philgresh/cpnx
 repo_name: philgresh/cpnx
 copyright: Copyright &copy; Phil Gresham — MIT License
 
+# Internal engineering docs (theory audit, ADRs, agent handoffs) live in the repo for
+# contributors and on GitHub, but are not part of the rendered API-documentation site.
+# Excluding them keeps `mkdocs build --strict` green (no orphan-page warnings).
+exclude_docs: |
+  cpn-theory-audit.md
+  handoff-cpn-binding-evaluation.md
+  adr/
+
 theme:
   name: material
   custom_dir: overrides

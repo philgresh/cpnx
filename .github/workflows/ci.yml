@@ -20,6 +20,12 @@ jobs:
           allow-prereleases: true
       - run: pip install -e ".[dev]"
       - run: ruff check src/ tests/
+      - name: Complexity gate (radon, rank A/B only)
+        run: |
+          radon cc src/cpnx -s -a
+          bad=$(radon cc src/cpnx --min C -s)
+          if [ -n "$bad" ]; then echo "Complexity gate FAILED — rank C or worse:"; echo "$bad"; exit 1; fi
+          echo "Complexity gate passed."
       - run: pytest tests/ -v
         continue-on-error: ${{ matrix.experimental == true }}
 

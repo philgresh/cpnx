@@ -10,34 +10,25 @@ from cpnx.tokens import FrozenDict, Token
 from cpnx.transitions import InputArc, OutputArc, Transition
 
 
-class TestC1TokenRollbackOnExpressionError:
-    """C1: Tokens consumed by earlier arcs must be returned when a later arc expression raises.
+class TestC1TokenRollbackOnConsumptionError:
+    """C1: Tokens consumed by earlier arcs must be returned if a later arc fails to consume.
 
-    The expression is called twice per step: once during _is_transition_enabled (peek,
-    no consumption) and once during the consumption loop. C1 covers the case where
-    the expression passes the enable check but raises during the actual consumption.
-    We use a call counter to simulate this: pass on call 1, raise on call 2.
+    Since 0.3.1 the engine resolves a transition's full binding — evaluating each input-arc
+    expression exactly once — *before* consuming any tokens, then consumes the resolved
+    tokens by id. This structurally eliminates the old "expression passes the enable check
+    but raises during consumption" partial-consume bug: an expression that raises now simply
+    disables the transition (see `test_no_partial_consumption_when_all_expressions_raise_at_enable_check`).
+    The remaining rollback path in `_consume_binding` covers the race where a token resolved
+    for a later arc has been removed (e.g. by a concurrent consumer) before this firing
+    consumes it — tokens already consumed from earlier arcs must be returned.
     """
 
-    def _make_boom_on_second_call(self, tokens):
-        """Return an expression callable that passes on first call, raises on second."""
-        calls = {"n": 0}
-
-        def expr(t):
-            calls["n"] += 1
-            if calls["n"] >= 2:
-                raise RuntimeError("boom on second call")
-            return t
-
-        return expr
-
-    def test_tokens_returned_when_second_arc_expression_raises(self):
+    def test_arc_expression_evaluated_once_per_firing(self):
+        """An input-arc expression is evaluated once during resolution, never again at consume."""
         calls = {"b": 0}
 
         def b_expr(tokens):
             calls["b"] += 1
-            if calls["b"] >= 2:
-                raise RuntimeError("boom")
             return tokens
 
         net = PetriNet(
@@ -54,51 +45,48 @@ class TestC1TokenRollbackOnExpressionError:
                 )
             ],
         )
-        ta = Token(payload={"src": "a"})
-        tb = Token(payload={"src": "b"})
-        net.deposit("a", ta)
-        net.deposit("b", tb)
+        net.deposit("a", Token())
+        net.deposit("b", Token())
 
-        # step() raises on the second call to b_expr (in consumption loop).
-        # Token from "a" (already consumed) must be rolled back.
-        with pytest.raises(RuntimeError, match="boom"):
-            net.step()
+        assert net.step() is True
+        assert calls["b"] == 1, "expression must be evaluated exactly once per firing (resolve, not consume)"
+        net.run(deadline=time.monotonic() + 1.0)
+        assert len(net.places["out"].tokens) == 2
 
-        assert len(net.places["a"].tokens) == 1, "token from first arc must be rolled back"
-        assert net.places["a"].tokens[0].id == ta.id
-        assert len(net.places["out"].tokens) == 0
+    def test_earlier_arc_tokens_rolled_back_when_later_arc_consume_fails(self):
+        """If a later arc cannot consume its resolved tokens, earlier-arc tokens are returned."""
 
-    def test_tokens_returned_when_string_expression_raises_on_second_call(self):
-        """String expressions that raise mid-loop also trigger rollback."""
-        calls = {"b": 0}
+        class VanishingPlace(Place):
+            """A place whose tokens pass enabling checks but disappear at consumption time."""
 
-        def b_expr_str_sim(tokens):
-            calls["b"] += 1
-            if calls["b"] >= 2:
-                raise IndexError("index out of range")
-            return tokens
+            def retrieve_specific(self, tokens, model_time=None):
+                raise ValueError("token vanished before consumption")
 
         net = PetriNet(
-            places=[Place("a"), Place("b"), Place("out")],
+            places=[Place("a"), VanishingPlace("b"), Place("out")],
             transitions=[
                 Transition(
                     name="t",
                     inputs=[
                         InputArc("a"),
-                        InputArc("b", expression=b_expr_str_sim),
+                        InputArc("b"),
                     ],
                     outputs=[OutputArc("out", count=2)],
                     action=lambda tokens: tokens,
                 )
             ],
         )
-        net.deposit("a", Token())
+        ta = Token(payload={"src": "a"})
+        net.deposit("a", ta)
         net.deposit("b", Token())
 
-        with pytest.raises(IndexError):
+        # Arc "a" is consumed first, then arc "b" fails mid-consume — "a" must be rolled back.
+        with pytest.raises(ValueError, match="vanished"):
             net.step()
 
-        assert len(net.places["a"].tokens) == 1, "first arc token must survive mid-loop failure"
+        assert len(net.places["a"].tokens) == 1, "token from first arc must be rolled back"
+        assert net.places["a"].tokens[0].id == ta.id
+        assert len(net.places["out"].tokens) == 0
 
     def test_no_partial_consumption_when_all_expressions_raise_at_enable_check(self):
         """When expression raises at _is_transition_enabled, transition is disabled — no
