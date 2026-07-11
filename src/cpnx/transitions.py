@@ -1,3 +1,4 @@
+import enum
 import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, ClassVar
@@ -7,6 +8,38 @@ from cpnx.tokens import Token
 
 if TYPE_CHECKING:
     from cpnx.engine import PetriNet
+
+
+class BindingPolicy(enum.Enum):
+    """Strategy for choosing which input tokens bind a transition when it is enabled.
+
+    In CPN theory a transition is enabled if *any* assignment of place tokens (a
+    *binding*) satisfies its guard. cpnx historically tested only the head of each
+    input place (FIFO, or reordered by [`InputArc.expression`][cpnx.InputArc]), which
+    causes **head-of-line blocking**: a place holding `[A, B]` whose guard wants `B`
+    reports the transition disabled, because only `A` is ever tested. `BindingPolicy`
+    selects how the engine resolves that binding. See the design record in
+    `docs/adr/0001-combinatorial-binding-search.md`.
+
+    Attributes:
+        LEGACY: Test only the first `count` tokens of each input place (FIFO, or the
+            leading tokens of the [`InputArc.expression`][cpnx.InputArc] ordering) and
+            evaluate the guard once against that single candidate set. This is the
+            historical behavior and the default — reproducible, but subject to
+            head-of-line blocking. Choose this to preserve pre-0.3.1 semantics exactly.
+        FIRST: Search input-token combinations in a stable insertion order and select
+            the **first** combination whose guard is satisfied. Complete (finds a valid
+            binding if one exists anywhere in the place, fixing head-of-line blocking)
+            **and** deterministic (the same marking always yields the same binding). When
+            the transition has no guard, this is identical to `LEGACY` and incurs no
+            search cost.
+    """
+
+    LEGACY = "legacy"
+    FIRST = "first"
+    # Phase 2 (planned): RANDOM = "random"  (seeded), PRIORITY = "priority" (token-key).
+    # Both will consume the same satisfying-binding generator used by FIRST; see
+    # docs/adr/0001-combinatorial-binding-search.md.
 
 
 @dataclass
@@ -147,6 +180,13 @@ class Transition:
                `None` means infinite retry (today's behavior; forfeits the quiescence guarantee).
                `0` means route data token(s) to `error_place` on the first failure.
                `N > 0` means retry up to `N` times, then route to `error_place`. Default is 5.
+        binding_policy: How the engine resolves which input tokens bind this transition
+               when checking enablement — see [`BindingPolicy`][cpnx.BindingPolicy].
+               `None` (default) inherits the net-wide default set on
+               [`PetriNet`][cpnx.PetriNet] (itself `BindingPolicy.LEGACY` by default), so
+               an unset transition behaves exactly as before. Set
+               `BindingPolicy.FIRST` to enable deterministic-complete binding search
+               (fixing head-of-line blocking) for this transition only.
     """
 
     name: str
@@ -157,6 +197,7 @@ class Transition:
     priority: int = 10
     action_timeout_secs: float | None = None
     max_retries: int | None = 5
+    binding_policy: BindingPolicy | None = None
 
     def __setattr__(self, name, value):
         # Keep the pre-compiled guard in sync with ``guard``, including

@@ -1,21 +1,30 @@
 """Concurrent Petri net executor."""
 
 import concurrent.futures
+import itertools
 import random
 import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, TypeAlias
+from typing import Callable, Iterator, TypeAlias
 
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace
 from cpnx.sandbox import SandboxEvaluator
 from cpnx.tokens import Token
-from cpnx.transitions import InputArc, OutputArc, SubstitutionTransition, Transition
+from cpnx.transitions import BindingPolicy, InputArc, OutputArc, SubstitutionTransition, Transition
 from cpnx.visualization import snapshot, to_dot
 
 _DepositFn: TypeAlias = Callable[[str, Token], None]
 """Callable that deposits a token into a named place. Must be invoked under the engine lock."""
+
+_Binding: TypeAlias = list[tuple[InputArc, list[Token]]]
+"""A resolved binding: each input arc paired with the exact tokens it will consume."""
+
+
+def _flatten_binding(binding: _Binding) -> list[Token]:
+    """Flatten a resolved binding into a single guard-candidate token list, in arc order."""
+    return [t for _, tokens in binding for t in tokens]
 
 
 def _enact_planned_deposits(
@@ -210,6 +219,8 @@ class PetriNet:
         timeout_secs: float = 1.0,
         expr_timeout_secs: float = 0.1,
         retry_delay: float = 1.0,
+        binding_policy: BindingPolicy = BindingPolicy.LEGACY,
+        binding_search_limit: int = 1000,
     ) -> None:
         """Construct the net, its thread pools, and register any initial places/transitions.
 
@@ -236,6 +247,18 @@ class PetriNet:
                                calls will block. Keep well under 1 s (default: 0.1).
             retry_delay: Delay in seconds to apply to data tokens when rolling them
                          back to their source places on transient failure (default: 1.0).
+            binding_policy: Net-wide default strategy for resolving which input tokens
+                         bind a transition — see [`BindingPolicy`][cpnx.BindingPolicy].
+                         Defaults to `BindingPolicy.LEGACY` (historical head-of-queue
+                         behavior), so existing nets are unaffected. A transition may
+                         override this via its own `binding_policy`.
+            binding_search_limit: Maximum number of input-token combinations tried per
+                         enablement check when a transition uses `BindingPolicy.FIRST`
+                         (default: 1000). If exhausted without finding a guard-satisfying
+                         binding, the transition is treated as disabled and
+                         `on_binding_search_exhausted` (if set) is invoked. Ignored under
+                         `BindingPolicy.LEGACY` and for guard-free transitions, which never
+                         search.
         """
         self.max_workers = max_workers
         self.error_place = error_place
@@ -243,6 +266,8 @@ class PetriNet:
         self.timeout_secs = timeout_secs
         self.expr_timeout_secs = expr_timeout_secs
         self.retry_delay = retry_delay
+        self.binding_policy = binding_policy
+        self.binding_search_limit = binding_search_limit
         self._has_timed_features = False
         self._model_time: float | None = None
         self.places: dict[str, Place] = {}
@@ -278,6 +303,14 @@ class PetriNet:
         #: or `None` if the transition had no data inputs.
         #: Fires outside the engine lock.
         self.on_error: Callable[[str, Exception, Token | None], None] | None = None
+
+        #: Called when a `BindingPolicy.FIRST` binding search hits `binding_search_limit`
+        #: without finding a guard-satisfying binding, causing the transition to be treated
+        #: as disabled for that check.
+        #: Signature: `(transition_name: str) -> None`.
+        #: Fires while holding the engine lock (it is invoked from the enabling check), so it
+        #: must not call back into the net; keep it to lightweight logging/metrics.
+        self.on_binding_search_exhausted: Callable[[str], None] | None = None
 
         self.add_place(Place(error_place))
         for p in places or []:
@@ -424,44 +457,65 @@ class PetriNet:
                 pass
 
     @staticmethod
-    def _filter_highest_priority(transitions: list[Transition]) -> list[Transition]:
-        if not transitions:
+    def _filter_highest_priority(
+        pairs: list[tuple[Transition, _Binding]],
+    ) -> list[tuple[Transition, _Binding]]:
+        if not pairs:
             return []
-        min_priority = min(t.priority for t in transitions)
-        return [t for t in transitions if t.priority == min_priority]
+        min_priority = min(t.priority for t, _ in pairs)
+        return [(t, b) for t, b in pairs if t.priority == min_priority]
 
-    def _select_transition_to_fire(self) -> Transition | None:
-        enabled = [t for t in self.transitions.values() if self._is_transition_enabled(t)]
-        candidates = self._filter_highest_priority(enabled)
+    def _enabled_transition_bindings(self) -> list[tuple[Transition, _Binding]]:
+        """Resolve each transition's binding once, keeping those that are currently enabled.
+
+        For every transition, checks output capacity and resolves a guard-satisfying binding
+        under its effective [`BindingPolicy`][cpnx.BindingPolicy]. Returning the resolved
+        binding alongside the transition lets [`step`][cpnx.PetriNet.step] consume exactly
+        those tokens without re-resolving (so the guard is evaluated once per firing).
+        """
+        m_time = self._get_model_time_under_lock()
+        result: list[tuple[Transition, _Binding]] = []
+        for t in self.transitions.values():
+            if not self._check_output_capacity(t):
+                continue
+            binding = self._resolve_binding(t, m_time)
+            if binding is not None:
+                result.append((t, binding))
+        return result
+
+    def _select_transition_to_fire(self) -> tuple[Transition, _Binding] | None:
+        candidates = self._filter_highest_priority(self._enabled_transition_bindings())
         return random.choice(candidates) if candidates else None
 
-    def _retrieve_tokens_for_arc(self, arc: InputArc, place: Place, m_time: float | None) -> list[Token]:
-        if arc.consume_all:
-            return place.retrieve_all(model_time=m_time)
-        if arc.expression is not None:
-            # Consumption uses the same string-vs-callable dispatch as enabling, but must let
-            # a raising expression propagate so _retrieve_consumed_tokens can roll back the
-            # tokens already consumed from earlier arcs (unlike the enable check, which treats
-            # a raising expression as "not enabled").
-            available = place.peek(len(place), model_time=m_time)
-            ordered = self._eval_expression(arc.expression, arc._compiled_expression, available)  # type: ignore[attr-defined]
-            return place.retrieve_specific(ordered[: arc.count], model_time=m_time)
-        return place.retrieve(arc.count, model_time=m_time)
+    def _consume_binding(self, binding: _Binding, m_time: float | None) -> tuple[list[Token], list[tuple[str, Token]]]:
+        """Remove the exact tokens named by `binding` from their source places.
 
-    def _retrieve_consumed_tokens(
-        self, transition: Transition, m_time: float | None
-    ) -> tuple[list[Token], list[tuple[str, Token]]]:
+        Each arc's tokens were already resolved (and its guard satisfied) by
+        `_resolve_binding`, so consumption is a straight `retrieve_specific` by id — no
+        arc expression is re-evaluated here. If a token has vanished (e.g. a concurrent
+        consumer removed it between resolution and consumption), the already-consumed
+        tokens are returned to their source places before the error propagates, so none
+        are silently lost.
+
+        Args:
+            binding: The resolved binding — arcs paired with the tokens they will consume.
+            m_time: The current model time used to validate token availability.
+
+        Returns:
+            A tuple of `(consumed_tokens, token_sources)`, where `token_sources` pairs each
+            consumed token with the name of the place it came from (for rollback).
+        """
         consumed_tokens: list[Token] = []
         token_sources: list[tuple[str, Token]] = []
         try:
-            for arc in transition.inputs:
+            for arc, tokens in binding:
                 place = self.places[arc.place]
-                tokens = self._retrieve_tokens_for_arc(arc, place, m_time)
-                consumed_tokens.extend(tokens)
-                for t in tokens:
+                got = place.retrieve_specific(tokens, model_time=m_time)
+                consumed_tokens.extend(got)
+                for t in got:
                     token_sources.append((arc.place, t))
         except Exception:
-            # Expression raised mid-loop — return already-consumed tokens to their
+            # A token vanished mid-loop — return already-consumed tokens to their
             # source places so they are not silently lost.
             for src_name, t in token_sources:
                 self._deposit_under_lock(src_name, t)
@@ -494,12 +548,16 @@ class PetriNet:
             if not selected:
                 return False
 
+            # The binding was resolved during selection (guard evaluated once); consume
+            # exactly those tokens. Under BindingPolicy.FIRST the chosen tokens may not be at
+            # the head of their places, so consumption is by token id, not FIFO position.
+            transition, binding = selected
             m_time = self._get_model_time_under_lock()
-            consumed_tokens, token_sources = self._retrieve_consumed_tokens(selected, m_time)
+            consumed_tokens, token_sources = self._consume_binding(binding, m_time)
 
             self._running_count += 1
             try:
-                self._executor.submit(self._execute_transition, selected, consumed_tokens, token_sources)
+                self._executor.submit(self._execute_transition, transition, consumed_tokens, token_sources)
             except Exception:
                 # submit() failed (e.g. executor shut down) — undo the increment so
                 # is_quiescent() doesn't permanently block.
@@ -749,42 +807,178 @@ class PetriNet:
         self.places[place_name].deposit(token, model_time=self._get_model_time_under_lock())
 
     def _is_transition_enabled(self, transition: Transition) -> bool:
-        """Return ``True`` if all preconditions for firing *transition* are satisfied.
+        """Return `True` if all preconditions for firing `transition` are satisfied right now.
 
-        Checks token availability (including cooldowns and thresholds), settle
-        windows, and the user-supplied guard. Called while holding ``self._lock``.
+        Checks output-place capacity (back-pressure), then resolves a binding that
+        satisfies token availability (including cooldowns, thresholds, and settle windows)
+        and the guard, honoring the transition's effective
+        [`BindingPolicy`][cpnx.BindingPolicy]. Called while holding `self._lock`.
+
+        Args:
+            transition: The transition to test.
+
+        Returns:
+            `True` if a guard-satisfying binding exists and every unguarded output arc has
+            capacity; `False` otherwise.
         """
-        m_time = self._get_model_time_under_lock()
-        ok, candidate_tokens = self._check_input_preconditions(transition, m_time)
-        if not ok:
-            return False
-
         if not self._check_output_capacity(transition):
             return False
+        m_time = self._get_model_time_under_lock()
+        return self._resolve_binding(transition, m_time) is not None
 
-        return self._check_transition_guard(transition, candidate_tokens)
+    def _effective_policy(self, transition: Transition) -> BindingPolicy:
+        """Return the binding policy in force for `transition` (its own, else the net default)."""
+        return transition.binding_policy or self.binding_policy
 
-    def _is_place_ready(self, arc: InputArc, place: Place | None, m_time: float | None) -> bool:
-        if not place or not place.can_retrieve(arc.count, model_time=m_time):
-            return False
-        return self._is_settle_time_met(place, arc)
+    def _arc_available(
+        self, arc: InputArc, place: Place | None, m_time: float | None, ignore_timing: bool
+    ) -> list[Token] | None:
+        """Return the tokens eligible to satisfy one input `arc`, or `None` if it cannot be met.
 
-    def _check_arc_preconditions(self, arc: InputArc, place: Place | None, m_time: float | None) -> list[Token] | None:
-        if not self._is_place_ready(arc, place, m_time):
+        Eligibility accounts for token count and — unless `ignore_timing` is set — cooldowns
+        and the arc's settle window. Returns `None` when the place is missing, holds fewer
+        than `arc.count` eligible tokens, or has not yet settled.
+
+        Args:
+            arc: The input arc whose source place is inspected.
+            place: The source place, or `None` if unregistered.
+            m_time: The current model time (used when `ignore_timing` is `False`).
+            ignore_timing: When `True`, treat cooling-down/not-yet-settled tokens as available
+                (used by [`is_quiescent`][cpnx.PetriNet.is_quiescent]).
+
+        Returns:
+            The eligible tokens in FIFO order, or `None` if the arc cannot be satisfied.
+        """
+        if place is None:
             return None
-        available = place.peek(len(place), model_time=m_time)  # type: ignore[union-attr]
-        # _resolve_input_tokens enforces the multiplicity rule (returns None if fewer
-        # than arc.count tokens are eligible) and already slices to arc.count.
-        return self._resolve_input_tokens(arc, available)
+        t_limit = float("inf") if ignore_timing else m_time
+        if not place.can_retrieve(arc.count, model_time=t_limit):
+            return None
+        if not ignore_timing and not self._is_settle_time_met(place, arc):
+            return None
+        return place.peek(len(place), model_time=t_limit)
 
-    def _check_input_preconditions(self, transition: Transition, m_time: float | None) -> tuple[bool, list[Token]]:
-        tokens_for_guard: list[Token] = []
+    def _gather_arc_pools(
+        self, transition: Transition, m_time: float | None, ignore_timing: bool
+    ) -> list[tuple[InputArc, list[Token]]] | None:
+        """Collect the eligible-token pool for every input arc, or `None` if any is unmet."""
+        pools: list[tuple[InputArc, list[Token]]] = []
         for arc in transition.inputs:
-            resolved = self._check_arc_preconditions(arc, self.places.get(arc.place), m_time)
-            if resolved is None:
-                return False, []
-            tokens_for_guard.extend(resolved)
-        return True, tokens_for_guard
+            available = self._arc_available(arc, self.places.get(arc.place), m_time, ignore_timing)
+            if available is None:
+                return None
+            pools.append((arc, available))
+        return pools
+
+    def _resolve_binding(
+        self, transition: Transition, m_time: float | None, *, ignore_timing: bool = False
+    ) -> _Binding | None:
+        """Resolve which input tokens bind `transition`, or `None` if it is not enabled.
+
+        Gathers each input arc's eligible tokens, then selects a guard-satisfying binding
+        according to the transition's effective [`BindingPolicy`][cpnx.BindingPolicy]:
+
+        - `LEGACY` (or any guard-free transition): take the first `count` tokens of each arc
+          (its head, or the leading tokens of the arc-expression ordering) and accept that
+          single binding only if the guard holds — the historical behavior.
+        - `FIRST`: search input-token combinations in insertion order and return the first
+          whose guard holds (fixing head-of-line blocking), bounded by
+          `binding_search_limit`.
+
+        Args:
+            transition: The transition to resolve.
+            m_time: The current model time used for availability/settle checks.
+            ignore_timing: When `True`, ignore cooldowns and settle windows (used by
+                [`is_quiescent`][cpnx.PetriNet.is_quiescent]).
+
+        Returns:
+            The resolved binding (each arc paired with the tokens it will consume), or `None`
+            if no guard-satisfying binding exists within the search limit.
+        """
+        pools = self._gather_arc_pools(transition, m_time, ignore_timing)
+        if pools is None:
+            return None
+        if transition.guard is None or self._effective_policy(transition) is BindingPolicy.LEGACY:
+            return self._head_binding(transition, pools)
+        return self._search_binding(transition, pools)
+
+    def _head_binding(self, transition: Transition, pools: list[tuple[InputArc, list[Token]]]) -> _Binding | None:
+        """Build the head binding (first `count` per arc) and accept it only if the guard holds."""
+        binding: _Binding = []
+        for arc, available in pools:
+            tokens = self._resolve_input_tokens(arc, available)
+            if tokens is None:
+                return None
+            binding.append((arc, tokens))
+        if self._check_transition_guard(transition, _flatten_binding(binding)):
+            return binding
+        return None
+
+    def _search_binding(self, transition: Transition, pools: list[tuple[InputArc, list[Token]]]) -> _Binding | None:
+        """Search input-token combinations for the first guard-satisfying binding.
+
+        Enumerates candidate bindings deterministically (insertion order) and returns the
+        first whose guard holds. Bounded by `binding_search_limit`; on exhaustion the
+        transition is treated as disabled and `on_binding_search_exhausted` (if set) fires.
+        """
+        for tried, binding in enumerate(self._iter_candidate_bindings(pools), start=1):
+            if tried > self.binding_search_limit:
+                self._signal_search_exhausted(transition.name)
+                return None
+            if self._check_transition_guard(transition, _flatten_binding(binding)):
+                return binding
+        return None
+
+    def _iter_candidate_bindings(self, pools: list[tuple[InputArc, list[Token]]]) -> Iterator[_Binding]:
+        """Yield candidate bindings as the Cartesian product of each arc's token-group options.
+
+        Options are generated in insertion order, so the first binding yielded is the head
+        selection and iteration proceeds deterministically from there.
+        """
+        arcs = [arc for arc, _ in pools]
+        option_lists = [self._arc_options(arc, available) for arc, available in pools]
+        for combo in itertools.product(*option_lists):
+            yield list(zip(arcs, combo, strict=True))
+
+    def _arc_options(self, arc: InputArc, available: list[Token]) -> Iterator[list[Token]]:
+        """Yield each `count`-sized token group one input `arc` could consume, in order.
+
+        A `consume_all` arc has a single option (every eligible token). Otherwise the tokens
+        are ordered (by the arc expression, else FIFO) and every `count`-sized combination is
+        yielded in index order — so the first yielded group is the arc's head selection. An
+        arc whose expression raises, or that has fewer than `count` eligible tokens, yields
+        nothing (making the transition unbindable).
+        """
+        if arc.consume_all:
+            yield available
+            return
+        ordered = self._order_available(arc, available)
+        if ordered is None or len(ordered) < arc.count:
+            return
+        for combo in itertools.combinations(ordered, arc.count):
+            yield list(combo)
+
+    def _order_available(self, arc: InputArc, available: list[Token]) -> list[Token] | None:
+        """Return `available` ordered by the arc's selection expression, or `None` if it raises.
+
+        With no expression, returns `available` unchanged (FIFO). A string expression is
+        evaluated via the sandboxed, precompiled path; a callable via the timed expression
+        pool.
+        """
+        if arc.expression is None:
+            return available
+        try:
+            return list(self._eval_expression(arc.expression, arc._compiled_expression, available))  # type: ignore[attr-defined]
+        except Exception:
+            return None
+
+    def _signal_search_exhausted(self, transition_name: str) -> None:
+        """Invoke `on_binding_search_exhausted` (if set), swallowing any callback error."""
+        if self.on_binding_search_exhausted:
+            try:
+                self.on_binding_search_exhausted(transition_name)
+            except Exception:
+                pass
 
     def _is_settle_time_met(self, place: Place, arc: InputArc) -> bool:
         if arc.settle_secs <= 0.0:
@@ -817,10 +1011,10 @@ class PetriNet:
         resolved, so a selection that yields fewer (or none) disables the
         transition rather than firing with a short or zero-length token list.
 
-        Shared by the firing check (via `_check_arc_preconditions`) and the
-        timing-agnostic `_is_transition_potentially_enabled` so both apply
-        the identical multiplicity rule; callers differ only in how `available`
-        is computed (real/model time vs. ignoring timing).
+        Used by `_head_binding` to build the head selection under
+        `BindingPolicy.LEGACY` (and for guard-free transitions), applying the
+        multiplicity rule so a short selection disables the transition rather than
+        firing with too few tokens.
         """
         if arc.consume_all:
             tokens = available
@@ -860,26 +1054,19 @@ class PetriNet:
         """Return `True` if `transition` could fire given current token counts, ignoring timing.
 
         Unlike `_is_transition_enabled`, this ignores cooldown timers on
-        `PacedResourcePlace` (tokens in cooldown are counted
-        as present) and settle windows. Used by [`is_quiescent`][cpnx.PetriNet.is_quiescent] to
+        `PacedResourcePlace` (tokens in cooldown are counted as present), settle windows, and
+        output-place back-pressure. It resolves a binding under the transition's effective
+        [`BindingPolicy`][cpnx.BindingPolicy] exactly as the firing check does, so binding
+        search is honored here too. Used by [`is_quiescent`][cpnx.PetriNet.is_quiescent] to
         distinguish "no work possible" from "work temporarily blocked by timing".
-        """
-        candidate_tokens: list[Token] = []
-        for arc in transition.inputs:
-            place = self.places.get(arc.place)
-            if place is None:
-                return False
-            # Check count ignoring timing (model_time=float("inf"))
-            if not place.can_retrieve(arc.count, model_time=float("inf")):
-                return False
-            # Speculatively resolve candidate tokens ignoring timing
-            available = place.peek(len(place), model_time=float("inf"))
-            tokens = self._resolve_input_tokens(arc, available)
-            if tokens is None:
-                return False
-            candidate_tokens.extend(tokens)
 
-        return self._check_transition_guard(transition, candidate_tokens)
+        Args:
+            transition: The transition to test.
+
+        Returns:
+            `True` if a guard-satisfying binding exists once timing is ignored.
+        """
+        return self._resolve_binding(transition, float("inf"), ignore_timing=True) is not None
 
     def _commit_or_rollback_transition(
         self,

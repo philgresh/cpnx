@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.1] — 2026-07-10
+
+### Added
+
+- **`BindingPolicy`** — A new public enum (exported from `cpnx`) controlling how a transition resolves which input tokens bind it. `BindingPolicy.LEGACY` (the default) preserves the historical behavior: only the leading `count` tokens of each input place (FIFO / `InputArc.expression` ordering) are tested, with the guard evaluated once — subject to head-of-line (HoL) blocking. `BindingPolicy.FIRST` performs a **deterministic-complete binding search**, walking input-token combinations in stable insertion order and selecting the first combination whose guard holds; this fixes HoL blocking while remaining reproducible, and reduces to `LEGACY` (no search) when the transition has no guard.
+- **`Transition.binding_policy`** — Optional per-transition policy (`BindingPolicy | None`, default `None`). `None` inherits the owning net's default, so binding search is **opt-in per transition or net-wide**.
+- **`PetriNet(binding_policy=..., binding_search_limit=...)`** — The net-wide default policy (`binding_policy`, default `BindingPolicy.LEGACY`) and the cap on combinations tried per enabling check under `FIRST` (`binding_search_limit`, default `1000`).
+- **`PetriNet.on_binding_search_exhausted`** — A new optional callback (`Callable[[str], None] | None`) fired (under the engine lock) with the transition name when a `FIRST` search reaches `binding_search_limit` without finding a satisfying binding; the transition is treated as disabled for that check, never a silent hang.
+
+### Notes
+
+- The default remains **`BindingPolicy.LEGACY`**, so existing nets are byte-for-byte unchanged; HoL blocking is only fixed when `FIRST` is explicitly selected.
+- This is the **opt-in realization of the combinatorial binding** whose "lazy `itertools.product` enumeration" the 0.3.0 **Notes** section had said was intentionally not implemented. It is Phase 1 of the plan in [`docs/adr/0001-combinatorial-binding-search.md`](docs/adr/0001-combinatorial-binding-search.md).
+- Planned follow-ups: **Phase 2** (`RANDOM`/`PRIORITY` selection policies) and **Phase 3** (flip the default to complete binding search at a major version bump).
+
+---
+
 ## [0.3.0] — 2026-06-30
 
 ### Added
