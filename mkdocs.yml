@@ -55,6 +55,30 @@ plugins:
             show_root_heading: true
             show_symbol_type_heading: true
             show_symbol_type_toc: true
+  - llmstxt:
+      # Generates /llms.txt (curated index) and /llms-full.txt (full content)
+      # for LLM-friendly consumption. Listed after mkdocstrings so it captures
+      # the rendered API reference.
+      # base_url points at the canonical `latest` alias, since mike deploys the
+      # whole site into /cpnx/latest/ (and /cpnx/<version>/) — without this the
+      # generated links would omit the version path and 404.
+      base_url: https://philgresh.github.io/cpnx/latest/
+      full_output: llms-full.txt
+      markdown_description: >-
+        cpnx is a Coloured Petri Net (CPN) executor for concurrent Python
+        pipelines — zero dependencies, stdlib-only threading. It models
+        resource-constrained workflows (GPU slots, API rate limits, connection
+        pools) as a Coloured Petri Net where transitions execute real work on
+        thread pools and resource tokens are returned atomically on failure.
+      sections:
+        Home:
+          - index.md
+        API reference:
+          - reference/core.md
+          - reference/transitions.md
+          - reference/places.md
+          - reference/tokens.md
+          - reference/visualization.md
   - mike:
       canonical_version: latest
 
