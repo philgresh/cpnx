@@ -66,15 +66,34 @@ def _time_policy(label: str, binding_policy: BindingPolicy) -> None:
 
     elapsed = timeit.timeit(lambda: net._is_transition_enabled(transition), number=N)
     per_call_us = elapsed / N * 1e6
-    print(
-        f"_is_transition_enabled [{label:6}]: {elapsed:.4f}s for {N} calls  "
-        f"({per_call_us:.3f} us/call)"
-    )
+    print(f"_is_transition_enabled [{label:8}]: {elapsed:.4f}s for {N} calls  ({per_call_us:.3f} us/call)")
+
+
+def _time_resolve(label: str, binding_policy: BindingPolicy) -> None:
+    """Time the *firing* resolution path (``_resolve_binding``).
+
+    Unlike ``_is_transition_enabled`` (an existence probe that short-circuits at the first
+    satisfying binding for every policy), the firing path is where ``RANDOM`` and ``PRIORITY``
+    pay to enumerate the whole candidate set to sample / rank it.
+    """
+    net, transition = build_net(binding_policy)
+    m_time = net._get_model_time_under_lock()
+    assert net._resolve_binding(transition, m_time) is not None, "transition should be enabled"
+
+    elapsed = timeit.timeit(lambda: net._resolve_binding(transition, m_time), number=N)
+    per_call_us = elapsed / N * 1e6
+    print(f"_resolve_binding       [{label:8}]: {elapsed:.4f}s for {N} calls  ({per_call_us:.3f} us/call)")
 
 
 def main() -> None:
     _time_policy("LEGACY", BindingPolicy.LEGACY)
     _time_policy("FIRST", BindingPolicy.FIRST)
+    print()
+    # Firing path: RANDOM/PRIORITY must scan all candidates, so they cost more than FIRST.
+    _time_resolve("LEGACY", BindingPolicy.LEGACY)
+    _time_resolve("FIRST", BindingPolicy.FIRST)
+    _time_resolve("RANDOM", BindingPolicy.RANDOM)
+    _time_resolve("PRIORITY", BindingPolicy.PRIORITY)
 
 
 if __name__ == "__main__":

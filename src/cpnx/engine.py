@@ -27,6 +27,21 @@ def _flatten_binding(binding: _Binding) -> list[Token]:
     return [t for _, tokens in binding for t in tokens]
 
 
+def _default_priority_key(tokens: list[Token]) -> float:
+    """Default `BindingPolicy.PRIORITY` key: oldest-first by minimum data-token `created_at`.
+
+    Resource tokens (`Token.is_resource`) are excluded from the minimum: a permit created at
+    net construction is older than any data token, so including it would make every candidate
+    binding tie on the permit's timestamp and collapse the selection to insertion order — the
+    "oldest-first" default would be silently defeated exactly for the resource-arc pattern the
+    docs recommend. A resource-only binding (no data tokens) falls back to the minimum over all
+    tokens. Note the exclusion keys off the built-in resource colour, so user-defined
+    resource-like colours are not filtered.
+    """
+    data_ts = [t.created_at for t in tokens if not t.is_resource]
+    return min(data_ts) if data_ts else min(t.created_at for t in tokens)
+
+
 def _enact_planned_deposits(
     planned_deposits: list[tuple[str, Token]],
     active_outputs: list[tuple[OutputArc, bool]],
@@ -221,6 +236,7 @@ class PetriNet:
         retry_delay: float = 1.0,
         binding_policy: BindingPolicy = BindingPolicy.LEGACY,
         binding_search_limit: int = 1000,
+        seed: int | None = None,
     ) -> None:
         """Construct the net, its thread pools, and register any initial places/transitions.
 
@@ -270,8 +286,27 @@ class PetriNet:
                          quiescence — and [`run`][cpnx.PetriNet.run] can return — with that
                          work still pending, signalled only via the callback; raise the limit
                          if this is a concern. Must be `>= 1`. Ignored under
-                         `BindingPolicy.LEGACY` and for guard-free transitions, which never
-                         search.
+                         `BindingPolicy.LEGACY` and for guard-free `FIRST` transitions, which
+                         never search. Under `BindingPolicy.RANDOM`/`PRIORITY` the search
+                         cannot short-circuit (it must scan every candidate to sample or rank),
+                         so the limit truncates the selection space to the first `limit`
+                         candidates: if that prefix contains a satisfying binding they select
+                         over it and fire (signalling the truncation); if it does not, the
+                         transition is disabled for that check and can stall exactly like
+                         `FIRST`.
+            seed: Optional integer seed for the net's internal random generator
+                         (`random.Random(seed)`). When set, it drives **both** the scheduler's
+                         tie-break among equal-priority enabled transitions **and**
+                         `BindingPolicy.RANDOM` binding selection. `None` (default) uses an
+                         unseeded instance (non-reproducible). Reproducibility caveats: use
+                         `max_workers=1` for strict replay — above 1, identical seeds are **not
+                         guaranteed** to reproduce, because concurrent action-commit ordering
+                         (an OS-scheduled race) can change which transitions are enabled at a
+                         firing step and hence the draw sequence. Each
+                         [`SubstitutionTransition`][cpnx.SubstitutionTransition] subnet is its
+                         own `PetriNet` with its own RNG, so seed subnets separately if they
+                         contain `RANDOM` transitions. Seeded streams are not stable across
+                         cpnx versions.
 
         Raises:
             ValueError: If `binding_search_limit < 1`.
@@ -286,6 +321,7 @@ class PetriNet:
         if binding_search_limit < 1:
             raise ValueError(f"binding_search_limit must be >= 1, got {binding_search_limit}.")
         self.binding_search_limit = binding_search_limit
+        self._rng = random.Random(seed)
         self._has_timed_features = False
         self._model_time: float | None = None
         self.places: dict[str, Place] = {}
@@ -322,9 +358,14 @@ class PetriNet:
         #: Fires outside the engine lock.
         self.on_error: Callable[[str, Exception, Token | None], None] | None = None
 
-        #: Called when a `BindingPolicy.FIRST` binding search hits `binding_search_limit`
-        #: without finding a guard-satisfying binding, causing the transition to be treated
-        #: as disabled for that check.
+        #: Called with a transition name when a binding search reaches `binding_search_limit`.
+        #: The meaning depends on policy: under `BindingPolicy.FIRST` the limit was hit
+        #: **without** a guard-satisfying binding, so the transition is treated as disabled for
+        #: that check; under `BindingPolicy.RANDOM`/`PRIORITY` (which must scan every candidate)
+        #: it signals that the candidate space was **truncated** to the first `limit`
+        #: candidates — a binding may still have been selected and the transition may still
+        #: fire. In both cases: raise `binding_search_limit` if you need the full space
+        #: considered.
         #: Signature: `(transition_name: str) -> None`.
         #: Fires **outside** the engine lock — it is safe to call back into the net (e.g.
         #: `deposit`) from here. Exhaustions are de-duplicated *within* a single enabling pass
@@ -337,6 +378,11 @@ class PetriNet:
         #: lock-holding enabling pass; drained and dispatched (de-duplicated) after the lock
         #: is released. A `set` so repeated exhaustions in one pass collapse to one callback.
         self._pending_exhaustions: set[str] = set()
+        #: Transition name -> first exception from a `binding_priority_key` that raised for
+        #: *every* candidate binding during the current enabling pass (so `PRIORITY` silently
+        #: fell back to insertion order). Drained and dispatched via `on_error` (de-duplicated)
+        #: after the lock releases, so a broken key surfaces instead of failing silently.
+        self._pending_key_failures: dict[str, Exception] = {}
 
         self.add_place(Place(error_place))
         for p in places or []:
@@ -511,7 +557,7 @@ class PetriNet:
 
     def _select_transition_to_fire(self) -> tuple[Transition, _Binding] | None:
         candidates = self._filter_highest_priority(self._enabled_transition_bindings())
-        return random.choice(candidates) if candidates else None
+        return self._rng.choice(candidates) if candidates else None
 
     def _consume_binding(self, binding: _Binding, m_time: float | None) -> tuple[list[Token], list[tuple[str, Token]]]:
         """Remove the exact tokens named by `binding` from their source places.
@@ -595,9 +641,10 @@ class PetriNet:
                         raise
                     fired = True
         finally:
-            # Dispatch any exhaustion callbacks accumulated during selection, off the lock —
+            # Dispatch any deferred callbacks accumulated during selection, off the lock —
             # even if consume/submit raised, so buffered signals are never delayed.
             self._flush_search_exhaustions()
+            self._flush_priority_key_failures()
 
         return fired
 
@@ -688,7 +735,18 @@ class PetriNet:
             `binding_search_limit` counts as disabled, so `run` can return "quiescent" while
             that token still sits in its place. The exhaustion is surfaced via
             `on_binding_search_exhausted`; raise `binding_search_limit` if such tokens must be
-            processed.
+            processed. `RANDOM`/`PRIORITY` stall the same way *when no satisfying binding lies
+            within the first `limit` candidates*; if one does, they select over that truncated
+            prefix and fire (still signalling the truncation).
+
+        Note:
+            Reproducibility of a seeded net (`PetriNet(seed=...)`) holds for **synchronous
+            stepping** and for nets whose enablement does not depend on in-flight deposits.
+            In a pipelined net with concurrent actions, whether a worker-thread deposit lands
+            before or after the next `step` acquires the lock is OS-scheduled; that can change
+            which transitions are enabled at a firing step and hence the RNG draw sequence.
+            For strict replay use `max_workers=1`; above 1, identical seeds are **not**
+            guaranteed to reproduce. Seeded streams are also not stable across cpnx versions.
 
         Example:
             ```python
@@ -727,6 +785,7 @@ class PetriNet:
             else:
                 result = not any(self._is_transition_potentially_enabled(t) for t in self.transitions.values())
         self._flush_search_exhaustions()
+        self._flush_priority_key_failures()
         return result
 
     @property
@@ -761,6 +820,7 @@ class PetriNet:
         with self._lock:
             result = not any(self._is_transition_enabled(t) for t in self.transitions.values())
         self._flush_search_exhaustions()
+        self._flush_priority_key_failures()
         return result
 
     def snapshot(self) -> dict:
@@ -868,7 +928,7 @@ class PetriNet:
         if not self._check_output_capacity(transition):
             return False
         m_time = self._get_model_time_under_lock()
-        return self._resolve_binding(transition, m_time) is not None
+        return self._binding_exists(transition, m_time)
 
     def _effective_policy(self, transition: Transition) -> BindingPolicy:
         """Return the binding policy in force for `transition` (its own, else the net default)."""
@@ -914,20 +974,37 @@ class PetriNet:
             pools.append((arc, available))
         return pools
 
+    def _is_head_only(self, transition: Transition, policy: BindingPolicy) -> bool:
+        """Whether `transition` resolves via the O(1) head binding rather than a search.
+
+        `LEGACY` always uses the head. `FIRST` with no guard reduces to the head (the first
+        candidate is the head and trivially satisfies). `RANDOM`/`PRIORITY` must always
+        enumerate — even guard-free, they select *among* eligible groups, not just the head.
+        """
+        if policy is BindingPolicy.LEGACY:
+            return True
+        return policy is BindingPolicy.FIRST and transition.guard is None
+
     def _resolve_binding(
         self, transition: Transition, m_time: float | None, *, ignore_timing: bool = False
     ) -> _Binding | None:
-        """Resolve which input tokens bind `transition`, or `None` if it is not enabled.
+        """Resolve the concrete binding `transition` will fire with, or `None` if not enabled.
 
         Gathers each input arc's eligible tokens, then selects a guard-satisfying binding
         according to the transition's effective [`BindingPolicy`][cpnx.BindingPolicy]:
 
-        - `LEGACY` (or any guard-free transition): take the first `count` tokens of each arc
-          (its head, or the leading tokens of the arc-expression ordering) and accept that
-          single binding only if the guard holds — the historical behavior.
-        - `FIRST`: search input-token combinations in insertion order and return the first
-          whose guard holds (fixing head-of-line blocking), bounded by
-          `binding_search_limit`.
+        - `LEGACY` (and guard-free `FIRST`): take the first `count` tokens of each arc (its
+          head, or the leading tokens of the arc-expression ordering) and accept it only if
+          the guard holds — the historical behavior, O(1).
+        - `FIRST`: return the first guard-satisfying combination in insertion order.
+        - `RANDOM`: return a uniformly-random guard-satisfying combination (drawing from the
+          net's seeded RNG).
+        - `PRIORITY`: return the guard-satisfying combination minimizing
+          `binding_priority_key`.
+
+        All search policies are bounded by `binding_search_limit`. This is the **firing**
+        path — it may consume RNG state — so probes must use
+        `_binding_exists` instead.
 
         Args:
             transition: The transition to resolve.
@@ -942,9 +1019,26 @@ class PetriNet:
         pools = self._gather_arc_pools(transition, m_time, ignore_timing)
         if pools is None:
             return None
-        if transition.guard is None or self._effective_policy(transition) is BindingPolicy.LEGACY:
+        policy = self._effective_policy(transition)
+        if self._is_head_only(transition, policy):
             return self._head_binding(transition, pools)
-        return self._search_binding(transition, pools)
+        return self._select_binding(transition, pools, policy)
+
+    def _binding_exists(self, transition: Transition, m_time: float | None, *, ignore_timing: bool = False) -> bool:
+        """Return whether *any* guard-satisfying binding exists — a probe that never draws RNG.
+
+        Existence is policy-independent, so this short-circuits at the first satisfying binding
+        regardless of policy. Used by the enabling/quiescence predicates
+        ([`is_dead`][cpnx.PetriNet.is_dead], [`is_quiescent`][cpnx.PetriNet.is_quiescent]),
+        which must not perturb the seeded RNG — otherwise a timing-dependent number of probe
+        calls would make `RANDOM` runs non-reproducible.
+        """
+        pools = self._gather_arc_pools(transition, m_time, ignore_timing)
+        if pools is None:
+            return False
+        if self._is_head_only(transition, self._effective_policy(transition)):
+            return self._head_binding(transition, pools) is not None
+        return next(self._iter_satisfying_bindings(transition, pools), None) is not None
 
     def _head_binding(self, transition: Transition, pools: list[tuple[InputArc, list[Token]]]) -> _Binding | None:
         """Build the head binding (first `count` per arc) and accept it only if the guard holds."""
@@ -958,20 +1052,100 @@ class PetriNet:
             return binding
         return None
 
-    def _search_binding(self, transition: Transition, pools: list[tuple[InputArc, list[Token]]]) -> _Binding | None:
-        """Search input-token combinations for the first guard-satisfying binding.
+    def _iter_satisfying_bindings(
+        self, transition: Transition, pools: list[tuple[InputArc, list[Token]]]
+    ) -> Iterator[tuple[_Binding, list[Token]]]:
+        """Yield each guard-satisfying `(binding, flat_tokens)` in insertion order, bounded by the limit.
 
-        Enumerates candidate bindings deterministically (insertion order) and returns the
-        first whose guard holds. Bounded by `binding_search_limit`; on exhaustion the
-        transition is treated as disabled and `on_binding_search_exhausted` (if set) fires.
+        Enumerates candidate bindings deterministically and yields those whose guard holds,
+        paired with the flattened token list already computed for the guard check (so
+        `PRIORITY`'s key does not re-flatten). Stops after `binding_search_limit` candidates
+        have been examined, signalling exhaustion via `on_binding_search_exhausted` (deferred
+        until the lock releases). This is the shared engine for every search policy: `FIRST`
+        takes the first item, `RANDOM` samples, and `PRIORITY` takes the min-key item.
         """
-        for tried, binding in enumerate(self._iter_candidate_bindings(pools), start=1):
-            if tried > self.binding_search_limit:
+        for examined, binding in enumerate(self._iter_candidate_bindings(pools), start=1):
+            if examined > self.binding_search_limit:
                 self._signal_search_exhausted(transition.name)
-                return None
-            if self._check_transition_guard(transition, _flatten_binding(binding)):
-                return binding
-        return None
+                return
+            flat = _flatten_binding(binding)
+            if self._check_transition_guard(transition, flat):
+                yield binding, flat
+
+    def _select_binding(
+        self, transition: Transition, pools: list[tuple[InputArc, list[Token]]], policy: BindingPolicy
+    ) -> _Binding | None:
+        """Pick one satisfying binding under a search policy (`FIRST`/`RANDOM`/`PRIORITY`)."""
+        gen = self._iter_satisfying_bindings(transition, pools)
+        if policy is BindingPolicy.RANDOM:
+            return self._reservoir_pick(gen)
+        if policy is BindingPolicy.PRIORITY:
+            return self._min_key_pick(gen, transition)
+        pair = next(gen, None)
+        return pair[0] if pair is not None else None
+
+    def _reservoir_pick(self, bindings: Iterator[tuple[_Binding, list[Token]]]) -> _Binding | None:
+        """Uniformly sample one binding from `bindings` in a single pass (reservoir, size 1).
+
+        Draws from the net's seeded RNG, so a seeded net reproduces the choice. Returns `None`
+        if the iterator is empty.
+        """
+        chosen: _Binding | None = None
+        for seen, (binding, _flat) in enumerate(bindings, start=1):
+            if self._rng.random() < 1.0 / seen:
+                chosen = binding
+        return chosen
+
+    def _min_key_pick(
+        self, bindings: Iterator[tuple[_Binding, list[Token]]], transition: Transition
+    ) -> _Binding | None:
+        """Return the binding minimizing `binding_priority_key` (default: oldest `created_at`).
+
+        Ties are broken by insertion order (the first-encountered minimum wins), so the choice
+        is deterministic. Both the key evaluation *and* the comparison are guarded: a candidate
+        whose key raises, or whose key is not comparable with the running best, is skipped
+        rather than aborting the enabling check (mirroring how a raising guard is treated as
+        `False`). If **every** candidate is skipped this way but satisfying bindings exist, the
+        first satisfying binding (insertion order) is returned — never `None` while bindings
+        exist — so this firing path stays consistent with the RNG-free
+        `_binding_exists` probe (which does not evaluate the
+        key). That silent fallback is surfaced via `on_error` (deferred, de-duplicated) so a
+        wholly-broken key does not vanish without a trace. Returns `None` only if the iterator
+        is empty.
+        """
+        key_fn = _default_priority_key if transition.binding_priority_key is None else transition.binding_priority_key
+        best, first, first_exc = self._reduce_min_key(bindings, key_fn)
+        if best is None and first is not None and first_exc is not None:
+            # Every satisfying candidate's key raised/was incomparable: we still fire the
+            # insertion-order fallback, but PRIORITY was effectively ignored — signal it.
+            self._signal_priority_key_failure(transition.name, first_exc)
+        return best if best is not None else first
+
+    @staticmethod
+    def _reduce_min_key(
+        bindings: Iterator[tuple[_Binding, list[Token]]], key_fn: Callable[[list[Token]], object]
+    ) -> tuple[_Binding | None, _Binding | None, Exception | None]:
+        """Scan `bindings`, returning `(best, first, first_exc)` for the min-key selection.
+
+        `best` is the minimum-key binding (ties → first-encountered), or `None` if every key
+        evaluation/comparison raised. `first` is the first satisfying binding (insertion order),
+        used as the fallback. `first_exc` is the first exception a key raised, if any.
+        """
+        first: _Binding | None = None
+        best: _Binding | None = None
+        best_key: object = None
+        first_exc: Exception | None = None
+        for binding, flat in bindings:
+            if first is None:
+                first = binding
+            try:
+                candidate_key = key_fn(flat)
+                if best is None or candidate_key < best_key:  # type: ignore[operator]
+                    best, best_key = binding, candidate_key
+            except Exception as exc:
+                if first_exc is None:
+                    first_exc = exc
+        return best, first, first_exc
 
     def _iter_candidate_bindings(self, pools: list[tuple[InputArc, list[Token]]]) -> Iterator[_Binding]:
         """Yield candidate bindings as the Cartesian product of each arc's token-group options.
@@ -1057,6 +1231,41 @@ class PetriNet:
             except Exception:
                 pass
 
+    def _signal_priority_key_failure(self, transition_name: str, first_exc: Exception) -> None:
+        """Buffer a "PRIORITY key failed for every candidate" event for off-lock `on_error` dispatch.
+
+        Called under the engine lock from `_min_key_pick`; keeps only the first exception per
+        transition (`on_error` must run off the lock, so this only buffers). See
+        `_flush_priority_key_failures`.
+        """
+        self._pending_key_failures.setdefault(transition_name, first_exc)
+
+    def _flush_priority_key_failures(self) -> None:
+        """Dispatch buffered PRIORITY-key failures via `on_error`. Must be called off the lock.
+
+        Swaps out the pending map under a brief lock, then fires `on_error(name, exc, None)` once
+        per distinct transition with a descriptive `RuntimeError` (chaining the first key error),
+        swallowing callback errors. Safe to call unconditionally; a no-op when nothing failed.
+        """
+        with self._lock:
+            if not self._pending_key_failures:
+                return
+            pending = self._pending_key_failures
+            self._pending_key_failures = {}
+        callback = self.on_error
+        if callback is None:
+            return
+        for name, first_exc in pending.items():
+            err = RuntimeError(
+                f"binding_priority_key raised for every candidate binding of transition '{name}'; "
+                f"PRIORITY selection fell back to insertion order. First error: {first_exc!r}"
+            )
+            err.__cause__ = first_exc
+            try:
+                callback(name, err, None)
+            except Exception:
+                pass
+
     def _is_settle_time_met(self, place: Place, arc: InputArc) -> bool:
         if arc.settle_secs <= 0.0:
             return True
@@ -1088,10 +1297,12 @@ class PetriNet:
         resolved, so a selection that yields fewer (or none) disables the
         transition rather than firing with a short or zero-length token list.
 
-        Used by `_head_binding` to build the head selection under
-        `BindingPolicy.LEGACY` (and for guard-free transitions), applying the
-        multiplicity rule so a short selection disables the transition rather than
-        firing with too few tokens.
+        Used by `_head_binding` to build the head selection whenever a transition
+        resolves head-only — under `BindingPolicy.LEGACY`, or guard-free
+        `BindingPolicy.FIRST` (see `_is_head_only`).
+        Guard-free `RANDOM`/`PRIORITY` do **not** use this path; they enumerate. The
+        multiplicity rule applies either way, so a short selection disables the transition
+        rather than firing with too few tokens.
         """
         if arc.consume_all:
             tokens = available
@@ -1132,10 +1343,12 @@ class PetriNet:
 
         Unlike `_is_transition_enabled`, this ignores cooldown timers on
         `PacedResourcePlace` (tokens in cooldown are counted as present), settle windows, and
-        output-place back-pressure. It resolves a binding under the transition's effective
-        [`BindingPolicy`][cpnx.BindingPolicy] exactly as the firing check does, so binding
-        search is honored here too. Used by [`is_quiescent`][cpnx.PetriNet.is_quiescent] to
-        distinguish "no work possible" from "work temporarily blocked by timing".
+        output-place back-pressure. It probes for a guard-satisfying binding under the
+        transition's effective [`BindingPolicy`][cpnx.BindingPolicy] via
+        `_binding_exists` (never drawing the seeded RNG, so
+        quiescence polling cannot perturb `RANDOM` reproducibility). Used by
+        [`is_quiescent`][cpnx.PetriNet.is_quiescent] to distinguish "no work possible" from
+        "work temporarily blocked by timing".
 
         Args:
             transition: The transition to test.
@@ -1143,7 +1356,7 @@ class PetriNet:
         Returns:
             `True` if a guard-satisfying binding exists once timing is ignored.
         """
-        return self._resolve_binding(transition, float("inf"), ignore_timing=True) is not None
+        return self._binding_exists(transition, float("inf"), ignore_timing=True)
 
     def _commit_or_rollback_transition(
         self,

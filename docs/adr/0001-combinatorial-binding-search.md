@@ -1,6 +1,7 @@
 # ADR 0001 — Combinatorial Binding Search with Deterministic-Complete Default
 
-- **Status:** Accepted — Phase 1 shipped in 0.3.1 (opt-in, `BindingPolicy.FIRST`)
+- **Status:** Accepted — Phase 1 shipped in 0.3.1 (`BindingPolicy.FIRST`); Phase 2 shipped in
+  0.3.2 (`BindingPolicy.RANDOM`/`PRIORITY`, `PetriNet(seed=...)`)
 - **Date:** 2026-07-02
 - **Deciders:** cpnx maintainers
 - **Related:** `docs/cpn-theory-audit.md` (Findings 1–3, §0 positioning)
@@ -98,7 +99,17 @@ consumed). Therefore it is **gated**:
 2. **Default-on later** — *(planned)* flip the default at a major version bump, retaining
    a `first_only`/legacy opt-out for one deprecation cycle.
 
-The `random`/`priority` policies (Phase 2) and the default flip (Phase 3) remain planned.
+**Phase 2 shipped in 0.3.2:** the `random` and `priority` policies land as
+`BindingPolicy.RANDOM`/`PRIORITY`. Both consume the same satisfying-binding enumeration as
+`first` (extracted into an internal generator) — `random` reservoir-samples one binding,
+`priority` takes the min-key binding — so there was no engine rearchitecture. `random` draws
+from a per-net seeded RNG introduced as `PetriNet(seed=...)`, which also now drives the
+scheduler's equal-priority tie-break so a seeded net replays end-to-end. To keep seeded
+`random` runs reproducible, the enabling/quiescence **probes** use an existence-only check
+that never draws the RNG (only the actual firing resolution samples). Unlike `first`,
+`random`/`priority` cannot short-circuit and enumerate the full bounded candidate set; when
+that set exceeds `binding_search_limit` they select over a truncated prefix and fire the
+exhaustion callback. The default flip (Phase 3) remains planned.
 
 ## Rationale — why the determinism worry is smaller than it appears
 
@@ -149,6 +160,10 @@ we are extending an existing policy knob one level down.
 ## Open questions
 
 - Exact default for the search bound (fixed constant vs. proportional to place size).
-- Whether `priority` policy keys on a fixed set of token fields or an arbitrary
-  user-supplied key function.
+- ~~Whether `priority` policy keys on a fixed set of token fields or an arbitrary
+  user-supplied key function.~~ **Resolved (0.3.2):** an arbitrary user-supplied pure
+  `Callable[[list[Token]], object]` (`Transition.binding_priority_key`), defaulting to
+  oldest-first (`min` of `Token.created_at`). String-expression keys deferred.
+- ~~Whether the `random` RNG is global or per-net.~~ **Resolved (0.3.2):** a per-net
+  `random.Random(seed)` via `PetriNet(seed=...)`, shared with the scheduler tie-break.
 - Precise shape of the observability hook for the selected binding.

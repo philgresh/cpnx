@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.2] — 2026-07-11
+
+### Added
+
+- **`BindingPolicy.RANDOM`** — Enumerates the guard-satisfying bindings and selects one **uniformly at random**. Reproducible when the net is constructed with a `seed` (and `max_workers=1`); otherwise it varies run to run. Unlike `FIRST`, a guard-free `RANDOM` transition still selects among *all* eligible token groups (there is no guard-free fast path), so it always enumerates. Phase 2 of the plan in [`docs/adr/0001-combinatorial-binding-search.md`](docs/adr/0001-combinatorial-binding-search.md).
+- **`BindingPolicy.PRIORITY`** — Enumerates the guard-satisfying bindings and selects the one **minimizing** `Transition.binding_priority_key`. Deterministic; ties fall to insertion order.
+- **`Transition.binding_priority_key`** — Optional pure `Callable[[list[Token]], object]` mapping a candidate binding (its flat token list) to a comparable sort key for `PRIORITY`. `None` (default) means oldest-first — the minimum `Token.created_at` across the binding's **data** tokens (resource permits are excluded, so an ancient permit can't tie every candidate and collapse the choice to insertion order). Must be callable or `None` — a non-callable (e.g. a string expression, which is not supported) raises `TypeError` at assignment. A candidate whose key raises or is incomparable with the running best is skipped; if every candidate is skipped the first satisfying binding (insertion order) is used, so the firing path never disagrees with the enabling probe — and `on_error` fires (once per pass, off the lock) so a wholly-broken key is not silent. The key runs **inline under the engine lock with no timeout** (unlike callable guards, which use the expression pool), so it must be trivially cheap.
+
+### Notes (search-limit clarification)
+
+- `RANDOM`/`PRIORITY` over the limit only "select from a truncated prefix and fire" **when that prefix contains a satisfying binding**. A guarded `RANDOM`/`PRIORITY` transition whose only satisfying binding lies beyond the first `binding_search_limit` candidates finds nothing in the prefix and is disabled for that check — it can stall and let `run()` return quiescent exactly like `FIRST`. Raise `binding_search_limit` if this matters.
+- **`PetriNet(seed=...)`** — Optional integer seed for the net's internal `random.Random`. When set it makes the run reproducible, driving **both** the scheduler's tie-break among equal-priority enabled transitions **and** `RANDOM` binding selection. Pair with `max_workers=1` for strict replay.
+
+### Changed
+
+- The scheduler's tie-break among equal-priority enabled transitions now draws from the net's `random.Random(seed)` instance instead of the global `random` module. Behavior is unchanged when unseeded, but the global `random.seed()` no longer influences cpnx scheduling — seed the net instead.
+
+### Notes
+
+- **Reproducibility is probe-independent.** Enabling/quiescence checks (`is_dead`, `is_quiescent`) use an existence-only probe that never draws the RNG, so a timing-dependent number of `run()` poll iterations cannot perturb a seeded `RANDOM` run.
+- **Cost.** `RANDOM`/`PRIORITY` cannot short-circuit — they scan the whole (bounded) candidate set to sample or rank — so they are typically several times costlier than `FIRST` on the firing path. `binding_search_limit` still bounds the work; if the candidate space exceeds it, selection is over the first `limit` candidates (a **truncated prefix**) and `on_binding_search_exhausted` fires even though a binding is returned.
+- The default policy remains `BindingPolicy.LEGACY`; `LEGACY`/`FIRST` behavior is unchanged from 0.3.1.
+
+---
+
 ## [0.3.1] — 2026-07-10
 
 ### Added
