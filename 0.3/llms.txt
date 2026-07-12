@@ -1,0 +1,18 @@
+# cpnx
+
+> Coloured Petri Net executor for concurrent Python pipelines
+
+cpnx is a Coloured Petri Net (CPN) executor for concurrent Python pipelines — zero dependencies, stdlib-only threading. It models resource-constrained workflows (GPU slots, API rate limits, connection pools) as a Coloured Petri Net where transitions execute real work on thread pools and resource tokens are returned atomically on failure.
+
+## Home
+
+- [Home](https://philgresh.github.io/cpnx/latest/index.md)
+
+## API reference
+
+- [Core](https://philgresh.github.io/cpnx/latest/reference/core/index.md)
+- [Transitions](https://philgresh.github.io/cpnx/latest/reference/transitions/index.md)
+- [Places](https://philgresh.github.io/cpnx/latest/reference/places/index.md)
+- [Tokens](https://philgresh.github.io/cpnx/latest/reference/tokens/index.md)
+- [Visualization](https://philgresh.github.io/cpnx/latest/reference/visualization/index.md)
+
