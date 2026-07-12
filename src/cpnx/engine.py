@@ -1085,7 +1085,7 @@ class PetriNet:
         [`_binding_exists`][cpnx.PetriNet._binding_exists] probe (which does not evaluate the
         key). Returns `None` only if the iterator is empty.
         """
-        key_fn = transition.binding_priority_key or _default_priority_key
+        key_fn = _default_priority_key if transition.binding_priority_key is None else transition.binding_priority_key
         first: _Binding | None = None  # insertion-order fallback when every key/compare fails
         best: _Binding | None = None
         best_key: object = None
