@@ -799,3 +799,137 @@ class TestSearchPoliciesWithResourcePlace:
         _fire_once(net)
         assert len(net.places["output"].tokens) == 1
         assert "t" in exhausted
+
+
+class TestPriorityDefaultKeyWithResources:
+    def test_default_key_ignores_ancient_permit_token(self):
+        """The default oldest-first key must select the oldest DATA token even when an
+        ancient resource permit is part of the binding (regression: the permit's tiny
+        created_at otherwise dominates min() and collapses selection to insertion order)."""
+        net = PetriNet(
+            places=[ResourcePlace("permits", capacity=2), Place("input"), Place("output")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("permits"), InputArc("input")],
+                    outputs=[OutputArc("permits"), OutputArc("output")],
+                    action=lambda toks: toks,
+                    binding_policy=BindingPolicy.PRIORITY,
+                )
+            ],
+        )
+        permit_ts = net.places["permits"].tokens[0].created_at
+        # Both data tokens are newer than the permit; insert the newer one FIRST so
+        # insertion-order != oldest-first. Oldest data = "older".
+        net.deposit("input", Token(payload={"i": "newer"}, created_at=permit_ts + 100.0))
+        net.deposit("input", Token(payload={"i": "older"}, created_at=permit_ts + 50.0))
+
+        binding = net._resolve_binding(net.transitions["t"], net._get_model_time_under_lock())
+        chosen = [t.payload["i"] for _, toks in binding for t in toks if not t.is_resource]
+        assert chosen == ["older"]
+
+    def test_resource_only_binding_does_not_crash(self):
+        """A binding with only resource tokens (no data) still resolves (fallback to all tokens)."""
+        net = PetriNet(
+            places=[ResourcePlace("permits", capacity=2), Place("output")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("permits")],
+                    outputs=[OutputArc("permits"), OutputArc("output")],
+                    action=lambda toks: toks,
+                    binding_policy=BindingPolicy.PRIORITY,
+                )
+            ],
+        )
+        binding = net._resolve_binding(net.transitions["t"], net._get_model_time_under_lock())
+        assert binding is not None  # resolves without raising on the resource-only binding
+
+
+class TestPriorityKeyFailureDiagnostic:
+    def test_all_candidates_failing_key_signals_on_error(self):
+        """A key that raises for every candidate must fire on_error (off-lock, token=None) —
+        the PRIORITY fallback stays silent otherwise."""
+        errors: list[tuple[str, str, object]] = []
+
+        net = PetriNet(
+            places=[Place("input"), Place("output")],
+            transitions=[
+                Transition(
+                    name="boom",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                    binding_policy=BindingPolicy.PRIORITY,
+                    binding_priority_key=lambda toks: toks[0].payload["missing"],  # KeyError
+                )
+            ],
+        )
+        # on_error may safely re-enter the net (dispatched off the engine lock).
+        net.on_error = lambda name, exc, tok: errors.append((name, type(exc).__name__, tok))
+        for i in range(2):
+            net.deposit("input", Token(payload={"i": i}))
+
+        net.run(deadline=time.monotonic() + 1.0)
+
+        assert errors, "on_error should fire when the priority key fails for every candidate"
+        name, exc_type, tok = errors[0]
+        assert name == "boom"
+        assert exc_type == "RuntimeError"  # descriptive wrapper
+        assert tok is None
+        # Fallback still fired the transition (no livelock): input drains.
+        assert net.is_quiescent() is True
+        assert len(net.places["output"].tokens) == 2
+
+    def test_working_key_does_not_signal_on_error(self):
+        errors: list = []
+        net = PetriNet(
+            places=[Place("input"), Place("output")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                    binding_policy=BindingPolicy.PRIORITY,
+                    binding_priority_key=lambda toks: toks[0].payload["rank"],
+                )
+            ],
+        )
+        net.on_error = lambda *a: errors.append(a)
+        for rank in [3, 1, 2]:
+            net.deposit("input", Token(payload={"rank": rank}))
+        net.run(deadline=time.monotonic() + 1.0)
+        assert errors == []  # a working key never triggers the diagnostic
+
+
+class TestGuardedSearchPolicyStall:
+    def test_random_stalls_when_no_satisfier_in_prefix(self):
+        """A guarded RANDOM whose only satisfying binding lies beyond the limit stalls like
+        FIRST (documents that RANDOM/PRIORITY do NOT universally avoid the over-limit stall)."""
+        net = PetriNet(
+            seed=1,
+            binding_search_limit=5,
+            places=[Place("input"), Place("output")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                    guard=lambda toks: toks[0].payload["i"] >= 100,
+                    binding_policy=BindingPolicy.RANDOM,
+                )
+            ],
+        )
+        exhausted: list[str] = []
+        net.on_binding_search_exhausted = exhausted.append
+        for i in range(5):  # fail guard, fill the prefix
+            net.deposit("input", Token(payload={"i": i}))
+        net.deposit("input", Token(payload={"i": 100}))  # satisfies, but beyond the limit
+
+        assert net.is_quiescent() is True  # stalls, exactly like FIRST
+        net.run(deadline=time.monotonic() + 0.3)
+        assert len(net.places["output"].tokens) == 0
+        assert any(t.payload["i"] == 100 for t in net.places["input"].tokens)
+        assert "t" in exhausted

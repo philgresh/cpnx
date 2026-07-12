@@ -61,8 +61,9 @@ class BindingPolicy(enum.Enum):
         - `RANDOM`/`PRIORITY` must scan the whole (bounded) candidate set, so they do not
           short-circuit and are typically costlier than `FIRST`. If the candidate space
           exceeds `binding_search_limit`, they select over the first `limit` candidates only
-          (a truncated prefix) and fire `on_binding_search_exhausted` even though a binding
-          is returned.
+          (a truncated prefix), firing `on_binding_search_exhausted`. If that prefix contains
+          no satisfying binding, the transition is treated as disabled for that check — it can
+          stall exactly like `FIRST`, not just fire over a smaller set.
     """
 
     LEGACY = "legacy"
@@ -222,10 +223,14 @@ class Transition:
                candidate binding (the flat list of tokens it would consume) to a comparable
                value; the binding with the **minimum** key is selected, ties broken by
                insertion order. `None` (default) means oldest-first — the minimum
-               `Token.created_at` across the binding. The key must return values that are
-               totally ordered *with each other*; a candidate whose key raises or is
-               incomparable with the running best is skipped (and if every candidate is
-               skipped, the first satisfying binding is used).
+               `Token.created_at` across the binding's **data** tokens (resource tokens are
+               excluded, since a permit created at net construction is older than any data
+               token and would otherwise tie every candidate and collapse selection to
+               insertion order; a resource-only binding falls back to all tokens). The key must
+               return values that are totally ordered *with each other*; a candidate whose key
+               raises or is incomparable with the running best is skipped. If **every**
+               candidate is skipped, the first satisfying binding is used *and* `on_error` fires
+               (once per enabling pass, off the lock) so a wholly-broken key is not silent.
 
                **Performance / lock discipline:** unlike a callable `guard` (which runs on
                the expression thread pool under `expr_timeout_secs`), the key is invoked
