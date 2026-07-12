@@ -283,11 +283,18 @@ class PetriNet:
                          candidates and the callback signals that truncation even when a
                          binding is returned.
             seed: Optional integer seed for the net's internal random generator
-                         (`random.Random(seed)`). When set, it makes the run reproducible: it
-                         drives **both** the scheduler's tie-break among equal-priority enabled
-                         transitions **and** `BindingPolicy.RANDOM` binding selection. Use with
-                         `max_workers=1` for strict, deterministic replay. `None` (default)
-                         uses an unseeded instance (non-reproducible).
+                         (`random.Random(seed)`). When set, it drives **both** the scheduler's
+                         tie-break among equal-priority enabled transitions **and**
+                         `BindingPolicy.RANDOM` binding selection. `None` (default) uses an
+                         unseeded instance (non-reproducible). Reproducibility caveats: use
+                         `max_workers=1` for strict replay — above 1, identical seeds are **not
+                         guaranteed** to reproduce, because concurrent action-commit ordering
+                         (an OS-scheduled race) can change which transitions are enabled at a
+                         firing step and hence the draw sequence. Each
+                         [`SubstitutionTransition`][cpnx.SubstitutionTransition] subnet is its
+                         own `PetriNet` with its own RNG, so seed subnets separately if they
+                         contain `RANDOM` transitions. Seeded streams are not stable across
+                         cpnx versions.
 
         Raises:
             ValueError: If `binding_search_limit < 1`.
@@ -339,9 +346,14 @@ class PetriNet:
         #: Fires outside the engine lock.
         self.on_error: Callable[[str, Exception, Token | None], None] | None = None
 
-        #: Called when a `BindingPolicy.FIRST` binding search hits `binding_search_limit`
-        #: without finding a guard-satisfying binding, causing the transition to be treated
-        #: as disabled for that check.
+        #: Called with a transition name when a binding search reaches `binding_search_limit`.
+        #: The meaning depends on policy: under `BindingPolicy.FIRST` the limit was hit
+        #: **without** a guard-satisfying binding, so the transition is treated as disabled for
+        #: that check; under `BindingPolicy.RANDOM`/`PRIORITY` (which must scan every candidate)
+        #: it signals that the candidate space was **truncated** to the first `limit`
+        #: candidates — a binding may still have been selected and the transition may still
+        #: fire. In both cases: raise `binding_search_limit` if you need the full space
+        #: considered.
         #: Signature: `(transition_name: str) -> None`.
         #: Fires **outside** the engine lock — it is safe to call back into the net (e.g.
         #: `deposit`) from here. Exhaustions are de-duplicated *within* a single enabling pass
@@ -705,7 +717,17 @@ class PetriNet:
             `binding_search_limit` counts as disabled, so `run` can return "quiescent" while
             that token still sits in its place. The exhaustion is surfaced via
             `on_binding_search_exhausted`; raise `binding_search_limit` if such tokens must be
-            processed.
+            processed. (`RANDOM`/`PRIORITY` differ: over the limit they still select from the
+            truncated prefix and fire, so they do not cause this stall.)
+
+        Note:
+            Reproducibility of a seeded net (`PetriNet(seed=...)`) holds for **synchronous
+            stepping** and for nets whose enablement does not depend on in-flight deposits.
+            In a pipelined net with concurrent actions, whether a worker-thread deposit lands
+            before or after the next `step` acquires the lock is OS-scheduled; that can change
+            which transitions are enabled at a firing step and hence the RNG draw sequence.
+            For strict replay use `max_workers=1`; above 1, identical seeds are **not**
+            guaranteed to reproduce. Seeded streams are also not stable across cpnx versions.
 
         Example:
             ```python
@@ -1054,20 +1076,29 @@ class PetriNet:
         """Return the binding minimizing `binding_priority_key` (default: oldest `created_at`).
 
         Ties are broken by insertion order (the first-encountered minimum wins), so the choice
-        is deterministic. A key that raises for some candidate skips that candidate rather than
-        aborting the enabling check. Returns `None` if the iterator is empty.
+        is deterministic. Both the key evaluation *and* the comparison are guarded: a candidate
+        whose key raises, or whose key is not comparable with the running best, is skipped
+        rather than aborting the enabling check (mirroring how a raising guard is treated as
+        `False`). If **every** candidate is skipped this way but satisfying bindings exist, the
+        first satisfying binding (insertion order) is returned — never `None` while bindings
+        exist — so this firing path stays consistent with the RNG-free
+        [`_binding_exists`][cpnx.PetriNet._binding_exists] probe (which does not evaluate the
+        key). Returns `None` only if the iterator is empty.
         """
         key_fn = transition.binding_priority_key or _default_priority_key
+        first: _Binding | None = None  # insertion-order fallback when every key/compare fails
         best: _Binding | None = None
         best_key: object = None
         for binding in bindings:
+            if first is None:
+                first = binding
             try:
                 candidate_key = key_fn(_flatten_binding(binding))
+                if best is None or candidate_key < best_key:  # type: ignore[operator]
+                    best, best_key = binding, candidate_key
             except Exception:
                 continue
-            if best is None or candidate_key < best_key:  # type: ignore[operator]
-                best, best_key = binding, candidate_key
-        return best
+        return best if best is not None else first
 
     def _iter_candidate_bindings(self, pools: list[tuple[InputArc, list[Token]]]) -> Iterator[_Binding]:
         """Yield candidate bindings as the Cartesian product of each arc's token-group options.
@@ -1184,10 +1215,12 @@ class PetriNet:
         resolved, so a selection that yields fewer (or none) disables the
         transition rather than firing with a short or zero-length token list.
 
-        Used by `_head_binding` to build the head selection under
-        `BindingPolicy.LEGACY` (and for guard-free transitions), applying the
-        multiplicity rule so a short selection disables the transition rather than
-        firing with too few tokens.
+        Used by `_head_binding` to build the head selection whenever a transition
+        resolves head-only — under `BindingPolicy.LEGACY`, or guard-free
+        `BindingPolicy.FIRST` (see [`_is_head_only`][cpnx.PetriNet._is_head_only]).
+        Guard-free `RANDOM`/`PRIORITY` do **not** use this path; they enumerate. The
+        multiplicity rule applies either way, so a short selection disables the transition
+        rather than firing with too few tokens.
         """
         if arc.consume_all:
             tokens = available

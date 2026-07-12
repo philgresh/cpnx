@@ -674,3 +674,128 @@ class TestSearchPolicyExhaustion:
         idx = _selected_index(net)
         assert idx < 5  # only the first `limit` candidates were in the sample space
         assert "t" in exhausted  # truncation signalled even though a binding fired
+
+
+class TestPriorityKeyErrorHandling:
+    def test_non_callable_key_rejected_at_construction(self):
+        import pytest
+
+        with pytest.raises(TypeError, match="binding_priority_key must be a callable or None"):
+            Transition(
+                name="t",
+                inputs=[InputArc("input")],
+                outputs=[OutputArc("output")],
+                action=lambda toks: toks,
+                binding_policy=BindingPolicy.PRIORITY,
+                binding_priority_key="tokens[0].payload['rank']",  # string not supported
+            )
+
+    def test_key_raising_for_every_candidate_falls_back_not_livelock(self):
+        """A key that raises for all candidates must fire the first satisfying binding,
+        keeping the probe (enabled) and firing paths consistent — no silent livelock."""
+
+        def boom(toks):
+            raise ValueError("key blows up")
+
+        net = PetriNet(
+            places=[Place("input"), Place("output")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                    binding_policy=BindingPolicy.PRIORITY,
+                    binding_priority_key=boom,
+                )
+            ],
+        )
+        for i in range(3):
+            net.deposit("input", Token(payload={"i": i}))
+
+        assert net.is_dead() is False  # probe says enabled
+        _fire_once(net)  # ...and it actually fires (fallback to first satisfying binding)
+        assert [t.payload["i"] for t in net.places["output"].tokens] == [0]
+        # drains to quiescence without spinning
+        net.run(deadline=time.monotonic() + 2.0)
+        assert net.is_quiescent() is True
+        assert len(net.places["input"].tokens) == 0
+
+    def test_incomparable_keys_do_not_crash_step(self):
+        """A key returning values that aren't mutually comparable skips the bad compare
+        rather than raising out of step()/run()."""
+        net = PetriNet(
+            places=[Place("input"), Place("output")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                    binding_policy=BindingPolicy.PRIORITY,
+                    binding_priority_key=lambda toks: toks[0].payload["rank"],
+                )
+            ],
+        )
+        for rank in [1, None, 2, None]:  # None vs int is not orderable
+            net.deposit("input", Token(payload={"rank": rank}))
+
+        # Must not raise; drains everything.
+        net.run(deadline=time.monotonic() + 2.0)
+        assert net.is_quiescent() is True
+        assert len(net.places["output"].tokens) == 4
+
+
+class TestSearchPoliciesWithResourcePlace:
+    def _build(self, policy, *, seed=None, n_data=6, capacity=3):
+        net = PetriNet(
+            seed=seed,
+            places=[ResourcePlace("permits", capacity=capacity), Place("input"), Place("output")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("permits"), InputArc("input")],  # resource arc first
+                    outputs=[OutputArc("permits"), OutputArc("output")],
+                    action=lambda toks: toks,
+                    binding_policy=policy,
+                )
+            ],
+        )
+        for i in range(n_data):
+            net.deposit("input", Token(payload={"i": i}))
+        return net
+
+    def test_random_with_permit_arc_is_reproducible(self):
+        a = self._build(BindingPolicy.RANDOM, seed=321)
+        b = self._build(BindingPolicy.RANDOM, seed=321)
+        _fire_once(a)
+        _fire_once(b)
+        ai = [t.payload["i"] for t in a.places["output"].tokens]
+        bi = [t.payload["i"] for t in b.places["output"].tokens]
+        assert ai == bi and len(ai) == 1
+        assert len(a.places["permits"].tokens) == 3  # permit returned
+
+    def test_random_permit_inflated_space_truncates_and_signals(self):
+        """A permit arc multiplies the candidate space; over the limit RANDOM still fires
+        and signals truncation."""
+        net = PetriNet(
+            seed=5,
+            binding_search_limit=4,
+            places=[ResourcePlace("permits", capacity=3), Place("input"), Place("output")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("permits"), InputArc("input")],
+                    outputs=[OutputArc("permits"), OutputArc("output")],
+                    action=lambda toks: toks,
+                    binding_policy=BindingPolicy.RANDOM,
+                )
+            ],
+        )
+        exhausted: list[str] = []
+        net.on_binding_search_exhausted = exhausted.append
+        for i in range(20):  # 3 permits x 20 data = 60 candidates >> limit 4
+            net.deposit("input", Token(payload={"i": i}))
+        _fire_once(net)
+        assert len(net.places["output"].tokens) == 1
+        assert "t" in exhausted

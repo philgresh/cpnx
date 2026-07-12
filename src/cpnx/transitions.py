@@ -217,11 +217,22 @@ class Transition:
                `BindingPolicy.FIRST` to enable deterministic-complete binding search
                (fixing head-of-line blocking) for this transition only.
         binding_priority_key: Sort key used only under `BindingPolicy.PRIORITY`. A pure
-               `Callable[[list[Token]], object]` mapping a candidate binding (the flat list
-               of tokens it would consume) to a comparable value; the binding with the
-               **minimum** key is selected, ties broken by insertion order. `None` (default)
-               means oldest-first — the minimum `Token.created_at` across the binding.
-               Evaluated under the engine lock, so it is purity-verified like `guard`.
+               `Callable[[list[Token]], object]` (must be callable or `None` — string
+               expressions are not supported and raise `TypeError` at assignment) mapping a
+               candidate binding (the flat list of tokens it would consume) to a comparable
+               value; the binding with the **minimum** key is selected, ties broken by
+               insertion order. `None` (default) means oldest-first — the minimum
+               `Token.created_at` across the binding. The key must return values that are
+               totally ordered *with each other*; a candidate whose key raises or is
+               incomparable with the running best is skipped (and if every candidate is
+               skipped, the first satisfying binding is used).
+
+               **Performance / lock discipline:** unlike a callable `guard` (which runs on
+               the expression thread pool under `expr_timeout_secs`), the key is invoked
+               **inline while holding the engine lock, with no timeout**, once per candidate
+               — up to `binding_search_limit` times per resolution. It is purity-verified
+               (no I/O) but *not* time-bounded, so it must be trivially cheap; an expensive
+               key stalls every concurrent `deposit`/`step`/probe on the net.
     """
 
     name: str
@@ -245,7 +256,15 @@ class Transition:
             if callable(value):
                 verify_callable_purity(value)
             super().__setattr__("_compiled_guard", compiled)
-        elif name == "binding_priority_key" and callable(value):
+        elif name == "binding_priority_key" and value is not None:
+            # String-expression keys are deferred (see ADR 0001), so reject non-callables
+            # loudly rather than letting a truthy string be used as a key and raise on every
+            # candidate at run time (which would silently livelock the engine).
+            if not callable(value):
+                raise TypeError(
+                    "binding_priority_key must be a callable or None; "
+                    f"got {type(value).__name__}. String-expression keys are not supported."
+                )
             verify_callable_purity(value)
         super().__setattr__(name, value)
 
