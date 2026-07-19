@@ -33,7 +33,10 @@ from concurrency_cafe import build_cafe  # noqa: E402
 
 from cpnx import Token  # noqa: E402
 
-ORDER_COUNTS = (10, 100, 500)
+# 2000 deliberately exceeds the engine's binding_search_limit (default 1000): once the ticket
+# line is deeper than that cap, the per-firing PRIORITY candidate scan saturates instead of
+# growing, so us/step should flatten between 500 and 2000 rather than keep climbing.
+ORDER_COUNTS = (10, 100, 500, 2000)
 WORKER_COUNTS = (1, 4)
 
 

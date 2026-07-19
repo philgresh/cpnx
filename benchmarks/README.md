@@ -41,6 +41,30 @@ genuinely unavailable for 8 *logical* seconds) but the waiting is free, so the
 measured wall time is engine CPU — the part we can optimise. Random channeling
 failures are disabled in this mode (`channel_failure_rate=0.0`) for determinism.
 
+## What the cafe throughput currently shows
+
+Indicative numbers from one machine (workers=1, so read the *shape*, not the
+absolute µs):
+
+| orders | steps | µs/step | note |
+| ---: | ---: | ---: | --- |
+| 10 | 40 | ~96 | |
+| 100 | 400 | ~113 | |
+| 500 | 2000 | ~224 | |
+| 2000 | 8000 | ~339 | past `binding_search_limit` |
+
+- **Step count is exactly linear** — 4 steps per order at every size.
+- **Per-step cost grows only mildly** and the growth *decays* with size:
+  quadrupling orders from 500 → 2000 raises µs/step just ~1.5×. The
+  `T_Weigh_And_Grind` transition uses `BindingPolicy.PRIORITY`, whose per-firing
+  candidate scan grows with ticket-line depth but is **capped by the engine's
+  `binding_search_limit` (default 1000)** — so the workload is effectively
+  linear with a fat constant, not quadratic. The 2000-order row deliberately
+  crosses that cap.
+- **`max_workers` makes no difference** for these trivial actions — a single
+  global engine lock plus per-firing thread-pool dispatch dominate, so more
+  workers buy nothing. Raw per-step overhead, not parallelism, is the lever.
+
 ## How to read the numbers
 
 These report **microseconds per call** on the machine that ran them. The
