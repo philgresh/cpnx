@@ -111,18 +111,23 @@ def _mobile_pickup_first(tokens: list[Token]) -> tuple[int, float]:
     return (0 if order.payload.get("mobile_pickup") else 1, order.created_at)
 
 
-def _pull_shot(tokens: list[Token]) -> list[Token]:
-    """Pull an espresso shot from the grounds — occasionally 'channels' and ruins the shot.
+def _make_pull_shot(failure_rate: float):
+    """Build the ``T_Pull_Shot`` action with a configurable channeling failure rate.
 
-    A ~15% failure rate stands in for a channeled/uneven extraction. Combined with this
-    transition's ``max_retries=1``, a channeled shot gets one automatic retry (the grounds
-    token is rolled back to ``P_Ground_Coffee``) before the engine dead-letters it to
-    ``P_Trash_Can`` (this net's ``error_place``) so a bad dose doesn't loop forever.
+    A ``failure_rate`` of ~0.15 stands in for a channeled/uneven extraction. Combined with the
+    transition's ``max_retries=1``, a channeled shot gets one automatic retry (the grounds token
+    is rolled back to ``P_Ground_Coffee``) before the engine dead-letters it to ``P_Trash_Can``
+    (this net's ``error_place``) so a bad dose doesn't loop forever. Benchmarks pass ``0.0`` to
+    make the run deterministic and to avoid the wall-clock ``retry_delay`` rollback path.
     """
-    grounds = tokens[0]
-    if random.random() < 0.15:
-        raise RuntimeError("channeling detected — shot pulled unevenly, discarding grounds")
-    return [grounds.evolve(payload_updates={"stage": "espresso"}, color="espresso")]
+
+    def _pull_shot(tokens: list[Token]) -> list[Token]:
+        grounds = tokens[0]
+        if failure_rate and random.random() < failure_rate:
+            raise RuntimeError("channeling detected — shot pulled unevenly, discarding grounds")
+        return [grounds.evolve(payload_updates={"stage": "espresso"}, color="espresso")]
+
+    return _pull_shot
 
 
 def _steam_milk(tokens: list[Token]) -> list[Token]:
@@ -145,7 +150,12 @@ def _serve_drink(tokens: list[Token]) -> list[Token]:
     return [Token(color="drink", payload={"components": components})]
 
 
-def build_cafe() -> PetriNet:
+def build_cafe(
+    *,
+    pacing_secs: float = 8.0,
+    channel_failure_rate: float = 0.15,
+    max_workers: int = 4,
+) -> PetriNet:
     """Wire up the Concurrency Cafe topology and return the (unstarted) PetriNet.
 
     Flow: ``P_Ticket_Line`` -> (weigh & grind, using a scale + the grinder) ->
@@ -156,6 +166,15 @@ def build_cafe() -> PetriNet:
     This net is illustrative and **not conservation-checked**: transitions transform token
     colours/payloads rather than merely relocating fixed tokens, so per-colour counts are
     not expected to balance across a run. See the module docstring for the full caveat.
+
+    Args:
+        pacing_secs: Grinder cooldown window. The default 8.0 models a real spin-down; the
+            throughput benchmark keeps it non-zero (real back-pressure) but drives the net on
+            a logical clock so the wait costs no wall-clock time.
+        channel_failure_rate: Probability that ``T_Pull_Shot`` "channels" and dead-letters a
+            shot. The default 0.15 exercises the retry/dead-letter path; benchmarks pass 0.0
+            for a deterministic run that avoids the wall-clock ``retry_delay`` rollback.
+        max_workers: Size of the engine's action thread pool.
     """
     places = [
         # Unbounded FIFO: the register never turns a customer away, it just queues them.
@@ -165,7 +184,7 @@ def build_cafe() -> PetriNet:
         ResourcePlace("P_Digital_Scales", capacity=3),
         # The single grinder is unavailable for 8s after dispensing while the burrs spin
         # down and the chute is brushed out — models a hard rate limit on throughput.
-        PacedResourcePlace("P_Burr_Grinder", capacity=1, pacing_secs=8.0),
+        PacedResourcePlace("P_Burr_Grinder", capacity=1, pacing_secs=pacing_secs),
         # Grounds waiting for a barista to pull a shot; restricted colour catches wiring bugs.
         Place("P_Ground_Coffee", color_set={"ground_coffee"}),
         # Milk tickets waiting to be steamed; restricted colour catches wiring bugs.
@@ -201,7 +220,7 @@ def build_cafe() -> PetriNet:
             name="T_Pull_Shot",
             inputs=[InputArc("P_Ground_Coffee")],
             outputs=[OutputArc("P_Order_Tray")],
-            action=_pull_shot,
+            action=_make_pull_shot(channel_failure_rate),
             # A stuck/uneven pull shouldn't hang the bar for long.
             action_timeout_secs=0.5,
             # One retry for a channeled shot, then dead-letter — a barista doesn't keep
@@ -232,7 +251,7 @@ def build_cafe() -> PetriNet:
     ]
 
     return PetriNet(
-        max_workers=4,
+        max_workers=max_workers,
         error_place="P_Trash_Can",
         places=places,
         transitions=transitions,
