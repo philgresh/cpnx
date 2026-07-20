@@ -8,7 +8,8 @@ reports how much engine CPU that costs.
 The net keeps its real structural friction but runs on a **logical clock** (see ``_driver.py``),
 so the grinder's 8-second cooldown blocks work (real back-pressure) without burning 8 real
 seconds. Channeling failures are turned off (``channel_failure_rate=0.0``) so the run is
-deterministic and avoids the wall-clock ``retry_delay`` path.
+deterministic — it draws no RNG, so step counts are byte-identical across runs and only
+wall-clock timing varies.
 
 Sweeps two knobs that drive engine cost:
 

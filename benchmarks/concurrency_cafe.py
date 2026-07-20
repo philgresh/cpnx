@@ -158,8 +158,8 @@ def _make_pull_shot(failure_rate: float):
     A ``failure_rate`` of ~0.15 stands in for a channeled/uneven extraction. Combined with the
     transition's ``max_retries=1``, a channeled shot gets one automatic retry (the grounds token
     is rolled back to ``P_Ground_Coffee``) before the engine dead-letters it to ``P_Trash_Can``
-    (this net's ``error_place``) so a bad dose doesn't loop forever. Benchmarks pass ``0.0`` to
-    make the run deterministic and to avoid the wall-clock ``retry_delay`` rollback path.
+    (this net's ``error_place``) so a bad dose doesn't loop forever. Benchmarks pass ``0.0`` so
+    the run draws no RNG and is reproducible step-for-step.
     """
 
     def _pull_shot(tokens: list[Token]) -> list[Token]:
@@ -217,7 +217,7 @@ def build_cafe(
             a logical clock so the wait costs no wall-clock time.
         channel_failure_rate: Probability that ``T_Pull_Shot`` "channels" and dead-letters a
             shot. The default 0.15 exercises the retry/dead-letter path; benchmarks pass 0.0
-            for a deterministic run that avoids the wall-clock ``retry_delay`` rollback.
+            so the run draws no RNG and reproduces step-for-step.
         max_workers: Size of the engine's action thread pool.
         dose_tolerance_g: Half-width, in grams, of the acceptable dose band around the 18g
             target (default 1.0 -> `[17, 19]`). This is the knob that drives per-candidate
