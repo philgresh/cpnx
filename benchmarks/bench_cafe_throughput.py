@@ -40,12 +40,20 @@ ORDER_COUNTS = (10, 100, 500, 2000)
 WORKER_COUNTS = (1, 4)
 
 
+# Dose sequence: 3 of every 10 tickets (indices 3, 6, 9 of each cycle) declare a weight
+# outside the default [17, 19] tolerance band, so T_Weigh_And_Grind's guard actually rejects
+# ~30% of candidates instead of trivially accepting every one (which would defeat the point
+# of exercising the guarded path — see ADR 0001). Deterministic, no RNG, so the benchmark
+# stays reproducible.
+_DOSE_CYCLE = {3: 16, 6: 21, 9: 20}
+
+
 def _order_payloads(n: int) -> list[dict]:
-    """Deterministic mix of mobile/walk-in and oat/dairy orders."""
+    """Deterministic mix of mobile/walk-in, oat/dairy, and in/out-of-spec-dose orders."""
     return [
         {
             "ratio": "1:2",
-            "weight_g": 18,
+            "weight_g": _DOSE_CYCLE.get(i % 10, 18),
             "dairy_free": (i % 2 == 0),
             "mobile_pickup": (i % 3 == 0),
         }
@@ -53,9 +61,11 @@ def _order_payloads(n: int) -> list[dict]:
     ]
 
 
-def _run_once(n_orders: int, max_workers: int) -> None:
+def _run_once(n_orders: int, max_workers: int, dose_tolerance_g: float | None) -> None:
     # Real friction (grinder cooldown, finite scales, tray threshold) but no random failures.
-    with build_cafe(channel_failure_rate=0.0, max_workers=max_workers) as net:
+    with build_cafe(
+        channel_failure_rate=0.0, max_workers=max_workers, dose_tolerance_g=dose_tolerance_g
+    ) as net:
         for payload in _order_payloads(n_orders):
             net.deposit("P_Ticket_Line", Token(payload=payload))
 
@@ -73,11 +83,17 @@ def _run_once(n_orders: int, max_workers: int) -> None:
 
 
 def main() -> None:
-    print("Concurrency Cafe throughput (logical clock, channeling off):")
-    for workers in WORKER_COUNTS:
-        for n in ORDER_COUNTS:
-            _run_once(n, workers)
-        print()
+    # Sweep both regimes: `None` leaves T_Weigh_And_Grind guard-free (and drops T_Rework_Dose),
+    # 1.0 puts the [17, 19] dose guard in front of the PRIORITY candidate scan. Comparing the
+    # two isolates the per-candidate guard-evaluation cost ADR 0001 calls the search's main
+    # expense. Note the guarded run also does strictly more *work* (the extra T_Rework_Dose
+    # firings), so compare us/step, not us/order, to read the guard's cost per candidate.
+    for label, tolerance in (("guard-free", None), ("guarded (dose 17-19g)", 1.0)):
+        print(f"Concurrency Cafe throughput — {label} (logical clock, channeling off):")
+        for workers in WORKER_COUNTS:
+            for n in ORDER_COUNTS:
+                _run_once(n, workers, tolerance)
+            print()
 
 
 if __name__ == "__main__":

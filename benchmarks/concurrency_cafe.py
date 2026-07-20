@@ -2,11 +2,13 @@
 
 Picture a single-bar specialty coffee shop during the morning rush. Tickets pile
 up at the register, baristas share a small pool of digital scales, there is
-exactly one burr grinder (which needs a breather after every dose), and a
-finished drink is only "done" once *both* the espresso shot and the steamed
-milk have landed on the same tray. That whole scene maps almost one-to-one onto
-``cpnx``'s vocabulary of places, resources, thresholds, and sinks — which is
-why it makes a good end-to-end tour of the library.
+exactly one burr grinder (which needs a breather after every dose), a barista
+won't grind a ticket whose declared dose misses spec (it goes back for a
+re-dose instead), and a finished drink is only "done" once *both* the espresso
+shot and the steamed milk have landed on the same tray. That whole scene maps
+almost one-to-one onto ``cpnx``'s vocabulary of places, resources, thresholds,
+guards, and sinks — which is why it makes a good end-to-end tour of the
+library.
 
 Warning:
     This is an **illustrative benchmark/demo, not a conservation-checked CPN**.
@@ -91,6 +93,45 @@ from cpnx import (  # noqa: E402
 # SubstitutionTransition("T_Kitchen", ...).
 
 
+#: Target dose in grams. Orders in this demo cluster around 18g (a typical single-shot dose);
+#: the tolerance band is centered on it.
+_DOSE_TARGET_G = 18.0
+
+
+def _make_dose_guard(low: float, high: float):
+    """Build the ``T_Weigh_And_Grind`` guard: a barista won't grind an out-of-spec dose.
+
+    Weighing the dose is the whole point of the scale step — a reading outside the shop's
+    tolerance band (too little grounds under-extracts, too much over-extracts) doesn't get
+    ground; it goes back for a re-dose instead (see ``T_Rework_Dose``). This is a *callable*
+    guard, not a string expression, because it closes over the configured ``low``/``high``
+    band, exactly like ``_make_pull_shot`` closes over ``failure_rate`` below.
+    """
+
+    def _dose_in_spec(tokens: list[Token]) -> bool:
+        order = next(t for t in tokens if not t.is_resource)
+        return low <= order.payload.get("weight_g", _DOSE_TARGET_G) <= high
+
+    return _dose_in_spec
+
+
+def _make_rework_dose(low: float, high: float):
+    """Build the ``T_Rework_Dose`` action: adjust the grinder and re-weigh an out-of-spec ticket.
+
+    Clamps to the *nearest* bound rather than snapping to the band's center, so a single
+    rework always lands the weight back in `[low, high]` — satisfying ``T_Weigh_And_Grind``'s
+    guard on the next pass — instead of overshooting past the opposite bound and bouncing
+    between the two transitions forever.
+    """
+
+    def _rework_dose(tokens: list[Token]) -> list[Token]:
+        ticket = tokens[0]
+        weight = ticket.payload.get("weight_g", _DOSE_TARGET_G)
+        return [ticket.evolve(payload_updates={"weight_g": min(max(weight, low), high)})]
+
+    return _rework_dose
+
+
 def _weigh_and_grind(tokens: list[Token]) -> list[Token]:
     """Consume the order ticket and hand off two parallel work items: grounds and a milk ticket.
 
@@ -155,13 +196,16 @@ def build_cafe(
     pacing_secs: float = 8.0,
     channel_failure_rate: float = 0.15,
     max_workers: int = 4,
+    dose_tolerance_g: float | None = 1.0,
 ) -> PetriNet:
     """Wire up the Concurrency Cafe topology and return the (unstarted) PetriNet.
 
-    Flow: ``P_Ticket_Line`` -> (weigh & grind, using a scale + the grinder) ->
-    ``P_Ground_Coffee`` / ``P_Milk_Queue`` in parallel -> (pull shot / steam milk) ->
-    ``P_Order_Tray`` (waits for both a shot and a milk) -> (serve) -> ``P_Served``.
-    Botched shots are dead-lettered to ``P_Trash_Can``.
+    Flow: ``P_Ticket_Line`` -> (weigh & grind, gated by the dose guard, using a scale + the
+    grinder) -> ``P_Ground_Coffee`` / ``P_Milk_Queue`` in parallel -> (pull shot / steam milk)
+    -> ``P_Order_Tray`` (waits for both a shot and a milk) -> (serve) -> ``P_Served``. A ticket
+    whose declared dose misses the tolerance band is reworked (``T_Rework_Dose``) and
+    returned to the back of ``P_Ticket_Line`` rather than ever reaching the grinder. Botched
+    shots are dead-lettered to ``P_Trash_Can``.
 
     This net is illustrative and **not conservation-checked**: transitions transform token
     colours/payloads rather than merely relocating fixed tokens, so per-colour counts are
@@ -175,6 +219,13 @@ def build_cafe(
             shot. The default 0.15 exercises the retry/dead-letter path; benchmarks pass 0.0
             for a deterministic run that avoids the wall-clock ``retry_delay`` rollback.
         max_workers: Size of the engine's action thread pool.
+        dose_tolerance_g: Half-width, in grams, of the acceptable dose band around the 18g
+            target (default 1.0 -> `[17, 19]`). This is the knob that drives per-candidate
+            guard evaluation cost (see ADR 0001): a tighter band rejects more tickets (more
+            guard evaluations, more ``T_Rework_Dose`` churn), a wider one accepts nearly
+            everything, and `None` removes the guard entirely (`T_Weigh_And_Grind.guard` is
+            left unset and `T_Rework_Dose` is omitted), reproducing the cheap guard-free
+            binding-search path for A/B comparison.
     """
     places = [
         # Unbounded FIFO: the register never turns a customer away, it just queues them.
@@ -199,6 +250,12 @@ def build_cafe(
         SinkPlace("P_Trash_Can", keep_last=10),
     ]
 
+    dose_low, dose_high = (
+        (_DOSE_TARGET_G - dose_tolerance_g, _DOSE_TARGET_G + dose_tolerance_g)
+        if dose_tolerance_g is not None
+        else (None, None)
+    )
+
     transitions = [
         Transition(
             name="T_Weigh_And_Grind",
@@ -211,6 +268,12 @@ def build_cafe(
             action=_weigh_and_grind,
             # Short timeout: weighing and dosing is a quick, bounded action in this demo.
             action_timeout_secs=1.0,
+            # Dose tolerance gate: a barista won't grind a dose outside spec. This is the
+            # PRIORITY transition draining the deep P_Ticket_Line, so it is exactly where
+            # per-candidate guard evaluation (the combinatorial search's dominant cost —
+            # see ADR 0001) actually happens. `None` (dose_tolerance_g unset) leaves the
+            # guard unset entirely, reproducing the cheap guard-free path.
+            guard=_make_dose_guard(dose_low, dose_high) if dose_tolerance_g is not None else None,
             # Mobile-pickup tickets jump the in-store line: PRIORITY enumerates satisfying
             # bindings and picks the one minimizing binding_priority_key.
             binding_policy=BindingPolicy.PRIORITY,
@@ -249,6 +312,30 @@ def build_cafe(
             action_timeout_secs=0.5,
         ),
     ]
+
+    if dose_tolerance_g is not None:
+        transitions.append(
+            Transition(
+                name="T_Rework_Dose",
+                # LEGACY (the net default): only ever inspects the head of P_Ticket_Line. A
+                # ticket that isn't at the head yet is simply skipped over by
+                # T_Weigh_And_Grind's PRIORITY search, so it reaches the head eventually
+                # without T_Rework_Dose needing to enumerate for it.
+                inputs=[InputArc("P_Ticket_Line")],
+                outputs=[OutputArc("P_Ticket_Line")],
+                action=_make_rework_dose(dose_low, dose_high),
+                action_timeout_secs=0.5,
+                # String guard (the complement of T_Weigh_And_Grind's callable one) so this
+                # demo exercises both guard flavours: string guards run through
+                # SandboxEvaluator's compile cache, callables through the timed expression
+                # pool. Clamping in the action always lands back in [dose_low, dose_high],
+                # so this can't ping-pong with T_Weigh_And_Grind's guard.
+                guard=(
+                    f"tokens[0].payload.get('weight_g', {_DOSE_TARGET_G}) < {dose_low} "
+                    f"or tokens[0].payload.get('weight_g', {_DOSE_TARGET_G}) > {dose_high}"
+                ),
+            )
+        )
 
     return PetriNet(
         max_workers=max_workers,

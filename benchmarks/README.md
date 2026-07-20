@@ -43,27 +43,70 @@ failures are disabled in this mode (`channel_failure_rate=0.0`) for determinism.
 
 ## What the cafe throughput currently shows
 
-Indicative numbers from one machine (workers=1, so read the *shape*, not the
-absolute µs):
+The benchmark sweeps **two regimes**: `dose_tolerance_g=None` leaves
+`T_Weigh_And_Grind` guard-free, and `dose_tolerance_g=1.0` puts a `[17, 19]`
+dose guard in front of its `PRIORITY` candidate scan. Indicative numbers from
+one machine (workers=1, so read the *shape* and the ratio, not the absolute µs):
 
-| orders | steps | µs/step | note |
-| ---: | ---: | ---: | --- |
-| 10 | 40 | ~96 | |
-| 100 | 400 | ~113 | |
-| 500 | 2000 | ~224 | |
-| 2000 | 8000 | ~339 | past `binding_search_limit` |
+| orders | steps (free / guarded) | µs/step guard-free | µs/step guarded | guarded ÷ free |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 40 / 43 | ~86 | ~138 | 1.6× |
+| 100 | 400 / 430 | ~117 | ~511 | 4.4× |
+| 500 | 2000 / 2150 | ~222 | ~1947 | 8.8× |
+| 2000 | 8000 / 8600 | ~328 | ~2704 | 8.2× |
 
-- **Step count is exactly linear** — 4 steps per order at every size.
-- **Per-step cost grows only mildly** and the growth *decays* with size:
-  quadrupling orders from 500 → 2000 raises µs/step just ~1.5×. The
-  `T_Weigh_And_Grind` transition uses `BindingPolicy.PRIORITY`, whose per-firing
-  candidate scan grows with ticket-line depth but is **capped by the engine's
-  `binding_search_limit` (default 1000)** — so the workload is effectively
-  linear with a fat constant, not quadratic. The 2000-order row deliberately
-  crosses that cap.
+> **These figures supersede an earlier guard-free-only table.** The cafe had no
+> `guard=` anywhere, so the old numbers measured the *cheapest possible* binding
+> path and understated the cost for any guarded net. The guarded column is the
+> honest one for guard-carrying workloads; nothing regressed.
+
+- **Step count is exactly linear** — 4 steps per order guard-free, plus one
+  `T_Rework_Dose` firing for the 30% of orders whose dose starts out of spec.
+- **Per-step cost grows mildly and the growth decays** in *both* regimes:
+  quadrupling 500 → 2000 raises guard-free µs/step ~1.5×. The `PRIORITY`
+  candidate scan grows with ticket-line depth but is **capped by
+  `binding_search_limit` (default 1000)**, so the workload is linear with a fat
+  constant, not quadratic. The 2000-order row deliberately crosses that cap —
+  and the guarded ratio flattening from 8.8× to 8.2× there is that cap working.
 - **`max_workers` makes no difference** for these trivial actions — a single
-  global engine lock plus per-firing thread-pool dispatch dominate, so more
-  workers buy nothing. Raw per-step overhead, not parallelism, is the lever.
+  global engine lock plus per-firing thread-pool dispatch dominate.
+
+### The guard cost is dispatch, not evaluation
+
+ADR 0001 anticipated that guards would be the search's main expense ("guard is
+evaluated once per candidate combination instead of once") and expected
+AST-caching to mitigate it. Profiling says the mitigation targets the wrong
+thing. In a 500-order guarded run, `_call_expr` (`engine.py:393`) accounts for
+**8.8 s of 10.9 s** cumulative — but only 0.36 s of *own* time. It submits every
+guard evaluation to a `ThreadPoolExecutor` and blocks on `fut.result(timeout)`,
+so each of the ~334 K candidate checks pays a full thread round-trip.
+
+Measured in isolation on the same machine:
+
+| | per call |
+| --- | ---: |
+| raw predicate | 0.097 µs |
+| via `_call_expr` | 9.819 µs |
+| **overhead** | **9.7 µs (102×)** |
+
+So ~99% of guard cost is the timeout sandbox, not the user's predicate — and
+because it is charged *per candidate binding* rather than per firing, it scales
+with search depth. Caching the guard's AST cannot help; the thread hop happens
+after any such cache. Both guard flavours route through it (string guards via
+`_eval_expression`, callables directly), so neither avoids the cost. A fast path
+that runs trivially-cheap guards inline when no timeout is configured looks like
+a much larger lever than anything in the candidate-enumeration code — but it
+trades away the I/O-in-a-guard protection `_call_expr` exists to provide, so it
+is a design decision, not a mechanical optimisation. Not attempted here.
+
+Hotspot ranking by own time, guarded (was: `_iter_candidate_bindings` first,
+`_check_transition_guard` 8th at ~1.4% when guard-free):
+
+1. `_call_expr` — 0.361 s own, **8.826 s cumulative**, 334 K calls
+2. `_iter_candidate_bindings` — 0.218 s
+3. `_eval_expression` — 0.208 s own, 9.072 s cumulative
+4. `_iter_satisfying_bindings` — 0.206 s own, 9.678 s cumulative
+5. `_reduce_min_key` — 0.144 s
 
 ## How to read the numbers
 
