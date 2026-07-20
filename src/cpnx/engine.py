@@ -95,10 +95,11 @@ def _rollback_data_token(
     transition: Transition,
     retry_delay: float,
     error_place: str,
+    ref_time: float,
 ) -> tuple[str, Token, bool]:
     max_retries = transition.max_retries
     if max_retries is None or t.attempts < max_retries:
-        retry_at = time.monotonic() + retry_delay
+        retry_at = ref_time + retry_delay
         return src_name, t.evolve(available_at=retry_at, attempts=t.attempts + 1), False
     return error_place, t.evolve(available_at=0.0), True
 
@@ -109,10 +110,11 @@ def _process_rollback_token(
     transition: Transition,
     retry_delay: float,
     error_place: str,
+    ref_time: float,
 ) -> tuple[str, Token, bool]:
     if t.is_resource:
         return src_name, t, False
-    return _rollback_data_token(t, src_name, transition, retry_delay, error_place)
+    return _rollback_data_token(t, src_name, transition, retry_delay, error_place, ref_time)
 
 
 def _rollback_failed_transition(
@@ -122,17 +124,25 @@ def _rollback_failed_transition(
     deposit: _DepositFn,
     retry_delay: float,
     error_place: str,
+    ref_time: float,
 ) -> tuple[list[tuple[str, Token]], list[Token], list[Token]]:
     """Return all consumed tokens to their source places after a failed firing.
 
     ``deposit`` must be a callable that is safe to invoke under the engine lock —
     callers are responsible for holding it before calling this function.
+
+    ``retry_delay`` is applied against ``ref_time``, so a retried token's ``available_at``
+    lands on the same clock as pacing/settle checks. Callers pass the net's resolved clock
+    (`PetriNet._get_model_time_under_lock`), which is the logical clock when one is set and
+    ``time.monotonic()`` otherwise.
     """
     deposited: list[tuple[str, Token]] = []
     dead_lettered_data_tokens: list[Token] = []
     data_tokens = [t for _, t in token_sources if not t.is_resource]
     for src_name, t in token_sources:
-        dest, rollback_t, is_dead_letter = _process_rollback_token(t, src_name, transition, retry_delay, error_place)
+        dest, rollback_t, is_dead_letter = _process_rollback_token(
+            t, src_name, transition, retry_delay, error_place, ref_time
+        )
         deposit(dest, rollback_t)
         deposited.append((dest, rollback_t))
         if is_dead_letter:
@@ -1387,6 +1397,7 @@ class PetriNet:
                 deposit=self._deposit_under_lock,
                 retry_delay=self.retry_delay,
                 error_place=self.error_place,
+                ref_time=self._get_model_time_under_lock(),
             )
         return success, error, data_tokens, dl_data, deposited
 
