@@ -264,7 +264,7 @@ def test_rollback_failed_transition():
     token_sources = [("p_in", res_token), ("p_in", token)]
 
     deposited, dl_data, data_tokens = _rollback_failed_transition(
-        transition, token_sources, deposit=fake_deposit, retry_delay=0.0, error_place="__error__"
+        transition, token_sources, deposit=fake_deposit, retry_delay=0.0, error_place="__error__", ref_time=10.0
     )
 
     assert len(deposited) == 2
@@ -273,6 +273,7 @@ def test_rollback_failed_transition():
     assert data_tokens[0] == token
     assert deposited[0][0] == "p_in"  # resource token returned to source
     assert deposited[1][0] == "p_in"  # data token retried
+    assert deposited[1][1].available_at == 10.0  # scheduled off ref_time, not the wall clock
     assert deposited_calls == deposited  # fake_deposit was called for every deposit
 
     # Exhausted token → dead-lettered
@@ -281,7 +282,7 @@ def test_rollback_failed_transition():
     token_sources2 = [("p_in", token2)]
 
     deposited2, dl_data2, data_tokens2 = _rollback_failed_transition(
-        transition, token_sources2, deposit=fake_deposit, retry_delay=0.0, error_place="__error__"
+        transition, token_sources2, deposit=fake_deposit, retry_delay=0.0, error_place="__error__", ref_time=10.0
     )
 
     assert len(deposited2) == 1

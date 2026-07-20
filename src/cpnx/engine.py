@@ -124,18 +124,18 @@ def _rollback_failed_transition(
     deposit: _DepositFn,
     retry_delay: float,
     error_place: str,
-    model_time: float | None = None,
+    ref_time: float,
 ) -> tuple[list[tuple[str, Token]], list[Token], list[Token]]:
     """Return all consumed tokens to their source places after a failed firing.
 
     ``deposit`` must be a callable that is safe to invoke under the engine lock —
     callers are responsible for holding it before calling this function.
 
-    ``retry_delay`` is applied against ``model_time`` when given, so a retried token's
-    ``available_at`` lands on the same clock as pacing/settle checks; otherwise it falls
-    back to ``time.monotonic()``.
+    ``retry_delay`` is applied against ``ref_time``, so a retried token's ``available_at``
+    lands on the same clock as pacing/settle checks. Callers pass the net's resolved clock
+    (`PetriNet._get_model_time_under_lock`), which is the logical clock when one is set and
+    ``time.monotonic()`` otherwise.
     """
-    ref_time = model_time if model_time is not None else time.monotonic()
     deposited: list[tuple[str, Token]] = []
     dead_lettered_data_tokens: list[Token] = []
     data_tokens = [t for _, t in token_sources if not t.is_resource]
@@ -1397,7 +1397,7 @@ class PetriNet:
                 deposit=self._deposit_under_lock,
                 retry_delay=self.retry_delay,
                 error_place=self.error_place,
-                model_time=self._model_time,
+                ref_time=self._get_model_time_under_lock(),
             )
         return success, error, data_tokens, dl_data, deposited
 
