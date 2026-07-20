@@ -1193,6 +1193,15 @@ class PetriNet:
         ordered = self._order_available(arc, available)
         if ordered is None or len(ordered) < arc.count:
             return
+        if arc.count == 1:
+            # Fast path for the common single-token arc. `combinations(ordered, 1)` yields one
+            # 1-tuple per token which is then rebuilt as a list; emitting `[token]` directly
+            # produces the identical groups in the identical order (so seeded `RANDOM` streams
+            # are unaffected) while skipping the combinations machinery in the hottest loop of
+            # the binding search.
+            for token in ordered:
+                yield [token]
+            return
         for combo in itertools.combinations(ordered, arc.count):
             yield list(combo)
 
