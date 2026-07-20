@@ -50,10 +50,16 @@ one machine (workers=1, so read the *shape* and the ratio, not the absolute µs)
 
 | orders | steps (free / guarded) | µs/step guard-free | µs/step guarded | guarded ÷ free |
 | ---: | ---: | ---: | ---: | ---: |
-| 10 | 40 / 43 | ~86 | ~138 | 1.6× |
-| 100 | 400 / 430 | ~117 | ~511 | 4.4× |
-| 500 | 2000 / 2150 | ~222 | ~1947 | 8.8× |
-| 2000 | 8000 / 8600 | ~328 | ~2704 | 8.2× |
+| 10 | 40 / 43 | 78.8 | 129.8 | 1.6× |
+| 100 | 400 / 430 | 104.0 | 474.0 | 4.6× |
+| 500 | 2000 / 2150 | 195.6 | 1791.4 | 9.2× |
+| 2000 | 8000 / 8600 | 285.8 | 2526.1 | 8.8× |
+
+Min of three sweeps on an otherwise-idle Apple M4 Pro / CPython 3.14.3 (min is
+the right estimator here — measurement noise only ever *adds* time). Run-to-run
+spread was ≤2% for every cell except guarded n=500 (5.9%) and guard-free n=10
+(27%); the n=10 row is a 3 ms workload dominated by fixed setup cost, so treat
+it as indicative only. Everything else is comfortably above the noise floor.
 
 > **These figures supersede an earlier guard-free-only table.** The cafe had no
 > `guard=` anywhere, so the old numbers measured the *cheapest possible* binding
@@ -67,7 +73,7 @@ one machine (workers=1, so read the *shape* and the ratio, not the absolute µs)
   candidate scan grows with ticket-line depth but is **capped by
   `binding_search_limit` (default 1000)**, so the workload is linear with a fat
   constant, not quadratic. The 2000-order row deliberately crosses that cap —
-  and the guarded ratio flattening from 8.8× to 8.2× there is that cap working.
+  and the guarded ratio flattening from 9.2× to 8.8× there is that cap working.
 - **`max_workers` makes no difference** for these trivial actions — a single
   global engine lock plus per-firing thread-pool dispatch dominate.
 
@@ -77,17 +83,18 @@ ADR 0001 anticipated that guards would be the search's main expense ("guard is
 evaluated once per candidate combination instead of once") and expected
 AST-caching to mitigate it. Profiling says the mitigation targets the wrong
 thing. In a 500-order guarded run, `_call_expr` (`engine.py:393`) accounts for
-**8.8 s of 10.9 s** cumulative — but only 0.36 s of *own* time. It submits every
-guard evaluation to a `ThreadPoolExecutor` and blocks on `fut.result(timeout)`,
-so each of the ~334 K candidate checks pays a full thread round-trip.
+**8.26 s of 10.20 s** cumulative (81%) — but only 0.35 s of *own* time. It
+submits every guard evaluation to a `ThreadPoolExecutor` and blocks on
+`fut.result(timeout)`, so each of the ~334 K candidate checks pays a full
+thread round-trip.
 
 Measured in isolation on the same machine:
 
 | | per call |
 | --- | ---: |
-| raw predicate | 0.097 µs |
-| via `_call_expr` | 9.819 µs |
-| **overhead** | **9.7 µs (102×)** |
+| raw predicate | 0.090 µs |
+| via `_call_expr` | 10.007 µs |
+| **overhead** | **9.9 µs (112×)** |
 
 So ~99% of guard cost is the timeout sandbox, not the user's predicate — and
 because it is charged *per candidate binding* rather than per firing, it scales
@@ -102,11 +109,11 @@ is a design decision, not a mechanical optimisation. Not attempted here.
 Hotspot ranking by own time, guarded (was: `_iter_candidate_bindings` first,
 `_check_transition_guard` 8th at ~1.4% when guard-free):
 
-1. `_call_expr` — 0.361 s own, **8.826 s cumulative**, 334 K calls
-2. `_iter_candidate_bindings` — 0.218 s
-3. `_eval_expression` — 0.208 s own, 9.072 s cumulative
-4. `_iter_satisfying_bindings` — 0.206 s own, 9.678 s cumulative
-5. `_reduce_min_key` — 0.144 s
+1. `_call_expr` — 0.353 s own, **8.258 s cumulative**, 334 K calls
+2. `_eval_expression` — 0.200 s own, 8.492 s cumulative
+3. `_iter_satisfying_bindings` — 0.195 s own, 9.057 s cumulative
+4. `_iter_candidate_bindings` — 0.193 s own, 0.204 s cumulative
+5. `_reduce_min_key` — 0.141 s own, 9.640 s cumulative
 
 ## How to read the numbers
 
