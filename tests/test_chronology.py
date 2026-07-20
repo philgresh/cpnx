@@ -138,3 +138,54 @@ def test_settle_secs_respects_model_time():
         # At t=110.0, it should be enabled and fire
         net.advance_time(110.0)
         assert net.step() is True
+
+
+def test_retry_delay_respects_model_time():
+    """A token rolled back after a transient failure retries on the logical clock.
+
+    Regression: the retry deadline was computed from `time.monotonic()`, so in
+    logical-time mode it landed seconds-since-boot in the future and the token was
+    stranded forever.
+    """
+    with PetriNet(max_workers=1, retry_delay=5.0) as net:
+        net.advance_time(100.0)
+
+        net.add_place(Place("in"))
+        net.add_place(Place("out"))
+
+        def boom(tokens):
+            raise RuntimeError("transient")
+
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[InputArc("in")],
+                outputs=[OutputArc("out")],
+                action=boom,
+                max_retries=1,
+            )
+        )
+
+        net.deposit("in", Token(payload={"n": 1}))
+        assert net.step() is True
+
+        # Wait for the action (and its rollback) to complete.
+        deadline = time.monotonic() + 5.0
+        while net._running_count > 0 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert net._running_count == 0
+
+        (rolled_back,) = net.marking["in"]
+        assert rolled_back.attempts == 1
+        # The retry deadline is on the logical clock, not seconds-since-boot.
+        assert rolled_back.available_at == pytest.approx(105.0)
+
+        # Still gated before the delay elapses...
+        net.advance_time(104.0)
+        assert net.places["in"].can_retrieve(1, model_time=net.model_time) is False
+        assert net.step() is False
+
+        # ...and retrievable once the logical clock passes it.
+        net.advance_time(105.0)
+        assert net.places["in"].can_retrieve(1, model_time=net.model_time) is True
+        assert net.step() is True

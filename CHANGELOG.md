@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Transient-failure retries now honour the logical clock.** When a transition's action failed and its data token was rolled back for retry, the token's `available_at` was computed as `time.monotonic() + retry_delay` — the wall clock — while every other availability check (`Place.retrieve`/`can_retrieve`, `PacedResourcePlace` pacing, input-arc settle windows) compares against the net's `model_time`. On a net driven by `advance_time`, the rolled-back token therefore received a deadline of seconds-since-boot (order 10^6–10^7) against a logical clock typically near zero, so it could **never** become retrievable again: the retry was stranded in its source place indefinitely, and `run()` could return quiescent with that work still pending. The rollback path now applies `retry_delay` against the same clock as pacing and settle, using the established `model_time if model_time is not None else time.monotonic()` fallback. Nets that never call `advance_time` are unaffected — the fallback reproduces the previous value exactly.
+
 ---
 
 ## [0.3.2] — 2026-07-11

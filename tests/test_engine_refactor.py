@@ -736,17 +736,17 @@ def test_rollback_data_token():
     t = Transition("t", inputs=[], outputs=[], action=lambda x: x, max_retries=2)
     tok = Token()
 
-    # Below retries: should evolve attempt count and schedule in future
-    with patch("time.monotonic", return_value=10.0):
-        dest, rb_tok, is_dl = _rollback_data_token(tok, "src", t, 5.0, "err")
-        assert dest == "src"
-        assert rb_tok.attempts == 1
-        assert rb_tok.available_at == 15.0
-        assert not is_dl
+    # Below retries: should evolve attempt count and schedule in future,
+    # relative to the caller-supplied reference time (not the wall clock).
+    dest, rb_tok, is_dl = _rollback_data_token(tok, "src", t, 5.0, "err", 10.0)
+    assert dest == "src"
+    assert rb_tok.attempts == 1
+    assert rb_tok.available_at == 15.0
+    assert not is_dl
 
     # Above retries: dead-lettered
     tok2 = Token(attempts=2)
-    dest, rb_tok, is_dl = _rollback_data_token(tok2, "src", t, 5.0, "err")
+    dest, rb_tok, is_dl = _rollback_data_token(tok2, "src", t, 5.0, "err", 10.0)
     assert dest == "err"
     assert is_dl
     assert rb_tok.available_at == 0.0
@@ -792,18 +792,17 @@ def test_process_rollback_token():
     p = ResourcePlace("p", 1)
     tok_res = p.retrieve(1)[0]
 
-    dest, rb_tok, is_dl = _process_rollback_token(tok_res, "src", t, 5.0, "err")
+    dest, rb_tok, is_dl = _process_rollback_token(tok_res, "src", t, 5.0, "err", 10.0)
     assert dest == "src"
     assert rb_tok is tok_res
     assert not is_dl
 
     tok_data = Token(attempts=0)
-    with patch("time.monotonic", return_value=10.0):
-        dest2, rb_tok2, is_dl2 = _process_rollback_token(tok_data, "src", t, 5.0, "err")
-        assert dest2 == "src"
-        assert rb_tok2.attempts == 1
-        assert rb_tok2.available_at == 15.0
-        assert not is_dl2
+    dest2, rb_tok2, is_dl2 = _process_rollback_token(tok_data, "src", t, 5.0, "err", 10.0)
+    assert dest2 == "src"
+    assert rb_tok2.attempts == 1
+    assert rb_tok2.available_at == 15.0
+    assert not is_dl2
 
 
 def test_arc_available_requires_full_count():
