@@ -340,9 +340,34 @@ There is no automatic time advancement to the smallest `available_at` among toke
 net will appear dead (quiescent) rather than time-blocked.
 
 **Recommendation:** Add a helper method (e.g. `advance_to_next_event()`) that
-automatically advances `_model_time` to `min(token.available_at for all tokens)` and
-wakes the run loop.  This would bring timed execution much closer to the formal
-semantics.
+automatically advances `_model_time` to the smallest pending time gate and wakes the
+run loop.  This would bring timed execution much closer to the formal semantics.
+
+**Two traps that recommendation must account for.** Both were found empirically while
+building `benchmarks/_driver.py`, which is a working implementation of this helper and
+can serve as a reference:
+
+1. **`min(token.available_at)` is not sufficient.**  Token cooldowns are only *one*
+   class of time gate.  Input-arc **settle windows** are a second, and they are
+   invisible to that formula — a settle window lives on `arc.settle_secs` measured
+   against `place.last_deposit_time_model`, not on any token.  A net whose only
+   pending gate is a settle window will not advance, and will look dead.
+
+2. **The boundary can round to exactly the present.**  `last_deposit + settle_secs`
+   is mathematically in the future whenever the window is unmet, but the model clock
+   carries `time.monotonic()` values around 7.4e6 where one float64 ULP is ~1e-9.  At
+   that magnitude the sum can round to exactly `model_time`, so a `boundary > now`
+   test fails while the engine's own `elapsed >= settle_secs` is *also* false by a
+   fraction of a nanosecond.  Neither side can advance and the net strands.  Floor the
+   computed boundary at `math.nextafter(now, math.inf)`.
+
+The failure mode is quiet, which is the dangerous part: a driver hitting trap 2 stops
+and reports a completed run.  Observed at 100 orders in the cafe benchmark — six
+tokens stranded in a `ThresholdPlace`, `is_quiescent()` returning `False`, 97 of 100
+orders served, and the benchmark printing its results table regardless.
+
+Note this only bites logical-clock driving.  Under `run()` the wall clock keeps
+advancing past the boundary on the next poll, so the window resolves on its own.
 
 ---
 
