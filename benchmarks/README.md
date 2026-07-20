@@ -61,6 +61,11 @@ spread was ≤2% for every cell except guarded n=500 (5.9%) and guard-free n=10
 (27%); the n=10 row is a 3 ms workload dominated by fixed setup cost, so treat
 it as indicative only. Everything else is comfortably above the noise floor.
 
+The channeling table below came from a later, *contended* run, so its absolute
+µs are not comparable with this table — only the within-run ratios in its last
+column are meaningful. Re-run the whole sweep on an idle machine if you want one
+unified set of figures.
+
 > **These figures supersede an earlier guard-free-only table.** The cafe had no
 > `guard=` anywhere, so the old numbers measured the *cheapest possible* binding
 > path and understated the cost for any guarded net. The guarded column is the
@@ -74,8 +79,40 @@ it as indicative only. Everything else is comfortably above the noise floor.
   `binding_search_limit` (default 1000)**, so the workload is linear with a fat
   constant, not quadratic. The 2000-order row deliberately crosses that cap —
   and the guarded ratio flattening from 9.2× to 8.8× there is that cap working.
-- **`max_workers` makes no difference** for these trivial actions — a single
-  global engine lock plus per-firing thread-pool dispatch dominate.
+- **`max_workers` is no longer swept, and the old flat result meant nothing.**
+  An earlier revision swept it, found no difference, and reported that as
+  evidence that dispatch overhead dominates parallelism. That conclusion was
+  unfounded: `drive_to_quiescence` awaits in-flight completion after every
+  `step()` (it must, so an action's outputs can enable the next firing before
+  the clock advances), so at most one action is ever in flight and the pool
+  size *cannot* matter. The benchmark never gave the pool anything to
+  parallelise. Measuring real concurrency needs a different driver, not a
+  different knob — nothing here says anything about cpnx's parallelism.
+
+### Third regime: channeling (retries and dead-letters)
+
+Since [#20](https://github.com/philgresh/cpnx/pull/20) made `retry_delay`
+model-clock-aware, the retry path is measurable on the logical clock — before
+it, a rolled-back token got a wall-clock deadline it could never reach against a
+logical clock near zero, so the run stranded. `channel_seed` makes it
+reproducible. Within one run (workers=1, guarded, 15% channel rate):
+
+| orders | steps | served | trashed | µs/step vs. guarded |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 442 | 99 | 2 | 0.99× |
+| 500 | 2217 | 494 | 11 | 0.99× |
+| 2000 | 8878 | 1975 | 50 | 0.96× |
+
+Dead-letter rate lands at 50/2000 = 2.5% against a 15% channel rate, which is
+the expected 0.15² — `max_retries=1` means a shot must channel *twice* to be
+binned. Served reconciles too: 1950 surviving espressos + 2000 milks = 3950
+components = 1975 two-component drinks.
+
+Note the retry path makes µs/**step** slightly *cheaper* while making the run
+strictly more expensive overall. Retries fire against the shallow
+`P_Ground_Coffee` queue, not the deep ticket line, so they add cheap steps that
+dilute the average. This is the clearest argument for reading us/step only
+within a fixed regime, and never as a cross-regime efficiency score.
 
 ### The guard cost is dispatch, not evaluation
 

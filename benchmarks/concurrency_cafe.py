@@ -152,19 +152,26 @@ def _mobile_pickup_first(tokens: list[Token]) -> tuple[int, float]:
     return (0 if order.payload.get("mobile_pickup") else 1, order.created_at)
 
 
-def _make_pull_shot(failure_rate: float):
+def _make_pull_shot(failure_rate: float, seed: int | None):
     """Build the ``T_Pull_Shot`` action with a configurable channeling failure rate.
 
     A ``failure_rate`` of ~0.15 stands in for a channeled/uneven extraction. Combined with the
     transition's ``max_retries=1``, a channeled shot gets one automatic retry (the grounds token
     is rolled back to ``P_Ground_Coffee``) before the engine dead-letters it to ``P_Trash_Can``
-    (this net's ``error_place``) so a bad dose doesn't loop forever. Benchmarks pass ``0.0`` so
-    the run draws no RNG and is reproducible step-for-step.
+    (this net's ``error_place``) so a bad dose doesn't loop forever.
+
+    Passing ``seed`` swaps the global ``random`` module for a private ``random.Random(seed)``,
+    which makes a channeling run reproducible — but **only at ``max_workers=1``**. Actions run
+    on a thread pool, so above one worker the *order* in which concurrent ``T_Pull_Shot``
+    firings draw from the shared generator is scheduler-dependent, and a fixed seed no longer
+    pins which shots channel. ``random.Random`` is also not documented as thread-safe. The
+    benchmark's channeling regime therefore runs single-worker only.
     """
+    rng = random.Random(seed) if seed is not None else random
 
     def _pull_shot(tokens: list[Token]) -> list[Token]:
         grounds = tokens[0]
-        if failure_rate and random.random() < failure_rate:
+        if failure_rate and rng.random() < failure_rate:
             raise RuntimeError("channeling detected — shot pulled unevenly, discarding grounds")
         return [grounds.evolve(payload_updates={"stage": "espresso"}, color="espresso")]
 
@@ -195,6 +202,7 @@ def build_cafe(
     *,
     pacing_secs: float = 8.0,
     channel_failure_rate: float = 0.15,
+    channel_seed: int | None = None,
     max_workers: int = 4,
     dose_tolerance_g: float | None = 1.0,
 ) -> PetriNet:
@@ -216,8 +224,11 @@ def build_cafe(
             throughput benchmark keeps it non-zero (real back-pressure) but drives the net on
             a logical clock so the wait costs no wall-clock time.
         channel_failure_rate: Probability that ``T_Pull_Shot`` "channels" and dead-letters a
-            shot. The default 0.15 exercises the retry/dead-letter path; benchmarks pass 0.0
-            so the run draws no RNG and reproduces step-for-step.
+            shot. The default 0.15 exercises the retry/dead-letter path; passing 0.0 makes the
+            run draw no RNG at all, so it reproduces step-for-step at any worker count.
+        channel_seed: Seed for a private channeling RNG, so a non-zero ``channel_failure_rate``
+            still reproduces. Only effective at ``max_workers=1`` — see ``_make_pull_shot``.
+            ``None`` (the default) uses the global ``random`` module, i.e. non-reproducible.
         max_workers: Size of the engine's action thread pool.
         dose_tolerance_g: Half-width, in grams, of the acceptable dose band around the 18g
             target (default 1.0 -> `[17, 19]`). This is the knob that drives per-candidate
@@ -283,7 +294,7 @@ def build_cafe(
             name="T_Pull_Shot",
             inputs=[InputArc("P_Ground_Coffee")],
             outputs=[OutputArc("P_Order_Tray")],
-            action=_make_pull_shot(channel_failure_rate),
+            action=_make_pull_shot(channel_failure_rate, channel_seed),
             # A stuck/uneven pull shouldn't hang the bar for long.
             action_timeout_secs=0.5,
             # One retry for a channeled shot, then dead-letter — a barista doesn't keep
