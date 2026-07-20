@@ -41,16 +41,18 @@ Token colours in play:
 
 Station legend (cpnx type -> what it models):
 
-| Place              | cpnx type             | Cafe role                                          |
-|--------------------|------------------------|-----------------------------------------------------|
-| ``P_Ticket_Line``  | ``Place``              | Unbounded FIFO of incoming order tickets            |
-| ``P_Digital_Scales``| ``ResourcePlace``     | Shared pool of 3 scales                             |
-| ``P_Burr_Grinder`` | ``PacedResourcePlace``  | The one grinder, with an 8s cooldown after dosing   |
-| ``P_Ground_Coffee``| ``Place``               | Ground coffee awaiting a shot to be pulled          |
-| ``P_Milk_Queue``   | ``Place``               | Milk tickets awaiting steaming                      |
-| ``P_Order_Tray``   | ``ThresholdPlace``      | Holds shot + milk until both have arrived           |
-| ``P_Served``       | ``SinkPlace``           | Terminal place for completed drinks                 |
-| ``P_Trash_Can``    | ``SinkPlace``           | Dead-letter bin for botched shots (also error_place) |
+| Place                | cpnx type              | Cafe role                                            |
+|----------------------|-------------------------|-------------------------------------------------------|
+| ``P_Ticket_Line``    | ``Place``               | Unbounded FIFO of incoming order tickets              |
+| ``P_Digital_Scales`` | ``ResourcePlace``       | Shared pool of 3 scales                                |
+| ``P_Burr_Grinder``   | ``PacedResourcePlace``  | Espresso + decaf grinders, each with a cooldown        |
+| ``P_Ground_Coffee``  | ``Place``               | Ground coffee awaiting a shot to be pulled             |
+| ``P_Milk_Queue``     | ``Place``               | Milk tickets awaiting steaming                         |
+| ``P_Espresso_Machine``| ``ResourcePlace``      | Two-group espresso machine head (2 shots at once)      |
+| ``P_Steam_Wand``     | ``ResourcePlace``       | Two steam wands                                        |
+| ``P_Order_Tray``     | ``ThresholdPlace``      | Holds shot + milk until both arrive; counter fits 6 cups|
+| ``P_Served``         | ``SinkPlace``           | Terminal place for completed drinks                    |
+| ``P_Trash_Can``      | ``SinkPlace``           | Dead-letter bin for botched shots (also error_place)   |
 
 Run it directly:
 
@@ -132,6 +134,24 @@ def _make_rework_dose(low: float, high: float):
     return _rework_dose
 
 
+def _with_work(work_secs: float, action):
+    """Wrap *action* so it sleeps ``work_secs`` before running, unless ``work_secs`` is 0.
+
+    A shared helper for the stations whose action body doesn't otherwise need to close over
+    ``work_secs`` itself (``T_Rework_Dose``). ``time.sleep`` releases the GIL, which is the
+    whole point of ``work_secs`` — it's what makes parallel speedup across the thread pool
+    observable instead of purely theoretical.
+    """
+    if work_secs <= 0:
+        return action
+
+    def _wrapped(tokens: list[Token]) -> list[Token]:
+        time.sleep(work_secs)
+        return action(tokens)
+
+    return _wrapped
+
+
 def _weigh_and_grind(tokens: list[Token]) -> list[Token]:
     """Consume the order ticket and hand off two parallel work items: grounds and a milk ticket.
 
@@ -166,11 +186,15 @@ def _make_pull_shot(failure_rate: float, seed: int | None):
     firings draw from the shared generator is scheduler-dependent, and a fixed seed no longer
     pins which shots channel. ``random.Random`` is also not documented as thread-safe. The
     benchmark's channeling regime therefore runs single-worker only.
+
+    The action also grabs a ``P_Espresso_Machine`` permit (the machine's second group head),
+    so ``tokens`` holds a resource token alongside the grounds; it is filtered out rather than
+    assumed to be ``tokens[0]``, since arc order doesn't guarantee position.
     """
     rng = random.Random(seed) if seed is not None else random
 
     def _pull_shot(tokens: list[Token]) -> list[Token]:
-        grounds = tokens[0]
+        grounds = next(t for t in tokens if not t.is_resource)
         if failure_rate and rng.random() < failure_rate:
             raise RuntimeError("channeling detected — shot pulled unevenly, discarding grounds")
         return [grounds.evolve(payload_updates={"stage": "espresso"}, color="espresso")]
@@ -179,8 +203,13 @@ def _make_pull_shot(failure_rate: float, seed: int | None):
 
 
 def _steam_milk(tokens: list[Token]) -> list[Token]:
-    """Steam oat or dairy milk depending on the original order's dairy_free flag."""
-    ticket = tokens[0]
+    """Steam oat or dairy milk depending on the original order's dairy_free flag.
+
+    Also grabs a ``P_Steam_Wand`` permit (one of two wands), so ``tokens`` holds a resource
+    token alongside the milk ticket; filtered by ``is_resource`` rather than assumed to be
+    ``tokens[0]``.
+    """
+    ticket = next(t for t in tokens if not t.is_resource)
     color = "oat_milk" if ticket.payload.get("dairy_free") else "dairy_milk"
     return [ticket.evolve(payload_updates={"stage": color}, color=color)]
 
@@ -205,12 +234,17 @@ def build_cafe(
     channel_seed: int | None = None,
     max_workers: int = 4,
     dose_tolerance_g: float | None = 1.0,
+    grinders: int = 2,
+    work_secs: float = 0.0,
+    tray_settle_secs: float = 0.05,
+    tray_bound: int | None = 6,
 ) -> PetriNet:
     """Wire up the Concurrency Cafe topology and return the (unstarted) PetriNet.
 
-    Flow: ``P_Ticket_Line`` -> (weigh & grind, gated by the dose guard, using a scale + the
-    grinder) -> ``P_Ground_Coffee`` / ``P_Milk_Queue`` in parallel -> (pull shot / steam milk)
-    -> ``P_Order_Tray`` (waits for both a shot and a milk) -> (serve) -> ``P_Served``. A ticket
+    Flow: ``P_Ticket_Line`` -> (weigh & grind, gated by the dose guard, using a scale + a
+    grinder) -> ``P_Ground_Coffee`` / ``P_Milk_Queue`` in parallel -> (pull shot, using an
+    espresso group / steam milk, using a steam wand) -> ``P_Order_Tray`` (waits for both a
+    shot and a milk, and for the counter to settle) -> (serve) -> ``P_Served``. A ticket
     whose declared dose misses the tolerance band is reworked (``T_Rework_Dose``) and
     returned to the back of ``P_Ticket_Line`` rather than ever reaching the grinder. Botched
     shots are dead-lettered to ``P_Trash_Can``.
@@ -237,6 +271,25 @@ def build_cafe(
             everything, and `None` removes the guard entirely (`T_Weigh_And_Grind.guard` is
             left unset and `T_Rework_Dose` is omitted), reproducing the cheap guard-free
             binding-search path for A/B comparison.
+        grinders: Number of burr grinders behind the counter (default 2: an espresso grinder
+            plus a decaf grinder). ``T_Weigh_And_Grind`` was previously the pipeline's only
+            source of work *and* gated behind a ``capacity=1`` paced resource, so sustained
+            concurrency was ~1 regardless of ``max_workers``. Raising this is what actually
+            lifts the dominant serializer — see the module's "real parallelism" note.
+        work_secs: Wall-clock seconds each station's action sleeps before returning, modelling
+            the physical time a barista actually spends at that station (as opposed to
+            ``pacing_secs``, which models the *machine's* recovery time). Default ``0.0``
+            preserves the original instant-action behaviour, so the logical-clock throughput
+            benchmark is unaffected in kind. A nonzero value makes parallel speedup across
+            the thread pool observable, because ``time.sleep`` releases the GIL.
+        tray_settle_secs: How long ``T_Serve_Drink`` waits for no new arrivals on
+            ``P_Order_Tray`` before serving — the barista pausing a beat to see if the rest
+            of the order lands before bussing the tray. Default is a small nonzero value so
+            the settle-window branch in ``benchmarks/_driver.py`` actually executes.
+        tray_bound: Optional k-bound on ``P_Order_Tray`` — the counter physically fits only
+            this many cups at once. Default 6 (three drinks' worth) gives genuine but
+            non-crippling back-pressure: once full, ``T_Pull_Shot``/``T_Steam_Milk`` block
+            until ``T_Serve_Drink`` clears space. ``None`` removes the bound.
     """
     places = [
         # Unbounded FIFO: the register never turns a customer away, it just queues them.
@@ -244,13 +297,20 @@ def build_cafe(
         # A shared pool of 3 scales; a barista grabs one to weigh the dose and returns it
         # immediately (the engine auto-returns consumed-but-unreturned resource tokens).
         ResourcePlace("P_Digital_Scales", capacity=3),
-        # The single grinder is unavailable for 8s after dispensing while the burrs spin
-        # down and the chute is brushed out — models a hard rate limit on throughput.
-        PacedResourcePlace("P_Burr_Grinder", capacity=1, pacing_secs=pacing_secs),
+        # `grinders` burr grinders (default 2: espresso + decaf), each unavailable for
+        # `pacing_secs` after dispensing while the burrs spin down and the chute is brushed
+        # out — models a hard rate limit on throughput, now shared across two machines
+        # instead of serializing every ticket behind a single one.
+        PacedResourcePlace("P_Burr_Grinder", capacity=grinders, pacing_secs=pacing_secs),
         # Grounds waiting for a barista to pull a shot; restricted colour catches wiring bugs.
         Place("P_Ground_Coffee", color_set={"ground_coffee"}),
         # Milk tickets waiting to be steamed; restricted colour catches wiring bugs.
         Place("P_Milk_Queue", color_set={"milk_ticket"}),
+        # A two-group espresso machine head: two shots can pull at once instead of
+        # serializing every pull through a single group.
+        ResourcePlace("P_Espresso_Machine", capacity=2),
+        # Two steam wands, for the same reason.
+        ResourcePlace("P_Steam_Wand", capacity=2),
         # A drink isn't handed off until BOTH the espresso shot and the steamed milk have
         # landed on the tray — threshold=2 encodes that rendezvous directly on the place.
         ThresholdPlace("P_Order_Tray", threshold=2),
@@ -260,6 +320,11 @@ def build_cafe(
         # net's error_place so failed T_Pull_Shot firings dead-letter here automatically.
         SinkPlace("P_Trash_Can", keep_last=10),
     ]
+    # ThresholdPlace's constructor doesn't expose `bound` (threshold and k-bound are
+    # orthogonal CPN concepts), but `bound` is a plain, settable attribute inherited from
+    # Place — the counter fits only so many cups regardless of the rendezvous threshold.
+    tray = next(p for p in places if p.name == "P_Order_Tray")
+    tray.bound = tray_bound
 
     dose_low, dose_high = (
         (_DOSE_TARGET_G - dose_tolerance_g, _DOSE_TARGET_G + dose_tolerance_g)
@@ -276,7 +341,7 @@ def build_cafe(
                 InputArc("P_Burr_Grinder"),
             ],
             outputs=[OutputArc("P_Ground_Coffee"), OutputArc("P_Milk_Queue")],
-            action=_weigh_and_grind,
+            action=_with_work(work_secs, _weigh_and_grind),
             # Short timeout: weighing and dosing is a quick, bounded action in this demo.
             action_timeout_secs=1.0,
             # Dose tolerance gate: a barista won't grind a dose outside spec. This is the
@@ -287,14 +352,28 @@ def build_cafe(
             guard=_make_dose_guard(dose_low, dose_high) if dose_tolerance_g is not None else None,
             # Mobile-pickup tickets jump the in-store line: PRIORITY enumerates satisfying
             # bindings and picks the one minimizing binding_priority_key.
+            #
+            # ...but only while the line is short. `binding_search_limit` (default 1000) is
+            # spent against raw Cartesian *product* tuples, so this transition's other arcs
+            # divide the usable ticket depth: effective_depth ~= limit / (scales x grinders).
+            # Measured on this topology, mobile-pickup preference holds to depth 166 and is
+            # silently gone by 170 (1000 / (3 x 2)); with grinders=1 it held to 333 (1000 / 3).
+            # Past that the scan still runs and still costs, it just stops finding the token
+            # it is looking for and falls back to insertion order — no error, no warning.
+            # That is issue #18 (the bug is budget *accounting*, not the limit itself), and
+            # raising `grinders` to buy parallelism makes it bite twice as early. Note the
+            # throughput benchmark runs at 100/500/2000 orders, i.e. entirely past the cutoff:
+            # its numbers measure the cost of the scan honestly, but not this preference.
             binding_policy=BindingPolicy.PRIORITY,
             binding_priority_key=_mobile_pickup_first,
         ),
         Transition(
             name="T_Pull_Shot",
-            inputs=[InputArc("P_Ground_Coffee")],
+            # A shot also needs a free group head on the espresso machine — two groups
+            # mean two shots can pull in parallel instead of serializing behind one.
+            inputs=[InputArc("P_Ground_Coffee"), InputArc("P_Espresso_Machine")],
             outputs=[OutputArc("P_Order_Tray")],
-            action=_make_pull_shot(channel_failure_rate, channel_seed),
+            action=_with_work(work_secs, _make_pull_shot(channel_failure_rate, channel_seed)),
             # A stuck/uneven pull shouldn't hang the bar for long.
             action_timeout_secs=0.5,
             # One retry for a channeled shot, then dead-letter — a barista doesn't keep
@@ -303,23 +382,28 @@ def build_cafe(
         ),
         Transition(
             name="T_Steam_Milk",
-            inputs=[InputArc("P_Milk_Queue")],
+            # Steaming also needs a free steam wand — two wands mean two milks can steam
+            # at once instead of serializing behind one.
+            inputs=[InputArc("P_Milk_Queue"), InputArc("P_Steam_Wand")],
             # Route the finished milk by colour so oat vs. dairy stays visible in the
             # event log even though both simply land on the shared tray.
             outputs=[
                 OutputArc.on_color("oat_milk", "P_Order_Tray"),
                 OutputArc.on_color("dairy_milk", "P_Order_Tray"),
             ],
-            action=_steam_milk,
+            action=_with_work(work_secs, _steam_milk),
             action_timeout_secs=0.5,
         ),
         Transition(
             name="T_Serve_Drink",
             # Threshold=2 on the tray means this only becomes enabled once a shot AND a
             # milk are both present; count=2 drains exactly one drink's worth per firing.
-            inputs=[InputArc("P_Order_Tray", count=2)],
+            # settle_secs makes the barista wait a beat after the last arrival to see if
+            # the rest of the order lands, rather than snatching the tray the instant it
+            # reads "full enough".
+            inputs=[InputArc("P_Order_Tray", count=2, settle_secs=tray_settle_secs)],
             outputs=[OutputArc("P_Served")],
-            action=_serve_drink,
+            action=_with_work(work_secs, _serve_drink),
             action_timeout_secs=0.5,
         ),
     ]
@@ -334,7 +418,7 @@ def build_cafe(
                 # without T_Rework_Dose needing to enumerate for it.
                 inputs=[InputArc("P_Ticket_Line")],
                 outputs=[OutputArc("P_Ticket_Line")],
-                action=_make_rework_dose(dose_low, dose_high),
+                action=_with_work(work_secs, _make_rework_dose(dose_low, dose_high)),
                 action_timeout_secs=0.5,
                 # String guard (the complement of T_Weigh_And_Grind's callable one) so this
                 # demo exercises both guard flavours: string guards run through

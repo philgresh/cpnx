@@ -43,10 +43,29 @@ class TestConcurrencyCafeBuilds:
         assert isinstance(net.places["P_Digital_Scales"], ResourcePlace)
         assert net.places["P_Digital_Scales"].capacity == 3
         assert isinstance(net.places["P_Burr_Grinder"], PacedResourcePlace)
+        assert net.places["P_Burr_Grinder"].capacity == 2  # default `grinders=2`
+        assert isinstance(net.places["P_Espresso_Machine"], ResourcePlace)
+        assert net.places["P_Espresso_Machine"].capacity == 2
+        assert isinstance(net.places["P_Steam_Wand"], ResourcePlace)
+        assert net.places["P_Steam_Wand"].capacity == 2
         assert isinstance(net.places["P_Order_Tray"], ThresholdPlace)
         assert net.places["P_Order_Tray"].threshold == 2
+        assert net.places["P_Order_Tray"].bound == 6  # default `tray_bound=6`
         assert isinstance(net.places["P_Served"], SinkPlace)
         assert isinstance(net.places["P_Trash_Can"], SinkPlace)
+
+    def test_grinders_kwarg_sizes_the_burr_grinder_pool(self):
+        net = build_cafe(grinders=1)
+        assert net.places["P_Burr_Grinder"].capacity == 1
+
+    def test_tray_bound_kwarg_sets_the_order_tray_bound(self):
+        net = build_cafe(tray_bound=None)
+        assert net.places["P_Order_Tray"].bound is None
+
+    def test_serve_drink_arc_carries_the_configured_settle_secs(self):
+        net = build_cafe(tray_settle_secs=1.5)
+        arc = next(a for a in net.transitions["T_Serve_Drink"].inputs if a.place == "P_Order_Tray")
+        assert arc.settle_secs == 1.5
 
 
 class TestConcurrencyCafeRuns:
@@ -64,8 +83,17 @@ class TestConcurrencyCafeRuns:
             remaining = len(net.marking["P_Ticket_Line"])
             assert remaining < len(ORDERS), "no order left the ticket line — cafe never fired"
 
-            # Every ticket that left the line was either served, binned, or is still in flight
-            # somewhere downstream — nothing should have vanished.
+            # A real conservation-derived bound (not a tautology): each grind firing produces
+            # exactly one milk ticket (always steamed successfully, never trashed) and exactly
+            # one grounds token (which becomes either one espresso tray arrival or one trashed
+            # shot). So total tray arrivals == 2*grind_firings - trashed, and since a served
+            # drink drains exactly 2 tray tokens, 2*served <= 2*grind_firings - trashed. Grind
+            # firings can never exceed the number of orders (rework mutates a ticket in place
+            # rather than creating new ones, and a ticket is ground exactly once), so
+            # grind_firings <= len(ORDERS), giving 2*served + trashed <= 2*len(ORDERS).
             served = net.places["P_Served"].stats()["absorbed"]
             trashed = net.places["P_Trash_Can"].stats()["absorbed"]
-            assert served + trashed >= 0  # sanity: sinks are readable and counting
+            assert 2 * served + trashed <= 2 * len(ORDERS), (
+                f"served={served}, trashed={trashed} exceed what {len(ORDERS)} orders could "
+                "possibly have produced — a token was double-counted or conjured from nowhere"
+            )
