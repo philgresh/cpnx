@@ -7,9 +7,15 @@ reports how much engine CPU that costs.
 
 The net keeps its real structural friction but runs on a **logical clock** (see ``_driver.py``),
 so the grinder's 8-second cooldown blocks work (real back-pressure) without burning 8 real
-seconds. Channeling failures are turned off (``channel_failure_rate=0.0``) so the run is
-deterministic — it draws no RNG, so step counts are byte-identical across runs and only
-wall-clock timing varies.
+seconds. Channeling failures are turned off (``channel_failure_rate=0.0``) and the net is
+seeded (``NET_SEED``), so step counts are byte-identical across runs and only wall-clock timing
+varies.
+
+Turning channeling off is *not* on its own enough to make the run deterministic, and an earlier
+revision of this file claimed it was ("it draws no RNG"). It does: every cafe transition shares
+the default ``priority``, so each ``step()`` breaks the tie with ``_rng.choice`` over the
+enabled set. Unseeded that comes from OS entropy, and the step count wandered ~2% run to run —
+enough that a us/step figure silently compared runs which had done different amounts of work.
 
 Sweeps two knobs that drive engine cost:
 
@@ -50,6 +56,13 @@ ORDER_COUNTS = (10, 100, 500, 2000)
 #: Seed for the channeling regime, so retry/dead-letter runs reproduce step-for-step.
 CHANNEL_SEED = 99
 
+#: Seed for the *net's own* RNG. Not optional for a benchmark: every cafe transition shares the
+#: default `priority`, so each step() picks among enabled transitions with `_rng.choice`, and
+#: unseeded that draw comes from OS entropy. The step count then wanders run to run (~2% over
+#: 200 orders), which turns every us/step figure into a comparison between runs that did
+#: different amounts of work. This file previously claimed the run "draws no RNG"; it does.
+NET_SEED = 4242
+
 
 # Dose sequence: 3 of every 10 tickets (indices 3, 6, 9 of each cycle) declare a weight
 # outside the default [17, 19] tolerance band, so T_Weigh_And_Grind's guard actually rejects
@@ -78,6 +91,7 @@ def _run_once(n_orders: int, dose_tolerance_g: float | None, channel_rate: float
     with build_cafe(
         channel_failure_rate=channel_rate,
         channel_seed=CHANNEL_SEED,
+        seed=NET_SEED,
         max_workers=1,
         dose_tolerance_g=dose_tolerance_g,
     ) as net:

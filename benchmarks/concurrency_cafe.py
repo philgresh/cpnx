@@ -238,6 +238,7 @@ def build_cafe(
     work_secs: float = 0.0,
     tray_settle_secs: float = 0.05,
     tray_bound: int | None = 6,
+    seed: int | None = None,
 ) -> PetriNet:
     """Wire up the Concurrency Cafe topology and return the (unstarted) PetriNet.
 
@@ -440,6 +441,14 @@ def build_cafe(
         # Fast rollback so a channeled shot's grounds are eligible for a retry quickly
         # instead of the 1s default — keeps this demo snappy.
         retry_delay=0.2,
+        # Every transition here shares the default `priority`, so on each step() the scheduler
+        # picks among all enabled transitions with `_rng.choice`. Unseeded, that draws from OS
+        # entropy and the *step count* wanders run to run (measured: 919-938 over five 200-order
+        # runs, ~2%), which silently makes every us/step comparison a comparison between runs
+        # that did different amounts of work. Seeding pins it — the same five runs then return
+        # 927 every time. Benchmarks must pass a fixed seed; `None` is available for the demo,
+        # where a bit of variety is the point.
+        seed=seed,
     )
 
 
