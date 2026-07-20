@@ -22,6 +22,7 @@ actions it measures nothing but the GIL.
 Native stdlib only — no dependencies, no test runner.
 """
 
+import math
 import time
 from dataclasses import dataclass
 
@@ -59,7 +60,18 @@ def _next_boundary(net: PetriNet) -> float | None:
             place = net.places.get(arc.place)
             if place is None or isinstance(place, SinkPlace) or len(place) == 0:
                 continue
-            boundary = getattr(place, "last_deposit_time_model", 0.0) + arc.settle_secs
+            last_deposit = getattr(place, "last_deposit_time_model", 0.0)
+            if now - last_deposit >= arc.settle_secs:
+                continue  # window already satisfied; nothing to wait for
+            # The window is still pending, so its boundary is mathematically in the future —
+            # but `last_deposit + settle_secs` can *round* to exactly `now` in float64, and
+            # the model clock runs on `time.monotonic()` values around 7.4e6 where one ULP is
+            # ~1e-9. When that happens the driver sees `boundary <= now`, concludes there is
+            # nothing to wait for, and stops with the window still unmet — while the engine's
+            # own `elapsed >= settle_secs` is *also* false by a fraction of a nanosecond. The
+            # run strands (observed: 6 tokens stuck on the tray, is_quiescent() False).
+            # Stepping to the next representable float guarantees forward progress.
+            boundary = max(last_deposit + arc.settle_secs, math.nextafter(now, math.inf))
             if boundary > now and (best is None or boundary < best):
                 best = boundary
     return best
