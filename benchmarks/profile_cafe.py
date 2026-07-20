@@ -27,13 +27,31 @@ from cpnx import Token  # noqa: E402
 
 DEFAULT_ORDERS = 500
 
+#: Must match bench_cafe_throughput.py: 3 of every 10 tickets declare a weight outside the
+#: default [17, 19] band. A constant `weight_g: 18` (as this file used to deposit) makes the dose
+#: guard accept *every* candidate and T_Rework_Dose never fire, so the profile would rank the
+#: guard path against an acceptance probability of 1 — the cheapest case, and not the one the
+#: throughput benchmark measures.
+_DOSE_CYCLE = {3: 16, 6: 21, 9: 20}
+
+#: Seeded for the same reason the throughput benchmark is: every cafe transition shares the
+#: default priority, so an unseeded net picks among enabled transitions with OS entropy and the
+#: step count — and therefore the call counts below — wanders run to run.
+NET_SEED = 4242
+
 
 def _workload(n_orders: int) -> None:
-    with build_cafe(channel_failure_rate=0.0, max_workers=1) as net:
+    with build_cafe(channel_failure_rate=0.0, max_workers=1, seed=NET_SEED) as net:
         for i in range(n_orders):
             net.deposit(
                 "P_Ticket_Line",
-                Token(payload={"weight_g": 18, "dairy_free": i % 2 == 0, "mobile_pickup": i % 3 == 0}),
+                Token(
+                    payload={
+                        "weight_g": _DOSE_CYCLE.get(i % 10, 18),
+                        "dairy_free": i % 2 == 0,
+                        "mobile_pickup": i % 3 == 0,
+                    }
+                ),
             )
         drive_to_quiescence(net)
 

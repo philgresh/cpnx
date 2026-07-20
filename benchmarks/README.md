@@ -7,6 +7,7 @@ installing the package.
 ```bash
 python benchmarks/bench_enablement.py
 python benchmarks/bench_cafe_throughput.py
+python benchmarks/bench_cafe_concurrency.py
 ```
 
 Two tiers:
@@ -22,11 +23,15 @@ Two tiers:
 
 | Script | Tier | Measures |
 | --- | --- | --- |
-| `bench_enablement.py` | micro | Cost of one `_is_transition_enabled` check (and `_resolve_binding` across binding policies) for a transition carrying a **string** guard and a **string** input-arc expression — the per-transition, per-`step()` hot path. |
-| `bench_cafe_throughput.py` | macro | End-to-end throughput (`us/order`, `us/step`) of the cafe net processing N orders, swept over `N` and `max_workers`. Reveals how per-step engine cost scales with marking depth. |
+| `bench_enablement.py` | micro | Cost of one `_is_transition_enabled` check (and `_resolve_binding` across binding policies), for a **string** guard and a **callable** guard computing the identical predicate — the per-transition, per-`step()` hot path, and the dispatch gap between the two flavours. |
+| `bench_cafe_throughput.py` | macro | End-to-end throughput (`us/order`, `us/step`) of the cafe net processing N orders, swept over `N` and the binding regime. Reveals how per-step engine cost scales with marking depth. Single-worker by construction. |
+| `bench_cafe_concurrency.py` | macro | Wall-clock **makespan** against `max_workers`, swept over queue depth and guard regime. The only script here that says anything about parallelism. |
 | `profile_cafe.py` | dev tool | `cProfile` a large cafe run and rank engine functions by cumulative / own time. Not a committed benchmark — a pointer to what to optimise. |
 
-Supporting module: `_driver.py` — the shared **logical-clock driver** (see below).
+Supporting module: `_driver.py` — two drivers, `drive_to_quiescence` (logical
+clock, deliberately serialized, measures engine CPU) and `drive_saturating`
+(wall clock, deliberately concurrent, measures makespan). They answer different
+questions and are not interchangeable; see the module docstring.
 
 ## Timing the engine, not `time.sleep`
 
@@ -50,21 +55,37 @@ one machine (workers=1, so read the *shape* and the ratio, not the absolute µs)
 
 | orders | steps (free / guarded) | µs/step guard-free | µs/step guarded | guarded ÷ free |
 | ---: | ---: | ---: | ---: | ---: |
-| 10 | 40 / 43 | 78.8 | 129.8 | 1.6× |
-| 100 | 400 / 430 | 104.0 | 474.0 | 4.6× |
-| 500 | 2000 / 2150 | 195.6 | 1791.4 | 9.2× |
-| 2000 | 8000 / 8600 | 285.8 | 2526.1 | 8.8× |
+| 10 | 40 / 43 | 101.8 | 158.4 | 1.6× |
+| 100 | 400 / 430 | 133.5 | 878.0 | 6.6× |
+| 500 | 2000 / 2150 | 270.9 | 3012.4 | 11.1× |
+| 2000 | 8000 / 8600 | 383.6 | 3999.4 | 10.4× |
 
-Min of three sweeps on an otherwise-idle Apple M4 Pro / CPython 3.14.3 (min is
-the right estimator here — measurement noise only ever *adds* time). Run-to-run
-spread was ≤2% for every cell except guarded n=500 (5.9%) and guard-free n=10
-(27%); the n=10 row is a 3 ms workload dominated by fixed setup cost, so treat
-it as indicative only. Everything else is comfortably above the noise floor.
+Min of three sweeps, one machine, one sitting (Apple M4 Pro / CPython 3.14.3);
+min is the right estimator because measurement noise only ever *adds* time.
+Run-to-run spread was 5–8% on this pass, higher than an earlier quieter run
+managed, so treat differences under ~10% as unresolved. The n=10 row is a ~4 ms
+workload dominated by fixed setup cost — indicative only.
 
-The channeling table below came from a later, *contended* run, so its absolute
-µs are not comparable with this table — only the within-run ratios in its last
-column are meaningful. Re-run the whole sweep on an idle machine if you want one
-unified set of figures.
+**Step counts are now identical across every repeat**, which was not true of any
+previously published table here. Two instrument defects had to be fixed first:
+
+- The net was never seeded. Every cafe transition shares the default `priority`,
+  so each `step()` breaks the tie with `_rng.choice`, and `build_cafe` left
+  `PetriNet` on OS entropy — step counts wandered ~2% run to run (919/936/917/
+  928/938 over five 200-order runs). Since µs/step divides by that count, every
+  earlier figure compared runs that had done different amounts of work, and any
+  effect under ~2% was unresolvable in principle.
+- The logical driver stranded on settle-window boundaries. Adding `settle_secs`
+  to the tray arc exercised a branch of `_driver.py` that no cafe arc had ever
+  triggered, and it turned out `last_deposit + settle_secs` can round to exactly
+  `now` in float64 at `time.monotonic()` magnitudes — the driver then saw
+  nothing to wait for and stopped while the window was still unmet. Observed at
+  100 orders guard-free: 6 tokens stranded on the tray, `is_quiescent()` False,
+  97 of 100 orders served, and the benchmark printed its table anyway.
+
+The clearest sign both are fixed: step counts are now exactly 4 per order
+guard-free and 4.3 guarded, the linearity this document has always claimed while
+the measured numbers quietly drifted above it.
 
 > **These figures supersede an earlier guard-free-only table.** The cafe had no
 > `guard=` anywhere, so the old numbers measured the *cheapest possible* binding
@@ -79,15 +100,15 @@ unified set of figures.
   `binding_search_limit` (default 1000)**, so the workload is linear with a fat
   constant, not quadratic. The 2000-order row deliberately crosses that cap —
   and the guarded ratio flattening from 9.2× to 8.8× there is that cap working.
-- **`max_workers` is no longer swept, and the old flat result meant nothing.**
-  An earlier revision swept it, found no difference, and reported that as
-  evidence that dispatch overhead dominates parallelism. That conclusion was
-  unfounded: `drive_to_quiescence` awaits in-flight completion after every
-  `step()` (it must, so an action's outputs can enable the next firing before
-  the clock advances), so at most one action is ever in flight and the pool
-  size *cannot* matter. The benchmark never gave the pool anything to
-  parallelise. Measuring real concurrency needs a different driver, not a
-  different knob — nothing here says anything about cpnx's parallelism.
+- **`max_workers` is not swept here, and the old flat result meant nothing.**
+  An earlier revision swept it against *this* driver, found no difference, and
+  reported that as evidence that dispatch overhead dominates parallelism. That
+  conclusion was unfounded: `drive_to_quiescence` awaits in-flight completion
+  after every `step()` — deliberately, since it measures engine CPU and the
+  seeded channeling regime reproduces only because of it — so at most one action
+  is ever in flight and the pool size *cannot* matter. The benchmark never gave
+  the pool anything to parallelise. Concurrency has its own driver and its own
+  script now; see `bench_cafe_concurrency.py` and the section below.
 
 ### Third regime: channeling (retries and dead-letters)
 
@@ -99,20 +120,52 @@ reproducible. Within one run (workers=1, guarded, 15% channel rate):
 
 | orders | steps | served | trashed | µs/step vs. guarded |
 | ---: | ---: | ---: | ---: | ---: |
-| 100 | 442 | 99 | 2 | 0.99× |
-| 500 | 2217 | 494 | 11 | 0.99× |
-| 2000 | 8878 | 1975 | 50 | 0.96× |
+| 100 | 442 | 99 | 2 | 0.97× |
+| 500 | 2214 | 493 | 13 | 1.01× |
+| 2000 | 8874 | 1974 | 51 | 0.99× |
 
-Dead-letter rate lands at 50/2000 = 2.5% against a 15% channel rate, which is
-the expected 0.15² — `max_retries=1` means a shot must channel *twice* to be
-binned. Served reconciles too: 1950 surviving espressos + 2000 milks = 3950
-components = 1975 two-component drinks.
+Same sweep as the table above — all three regimes now come from one run on one
+machine, rather than being stitched together from two.
+
+Dead-letter rate lands at 51/2000 = 2.6% against a 15% channel rate, close to
+the expected 0.15² = 2.25% — `max_retries=1` means a shot must channel *twice*
+to be binned.
 
 Note the retry path makes µs/**step** slightly *cheaper* while making the run
 strictly more expensive overall. Retries fire against the shallow
 `P_Ground_Coffee` queue, not the deep ticket line, so they add cheap steps that
 dilute the average. This is the clearest argument for reading us/step only
 within a fixed regime, and never as a cross-regime efficiency score.
+
+### Does `max_workers` help? Only until the guard search gets deep
+
+`bench_cafe_concurrency.py` answers what the logical driver structurally cannot.
+It drives the net on the **wall** clock without ever awaiting, so firings stack
+up to `max_workers`, and it gives each station real work (`work_secs`) because
+instant pure-Python actions are GIL-bound — a flat curve there would measure
+CPython, not cpnx. Speedups are against that regime's own `workers=1`:
+
+| orders | regime | w=2 | w=4 | w=8 |
+| ---: | --- | ---: | ---: | ---: |
+| 60 | guard-free | 2.00× | 3.93× | 6.93× |
+| 300 | guard-free | 2.01× | 4.03× | 7.00× |
+| 60 | guarded | 1.99× | 3.86× | 6.04× |
+| 300 | guarded | 1.80× | 1.63× | 1.72× |
+
+**cpnx parallelises well — until a guard is in the way of a deep candidate set.**
+The guard-free rows are flat across depths, which is the control that says the
+collapse is real and not a loaded machine. The guarded row at 300 orders is not
+merely sublinear: it is *non-monotonic*. Going from 2 workers to 4 makes the run
+slower. That is lock contention, not the GIL.
+
+The mechanism is `step()`: it runs `_select_transition_to_fire()` — which
+evaluates a guard per candidate binding — entirely inside `with self._lock`, and
+commit and deposit take the same lock. Guard cost therefore scales with queue
+depth while the interval each worker needs serving in (`work_secs / workers`)
+does not, so there is a crossover, and past it extra workers only add contention.
+
+Note how easily this is missed: at 60 orders the guarded arm scales 6.04× against
+6.93×, which reads as "guards cost a little". Sweep the depth before concluding.
 
 ### The guard cost is dispatch, not evaluation
 
@@ -133,24 +186,54 @@ Measured in isolation on the same machine:
 | via `_call_expr` | 10.007 µs |
 | **overhead** | **9.9 µs (112×)** |
 
-So ~99% of guard cost is the timeout sandbox, not the user's predicate — and
-because it is charged *per candidate binding* rather than per firing, it scales
-with search depth. Caching the guard's AST cannot help; the thread hop happens
-after any such cache. Both guard flavours route through it (string guards via
-`_eval_expression`, callables directly), so neither avoids the cost. A fast path
-that runs trivially-cheap guards inline when no timeout is configured looks like
-a much larger lever than anything in the candidate-enumeration code — but it
-trades away the I/O-in-a-guard protection `_call_expr` exists to provide, so it
-is a design decision, not a mechanical optimisation. Not attempted here.
+So ~99% of the *isolated* call is the timeout sandbox rather than the user's
+predicate. **Do not read 112× as an end-to-end figure** — it is the ratio around
+a bare predicate. Measured through the real engine path by `bench_enablement.py`,
+fixed per-call work (arc-pool gathering, availability and settle checks) dilutes
+it considerably, and the result depends on the binding policy:
 
-Hotspot ranking by own time, guarded (was: `_iter_candidate_bindings` first,
-`_check_transition_guard` 8th at ~1.4% when guard-free):
+| path | callable ÷ string |
+| --- | ---: |
+| `_is_transition_enabled`, LEGACY / FIRST | 2.0–2.6× |
+| `_resolve_binding`, LEGACY / FIRST | 2.0–2.6× |
+| `_resolve_binding`, RANDOM / PRIORITY | **15–16×** |
 
-1. `_call_expr` — 0.353 s own, **8.258 s cumulative**, 334 K calls
-2. `_eval_expression` — 0.200 s own, 8.492 s cumulative
-3. `_iter_satisfying_bindings` — 0.195 s own, 9.057 s cumulative
-4. `_iter_candidate_bindings` — 0.193 s own, 0.204 s cumulative
-5. `_reduce_min_key` — 0.141 s own, 9.640 s cumulative
+Both numbers are real; they measure different things. The useful conclusion is
+that the cost concentrates in the policies that enumerate the *whole* candidate
+set instead of short-circuiting at the first satisfying binding — which is where
+the cafe's `PRIORITY` transition sits. The RANDOM gap reconciles arithmetically:
+200 tokens × ~11 µs round trip accounts for essentially all of it.
+
+**The two flavours do not cost the same, contrary to what this file used to say.**
+`_eval_expression` sends strings to `SandboxEvaluator.evaluate_compiled` *inline*
+and only callables to `_call_expr`. Strings never pay the thread hop.
+
+Caching the guard's AST cannot help either flavour: for callables the thread hop
+happens after any such cache, and strings are already compiled once. A fast path
+that runs verified callables inline is a much larger lever than anything in the
+candidate-enumeration code — but it trades away the I/O-in-a-guard time bound
+`_call_expr` exists to provide, so it is a design decision, not a mechanical
+optimisation. Not attempted here.
+
+Hotspot ranking by own time, 500 orders guarded (was: `_iter_candidate_bindings`
+first, `_check_transition_guard` 8th at ~1.4% when guard-free):
+
+1. `_call_expr` — 0.621 s own, **14.290 s cumulative**, 571 K calls
+2. `_eval_expression` — 0.353 s own, 14.700 s cumulative, 575 K calls
+3. `_iter_satisfying_bindings` — 0.349 s own, 15.710 s cumulative
+4. `_iter_candidate_bindings` — 0.347 s own, 0.365 s cumulative
+5. `_check_transition_guard` — 0.167 s own, 14.866 s cumulative
+
+`_call_expr` is 84% of the 17.06 s run by cumulative time but 3.6% by own time:
+the work is the thread round-trip, not the predicate. It is charged **per
+candidate binding** — 571 K calls against 2 900 `step()`s, i.e. ~197 guard
+evaluations per step — so it scales with search depth, and every one of those
+round-trips holds the global engine lock.
+
+An earlier ranking here was profiled against a constant `weight_g: 18`, which the
+dose guard accepts unconditionally, so `T_Rework_Dose` never fired and the guard
+ran at acceptance probability 1. `profile_cafe.py` now deposits the same ~30%
+out-of-spec mix as the throughput benchmark.
 
 ## How to read the numbers
 
@@ -165,6 +248,28 @@ git checkout your-branch   && python benchmarks/bench_enablement.py   # candidat
 ```
 
 Compare the two and report the ratio (e.g. "2× faster"), not the raw µs.
+
+## Correction: the `count==1` fast path is ~1%, not 3.3%
+
+Commit `03b43fb` ("perf: fast path for count==1 arcs") is documented as **~3.3%
+faster** with "baseline noise ~0.4%". Re-measured here, min-of-five, on a seeded
+net and a driver that no longer strands:
+
+| regime | with fast path | without | delta |
+| --- | ---: | ---: | ---: |
+| guard-free, 2000 orders | 3167.3 ms | 3202.3 ms | **1.1%** |
+| guarded, 500 orders | 8539.4 ms | 8546.6 ms | **0.08%** |
+
+Neither the original headline nor its noise estimate holds. The 3.3% was measured
+guard-free (the cheapest possible binding path, before guards existed in the
+fixture) **and** on an unseeded net whose step counts were themselves varying
+~2% — so the claimed effect sat inside an unquantified band larger than itself.
+
+The change is behaviour-preserving: `tests/test_seeded_determinism.py` passes
+with the fast path both present and reverted, which is a much stronger check than
+the ad-hoc fingerprint used at the time. It is kept because it is nine lines and
+directionally faster on the guard-free path. But treat ~1% guard-free / ~0%
+guarded as the honest figure, not 3.3%.
 
 ## Scope
 
