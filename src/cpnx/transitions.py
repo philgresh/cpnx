@@ -1,7 +1,8 @@
 import enum
+import typing
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, ClassVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar
 
 from cpnx.certification import is_inline_safe
 from cpnx.sandbox import verify_callable_purity
@@ -38,6 +39,50 @@ def _inline_safe_for(value) -> bool:
     flag is immaterial — reported ``False``.
     """
     return is_inline_safe(value) if callable(value) else False
+
+
+def _reject_non_bool_return(field: str, value) -> None:
+    """Reject a boolean-predicate callable whose *return annotation* is not ``bool``.
+
+    Enforces the CPN guard contract ``Type[G(t)] = Bool`` (see
+    ``docs/cpn-theory-audit.md``) at construction time, for the two callables that must
+    return a boolean: a transition ``guard`` and an ``OutputArc.expression`` (skip-arc
+    predicate). ``InputArc.expression`` returns ``list[Token]`` and is never passed here.
+
+    The check is deliberately *conservative* — it only fires on an unambiguous mismatch,
+    so it never punishes correct code:
+
+    - **Unannotated → pass.** Lambdas cannot carry a return annotation, so the common
+      lambda predicate is always accepted untouched; only an annotated ``def`` engages
+      the check.
+    - **``bool`` / ``Any`` / a union containing ``bool`` → pass.** ``bool`` is the
+      contract; ``Any`` is a deliberate opt-out; ``bool | None`` / ``Optional[bool]``
+      *can* return ``bool``, so they are tolerated.
+    - **Unresolvable → pass.** A forward reference, ``TYPE_CHECKING``-only name, or any
+      other resolution failure never breaks construction — the annotation is advisory.
+    - **Everything else (``-> int``, ``-> str``, ``-> None``, some other type) → raise
+      ``TypeError``.**
+    """
+    if not callable(value):
+        return
+    try:
+        return_type = typing.get_type_hints(value).get("return", _UNANNOTATED)
+    except Exception:  # unresolvable annotation (forward ref, TYPE_CHECKING import, ...)
+        return
+    if return_type is _UNANNOTATED or return_type is bool or return_type is Any:
+        return
+    if bool in typing.get_args(return_type):  # bool | None, Optional[bool], Union[bool, ...]
+        return
+    raise TypeError(
+        f"{field} must return bool (CPN guard contract Type[G(t)] = Bool); its annotated "
+        f"return type is {getattr(return_type, '__name__', return_type)!r}. "
+        "Correct the annotation to '-> bool' (or drop it)."
+    )
+
+
+#: Sentinel distinguishing "no return annotation" from an annotation that is literally
+#: ``None`` (i.e. ``-> None``, which is a real mismatch and must be rejected).
+_UNANNOTATED = object()
 
 
 class BindingPolicy(enum.Enum):
@@ -157,6 +202,9 @@ class OutputArc:
                     (no tokens deposited) when it returns `False`. `None`
                     (default) means the arc always fires. A pure `Callable`;
                     certified callables run inline (see [`cpnx.certification`]).
+                    A boolean predicate: if annotated, its return type is checked to
+                    be `bool` at construction (a non-`bool` annotation raises
+                    `TypeError`); unannotated callables are accepted unchecked.
     """
 
     place: str
@@ -171,6 +219,7 @@ class OutputArc:
             _reject_string_expression("expression", value)
             if callable(value):
                 verify_callable_purity(value)
+                _reject_non_bool_return("OutputArc.expression", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         super().__setattr__(name, value)
 
@@ -219,7 +268,11 @@ class Transition:
         guard: CPN transition guard — a `Callable[[list[Token]], bool]` (a string raises
                `TypeError`). Evaluated while holding the engine lock; return `False` to
                block firing. `None` (default) means always enabled. A certified guard
-               runs inline; an uncertified one runs on the timeout-bounded pool.
+               runs inline; an uncertified one runs on the timeout-bounded pool. Enforces
+               the CPN guard contract `Type[G(t)] = Bool`: if the callable is annotated,
+               its return type is checked to be `bool` at construction and a non-`bool`
+               annotation (e.g. `-> int`) raises `TypeError`; unannotated guards (including
+               every lambda) are accepted unchecked.
         priority: Lower value fires first when multiple transitions are enabled. Defaults to 10.
         action_timeout_secs: Maximum wall-clock seconds the action may run. When `None`
                (default), the action runs without a deadline — fully backward compatible.
@@ -291,6 +344,7 @@ class Transition:
             _reject_string_expression("guard", value)
             if callable(value):
                 verify_callable_purity(value)
+                _reject_non_bool_return("guard", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         elif name == "binding_priority_key" and value is not None:
             # String-expression keys are deferred (see ADR 0001), so reject non-callables
