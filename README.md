@@ -311,17 +311,30 @@ class PetriNet:
 
 ---
 
-## Sandboxing & Pure Evaluation
+## Guards & Arc Expressions: Certification and the Inline Fast Path
 
-cpnx supports two forms of guard and arc expressions:
+Guards and arc expressions are Python callables — `def`s or lambdas — full stop. Passing a `str` to `guard=` or `expression=` raises `TypeError` at construction. This replaced an earlier string-expression surface; cpnx now has one authoring surface and one security model to reason about, not two.
 
-1. **String expressions** — evaluated by `SandboxEvaluator` via static AST analysis against a strict allowlist of mathematical and comparison operations. Fully hermetic.
+Removing strings doesn't mean removing the fast path they enabled. Instead, cpnx **certifies** callables: a callable that draws only on a fixed, library-controlled vocabulary (a small whitelist of builtins and methods), iterates only over its own argument, calls only helpers that themselves certify, and closes over nothing mutable is *closed-world and provably terminating* — so it's safe to call **inline**, under the engine lock, with no timeout. A callable that can't be certified falls back to the **timeout-bounded executor** (`expr_timeout_secs`, default 100 ms), exactly as before. Certification never changes *whether* a callable is allowed — only *how* it runs. The difference matters on the hot path: guards are re-evaluated per transition on every `step()`, and per candidate binding under `RANDOM`/`PRIORITY` binding-selection — the executor round-trip costs roughly 90x the inline call.
 
-2. **Callable expressions** — Python functions or lambdas. Executed in a separate thread pool (`cpnx-expr`) bounded by `expr_timeout_secs` (default 100 ms). Not I/O-isolated, but `verify_callable_purity` performs AST analysis at construction time to block common I/O calls (`open`, `print`, `time.sleep`, `os.system`, etc.). Full hermetic isolation requires string expressions.
+**The guard contract.** A guard is a *pure predicate over a candidate binding, evaluated an unbounded number of times, possibly under the engine lock.* Certification proves closed-world-ness and termination, not purity — Python offers no way to enforce that mechanically. A side-effecting guard can certify and run inline with no timeout, speculatively and repeatedly. Keep side effects out of guards; that's what actions are for.
 
-### Performance: compile-once string expressions
+To parameterise a guard, close over a value captured at construction time rather than reaching for module state:
 
-String guards and arc expressions are parsed, security-checked, and compiled once at construction time, then reused on every enablement check. Since the engine re-evaluates enablement for every transition on each `step()`, this keeps the hot path free of repeated `ast.parse()`/`compile()` work. One consequence worth knowing: a malformed or forbidden string expression raises `PermissionError` when you build the `Transition`/`InputArc`/`OutputArc`, not later at run time. See `benchmarks/bench_enablement.py` for a representative measurement.
+```python
+threshold = config["max_weight"]                       # read once, at net-build time
+guard = lambda toks: toks[0].payload["w"] <= threshold  # closes over an immutable float → certifies
+```
+
+Finally, an *annotated* guard or output-arc expression (`-> bool`) is checked at construction time to actually return `bool`; unannotated callables (including all lambdas) pass through unchecked. See [ADR 0002](https://github.com/philgresh/cpnx/blob/main/docs/adr/0002-guard-type-checking-scope.md) for the exact rules.
+
+### Modelling external state
+
+Two shapes handle the cases a pure, closed-over guard can't reach on its own — treat these as the recommended patterns, not the uncertified-executor path as a goal in itself:
+
+**(a) Per-token external data → reify upstream in an action.** If a guard needs to look something up per token — a DB row, an API response — do that lookup in an upstream transition's `action` (side effects are explicitly allowed there, and actions run off the lock) and attach the result to the token, e.g. via `payload`. The downstream guard then reads a plain token attribute and stays pure.
+
+**(b) Shared/global state → model it as a token in a place.** If firing should depend on mutable state shared across transitions — a feature flag, a pool count — represent that state as a token in a `Place` and consume/return it through an input arc, rather than closing a guard over a module global. `examples/api_rate_limit.py` and `examples/gpu_pipeline.py` already do this for capacity: `PacedResourcePlace`/`ResourcePlace` model paced and pooled resources as tokens, not external counters — the same resource-as-token shape generalises to other shared state.
 
 ---
 
@@ -358,7 +371,7 @@ cpnx's execution model is aligned with **Coloured Petri Nets (CPNs)** as formali
 | cpnx feature | Status |
 |---|---|
 | `PacedResourcePlace`, `settle_secs` | Pragmatic concurrency extensions; no CPN equivalent |
-| `expr_timeout_secs`, `verify_callable_purity` | Pragmatic sandboxing; no CPN equivalent |
+| `expr_timeout_secs`, certification (`cpnx.certification`) | Pragmatic purity-checking / certification of callable expressions; no CPN equivalent |
 | `is_quiescent()` | Dead marking AND no in-flight threads; no single CPN term |
 | `ResourcePlace`, `ThresholdPlace` | CPN patterns expressed as typed place shorthands |
 | `Place.bound` | Standard CPN: k-bounded place |

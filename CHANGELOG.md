@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [1.0.0] — 2026-07-21
+
+### Removed
+
+- **String guards and arc expressions removed (BREAKING).** `guard=` and `InputArc`/`OutputArc` `expression=` now accept a `Callable` only; passing a `str` raises `TypeError` at construction, with a message pointing to the callable form and the config-via-closure pattern. The string-expression evaluator (`SandboxEvaluator.evaluate_compiled` and the string-eval entry point) was deleted. The former "two forms" model — a string whitelist-sandbox alongside a callable — is gone; callables are now the sole expression surface. Migration: replace `guard="expr"` with a lambda/`def`; parameterise from config by reading the value at construction time and closing over the immutable result (which certifies). See [`docs/adr/0003-inline-execution-and-string-removal.md`](docs/adr/0003-inline-execution-and-string-removal.md).
+
+### Added
+
+- **Closed-world certification (`cpnx.certification`).** A new module that proves a callable guard/expression is closed-world and provably terminating: a fixed whitelist of builtins/methods, iteration bounded by the argument, transitive certification of user helpers with cycle rejection, and immutable closure cells. Exposes `certify(func) -> Verdict` and `is_inline_safe(func) -> bool`; never raises for an un-certifiable callable.
+- **Inline fast path.** A **certified** callable now runs **inline** — directly, under the engine lock, with no timeout — instead of via the `ThreadPoolExecutor`; an uncertified callable keeps the existing timeout-bounded executor path unchanged. This removes a ~90×-per-call dispatch cost on the hot path, since guards are re-evaluated per transition per `step()`, and per candidate binding under `RANDOM`/`PRIORITY`. Certification changes *how* a callable runs, never *whether* it is allowed. See [`docs/adr/0003-inline-execution-and-string-removal.md`](docs/adr/0003-inline-execution-and-string-removal.md).
+- **Construction-time guard return-type check.** An annotated `Transition.guard` / `OutputArc.expression` is now verified to return `bool` at construction — a non-`bool` return annotation raises `TypeError` — while unannotated callables (including all lambdas) pass through unchecked. Enforces the CPN guard contract `Type[G(t)] = Bool`. See [`docs/adr/0002-guard-type-checking-scope.md`](docs/adr/0002-guard-type-checking-scope.md).
+
+### Changed
+
+- **Guard contract documented.** A guard is a pure predicate over a candidate binding, evaluated an unbounded number of times, possibly under the engine lock — a side-effecting guard violates this contract. Effect-freedom is documented, not enforced; certification proves closed-world termination, not the absence of side effects.
+
+### Notes
+
+- **Executor batching stays deferred.** A certification hit-rate of **88.7%** across the combined corpus (81.7% of cpnx's own tests, 100% of the downstream causal-trader consumer) clears the ~80% go/no-go threshold, so inline certification already covers the common case and chunked-submit batching for uncertified callables is not being pursued now.
+
 ### Fixed
 
 - **Transient-failure retries now honour the logical clock.** When a transition's action failed and its data token was rolled back for retry, the token's `available_at` was computed as `time.monotonic() + retry_delay` — the wall clock — while every other availability check (`Place.retrieve`/`can_retrieve`, `PacedResourcePlace` pacing, input-arc settle windows) compares against the net's `model_time`. On a net driven by `advance_time`, the rolled-back token therefore received a deadline of seconds-since-boot (order 10^6–10^7) against a logical clock typically near zero, so it could **never** become retrievable again: the retry was stranded in its source place indefinitely, and `run()` could return quiescent with that work still pending. The rollback path now applies `retry_delay` against the same clock as pacing and settle, resolved through the same `PetriNet._get_model_time_under_lock()` helper the deposit path already uses. Nets that never call `advance_time` are unaffected — the fallback reproduces the previous value exactly.
