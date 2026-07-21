@@ -205,15 +205,20 @@ the cafe's `PRIORITY` transition sits. The RANDOM gap reconciles arithmetically:
 200 tokens × ~11 µs round trip accounts for essentially all of it.
 
 **The two flavours do not cost the same, contrary to what this file used to say.**
-`_eval_expression` sends strings to `SandboxEvaluator.evaluate_compiled` *inline*
-and only callables to `_call_expr`. Strings never pay the thread hop.
+`_eval_expression` dispatches a certified closed-world callable (per
+`cpnx.certification.is_inline_safe`) *inline* — no executor, no timeout — and
+sends only an uncertified callable through `_call_expr`. Certified guards never
+pay the thread hop.
 
-Caching the guard's AST cannot help either flavour: for callables the thread hop
-happens after any such cache, and strings are already compiled once. A fast path
-that runs verified callables inline is a much larger lever than anything in the
-candidate-enumeration code — but it trades away the I/O-in-a-guard time bound
-`_call_expr` exists to provide, so it is a design decision, not a mechanical
-optimisation. Not attempted here.
+Caching the guard's AST cannot help either flavour: for the uncertified path the
+thread hop happens after any such cache, and a certified callable is already
+running inline with no hop to amortise. The fast path that runs certified
+callables inline is a much larger lever than anything in the
+candidate-enumeration code — and, unlike when this file last described it as a
+future option, it is now implemented: it trades away the I/O-in-a-guard time
+bound `_call_expr` exists to provide, but only for the callables the certifier
+can prove closed-world; anything it cannot prove still pays the full
+timeout-bounded round trip.
 
 Hotspot ranking by own time, 500 orders guarded (was: `_iter_candidate_bindings`
 first, `_check_transition_guard` 8th at ~1.4% when guard-free):

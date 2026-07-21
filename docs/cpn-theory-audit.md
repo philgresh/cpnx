@@ -416,23 +416,28 @@ input tokens" and clarify that it is evaluated after token selection, not before
 
 ---
 
-### Finding 11 — Comment at engine.py:684 Does Not Match Code
+### Finding 11 — Comment at engine.py:1671 Does Not Match Code
 
 **Severity:** Documentation bug.
 
-**Code:** [`engine.py:684`](../src/cpnx/engine.py)
+**Code:** [`_evaluate_output_guards`, engine.py:1671](../src/cpnx/engine.py)
 ```python
 # Resource arcs are never guarded — resources must always return to a place.
 ...
-for arc in transition.outputs:
-    is_res = isinstance(self.places.get(arc.place), (ResourcePlace, PacedResourcePlace))
+def _is_arc_active(self, arc: OutputArc, output_tokens_data: list[Token]) -> bool:
     if arc.expression is None:
-        active_outputs.append((arc, is_res))
-    elif isinstance(arc.expression, str):
-        if SandboxEvaluator.evaluate_compiled(arc._compiled_expression, {"tokens": output_tokens_data}):
+        return True
+    return bool(self._eval_expression(arc.expression, output_tokens_data, arc._inline_safe))
+
+def _evaluate_output_guards(
+    self, transition: Transition, output_tokens_data: list[Token]
+) -> list[tuple[OutputArc, bool]]:
+    active_outputs: list[tuple[OutputArc, bool]] = []
+    for arc in transition.outputs:
+        is_res = isinstance(self.places.get(arc.place), (ResourcePlace, PacedResourcePlace))
+        if self._is_arc_active(arc, output_tokens_data):
             active_outputs.append((arc, is_res))
-    elif self._call_expr(arc.expression, output_tokens_data, ...):
-        active_outputs.append((arc, is_res))
+    return active_outputs
 ```
 
 The comment says "Resource arcs are never guarded" but the code evaluates

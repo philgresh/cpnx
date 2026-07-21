@@ -1,29 +1,94 @@
 import enum
+import typing
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, ClassVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Literal
 
 from cpnx.certification import is_inline_safe
-from cpnx.sandbox import SandboxEvaluator, verify_callable_purity
+from cpnx.sandbox import verify_callable_purity
 from cpnx.tokens import Token
 
 if TYPE_CHECKING:
     from cpnx.engine import PetriNet
 
 
-def _inline_safe_for(value) -> bool:
-    """Whether a guard/arc-expression value may be evaluated inline (no executor).
+def _reject_string_expression(field: str, value) -> None:
+    """Reject a string guard/arc-expression — callables are the only supported form.
 
-    String expressions always run inline via the sandbox. A callable runs inline
-    only if it *certifies* closed-world (see :mod:`cpnx.certification`); an
-    uncertified callable falls back to the timeout-bounded executor. ``None`` (no
-    expression) is never evaluated, so its flag is immaterial — reported ``False``.
+    String expressions (and their sandbox) were removed: a callable is provably as
+    safe (see :mod:`cpnx.certification`) and, when certified, faster. To parameterise
+    a predicate from configuration, read the value at construction time and close over
+    it — the resulting callable certifies just like a literal::
+
+        threshold = config["max_weight"]
+        guard = lambda tokens: tokens[0].payload["w"] <= threshold
     """
     if isinstance(value, str):
-        return True
-    if callable(value):
-        return is_inline_safe(value)
-    return False
+        raise TypeError(
+            f"{field} must be a callable, not a string; string expressions were removed. "
+            "Use a lambda/def (close over config values read at construction time if needed)."
+        )
+
+
+def _inline_safe_for(value) -> bool:
+    """Whether a guard/arc-expression callable may be evaluated inline (no executor).
+
+    A callable runs inline only if it *certifies* closed-world (see
+    :mod:`cpnx.certification`); an uncertified callable falls back to the
+    timeout-bounded executor. ``None`` (no expression) is never evaluated, so its
+    flag is immaterial — reported ``False``.
+    """
+    return is_inline_safe(value) if callable(value) else False
+
+
+def _reject_non_bool_return(field: str, value) -> None:
+    """Reject a boolean-predicate callable whose *return annotation* is not ``bool``.
+
+    Enforces the CPN guard contract ``Type[G(t)] = Bool`` (see
+    ``docs/cpn-theory-audit.md``) at construction time, for the two callables that must
+    return a boolean: a transition ``guard`` and an ``OutputArc.expression`` (skip-arc
+    predicate). ``InputArc.expression`` returns ``list[Token]`` and is never passed here.
+
+    The check is deliberately *conservative* — it only fires on an unambiguous mismatch,
+    so it never punishes correct code:
+
+    - **Unannotated → pass.** Lambdas cannot carry a return annotation, so the common
+      lambda predicate is always accepted untouched; only an annotated ``def`` engages
+      the check.
+    - **``bool`` / ``Any`` / a union containing ``bool`` → pass.** ``bool`` is the
+      contract; ``Any`` is a deliberate opt-out; ``bool | None`` / ``Optional[bool]``
+      *can* return ``bool``, so they are tolerated.
+    - **Unresolvable → pass.** A forward reference, ``TYPE_CHECKING``-only name, or any
+      other resolution failure never breaks construction — the annotation is advisory.
+    - **``Literal`` of only ``bool`` values → pass.** ``Literal[True]``, ``Literal[False]``,
+      and ``Literal[True, False]`` are valid boolean predicates.
+    - **Everything else (``-> int``, ``-> str``, ``-> None``, some other type) → raise
+      ``TypeError``.**
+    """
+    if not callable(value):
+        return
+    try:
+        return_type = typing.get_type_hints(value).get("return", _UNANNOTATED)
+    except Exception:  # unresolvable annotation (forward ref, TYPE_CHECKING import, ...)
+        return
+    if return_type is _UNANNOTATED or return_type is bool or return_type is Any:
+        return
+    if bool in typing.get_args(return_type):  # bool | None, Optional[bool], Union[bool, ...]
+        return
+    if typing.get_origin(return_type) is Literal and all(
+        isinstance(arg, bool) for arg in typing.get_args(return_type)
+    ):
+        return  # Literal[True] / Literal[False] / Literal[True, False]
+    raise TypeError(
+        f"{field} must return bool (CPN guard contract Type[G(t)] = Bool); its annotated "
+        f"return type is {getattr(return_type, '__name__', return_type)!r}. "
+        "Correct the annotation to '-> bool' (or drop it)."
+    )
+
+
+#: Sentinel distinguishing "no return annotation" from an annotation that is literally
+#: ``None`` (i.e. ``-> None``, which is a real mismatch and must be rejected).
+_UNANNOTATED = object()
 
 
 class BindingPolicy(enum.Enum):
@@ -104,26 +169,25 @@ class InputArc:
                      consuming. Defaults to `0.0` (no wait).
         expression: CPN input arc expression. Receives all tokens currently
                     in the place; returns them in desired consumption order.
-                    Can be a pure Callable or a sandboxed expression string.
-                    The engine consumes the first `count` tokens from the
-                    result. `None` (default) means FIFO order.
+                    A pure `Callable`; certified callables run inline (see
+                    [`cpnx.certification`]). The engine consumes the first
+                    `count` tokens from the result. `None` (default) means FIFO order.
     """
 
     place: str
     count: int = 1
     consume_all: bool = False
     settle_secs: float = 0.0
-    expression: Callable[[list[Token]], list[Token]] | str | None = field(default=None, compare=False)
+    expression: Callable[[list[Token]], list[Token]] | None = field(default=None, compare=False)
 
     def __setattr__(self, name, value):
-        # Keep the pre-compiled code object and the inline-safe flag in sync with
-        # ``expression``, including post-construction reassignment. Compile/verify
-        # before mutating so a bad value leaves the arc in its previous valid state.
+        # Keep the inline-safe flag in sync with ``expression``, including
+        # post-construction reassignment. Reject/verify before mutating so a bad
+        # value leaves the arc in its previous valid state.
         if name == "expression":
-            compiled = SandboxEvaluator.maybe_compile(value)
+            _reject_string_expression("expression", value)
             if callable(value):
                 verify_callable_purity(value)
-            super().__setattr__("_compiled_expression", compiled)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         super().__setattr__(name, value)
 
@@ -142,23 +206,26 @@ class OutputArc:
         expression: CPN output arc expression. Receives the list of non-resource
                     output tokens returned by the action; the arc is *skipped*
                     (no tokens deposited) when it returns `False`. `None`
-                    (default) means the arc always fires.
-                    Can be a pure Callable or a sandboxed expression string.
+                    (default) means the arc always fires. A pure `Callable`;
+                    certified callables run inline (see [`cpnx.certification`]).
+                    A boolean predicate: if annotated, its return type is checked to
+                    be `bool` at construction (a non-`bool` annotation raises
+                    `TypeError`); unannotated callables are accepted unchecked.
     """
 
     place: str
     count: int = 1
-    expression: Callable[[list[Token]], bool] | str | None = field(default=None, compare=False)
+    expression: Callable[[list[Token]], bool] | None = field(default=None, compare=False)
 
     def __setattr__(self, name, value):
-        # Keep the pre-compiled code object and the inline-safe flag in sync with
-        # ``expression``, including post-construction reassignment. Compile/verify
-        # before mutating so a bad value leaves the arc in its previous valid state.
+        # Keep the inline-safe flag in sync with ``expression``, including
+        # post-construction reassignment. Reject/verify before mutating so a bad
+        # value leaves the arc in its previous valid state.
         if name == "expression":
-            compiled = SandboxEvaluator.maybe_compile(value)
+            _reject_string_expression("expression", value)
             if callable(value):
                 verify_callable_purity(value)
-            super().__setattr__("_compiled_expression", compiled)
+                _reject_non_bool_return("OutputArc.expression", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         super().__setattr__(name, value)
 
@@ -166,8 +233,9 @@ class OutputArc:
     def on_color(cls, color: str, place: str, count: int = 1) -> "OutputArc":
         """Build an [`OutputArc`][cpnx.OutputArc] that only fires for a matching first token color.
 
-        The returned arc's `expression` is a sandboxed expression string that checks whether
-        the action's output tokens are non-empty and the first token's color equals `color`.
+        The returned arc's `expression` is a callable that checks whether the action's
+        output tokens are non-empty and the first token's color equals `color`. It closes
+        over `color` (an immutable string), so it certifies for inline evaluation.
 
         Args:
             color: The `Token` color to match against the first output token.
@@ -183,8 +251,7 @@ class OutputArc:
             OutputArc.on_color("success", place="done", count=1)
             ```
         """
-        expr_str = f"bool(tokens and tokens[0].color == {color!r})"
-        return cls(place=place, count=count, expression=expr_str)
+        return cls(place=place, count=count, expression=lambda tokens: bool(tokens and tokens[0].color == color))
 
 
 @dataclass
@@ -204,9 +271,14 @@ class Transition:
         outputs: Output arcs (transition to place).
         action: Callable consuming input tokens and returning output tokens.
                 Runs on the thread pool outside the engine lock.
-        guard: CPN transition guard — `Callable[[list[Token]], bool]` or expression string.
-               Evaluated while holding the engine lock; return `False` to block firing.
-               `None` (default) means always enabled.
+        guard: CPN transition guard — a `Callable[[list[Token]], bool]` (a string raises
+               `TypeError`). Evaluated while holding the engine lock; return `False` to
+               block firing. `None` (default) means always enabled. A certified guard
+               runs inline; an uncertified one runs on the timeout-bounded pool. Enforces
+               the CPN guard contract `Type[G(t)] = Bool`: if the callable is annotated,
+               its return type is checked to be `bool` at construction and a non-`bool`
+               annotation (e.g. `-> int`) raises `TypeError`; unannotated guards (including
+               every lambda) are accepted unchecked.
         priority: Lower value fires first when multiple transitions are enabled. Defaults to 10.
         action_timeout_secs: Maximum wall-clock seconds the action may run. When `None`
                (default), the action runs without a deadline — fully backward compatible.
@@ -262,7 +334,7 @@ class Transition:
     inputs: list[InputArc]
     outputs: list[OutputArc]
     action: Callable[[list[Token]], list[Token]]
-    guard: Callable[[list[Token]], bool] | str | None = None
+    guard: Callable[[list[Token]], bool] | None = None
     priority: int = 10
     action_timeout_secs: float | None = None
     max_retries: int | None = 5
@@ -270,15 +342,15 @@ class Transition:
     binding_priority_key: Callable[[list[Token]], object] | None = None
 
     def __setattr__(self, name, value):
-        # Keep the pre-compiled guard in sync with ``guard``, including
-        # post-construction reassignment. Actions are explicitly allowed side effects
-        # (DB writes, API calls, I/O), so guards and the PRIORITY sort key — both evaluated
-        # under the engine lock — are purity-verified; actions are not.
+        # Keep the inline-safe flag in sync with ``guard``, including post-construction
+        # reassignment. Actions are explicitly allowed side effects (DB writes, API calls,
+        # I/O), so guards and the PRIORITY sort key — both evaluated under the engine lock —
+        # are purity-verified; actions are not.
         if name == "guard":
-            compiled = SandboxEvaluator.maybe_compile(value)
+            _reject_string_expression("guard", value)
             if callable(value):
                 verify_callable_purity(value)
-            super().__setattr__("_compiled_guard", compiled)
+                _reject_non_bool_return("guard", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         elif name == "binding_priority_key" and value is not None:
             # String-expression keys are deferred (see ADR 0001), so reject non-callables
@@ -327,7 +399,7 @@ class SubstitutionTransition(Transition):
     subnet_deadline_secs: float = 30.0
 
     def __post_init__(self):
-        # Guard compilation/purity is handled by Transition.__setattr__ during field
+        # Guard purity/inline-safety is handled by Transition.__setattr__ during field
         # assignment; here we only validate the substitution-specific structure.
         # Validate that the ports and sockets are structurally valid mapping names
         if not isinstance(self.port_socket_map, dict):

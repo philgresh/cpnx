@@ -6,8 +6,6 @@ import pytest
 from cpnx.engine import PetriNet
 from cpnx.places import Place
 from cpnx.sandbox import (
-    SandboxEvaluator,
-    _check_expression_node_call,
     _clean_fallback_source,
     _is_more_specific_node,
     _node_contains_line,
@@ -17,37 +15,12 @@ from cpnx.sandbox import (
 from cpnx.tokens import Token
 from cpnx.transitions import InputArc, OutputArc, Transition
 
-
-def test_sandbox_evaluator_whitelist():
-    # Math operations and whitelisted builtins should work
-    res = SandboxEvaluator.evaluate("sum([1, 2, 3]) + len(tokens)", {"tokens": [1, 2]})
-    assert res == 8
-
-
-def test_sandbox_evaluator_blacklist():
-    # Attempting to call forbidden builtins raises PermissionError
-    with pytest.raises(PermissionError, match="Forbidden call to 'print'"):
-        SandboxEvaluator.evaluate("print(tokens)", {"tokens": []})
-
-    with pytest.raises(PermissionError, match="Forbidden call to 'open'"):
-        SandboxEvaluator.evaluate("open('secrets.txt')", {"tokens": []})
-
-    with pytest.raises(PermissionError, match="Imports are forbidden"):
-        SandboxEvaluator.evaluate("import os", {"tokens": []})
-
-    # Non-whitelisted attribute calls are blocked
-    with pytest.raises(PermissionError, match="Forbidden call to method 'system'"):
-        SandboxEvaluator.evaluate("os.system('ls')", {"tokens": []})
-
-    # Complex/nested calls are blocked
-    with pytest.raises(PermissionError, match="Forbidden complex call"):
-        SandboxEvaluator.evaluate("func()()", {"tokens": []})
-
-
-def test_sandbox_evaluator_private_attributes():
-    # Accessing private/dunder attributes starting with _ is forbidden
-    with pytest.raises(PermissionError, match="Access to private/dunder attribute '__class__' is forbidden"):
-        SandboxEvaluator.evaluate("tokens.__class__", {"tokens": []})
+# NOTE: the string-expression sandbox (`SandboxEvaluator.evaluate` and the
+# `_check_expression_node*` whitelist walk) was removed with the string surface.
+# Its coverage — forbidden builtins, imports, private attributes, unbounded
+# iteration — now lives in tests/test_certification_*.py against the callable
+# certifier. This file keeps the still-live blocklist (`verify_callable_purity`)
+# and source-recovery helper tests.
 
 
 def test_callable_purity_verification_valid():
@@ -161,37 +134,6 @@ def test_find_target_node_outside_span():
     assert node is None
 
 
-def test_arc_expression_sandbox():
-    # Test that engine evaluates string expressions in InputArc, OutputArc, and guards
-    net = PetriNet()
-    p_in = Place("in")
-    p_out = Place("out")
-    net.add_place(p_in)
-    net.add_place(p_out)
-
-    # Let's write transition with string-based guard and input/output arc expressions
-    net.add_transition(
-        Transition(
-            name="t",
-            inputs=[InputArc("in", expression="tokens")],  # Identity input expression
-            outputs=[OutputArc("out", expression="len(tokens) > 0")],  # Only deposit if outputs present
-            action=lambda tokens: tokens,
-            guard="tokens[0].payload.get('val') == 42",  # Enabled if token val is 42
-        )
-    )
-
-    # Deposit token without val=42 (so guard evaluates to False)
-    net.deposit("in", Token())
-    assert net.step() is False
-
-    # Retrieve the non-matching token to empty the place
-    net.places["in"].retrieve(1)
-
-    # Deposit token with val=42 (so guard evaluates to True)
-    net.deposit("in", Token(payload={"val": 42}))
-    assert net.step() is True
-
-
 def test_callable_expression_timeout():
     import time
 
@@ -227,35 +169,6 @@ def test_callable_expression_timeout():
 # Module-level helper: set literal default (inspectable by verify_callable_purity)
 def _guard_with_set_literal_default(tokens, s={1, 2}):  # noqa: B006
     return True
-
-
-class TestSandboxIterationBlocking:
-    """Task 4: SandboxEvaluator must block all unbounded iteration forms."""
-
-    def test_while_loop_blocked(self):
-        assert SandboxEvaluator.evaluate("1 if True else 0", {}) == 1  # baseline passes
-        with pytest.raises(PermissionError, match="Unbounded iteration"):
-            SandboxEvaluator.evaluate("while True: pass", {})
-
-    def test_for_loop_blocked(self):
-        with pytest.raises(PermissionError, match="Unbounded iteration"):
-            SandboxEvaluator.evaluate("for x in []: pass", {})
-
-    def test_list_comprehension_blocked(self):
-        with pytest.raises(PermissionError, match="Unbounded iteration"):
-            SandboxEvaluator.evaluate("[x for x in range(10)]", {})
-
-    def test_dict_comprehension_blocked(self):
-        with pytest.raises(PermissionError, match="Unbounded iteration"):
-            SandboxEvaluator.evaluate("{k: k for k in []}", {})
-
-    def test_set_comprehension_blocked(self):
-        with pytest.raises(PermissionError, match="Unbounded iteration"):
-            SandboxEvaluator.evaluate("{x for x in []}", {})
-
-    def test_generator_expression_blocked(self):
-        with pytest.raises(PermissionError, match="Unbounded iteration"):
-            SandboxEvaluator.evaluate("(x for x in [])", {})
 
 
 class TestMutableDefaultArgDetection:
@@ -392,37 +305,6 @@ class TestIsMoreSpecificNode:
     def test_outer_is_not_more_specific_than_inner(self):
         outer, inner = self._parse_nested()
         assert not _is_more_specific_node(outer, inner)
-
-
-class TestCheckExpressionNodeCall:
-    def _call_node(self, expr: str) -> ast.Call:
-        return ast.parse(expr, mode="eval").body
-
-    def test_allowed_builtin_passes(self):
-        _check_expression_node_call(self._call_node("len(tokens)"))
-
-    def test_forbidden_builtin_raises(self):
-        with pytest.raises(PermissionError, match="Forbidden call to 'print'"):
-            _check_expression_node_call(self._call_node("print(tokens)"))
-
-    def test_allowed_method_passes(self):
-        _check_expression_node_call(self._call_node("tokens.get('key')"))
-
-    def test_forbidden_method_raises(self):
-        with pytest.raises(PermissionError, match="Forbidden call to method 'system'"):
-            _check_expression_node_call(self._call_node("x.system('cmd')"))
-
-    def test_complex_call_raises(self):
-        # f()() — outer Call has func=Call, not Name or Attribute
-        outer_call = self._call_node("f()()")
-        with pytest.raises(PermissionError, match="Forbidden complex call"):
-            _check_expression_node_call(outer_call)
-
-    def test_subscript_call_raises(self):
-        # funcs[0]() — func is a Subscript, not Name or Attribute
-        subscript_call = self._call_node("funcs[0]()")
-        with pytest.raises(PermissionError, match="Forbidden complex call"):
-            _check_expression_node_call(subscript_call)
 
 
 class TestVerifyFunctionDefaults:

@@ -117,6 +117,22 @@ def _make_dose_guard(low: float, high: float):
     return _dose_in_spec
 
 
+def _make_rework_guard(low: float, high: float):
+    """Build the ``T_Rework_Dose`` guard: the exact complement of ``_make_dose_guard``.
+
+    A ticket is reworked precisely when its dose is *out* of the tolerance band. Written
+    as a callable closing over ``low``/``high`` (both immutable floats), it certifies for
+    inline evaluation just like the grind guard it mirrors.
+    """
+
+    def _dose_out_of_spec(tokens: list[Token]) -> bool:
+        order = next(t for t in tokens if not t.is_resource)
+        weight = order.payload.get("weight_g", _DOSE_TARGET_G)
+        return weight < low or weight > high
+
+    return _dose_out_of_spec
+
+
 def _make_rework_dose(low: float, high: float):
     """Build the ``T_Rework_Dose`` action: adjust the grinder and re-weigh an out-of-spec ticket.
 
@@ -421,15 +437,10 @@ def build_cafe(
                 outputs=[OutputArc("P_Ticket_Line")],
                 action=_with_work(work_secs, _make_rework_dose(dose_low, dose_high)),
                 action_timeout_secs=0.5,
-                # String guard (the complement of T_Weigh_And_Grind's callable one) so this
-                # demo exercises both guard flavours: string guards run through
-                # SandboxEvaluator's compile cache, callables through the timed expression
-                # pool. Clamping in the action always lands back in [dose_low, dose_high],
-                # so this can't ping-pong with T_Weigh_And_Grind's guard.
-                guard=(
-                    f"tokens[0].payload.get('weight_g', {_DOSE_TARGET_G}) < {dose_low} "
-                    f"or tokens[0].payload.get('weight_g', {_DOSE_TARGET_G}) > {dose_high}"
-                ),
+                # The complement of T_Weigh_And_Grind's guard: rework fires exactly when the
+                # dose is out of band. Clamping in the action always lands back in
+                # [dose_low, dose_high], so this can't ping-pong with T_Weigh_And_Grind.
+                guard=_make_rework_guard(dose_low, dose_high),
             )
         )
 

@@ -14,6 +14,7 @@ from cpnx.certification import certify
 
 _MUTABLE_STATE = {"allow": True}
 _MUTABLE_LIST = [True]
+_CONST_TUPLE = (1, 2, 3)
 
 
 def _assert_rejected(fn, reason_contains: str | None = None) -> None:
@@ -116,6 +117,32 @@ def test_global_declaration():
         return True
 
     _assert_rejected(guard, "global")
+
+
+def test_nonlocal_declaration_is_rejected():
+    # `nonlocal` mutates an enclosing scope's cell, same closed-world hazard as
+    # `global` (just one scope removed). Both are structurally rejected.
+    def make():
+        flag = True
+
+        def guard(toks):
+            nonlocal flag
+            flag = not flag
+            return flag
+
+        return guard
+
+    _assert_rejected(make(), "nonlocal")
+
+
+def test_comprehension_over_non_parameter_iterable_is_rejected():
+    # Iterates an immutable module constant, not the argument. Iterating a
+    # finite constant provably terminates, so this is a deliberately
+    # CONSERVATIVE rejection: the certifier's rule is "iterate only the
+    # argument", not "iterate anything provably finite". This isolates the
+    # iteration-bounds check from the mutable-read check: `_CONST_TUPLE` is
+    # itself immutable, so the sole disqualifying property is the bounds rule.
+    _assert_rejected(lambda toks: any(x > 0 for x in _CONST_TUPLE), "not bounded")
 
 
 def test_private_attribute_access():
