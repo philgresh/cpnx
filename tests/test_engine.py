@@ -355,3 +355,30 @@ class TestDriveToQuiescence:
                     net.drive_to_quiescence(max_spins=7)
             finally:
                 release.set()  # let the worker finish so the pool can shut down cleanly
+
+    def test_next_availability_boundary_is_earliest_of_cooldown_and_settle(self):
+        # Both a cooldown-gated resource and a settle-gated input arc are pending at once;
+        # the boundary must be the earlier of the two, not just "some" future time.
+        net = PetriNet(max_workers=1)
+        net.add_place(PacedResourcePlace("R", capacity=1, pacing_secs=5.0))
+        net.add_place(Place("S_in"))
+        net.add_place(SinkPlace("S_out"))
+        net.add_transition(
+            Transition(
+                "settle_t",
+                inputs=[InputArc("S_in", settle_secs=3.0)],
+                outputs=[OutputArc("S_out")],
+                action=lambda tokens: list(tokens),
+            )
+        )
+
+        net.advance_time(100.0)  # fixed logical clock; no wall-clock dependence
+
+        # Nothing deposited yet, so nothing is time-gated.
+        assert net._next_availability_boundary() is None
+
+        net.deposit("R", Token())  # cooldown boundary: 100.0 + pacing_secs(5.0) = 105.0
+        net.deposit("S_in", Token())  # settle boundary: 100.0 + settle_secs(3.0) = 103.0
+
+        # The settle boundary (103.0) is earlier than the cooldown boundary (105.0).
+        assert net._next_availability_boundary() == pytest.approx(103.0)

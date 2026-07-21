@@ -1448,6 +1448,44 @@ class PetriNet:
         """
         return self._binding_exists(transition, float("inf"), ignore_timing=True)
 
+    def _earliest_cooldown_boundary(self, now: float) -> float | None:
+        """Smallest future `available_at` among tokens in non-sink places, or `None` if none."""
+        candidates = (
+            tok.available_at
+            for place in self.places.values()
+            if not isinstance(place, SinkPlace)
+            for tok in place.tokens
+            if tok.available_at > now
+        )
+        return min(candidates, default=None)
+
+    def _pending_settle_boundary(self, arc: InputArc, now: float) -> float | None:
+        """Future boundary at which `arc`'s settle window becomes satisfied, or `None` if not pending."""
+        if arc.settle_secs <= 0:
+            return None
+        place = self.places.get(arc.place)
+        if place is None or isinstance(place, SinkPlace) or len(place) == 0:
+            return None
+        last_deposit = getattr(place, "last_deposit_time_model", 0.0)
+        if now - last_deposit >= arc.settle_secs:
+            return None  # window already satisfied; nothing to wait for
+        # The window is still pending, so its boundary is mathematically in the future — but
+        # `last_deposit + settle_secs` can *round* to exactly `now` in float64 (one ULP at
+        # monotonic-clock magnitudes is ~2e-9). Stepping to the next representable float
+        # guarantees forward progress rather than stranding with the window unmet.
+        boundary = max(last_deposit + arc.settle_secs, math.nextafter(now, math.inf))
+        return boundary if boundary > now else None
+
+    def _earliest_settle_boundary(self, now: float) -> float | None:
+        """Smallest future settle-window boundary among all transitions' input arcs, or `None`."""
+        candidates = (
+            b
+            for transition in self.transitions.values()
+            for arc in transition.inputs
+            if (b := self._pending_settle_boundary(arc, now)) is not None
+        )
+        return min(candidates, default=None)
+
     def _next_availability_boundary(self) -> float | None:
         """Smallest future logical time at which a currently-blocked token/window becomes available.
 
@@ -1458,31 +1496,12 @@ class PetriNet:
         worker thread is mutating the marking.
         """
         now = self.model_time
-        best: float | None = None
-        for place in self.places.values():
-            if isinstance(place, SinkPlace):
-                continue
-            for tok in place.tokens:
-                if tok.available_at > now and (best is None or tok.available_at < best):
-                    best = tok.available_at
-        for transition in self.transitions.values():
-            for arc in transition.inputs:
-                if arc.settle_secs <= 0:
-                    continue
-                place = self.places.get(arc.place)
-                if place is None or isinstance(place, SinkPlace) or len(place) == 0:
-                    continue
-                last_deposit = getattr(place, "last_deposit_time_model", 0.0)
-                if now - last_deposit >= arc.settle_secs:
-                    continue  # window already satisfied; nothing to wait for
-                # The window is still pending, so its boundary is mathematically in the future — but
-                # `last_deposit + settle_secs` can *round* to exactly `now` in float64 (one ULP at
-                # monotonic-clock magnitudes is ~2e-9). Stepping to the next representable float
-                # guarantees forward progress rather than stranding with the window unmet.
-                boundary = max(last_deposit + arc.settle_secs, math.nextafter(now, math.inf))
-                if boundary > now and (best is None or boundary < best):
-                    best = boundary
-        return best
+        candidates = [
+            b
+            for b in (self._earliest_cooldown_boundary(now), self._earliest_settle_boundary(now))
+            if b is not None
+        ]
+        return min(candidates, default=None)
 
     def _await_inflight(self, *, max_spins: int = 10_000_000) -> None:
         """Block until no transition action is mid-flight (barrier for `drive_to_quiescence`).
