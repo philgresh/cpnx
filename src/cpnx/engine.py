@@ -2,14 +2,16 @@
 
 import concurrent.futures
 import itertools
+import math
 import random
 import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Callable, Iterator, TypeAlias
 
-from cpnx.places import PacedResourcePlace, Place, ResourcePlace
+from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace
 from cpnx.sandbox import SandboxEvaluator
 from cpnx.tokens import Token
 from cpnx.transitions import BindingPolicy, InputArc, OutputArc, SubstitutionTransition, Transition
@@ -20,6 +22,14 @@ _DepositFn: TypeAlias = Callable[[str, Token], None]
 
 _Binding: TypeAlias = list[tuple[InputArc, list[Token]]]
 """A resolved binding: each input arc paired with the exact tokens it will consume."""
+
+
+@dataclass(frozen=True)
+class DriveResult:
+    """Counters from a [`drive_to_quiescence`][cpnx.PetriNet.drive_to_quiescence] run."""
+
+    steps: int  #: number of successful ``step()`` firings
+    ticks: int  #: number of logical-clock advances (cooldown/settle boundaries jumped)
 
 
 def _flatten_binding(binding: _Binding) -> list[Token]:
@@ -772,6 +782,67 @@ class PetriNet:
             if not self.step():
                 self._wait_for_work(deadline, stop_event)
 
+    def drive_to_quiescence(self, *, max_ticks: int = 1_000_000, max_spins: int = 10_000_000) -> DriveResult:
+        """Drive the net to quiescence on its **logical clock**, jumping over timed waits.
+
+        The deterministic counterpart to [`run`][cpnx.PetriNet.run]. Where `run` waits out
+        cooldowns and settle windows on the real wall clock — so a net with an 8-second grinder
+        cooldown takes 8 real seconds — this drives the net on its logical clock: fire every
+        transition enabled at the current instant (awaiting each action so its outputs can enable
+        the next), then, once nothing more fires, jump [`advance_time`][cpnx.PetriNet.advance_time]
+        straight to the next availability boundary. Blocking/back-pressure is fully preserved (a
+        cooling resource is genuinely unavailable for its full *logical* cooldown), but the waiting
+        costs no wall-clock time. Because it never races real time, the marking observed after this
+        returns is a true fixed point — useful for benchmarking engine CPU cost and for
+        property-test oracles that must not race a wall-clock settle window.
+
+        The first call anchors the net onto the logical clock (via `advance_time`); subsequent
+        calls continue from the current logical time. The await after every `step` keeps at most one
+        action in flight, which is what makes the drive single-threaded and deterministic —
+        `max_workers` does not affect it. Use [`run`][cpnx.PetriNet.run] to exploit concurrency.
+
+        Args:
+            max_ticks: Safety cap on logical-clock advances, so a pathological net cannot loop
+                forever.
+            max_spins: Safety cap on the per-firing barrier that awaits each in-flight action. The
+                default suits the fast (~microsecond) actions this driver is built for; raise it for
+                nets whose actions legitimately block for longer, so a slow-but-healthy action is
+                not mistaken for a hung one.
+
+        Returns:
+            A [`DriveResult`][cpnx.DriveResult] with the number of firings and clock advances.
+
+        Raises:
+            RuntimeError: If an in-flight action does not complete within `max_spins` barrier spins.
+        """
+        # Anchor onto the logical clock the first time only. `math.nextafter` (not `+ 1e-9`)
+        # guarantees a strictly-greater value: at monotonic-clock magnitudes one ULP is ~2e-9, so a
+        # fixed epsilon can round back to the current time — the same float hazard guarded against
+        # in `_next_availability_boundary`.
+        if self._model_time is None:
+            self.advance_time(math.nextafter(self.model_time, math.inf))
+
+        steps = 0
+        ticks = 0
+        while ticks < max_ticks:
+            # Fire everything enabled at the current logical instant. The await after each firing is
+            # deliberate: `step` returns as soon as the action is submitted, so awaiting means at
+            # most one action is ever in flight. This keeps the drive single-threaded (determinism)
+            # and ensures each completed action's outputs are committed before the next enablement
+            # check (instant accounting).
+            while self.step():
+                steps += 1
+                self._await_inflight(max_spins=max_spins)
+            # Nothing fires right now. Done, or just waiting out a cooldown/settle window?
+            if self.is_quiescent():
+                break
+            boundary = self._next_availability_boundary()
+            if boundary is None or boundary <= self._model_time:
+                break
+            self.advance_time(boundary)
+            ticks += 1
+        return DriveResult(steps=steps, ticks=ticks)
+
     def is_quiescent(self) -> bool:
         """Return `True` if there is no in-flight work and nothing could become enabled soon.
 
@@ -1376,6 +1447,86 @@ class PetriNet:
             `True` if a guard-satisfying binding exists once timing is ignored.
         """
         return self._binding_exists(transition, float("inf"), ignore_timing=True)
+
+    def _earliest_cooldown_boundary(self, now: float) -> float | None:
+        """Smallest future `available_at` among tokens in non-sink places, or `None` if none."""
+        candidates = (
+            tok.available_at
+            for place in self.places.values()
+            if not isinstance(place, SinkPlace)
+            for tok in place.tokens
+            if tok.available_at > now
+        )
+        return min(candidates, default=None)
+
+    def _pending_settle_boundary(self, arc: InputArc, now: float) -> float | None:
+        """Future boundary at which `arc`'s settle window becomes satisfied, or `None` if not pending."""
+        if arc.settle_secs <= 0:
+            return None
+        place = self.places.get(arc.place)
+        if place is None or isinstance(place, SinkPlace) or len(place) == 0:
+            return None
+        last_deposit = getattr(place, "last_deposit_time_model", 0.0)
+        if now - last_deposit >= arc.settle_secs:
+            return None  # window already satisfied; nothing to wait for
+        # The window is still pending, so its boundary is mathematically in the future — but
+        # `last_deposit + settle_secs` can *round* to exactly `now` in float64 (one ULP at
+        # monotonic-clock magnitudes is ~2e-9). Stepping to the next representable float
+        # guarantees forward progress rather than stranding with the window unmet.
+        boundary = max(last_deposit + arc.settle_secs, math.nextafter(now, math.inf))
+        return boundary if boundary > now else None
+
+    def _earliest_settle_boundary(self, now: float) -> float | None:
+        """Smallest future settle-window boundary among all transitions' input arcs, or `None`."""
+        candidates = (
+            b
+            for transition in self.transitions.values()
+            for arc in transition.inputs
+            if (b := self._pending_settle_boundary(arc, now)) is not None
+        )
+        return min(candidates, default=None)
+
+    def _next_availability_boundary(self) -> float | None:
+        """Smallest future logical time at which a currently-blocked token/window becomes available.
+
+        Scans token cooldowns (`available_at`, set by `PacedResourcePlace` and retries) and
+        input-arc settle windows. Returns `None` if nothing is time-gated (a genuine deadlock or
+        completion), so [`drive_to_quiescence`][cpnx.PetriNet.drive_to_quiescence] stops instead of
+        advancing the clock forever. Called only between firings, after `_await_inflight`, so no
+        worker thread is mutating the marking.
+        """
+        now = self.model_time
+        candidates = [
+            b
+            for b in (self._earliest_cooldown_boundary(now), self._earliest_settle_boundary(now))
+            if b is not None
+        ]
+        return min(candidates, default=None)
+
+    def _await_inflight(self, *, max_spins: int = 10_000_000) -> None:
+        """Block until no transition action is mid-flight (barrier for `drive_to_quiescence`).
+
+        Spins on `_running_count` with `time.sleep(0)` (yields the GIL to worker threads without a
+        real sleep). Safe as a barrier: `_execute_transition` decrements `_running_count` *after*
+        committing its output deposits, so observing zero implies every completed action's outputs
+        are visible.
+
+        Args:
+            max_spins: Safety cap. Actions are expected to complete promptly; a hung action would
+                otherwise spin forever, so exceeding the cap raises rather than hangs silently.
+
+        Raises:
+            RuntimeError: If `max_spins` is exceeded while an action is still in flight.
+        """
+        spins = 0
+        while self._running_count > 0:
+            if spins >= max_spins:
+                raise RuntimeError(
+                    f"_await_inflight exceeded max_spins={max_spins} with "
+                    f"{self._running_count} action(s) still in flight — hung action?"
+                )
+            spins += 1
+            time.sleep(0)
 
     def _commit_or_rollback_transition(
         self,

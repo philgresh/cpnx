@@ -1,4 +1,4 @@
-from cpnx.engine import PetriNet
+from cpnx.engine import DriveResult, PetriNet
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace, ThresholdPlace
 from cpnx.tokens import AVAILABLE_NOW, ERROR_COLOR, FrozenDict, Token
 from cpnx.transitions import BindingPolicy, InputArc, OutputArc, SubstitutionTransition, Transition
@@ -8,6 +8,7 @@ __all__ = [
     "AVAILABLE_NOW",
     "ERROR_COLOR",
     "FrozenDict",
+    "DriveResult",
     "PetriNet",
     "Place",
     "ResourcePlace",
