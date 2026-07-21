@@ -1,0 +1,149 @@
+"""Rejection cases for :mod:`cpnx.certification`.
+
+One test per disqualifying property. Certification gates *inline* execution
+(under the engine lock, with no timeout), so every rejection here is a callable
+that must NOT earn that path — either because it could fail to terminate, or
+because it reaches outside the closed world. We assert ``certified is False``;
+reason strings are diagnostic, not contractual, so they are only spot-checked
+with substring matches where it adds clarity.
+"""
+
+import functools
+
+from cpnx.certification import certify
+
+_MUTABLE_STATE = {"allow": True}
+_MUTABLE_LIST = [True]
+
+
+def _assert_rejected(fn, reason_contains: str | None = None) -> None:
+    verdict = certify(fn)
+    assert verdict.certified is False
+    assert verdict.reason  # a rejection must explain itself
+    if reason_contains is not None:
+        assert reason_contains in verdict.reason
+
+
+def test_reads_mutable_dict_closure():
+    # The canonical impure guard: its truth value is external mutable state.
+    def make():
+        state = {"allow": True}
+        return lambda toks: state["allow"]
+
+    _assert_rejected(make(), "mutable")
+
+
+def test_reads_mutable_dict_module_global():
+    # Same hazard, reached via __globals__ rather than a closure cell.
+    _assert_rejected(lambda toks: _MUTABLE_STATE["allow"], "_MUTABLE_STATE")
+
+
+def test_reads_mutable_list_module_global():
+    _assert_rejected(lambda toks: _MUTABLE_LIST[0], "_MUTABLE_LIST")
+
+
+def test_for_statement_is_unbounded_iteration():
+    def guard(toks):
+        total = 0
+        for _ in toks:  # only comprehensions (bounded by the arg) are allowed
+            total += 1
+        return total > 0
+
+    _assert_rejected(guard, "for/while")
+
+
+def test_while_statement_is_unbounded_iteration():
+    def guard(toks):
+        while toks:
+            toks = toks[1:]
+        return True
+
+    _assert_rejected(guard, "for/while")
+
+
+def test_import_statement():
+    def guard(toks):
+        import os
+
+        return bool(os)
+
+    _assert_rejected(guard, "import")
+
+
+def test_global_declaration():
+    def guard(toks):
+        global _MUTABLE_STATE
+        return True
+
+    _assert_rejected(guard, "global")
+
+
+def test_private_attribute_access():
+    _assert_rejected(lambda toks: toks[0]._secret, "private")
+
+
+def test_dunder_attribute_access():
+    _assert_rejected(lambda toks: toks[0].__class__, "private")
+
+
+def test_unwhitelisted_method_call():
+    # `.extend` mutates and is not in ALLOWED_METHODS.
+    _assert_rejected(lambda toks: toks[0].payload.popitem(), "popitem")
+
+
+def test_call_to_unresolved_name():
+    _assert_rejected(lambda toks: mystery(toks), "unresolved")  # noqa: F821
+
+
+def test_call_to_non_function_global():
+    # `str` is whitelisted, but a call to a *class* we resolve is not a
+    # certifying user function.
+    class Widget:
+        pass
+
+    def guard(toks):
+        return bool(Widget(toks))
+
+    _assert_rejected(guard)
+
+
+def test_non_name_complex_call():
+    # Calling the result of a subscript needs runtime resolution — reject.
+    _assert_rejected(lambda toks: toks[0].handlers[0](toks))
+
+
+def test_raises_via_unwhitelisted_constructor():
+    # `raise ValueError(...)` is a call to a name outside the whitelist.
+    def guard(toks):
+        raise ValueError("nope")
+
+    _assert_rejected(guard)
+
+
+def test_source_unavailable_is_not_certified():
+    # A lambda built by exec has no recoverable source; certification must
+    # treat "can't verify" as "not certified", never as "allowed".
+    namespace: dict = {}
+    exec("f = lambda toks: True", namespace)  # noqa: S102
+    _assert_rejected(namespace["f"], "source unavailable")
+
+
+def test_decorated_callable_is_rejected():
+    # The live object is the wrapper; the recoverable source is the inner body.
+    # Certifying the body while running the wrapper would be unsound.
+    def passthrough(fn):
+        @functools.wraps(fn)
+        def wrapper(toks):
+            return fn(toks)
+
+        return wrapper
+
+    @passthrough
+    def guard(toks):
+        return len(toks) > 0
+
+    _assert_rejected(guard, "decorated")
+
+
+def test_non_callable_input():
+    _assert_rejected(42)
