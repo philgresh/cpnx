@@ -8,6 +8,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from typing import Callable, Iterator, TypeAlias
 
@@ -411,8 +412,6 @@ class PetriNet:
             self.add_transition(t)
 
     def _call_expr(self, fn, *args, timeout: float | None = None):
-        from concurrent.futures import TimeoutError as FuturesTimeout
-
         t = timeout if timeout is not None else self.timeout_secs
         fut = self._expr_executor.submit(fn, *args)
         try:
@@ -1286,7 +1285,7 @@ class PetriNet:
         if arc.expression is None:
             return available
         try:
-            return list(self._eval_expression(arc.expression, arc._compiled_expression, available))  # type: ignore[attr-defined]
+            return list(self._eval_expression(arc.expression, arc._compiled_expression, available, arc._inline_safe))  # type: ignore[attr-defined]
         except Exception:
             return None
 
@@ -1365,16 +1364,28 @@ class PetriNet:
             elapsed = time.monotonic() - place.last_deposit_time
         return elapsed >= arc.settle_secs
 
-    def _eval_expression(self, expression, compiled, tokens: list[Token]):
+    def _eval_expression(self, expression, compiled, tokens: list[Token], inline_safe: bool = False):
         """Evaluate a string (precompiled, sandboxed) or callable `expression` over `tokens`.
 
-        Centralizes the string-vs-callable dispatch shared by input-arc selection
-        (`_resolve_input_tokens`), output-arc guards (`_is_arc_active`),
-        and transition guards (`_check_transition_guard`). Callers are
-        responsible for coercing/bounding the result and for exception handling.
+        Centralizes the dispatch shared by input-arc ordering/selection
+        (`_order_available`, `_resolve_input_tokens`), output-arc guards
+        (`_is_arc_active`), and transition guards (`_check_transition_guard`).
+        Three execution modes, chosen by what was proven at construction:
+
+        - **string** — evaluated inline via the sandbox (whitelist-verified, already
+          compiled);
+        - **certified callable** (`inline_safe`) — called directly, no executor. It
+          was proven closed-world and terminating (see `cpnx.certification`), so it
+          is as safe inline as a string and skips the ~90x thread round-trip;
+        - **uncertified callable** — dispatched to the timeout-bounded executor via
+          `_call_expr`, exactly as before.
+
+        Callers coerce/bound the result and handle exceptions.
         """
         if isinstance(expression, str):
             return SandboxEvaluator.evaluate_compiled(compiled, {"tokens": tokens})
+        if inline_safe:
+            return expression(tokens)
         return self._call_expr(expression, tokens, timeout=self.expr_timeout_secs)
 
     def _resolve_input_tokens(self, arc: InputArc, available: list[Token]) -> list[Token] | None:
@@ -1398,7 +1409,7 @@ class PetriNet:
             tokens = available
         elif arc.expression is not None:
             try:
-                ordered = self._eval_expression(arc.expression, arc._compiled_expression, available)  # type: ignore[attr-defined]
+                ordered = self._eval_expression(arc.expression, arc._compiled_expression, available, arc._inline_safe)  # type: ignore[attr-defined]
                 tokens = ordered[: arc.count]
             except Exception:
                 return None
@@ -1424,7 +1435,11 @@ class PetriNet:
         if transition.guard is None:
             return True
         try:
-            return bool(self._eval_expression(transition.guard, transition._compiled_guard, candidate_tokens))  # type: ignore[attr-defined]
+            return bool(
+                self._eval_expression(
+                    transition.guard, transition._compiled_guard, candidate_tokens, transition._inline_safe
+                )  # type: ignore[attr-defined]
+            )
         except Exception:
             return False
 
@@ -1655,7 +1670,9 @@ class PetriNet:
     def _is_arc_active(self, arc: OutputArc, output_tokens_data: list[Token]) -> bool:
         if arc.expression is None:
             return True
-        return bool(self._eval_expression(arc.expression, arc._compiled_expression, output_tokens_data))  # type: ignore[attr-defined]
+        return bool(
+            self._eval_expression(arc.expression, arc._compiled_expression, output_tokens_data, arc._inline_safe)  # type: ignore[attr-defined]
+        )
 
     def _evaluate_output_guards(
         self, transition: Transition, output_tokens_data: list[Token]
