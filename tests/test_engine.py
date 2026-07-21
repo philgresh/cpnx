@@ -332,3 +332,26 @@ class TestDriveToQuiescence:
                     net._await_inflight(max_spins=100)
             finally:
                 release.set()  # let the worker finish so the pool can shut down cleanly
+
+    def test_drive_to_quiescence_forwards_max_spins_to_barrier(self):
+        # drive_to_quiescence must thread its max_spins through to _await_inflight so a caller
+        # with legitimately slow actions can lift the barrier's cap. Proven deterministically: a
+        # blocking action keeps one firing in flight, and the raised message echoes the *exact*
+        # cap we passed — a hardcoded _await_inflight() call would report the 10_000_000 default.
+        release = threading.Event()
+
+        def hang(tokens):
+            release.wait(timeout=5.0)
+            return list(tokens)
+
+        with PetriNet(max_workers=1) as net:
+            net.add_place(Place("in"))
+            net.add_place(SinkPlace("out"))
+            net.add_transition(Transition("t", [InputArc("in")], [OutputArc("out")], action=hang))
+            net.deposit("in", Token())
+
+            try:
+                with pytest.raises(RuntimeError, match=r"max_spins=7\b"):
+                    net.drive_to_quiescence(max_spins=7)
+            finally:
+                release.set()  # let the worker finish so the pool can shut down cleanly

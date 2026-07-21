@@ -782,7 +782,7 @@ class PetriNet:
             if not self.step():
                 self._wait_for_work(deadline, stop_event)
 
-    def drive_to_quiescence(self, *, max_ticks: int = 1_000_000) -> DriveResult:
+    def drive_to_quiescence(self, *, max_ticks: int = 1_000_000, max_spins: int = 10_000_000) -> DriveResult:
         """Drive the net to quiescence on its **logical clock**, jumping over timed waits.
 
         The deterministic counterpart to [`run`][cpnx.PetriNet.run]. Where `run` waits out
@@ -804,9 +804,16 @@ class PetriNet:
         Args:
             max_ticks: Safety cap on logical-clock advances, so a pathological net cannot loop
                 forever.
+            max_spins: Safety cap on the per-firing barrier that awaits each in-flight action. The
+                default suits the fast (~microsecond) actions this driver is built for; raise it for
+                nets whose actions legitimately block for longer, so a slow-but-healthy action is
+                not mistaken for a hung one.
 
         Returns:
             A [`DriveResult`][cpnx.DriveResult] with the number of firings and clock advances.
+
+        Raises:
+            RuntimeError: If an in-flight action does not complete within `max_spins` barrier spins.
         """
         # Anchor onto the logical clock the first time only. `math.nextafter` (not `+ 1e-9`)
         # guarantees a strictly-greater value: at monotonic-clock magnitudes one ULP is ~2e-9, so a
@@ -825,7 +832,7 @@ class PetriNet:
             # check (instant accounting).
             while self.step():
                 steps += 1
-                self._await_inflight()
+                self._await_inflight(max_spins=max_spins)
             # Nothing fires right now. Done, or just waiting out a cooldown/settle window?
             if self.is_quiescent():
                 break
