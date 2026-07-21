@@ -1,9 +1,10 @@
+import threading
 import time
 
 import pytest
 
-from cpnx.engine import PetriNet
-from cpnx.places import Place
+from cpnx.engine import DriveResult, PetriNet
+from cpnx.places import PacedResourcePlace, Place, SinkPlace
 from cpnx.tokens import Token
 from cpnx.transitions import InputArc, OutputArc, Transition
 
@@ -266,3 +267,68 @@ def test_memoryerror_does_not_leak_running_count():
 
         with net._lock:
             assert net._running_count == 0
+
+
+class TestDriveToQuiescence:
+    @staticmethod
+    def _paced_net(*, pacing_secs: float) -> PetriNet:
+        """A net whose only permit is a `PacedResourcePlace`, so throughput is cooldown-gated."""
+        net = PetriNet(max_workers=1)
+        net.add_place(Place("P_in"))
+        net.add_place(PacedResourcePlace("R", capacity=1, pacing_secs=pacing_secs))
+        net.add_place(SinkPlace("out"))
+        net.add_transition(
+            Transition(
+                "t",
+                inputs=[InputArc("P_in"), InputArc("R")],
+                outputs=[OutputArc("R"), OutputArc("out")],
+                action=lambda tokens: list(tokens),
+            )
+        )
+        return net
+
+    def test_drives_to_fixed_point_on_logical_clock(self):
+        # Three data tokens through a single permit with a long (5s) cooldown: on the wall clock
+        # this would take ~10 real seconds, but drive_to_quiescence jumps the cooldowns on the
+        # logical clock, so it reaches a true fixed point in negligible real time.
+        net = self._paced_net(pacing_secs=5.0)
+        for _ in range(3):
+            net.deposit("P_in", Token())
+
+        start = time.monotonic()
+        result = net.drive_to_quiescence()
+        elapsed = time.monotonic() - start
+
+        assert isinstance(result, DriveResult)
+        assert net.is_quiescent()
+        assert net.is_dead()
+        assert net.places["out"]._absorbed == 3  # every token made it to the sink
+        assert result.steps == 3  # one firing per token
+        assert result.ticks >= 2  # two cooldown boundaries jumped (tokens 2 and 3)
+        assert elapsed < 1.0  # the 10s of logical cooldown cost no real time
+
+    def test_anchors_logical_clock_on_first_call(self):
+        net = self._paced_net(pacing_secs=1.0)
+        assert net._model_time is None  # starts on the wall clock
+        net.drive_to_quiescence()
+        assert net._model_time is not None  # first call engaged the logical clock
+
+    def test_await_inflight_spin_cap_raises_on_hung_action(self):
+        release = threading.Event()
+
+        def hang(tokens):
+            release.wait(timeout=5.0)
+            return list(tokens)
+
+        with PetriNet(max_workers=1) as net:
+            net.add_place(Place("in"))
+            net.add_place(SinkPlace("out"))
+            net.add_transition(Transition("t", [InputArc("in")], [OutputArc("out")], action=hang))
+            net.deposit("in", Token())
+
+            assert net.step() is True  # action submitted, now mid-flight
+            try:
+                with pytest.raises(RuntimeError, match="in flight"):
+                    net._await_inflight(max_spins=100)
+            finally:
+                release.set()  # let the worker finish so the pool can shut down cleanly

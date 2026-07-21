@@ -22,11 +22,10 @@ actions it measures nothing but the GIL.
 Native stdlib only — no dependencies, no test runner.
 """
 
-import math
 import time
 from dataclasses import dataclass
 
-from cpnx import PetriNet, SinkPlace
+from cpnx import PetriNet
 
 
 @dataclass
@@ -38,103 +37,18 @@ class RunResult:
     wall_secs: float  #: wall-clock seconds spent — dominated by engine CPU, not sleeping
 
 
-def _next_boundary(net: PetriNet) -> float | None:
-    """Smallest future logical time at which a currently-blocked token/window becomes available.
-
-    Scans token cooldowns (``available_at``, set by ``PacedResourcePlace`` and retries) and
-    input-arc settle windows. Returns ``None`` if nothing is time-gated (a genuine deadlock or
-    completion), so the driver stops instead of advancing the clock forever.
-    """
-    now = net.model_time
-    best: float | None = None
-    for place in net.places.values():
-        if isinstance(place, SinkPlace):
-            continue
-        for tok in place.tokens:
-            if tok.available_at > now and (best is None or tok.available_at < best):
-                best = tok.available_at
-    for transition in net.transitions.values():
-        for arc in transition.inputs:
-            if arc.settle_secs <= 0:
-                continue
-            place = net.places.get(arc.place)
-            if place is None or isinstance(place, SinkPlace) or len(place) == 0:
-                continue
-            last_deposit = getattr(place, "last_deposit_time_model", 0.0)
-            if now - last_deposit >= arc.settle_secs:
-                continue  # window already satisfied; nothing to wait for
-            # The window is still pending, so its boundary is mathematically in the future —
-            # but `last_deposit + settle_secs` can *round* to exactly `now` in float64, and
-            # the model clock runs on `time.monotonic()` values around 7.4e6 where one ULP is
-            # ~1e-9. When that happens the driver sees `boundary <= now`, concludes there is
-            # nothing to wait for, and stops with the window still unmet — while the engine's
-            # own `elapsed >= settle_secs` is *also* false by a fraction of a nanosecond. The
-            # run strands (observed: 6 tokens stuck on the tray, is_quiescent() False).
-            # Stepping to the next representable float guarantees forward progress.
-            boundary = max(last_deposit + arc.settle_secs, math.nextafter(now, math.inf))
-            if boundary > now and (best is None or boundary < best):
-                best = boundary
-    return best
-
-
-def _await_inflight(net: PetriNet) -> None:
-    """Block until no transition action is mid-flight (actions here are ~microseconds).
-
-    Reads the ``_running_count`` counter directly rather than via ``snapshot()``: snapshot
-    deep-copies the whole marking, which in a tight spin loop would swamp the measurement with
-    O(tokens) copying and hide the engine cost we're trying to time. A momentarily stale read
-    is harmless — the outer loop re-checks enablement anyway.
-
-    Safe as a barrier: ``_execute_transition`` decrements ``_running_count`` *after* committing
-    its output deposits, so observing zero implies every completed action's outputs are visible.
-    """
-    while net._running_count > 0:
-        time.sleep(0)  # yield the GIL to the worker thread without a real sleep
-
-
 def drive_to_quiescence(net: PetriNet, *, max_ticks: int = 1_000_000) -> RunResult:
     """Run ``net`` to logical quiescence and return timing/step counters.
 
-    Starts the logical clock at the current model time, then repeats: fire every transition
-    enabled at the current instant (waiting for each action to settle so its outputs can enable
-    the next), and once nothing more fires, jump the clock to the next availability boundary.
-    Stops when the net is quiescent (all time-gated work has drained) or nothing is left to wait
-    for.
+    Delegates to ``PetriNet.drive_to_quiescence`` (the engine's own logical-clock driver, which
+    this benchmark driver's loop was extracted into) and just wraps the wall-clock timing around
+    the call, so the reported ``wall_secs`` is still the engine's CPU cost rather than time spent
+    waiting on anything.
     """
-    # Anchor the logical clock so cooldowns/settle windows are measured against it from here on.
-    net.advance_time(net.model_time + 1e-9)
-
-    steps = 0
-    ticks = 0
     start = time.perf_counter()
-    while ticks < max_ticks:
-        # Fire everything enabled at the current logical instant.
-        #
-        # The await here is DELIBERATE, not an oversight. `step()` returns as soon as the action
-        # is submitted, so awaiting after each one means at most a single action is ever in
-        # flight — this driver is single-threaded by construction, and `max_workers` cannot
-        # affect its numbers. That is the intent: it measures engine CPU, not makespan. Two
-        # things break if you remove it:
-        #   1. Determinism. The seeded channeling regime reproduces step-for-step *because*
-        #      everything is serialized; concurrent retries would reorder the RNG draws.
-        #   2. Instant accounting. Without the barrier the inner loop exits early, while inputs
-        #      are consumed-but-not-yet-committed, so a "logical instant" fires short.
-        # Use `drive_saturating` to measure concurrency. An earlier revision swept `max_workers`
-        # against *this* driver, found it flat, and published that as evidence about cpnx's
-        # parallelism; the conclusion was unfounded and had to be retracted.
-        while net.step():
-            steps += 1
-            _await_inflight(net)
-        # Nothing fires right now. Done, or just waiting out a cooldown/settle window?
-        if net.is_quiescent():
-            break
-        boundary = _next_boundary(net)
-        if boundary is None or boundary <= net.model_time:
-            break
-        net.advance_time(boundary)
-        ticks += 1
+    result = net.drive_to_quiescence(max_ticks=max_ticks)
     wall = time.perf_counter() - start
-    return RunResult(steps=steps, ticks=ticks, wall_secs=wall)
+    return RunResult(steps=result.steps, ticks=result.ticks, wall_secs=wall)
 
 
 def drive_saturating(net: PetriNet, *, max_secs: float = 300.0, poll_secs: float = 2e-4) -> RunResult:

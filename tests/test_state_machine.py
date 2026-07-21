@@ -7,8 +7,6 @@ invariants: k-bound respect, data-token conservation, and liveness (no stuck dat
 in a genuinely dead marking).
 """
 
-import time
-
 from hypothesis import settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
@@ -58,7 +56,7 @@ def build_verification_net(seed: int) -> PetriNet:
         Transition(
             name="t_intake",
             # Small but nonzero settle window to exercise the settle-window mechanism
-            # without making the fuzz run slow (see CPNTestMachine._pending_settle_wait).
+            # without making the fuzz run slow (see CPNTestMachine._drain).
             inputs=[InputArc("P_in", count=1, settle_secs=0.02)],
             outputs=[OutputArc("P_work", count=1)],
             action=_pass_through,
@@ -129,56 +127,14 @@ class CPNTestMachine(RuleBasedStateMachine):
         super().__init__()
         self.net = build_verification_net(SEED)
         self.deposited = 0
-        self.clock = 0.0
-        self._time_advanced = False
 
     def _drain(self):
-        """Run step() to quiescence: keep stepping while work fires, is in flight, or is
-        merely waiting out a settle window (net.is_dead() is an instantaneous check that
-        does not know a settle window is about to elapse, so we wait it out explicitly
-        rather than mistake it for a genuine deadlock).
+        """Drive the net to a logical-clock fixed point (deterministic, no wall-clock races).
 
-        Once `advance_time` has ever been called, settle windows are measured against the
-        net's logical clock, which real-time sleeping cannot advance — so in that mode we
-        stop retrying immediately and leave any settle-blocked tokens to be recognized (and
-        excluded) by `check_liveness`.
+        Delegates to PetriNet.drive_to_quiescence so the liveness oracle never observes a
+        transient marking mid-settle-window (the cause of the issue-21 flake).
         """
-        iterations = 0
-        max_iterations = 10000
-        while iterations < max_iterations:
-            iterations += 1
-            if self.net.step():
-                continue
-            if self.net.snapshot()["running_count"] > 0:
-                time.sleep(0.001)
-                continue
-            if self._time_advanced:
-                break
-            wait = self._pending_settle_wait()
-            if wait > 0:
-                time.sleep(wait + 0.005)
-                continue
-            break
-
-    def _pending_settle_wait(self) -> float:
-        """Return the longest remaining settle-window wait (seconds), using wall-clock time.
-
-        Only meaningful before `advance_time` has ever been called (real-time sleeping
-        cannot advance a logical clock). Zero if nothing is currently settle-blocked.
-        """
-        now = time.monotonic()
-        longest = 0.0
-        for transition in self.net.transitions.values():
-            for arc in transition.inputs:
-                if arc.settle_secs <= 0:
-                    continue
-                place = self.net.places.get(arc.place)
-                if place is None or len(place) == 0:
-                    continue
-                remaining = arc.settle_secs - (now - place.last_deposit_time)
-                if remaining > longest:
-                    longest = remaining
-        return longest
+        self.net.drive_to_quiescence()
 
     def _resource_blocked_places(self) -> set:
         """Return names of (non-resource) input places whose owning transition currently
@@ -239,9 +195,7 @@ class CPNTestMachine(RuleBasedStateMachine):
 
     @rule(delta=st.floats(min_value=0.01, max_value=10.0, allow_nan=False, allow_infinity=False))
     def advance_time(self, delta):
-        self.clock += delta
-        self.net.advance_time(self.clock)
-        self._time_advanced = True
+        self.net.advance_time(self.net.model_time + delta)
         self._drain()
 
     @invariant()
@@ -269,6 +223,11 @@ class CPNTestMachine(RuleBasedStateMachine):
 
     @invariant()
     def check_liveness(self):
+        """Assert no non-resource data token is stuck in a genuinely dead marking.
+
+        The run is now fully logical (driven via `drive_to_quiescence`), so a dead marking
+        is only ever observed at a true fixed point, not mid-settle-window.
+        """
         if not self.net.is_dead():
             return
         marking = self.net.marking
