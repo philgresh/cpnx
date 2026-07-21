@@ -351,19 +351,22 @@ def _bound_names(node: ast.AST) -> frozenset[str]:
     of nested functions defined here.
 
     A ``Name`` read whose id is in this set refers to something the callable
-    itself binds, so it is not external state. Store-context ``Name`` nodes cover
-    assignments, augmented assignments, ``for``/comprehension targets and walrus
-    bindings; a nested ``def`` also binds its own name in this scope.
+    itself binds, so it is not external state. It covers function-scope
+    assignments, augmented assignments and walrus (``:=``) bindings, and a nested
+    ``def``'s own name — but **not** bindings that belong to a nested scope: a
+    nested ``Lambda``/``def`` body, or a comprehension's ``for``-targets (Python 3
+    gives comprehensions their own scope). See :func:`_collect_scope_bindings`.
 
-    Crucially this does **not** descend into nested ``Lambda``/``def`` bodies:
-    names bound only inside a nested scope (its parameters, its internal
-    assignments) are *not* bindings of this scope. Unioning them would let a
-    nested binding mask an outer read of an external — possibly mutable — name,
-    a false *accept* of exactly what :meth:`_Certifier._check_name` exists to
-    reject. A read of a genuine nested-scope local instead resolves to
-    :data:`_UNRESOLVED` in ``_check_name`` and passes safely, so leaving those
-    names out costs nothing; the only theoretical effect is that a nested local
-    *shadowing* a mutable global is conservatively rejected — the safe direction.
+    This over-inclusion is the *unsound* direction: a name wrongly treated as
+    locally bound lets :meth:`_Certifier._check_name` short-circuit before it can
+    reject an outer read of a same-named mutable external. So we err the other
+    way — a read of a genuine nested/comprehension-scope local instead resolves to
+    :data:`_UNRESOLVED` in ``_check_name`` and passes safely, and the only
+    residual cost is that a local *shadowing* a mutable global of the same name is
+    conservatively rejected (the safe direction). Note ``bound`` is a
+    false-*reject*-avoidance heuristic, not a soundness mechanism; other Python
+    scope-introducers not reachable in a certifiable body today (e.g. a nested
+    ``class``) would share the same shadowing trait if they became reachable.
     """
     names: set[str] = set()
     for child in ast.iter_child_nodes(node):
@@ -371,14 +374,23 @@ def _bound_names(node: ast.AST) -> frozenset[str]:
     return frozenset(names)
 
 
+#: Comprehension node types. In Python 3 each introduces its **own** scope, so
+#: its ``for``-targets do not bind in the enclosing scope — see
+#: :func:`_collect_scope_bindings`.
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
 def _collect_scope_bindings(node: ast.AST, names: set[str]) -> None:
     """Accumulate the names *node* binds in the current scope, without recursing
-    into nested function/lambda bodies (whose bindings belong to *their* scope).
+    into scopes whose bindings do not belong to it.
 
     A nested ``def``'s own name is bound in this scope, so record it and stop; a
-    ``Lambda`` binds no name here, so stop without recording. Everything else
-    (including comprehensions, whose targets bind in this scope as before) is
-    walked through.
+    ``Lambda`` binds no name here, so stop without recording. A **comprehension**
+    likewise has its own scope: its ``for``-targets do *not* bind here (collecting
+    them would let a target shadowing a mutable global mask an outer read of it —
+    the same false accept as a nested-``def`` binding), but a walrus (``:=``)
+    binding *does* leak out to the enclosing function, so those are collected
+    (see :func:`_leaked_walrus_targets`). Everything else is walked through.
     """
     if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
         names.add(node.id)
@@ -388,5 +400,25 @@ def _collect_scope_bindings(node: ast.AST, names: set[str]) -> None:
         return
     if isinstance(node, ast.Lambda):
         return
+    if isinstance(node, _COMPREHENSIONS):
+        _leaked_walrus_targets(node, names)
+        return
     for child in ast.iter_child_nodes(node):
         _collect_scope_bindings(child, names)
+
+
+def _leaked_walrus_targets(node: ast.AST, names: set[str]) -> None:
+    """Collect walrus (``NamedExpr``) target names that leak from *node* into the
+    enclosing function scope.
+
+    A walrus inside a comprehension binds in the nearest enclosing *function*
+    scope (PEP 572), transparently through any number of comprehension layers —
+    so descend through comprehensions, but stop at a nested ``Lambda``/``def``
+    boundary, whose walruses are scoped to *it*, not to us.
+    """
+    if isinstance(node, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)):
+        return
+    if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+        names.add(node.target.id)
+    for child in ast.iter_child_nodes(node):
+        _leaked_walrus_targets(child, names)

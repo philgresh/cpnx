@@ -57,6 +57,31 @@ def test_nested_scope_binding_does_not_mask_outer_mutable_read():
     _assert_rejected(guard, "_MUTABLE_STATE")
 
 
+def test_comprehension_target_does_not_mask_outer_mutable_read():
+    # Python 3 gives a comprehension its own scope, so its `for`-target does not
+    # bind in the enclosing scope. Collecting it into `bound` would mask an outer
+    # read of a same-named mutable global — the same false accept as the nested-def
+    # case above, one node type over.
+    def guard(toks):
+        _ = [_MUTABLE_STATE for _MUTABLE_STATE in toks]  # comp-scoped target; must not leak
+        return _MUTABLE_STATE["allow"]  # outer read of the GLOBAL mutable dict
+
+    _assert_rejected(guard, "_MUTABLE_STATE")
+
+
+def test_comprehension_walrus_binding_is_treated_as_local():
+    # Counterpart to the previous test: a walrus (`:=`) inside a comprehension *does*
+    # leak to the enclosing function scope (PEP 572), so a later read of it is a
+    # genuine local — even when it shadows a mutable global of the same name. It must
+    # therefore certify (True); a blanket "skip everything inside a comprehension"
+    # fix would wrongly reject it. This pins the walrus-preserving behaviour.
+    def guard(toks):
+        _ = [x for x in toks if (_MUTABLE_STATE := x)]  # walrus binds a LOCAL _MUTABLE_STATE
+        return bool(_MUTABLE_STATE)  # reads the walrus-bound local, not the global
+
+    assert certify(guard).certified is True
+
+
 def test_for_statement_is_unbounded_iteration():
     def guard(toks):
         total = 0
