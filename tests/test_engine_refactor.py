@@ -777,8 +777,7 @@ def test_is_arc_active():
     arc_none = OutputArc("p1")
     assert net._is_arc_active(arc_none, []) is True
 
-    # SandboxEvaluator is used for string, we'll just test callable for simplicity
-    # since we don't compile strings in the test easily. Let's do callable.
+    # Expressions are callables only; a None expression means the arc is always active.
     arc_callable = OutputArc("p1", expression=lambda t: len(t) > 0)
     assert net._is_arc_active(arc_callable, []) is False
     assert net._is_arc_active(arc_callable, [Token()]) is True

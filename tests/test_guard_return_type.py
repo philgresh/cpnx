@@ -14,7 +14,7 @@ inside a test function) so ``verify_callable_purity``'s ``inspect.getsource`` ca
 recover real source, per the certifier's requirements.
 """
 
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any, Literal, Optional
 
 import pytest
 
@@ -50,12 +50,24 @@ def guard_annotated_bool(toks: list[Token]) -> Annotated[bool, "doc"]:
     return bool(toks)
 
 
+def guard_literal_true(toks: list[Token]) -> Literal[True]:
+    return True
+
+
+def guard_literal_false(toks: list[Token]) -> Literal[False]:
+    return False
+
+
 def output_predicate_unannotated(toks):
     return bool(toks)
 
 
 def output_predicate_bool(toks: list[Token]) -> bool:
     return bool(toks)
+
+
+def output_predicate_literal_true(toks: list[Token]) -> Literal[True]:
+    return True
 
 
 def ie(toks: list[Token]) -> list[Token]:
@@ -81,6 +93,10 @@ def guard_none(toks: list[Token]) -> None:
 
 def guard_list_tokens(toks: list[Token]) -> list[Token]:
     return toks
+
+
+def guard_literal_int(toks: list[Token]) -> Literal[1]:
+    return 1
 
 
 def output_predicate_int(toks: list[Token]) -> int:
@@ -125,6 +141,14 @@ class TestGuardReturnTypeAcceptance:
         # typing.get_type_hints strips Annotated[bool, ...] down to bool.
         _build_transition(guard=guard_annotated_bool)
 
+    def test_literal_true_guard_constructs(self):
+        # Literal[True] is a valid boolean predicate return type.
+        _build_transition(guard=guard_literal_true)
+
+    def test_literal_false_guard_constructs(self):
+        # Literal[False] is a valid boolean predicate return type.
+        _build_transition(guard=guard_literal_false)
+
 
 class TestOutputArcReturnTypeAcceptance:
     """`OutputArc.expression` acceptance mirrors the guard acceptance cases."""
@@ -134,6 +158,10 @@ class TestOutputArcReturnTypeAcceptance:
 
     def test_bool_annotated_expression_constructs(self):
         OutputArc("b", expression=output_predicate_bool)
+
+    def test_literal_true_expression_constructs(self):
+        # Literal[True] is a valid boolean predicate return type.
+        OutputArc("b", expression=output_predicate_literal_true)
 
 
 class TestGuardReturnTypeRejection:
@@ -155,6 +183,11 @@ class TestGuardReturnTypeRejection:
         with pytest.raises(TypeError, match="must return bool"):
             _build_transition(guard=guard_list_tokens)
 
+    def test_literal_non_bool_guard_raises(self):
+        # A Literal of non-bool values (e.g. Literal[1]) is not a boolean predicate.
+        with pytest.raises(TypeError, match="must return bool"):
+            _build_transition(guard=guard_literal_int)
+
     def test_reassignment_of_bad_guard_raises(self):
         transition = _build_transition(guard=guard_bool)
         with pytest.raises(TypeError, match="must return bool"):
@@ -167,6 +200,11 @@ class TestOutputArcReturnTypeRejection:
     def test_int_annotated_expression_raises(self):
         with pytest.raises(TypeError, match="OutputArc.expression must return bool"):
             OutputArc("b", expression=output_predicate_int)
+
+    def test_reassignment_of_bad_expression_raises(self):
+        arc = OutputArc("b", expression=output_predicate_bool)
+        with pytest.raises(TypeError, match="OutputArc.expression must return bool"):
+            arc.expression = output_predicate_int
 
 
 class TestReturnTypeScope:

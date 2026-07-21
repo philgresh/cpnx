@@ -2,7 +2,7 @@ import enum
 import typing
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, ClassVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Literal
 
 from cpnx.certification import is_inline_safe
 from cpnx.sandbox import verify_callable_purity
@@ -60,6 +60,8 @@ def _reject_non_bool_return(field: str, value) -> None:
       *can* return ``bool``, so they are tolerated.
     - **Unresolvable → pass.** A forward reference, ``TYPE_CHECKING``-only name, or any
       other resolution failure never breaks construction — the annotation is advisory.
+    - **``Literal`` of only ``bool`` values → pass.** ``Literal[True]``, ``Literal[False]``,
+      and ``Literal[True, False]`` are valid boolean predicates.
     - **Everything else (``-> int``, ``-> str``, ``-> None``, some other type) → raise
       ``TypeError``.**
     """
@@ -73,6 +75,10 @@ def _reject_non_bool_return(field: str, value) -> None:
         return
     if bool in typing.get_args(return_type):  # bool | None, Optional[bool], Union[bool, ...]
         return
+    if typing.get_origin(return_type) is Literal and all(
+        isinstance(arg, bool) for arg in typing.get_args(return_type)
+    ):
+        return  # Literal[True] / Literal[False] / Literal[True, False]
     raise TypeError(
         f"{field} must return bool (CPN guard contract Type[G(t)] = Bool); its annotated "
         f"return type is {getattr(return_type, '__name__', return_type)!r}. "

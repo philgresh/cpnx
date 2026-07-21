@@ -1277,9 +1277,9 @@ class PetriNet:
     def _order_available(self, arc: InputArc, available: list[Token]) -> list[Token] | None:
         """Return `available` ordered by the arc's selection expression, or `None` if it raises.
 
-        With no expression, returns `available` unchanged (FIFO). A string expression is
-        evaluated via the sandboxed, precompiled path; a callable via the timed expression
-        pool.
+        With no expression, returns `available` unchanged (FIFO). Otherwise the callable
+        expression is evaluated — inline if certified closed-world, else via the
+        timed expression pool.
         """
         if arc.expression is None:
             return available
