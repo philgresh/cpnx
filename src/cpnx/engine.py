@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from typing import Callable, Iterator, TypeAlias
 
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace
-from cpnx.sandbox import SandboxEvaluator
 from cpnx.tokens import Token
 from cpnx.transitions import BindingPolicy, InputArc, OutputArc, SubstitutionTransition, Transition
 from cpnx.visualization import snapshot, to_dot
@@ -1285,7 +1284,7 @@ class PetriNet:
         if arc.expression is None:
             return available
         try:
-            return list(self._eval_expression(arc.expression, arc._compiled_expression, available, arc._inline_safe))  # type: ignore[attr-defined]
+            return list(self._eval_expression(arc.expression, available, arc._inline_safe))  # type: ignore[attr-defined]
         except Exception:
             return None
 
@@ -1364,26 +1363,23 @@ class PetriNet:
             elapsed = time.monotonic() - place.last_deposit_time
         return elapsed >= arc.settle_secs
 
-    def _eval_expression(self, expression, compiled, tokens: list[Token], inline_safe: bool = False):
-        """Evaluate a string (precompiled, sandboxed) or callable `expression` over `tokens`.
+    def _eval_expression(self, expression, tokens: list[Token], inline_safe: bool = False):
+        """Evaluate a callable `expression` over `tokens`.
 
         Centralizes the dispatch shared by input-arc ordering/selection
         (`_order_available`, `_resolve_input_tokens`), output-arc guards
         (`_is_arc_active`), and transition guards (`_check_transition_guard`).
-        Three execution modes, chosen by what was proven at construction:
+        Two execution modes, chosen by what was proven at construction:
 
-        - **string** — evaluated inline via the sandbox (whitelist-verified, already
-          compiled);
         - **certified callable** (`inline_safe`) — called directly, no executor. It
-          was proven closed-world and terminating (see `cpnx.certification`), so it
-          is as safe inline as a string and skips the ~90x thread round-trip;
+          was proven closed-world and terminating (see `cpnx.certification`), so it is
+          safe to run under the engine lock without a timeout, and skips the ~90x
+          thread round-trip;
         - **uncertified callable** — dispatched to the timeout-bounded executor via
-          `_call_expr`, exactly as before.
+          `_call_expr`.
 
         Callers coerce/bound the result and handle exceptions.
         """
-        if isinstance(expression, str):
-            return SandboxEvaluator.evaluate_compiled(compiled, {"tokens": tokens})
         if inline_safe:
             return expression(tokens)
         return self._call_expr(expression, tokens, timeout=self.expr_timeout_secs)
@@ -1409,7 +1405,7 @@ class PetriNet:
             tokens = available
         elif arc.expression is not None:
             try:
-                ordered = self._eval_expression(arc.expression, arc._compiled_expression, available, arc._inline_safe)  # type: ignore[attr-defined]
+                ordered = self._eval_expression(arc.expression, available, arc._inline_safe)  # type: ignore[attr-defined]
                 tokens = ordered[: arc.count]
             except Exception:
                 return None
@@ -1436,9 +1432,7 @@ class PetriNet:
             return True
         try:
             return bool(
-                self._eval_expression(
-                    transition.guard, transition._compiled_guard, candidate_tokens, transition._inline_safe
-                )  # type: ignore[attr-defined]
+                self._eval_expression(transition.guard, candidate_tokens, transition._inline_safe)  # type: ignore[attr-defined]
             )
         except Exception:
             return False
@@ -1671,7 +1665,7 @@ class PetriNet:
         if arc.expression is None:
             return True
         return bool(
-            self._eval_expression(arc.expression, arc._compiled_expression, output_tokens_data, arc._inline_safe)  # type: ignore[attr-defined]
+            self._eval_expression(arc.expression, output_tokens_data, arc._inline_safe)  # type: ignore[attr-defined]
         )
 
     def _evaluate_output_guards(

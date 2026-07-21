@@ -297,8 +297,8 @@ def test_evaluate_output_guards():
     net.add_place(p_data)
 
     arc_always = OutputArc("p_data")
-    arc_true = OutputArc("p_data", expression="len(tokens) > 0")
-    arc_false = OutputArc("p_data", expression="False")
+    arc_true = OutputArc("p_data", expression=lambda tokens: len(tokens) > 0)
+    arc_false = OutputArc("p_data", expression=lambda tokens: False)
 
     transition = Transition(
         "t",
@@ -317,7 +317,7 @@ def test_evaluate_output_guards():
     assert any(a is arc_true for a in active_arcs)
     assert not any(a is arc_false for a in active_arcs)
 
-    # With no tokens the string guard also evaluates to False
+    # With no tokens the callable guard also evaluates to False
     active_empty = net._evaluate_output_guards(transition, [])
     assert len(active_empty) == 1
     assert active_empty[0][0] is arc_always
@@ -389,13 +389,13 @@ def test_resolve_input_tokens():
     arc = InputArc("p", consume_all=True)
     assert net._resolve_input_tokens(arc, available) == available
 
-    # string expression
-    arc2 = InputArc("p", expression="tokens")
+    # identity expression
+    arc2 = InputArc("p", expression=lambda tokens: tokens)
     res = net._resolve_input_tokens(arc2, available)
     assert res == available[:1]  # count is 1 by default
 
     # exception in expression
-    arc3 = InputArc("p", expression="1/0")
+    arc3 = InputArc("p", expression=lambda tokens: 1 / 0)
     assert net._resolve_input_tokens(arc3, available) is None
 
 
@@ -414,7 +414,7 @@ def test_check_output_capacity():
     assert not net._check_output_capacity(t)
 
     # guarded arc ignores capacity
-    t2 = Transition("t", inputs=[], outputs=[OutputArc("p_out", expression="True")], action=lambda t: t)
+    t2 = Transition("t", inputs=[], outputs=[OutputArc("p_out", expression=lambda tokens: True)], action=lambda t: t)
     assert net._check_output_capacity(t2)
 
 
@@ -425,8 +425,8 @@ def test_check_transition_guard():
     # no guard
     assert net._check_transition_guard(t, [])
 
-    # string guard
-    t2 = Transition("t", inputs=[], outputs=[], action=lambda t: t, guard="len(tokens) > 0")
+    # callable guard (certified)
+    t2 = Transition("t", inputs=[], outputs=[], action=lambda t: t, guard=lambda tokens: len(tokens) > 0)
     assert not net._check_transition_guard(t2, [])
     assert net._check_transition_guard(t2, [Token()])
 

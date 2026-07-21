@@ -4,26 +4,40 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, ClassVar
 
 from cpnx.certification import is_inline_safe
-from cpnx.sandbox import SandboxEvaluator, verify_callable_purity
+from cpnx.sandbox import verify_callable_purity
 from cpnx.tokens import Token
 
 if TYPE_CHECKING:
     from cpnx.engine import PetriNet
 
 
-def _inline_safe_for(value) -> bool:
-    """Whether a guard/arc-expression value may be evaluated inline (no executor).
+def _reject_string_expression(field: str, value) -> None:
+    """Reject a string guard/arc-expression — callables are the only supported form.
 
-    String expressions always run inline via the sandbox. A callable runs inline
-    only if it *certifies* closed-world (see :mod:`cpnx.certification`); an
-    uncertified callable falls back to the timeout-bounded executor. ``None`` (no
-    expression) is never evaluated, so its flag is immaterial — reported ``False``.
+    String expressions (and their sandbox) were removed: a callable is provably as
+    safe (see :mod:`cpnx.certification`) and, when certified, faster. To parameterise
+    a predicate from configuration, read the value at construction time and close over
+    it — the resulting callable certifies just like a literal::
+
+        threshold = config["max_weight"]
+        guard = lambda tokens: tokens[0].payload["w"] <= threshold
     """
     if isinstance(value, str):
-        return True
-    if callable(value):
-        return is_inline_safe(value)
-    return False
+        raise TypeError(
+            f"{field} must be a callable, not a string; string expressions were removed. "
+            "Use a lambda/def (close over config values read at construction time if needed)."
+        )
+
+
+def _inline_safe_for(value) -> bool:
+    """Whether a guard/arc-expression callable may be evaluated inline (no executor).
+
+    A callable runs inline only if it *certifies* closed-world (see
+    :mod:`cpnx.certification`); an uncertified callable falls back to the
+    timeout-bounded executor. ``None`` (no expression) is never evaluated, so its
+    flag is immaterial — reported ``False``.
+    """
+    return is_inline_safe(value) if callable(value) else False
 
 
 class BindingPolicy(enum.Enum):
@@ -104,26 +118,25 @@ class InputArc:
                      consuming. Defaults to `0.0` (no wait).
         expression: CPN input arc expression. Receives all tokens currently
                     in the place; returns them in desired consumption order.
-                    Can be a pure Callable or a sandboxed expression string.
-                    The engine consumes the first `count` tokens from the
-                    result. `None` (default) means FIFO order.
+                    A pure `Callable`; certified callables run inline (see
+                    [`cpnx.certification`]). The engine consumes the first
+                    `count` tokens from the result. `None` (default) means FIFO order.
     """
 
     place: str
     count: int = 1
     consume_all: bool = False
     settle_secs: float = 0.0
-    expression: Callable[[list[Token]], list[Token]] | str | None = field(default=None, compare=False)
+    expression: Callable[[list[Token]], list[Token]] | None = field(default=None, compare=False)
 
     def __setattr__(self, name, value):
-        # Keep the pre-compiled code object and the inline-safe flag in sync with
-        # ``expression``, including post-construction reassignment. Compile/verify
-        # before mutating so a bad value leaves the arc in its previous valid state.
+        # Keep the inline-safe flag in sync with ``expression``, including
+        # post-construction reassignment. Reject/verify before mutating so a bad
+        # value leaves the arc in its previous valid state.
         if name == "expression":
-            compiled = SandboxEvaluator.maybe_compile(value)
+            _reject_string_expression("expression", value)
             if callable(value):
                 verify_callable_purity(value)
-            super().__setattr__("_compiled_expression", compiled)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         super().__setattr__(name, value)
 
@@ -142,23 +155,22 @@ class OutputArc:
         expression: CPN output arc expression. Receives the list of non-resource
                     output tokens returned by the action; the arc is *skipped*
                     (no tokens deposited) when it returns `False`. `None`
-                    (default) means the arc always fires.
-                    Can be a pure Callable or a sandboxed expression string.
+                    (default) means the arc always fires. A pure `Callable`;
+                    certified callables run inline (see [`cpnx.certification`]).
     """
 
     place: str
     count: int = 1
-    expression: Callable[[list[Token]], bool] | str | None = field(default=None, compare=False)
+    expression: Callable[[list[Token]], bool] | None = field(default=None, compare=False)
 
     def __setattr__(self, name, value):
-        # Keep the pre-compiled code object and the inline-safe flag in sync with
-        # ``expression``, including post-construction reassignment. Compile/verify
-        # before mutating so a bad value leaves the arc in its previous valid state.
+        # Keep the inline-safe flag in sync with ``expression``, including
+        # post-construction reassignment. Reject/verify before mutating so a bad
+        # value leaves the arc in its previous valid state.
         if name == "expression":
-            compiled = SandboxEvaluator.maybe_compile(value)
+            _reject_string_expression("expression", value)
             if callable(value):
                 verify_callable_purity(value)
-            super().__setattr__("_compiled_expression", compiled)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         super().__setattr__(name, value)
 
@@ -166,8 +178,9 @@ class OutputArc:
     def on_color(cls, color: str, place: str, count: int = 1) -> "OutputArc":
         """Build an [`OutputArc`][cpnx.OutputArc] that only fires for a matching first token color.
 
-        The returned arc's `expression` is a sandboxed expression string that checks whether
-        the action's output tokens are non-empty and the first token's color equals `color`.
+        The returned arc's `expression` is a callable that checks whether the action's
+        output tokens are non-empty and the first token's color equals `color`. It closes
+        over `color` (an immutable string), so it certifies for inline evaluation.
 
         Args:
             color: The `Token` color to match against the first output token.
@@ -183,8 +196,7 @@ class OutputArc:
             OutputArc.on_color("success", place="done", count=1)
             ```
         """
-        expr_str = f"bool(tokens and tokens[0].color == {color!r})"
-        return cls(place=place, count=count, expression=expr_str)
+        return cls(place=place, count=count, expression=lambda tokens: bool(tokens and tokens[0].color == color))
 
 
 @dataclass
@@ -204,9 +216,10 @@ class Transition:
         outputs: Output arcs (transition to place).
         action: Callable consuming input tokens and returning output tokens.
                 Runs on the thread pool outside the engine lock.
-        guard: CPN transition guard — `Callable[[list[Token]], bool]` or expression string.
-               Evaluated while holding the engine lock; return `False` to block firing.
-               `None` (default) means always enabled.
+        guard: CPN transition guard — a `Callable[[list[Token]], bool]` (a string raises
+               `TypeError`). Evaluated while holding the engine lock; return `False` to
+               block firing. `None` (default) means always enabled. A certified guard
+               runs inline; an uncertified one runs on the timeout-bounded pool.
         priority: Lower value fires first when multiple transitions are enabled. Defaults to 10.
         action_timeout_secs: Maximum wall-clock seconds the action may run. When `None`
                (default), the action runs without a deadline — fully backward compatible.
@@ -262,7 +275,7 @@ class Transition:
     inputs: list[InputArc]
     outputs: list[OutputArc]
     action: Callable[[list[Token]], list[Token]]
-    guard: Callable[[list[Token]], bool] | str | None = None
+    guard: Callable[[list[Token]], bool] | None = None
     priority: int = 10
     action_timeout_secs: float | None = None
     max_retries: int | None = 5
@@ -270,15 +283,14 @@ class Transition:
     binding_priority_key: Callable[[list[Token]], object] | None = None
 
     def __setattr__(self, name, value):
-        # Keep the pre-compiled guard in sync with ``guard``, including
-        # post-construction reassignment. Actions are explicitly allowed side effects
-        # (DB writes, API calls, I/O), so guards and the PRIORITY sort key — both evaluated
-        # under the engine lock — are purity-verified; actions are not.
+        # Keep the inline-safe flag in sync with ``guard``, including post-construction
+        # reassignment. Actions are explicitly allowed side effects (DB writes, API calls,
+        # I/O), so guards and the PRIORITY sort key — both evaluated under the engine lock —
+        # are purity-verified; actions are not.
         if name == "guard":
-            compiled = SandboxEvaluator.maybe_compile(value)
+            _reject_string_expression("guard", value)
             if callable(value):
                 verify_callable_purity(value)
-            super().__setattr__("_compiled_guard", compiled)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         elif name == "binding_priority_key" and value is not None:
             # String-expression keys are deferred (see ADR 0001), so reject non-callables
@@ -327,7 +339,7 @@ class SubstitutionTransition(Transition):
     subnet_deadline_secs: float = 30.0
 
     def __post_init__(self):
-        # Guard compilation/purity is handled by Transition.__setattr__ during field
+        # Guard purity/inline-safety is handled by Transition.__setattr__ during field
         # assignment; here we only validate the substitution-specific structure.
         # Validate that the ports and sockets are structurally valid mapping names
         if not isinstance(self.port_socket_map, dict):

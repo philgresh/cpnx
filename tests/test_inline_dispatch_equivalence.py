@@ -23,6 +23,8 @@ real source, per the certifier's requirements.
 
 import time
 
+import pytest
+
 from cpnx.engine import PetriNet
 from cpnx.places import Place
 from cpnx.tokens import Token
@@ -357,58 +359,25 @@ class TestUncertifiedCallableStillWorksViaExecutor:
             _STATE["allow"] = False  # leave module state clean for other tests
 
 
-class TestStringGuardsAndExpressionsUnchanged:
-    """String guards/expressions are unaffected by Phase 2 — always inline via the sandbox."""
+class TestStringExpressionsRejected:
+    """String guards/expressions were removed — every entry point raises TypeError."""
 
-    def test_string_guard_is_inline_safe_and_still_gates_firing(self):
-        net = PetriNet(
-            max_workers=1,
-            places=[Place("input"), Place("output")],
-            transitions=[
-                Transition(
-                    name="t",
-                    inputs=[InputArc("input")],
-                    outputs=[OutputArc("output")],
-                    action=lambda toks: toks,
-                    guard="bool(tokens and tokens[0].payload['sym'] == 'MSFT')",
-                )
-            ],
-        )
-        transition = net.transitions["t"]
-        assert transition._inline_safe is True
+    def test_string_guard_raises_type_error(self):
+        with pytest.raises(TypeError, match="callable"):
+            Transition(name="t", inputs=[], outputs=[], action=lambda toks: toks, guard="bool(tokens)")
 
-        net.deposit("input", Token(payload={"sym": "AAPL"}))
-        assert net.step() is False
-        assert len(net.places["output"].tokens) == 0
+    def test_string_input_arc_expression_raises_type_error(self):
+        with pytest.raises(TypeError, match="callable"):
+            InputArc("p", expression="tokens")
 
-        net2 = PetriNet(
-            max_workers=1,
-            places=[Place("input"), Place("output")],
-            transitions=[
-                Transition(
-                    name="t",
-                    inputs=[InputArc("input")],
-                    outputs=[OutputArc("output")],
-                    action=lambda toks: toks,
-                    guard="bool(tokens and tokens[0].payload['sym'] == 'MSFT')",
-                )
-            ],
-        )
-        net2.deposit("input", Token(payload={"sym": "MSFT"}))
-        assert net2.step() is True
-        _drain(net2)
-        assert len(net2.places["output"].tokens) == 1
+    def test_string_output_arc_expression_raises_type_error(self):
+        with pytest.raises(TypeError, match="callable"):
+            OutputArc("q", expression="bool(tokens)")
 
-    def test_string_input_arc_expression_is_inline_safe(self):
-        # `sorted` is certification's whitelist for callables, not the string
-        # sandbox's (see `SandboxEvaluator.ALLOWED_BUILTINS`); use a
-        # sandbox-legal expression here.
-        arc = InputArc("p", expression="tokens")
-        assert arc._inline_safe is True
-
-    def test_string_output_arc_expression_is_inline_safe(self):
-        arc = OutputArc("q", expression="bool(tokens)")
-        assert arc._inline_safe is True
+    def test_string_reassignment_raises_type_error(self):
+        arc = InputArc("p", expression=lambda toks: toks)
+        with pytest.raises(TypeError, match="callable"):
+            arc.expression = "tokens"
 
 
 class TestInlineSafeFlagAlwaysPresent:
