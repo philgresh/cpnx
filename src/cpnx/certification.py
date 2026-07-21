@@ -13,8 +13,17 @@ for anything we can *prove* is safe. This module supplies that proof.
 only on a fixed, library-controlled vocabulary (a small whitelist of builtins
 and methods), calls only user helpers that themselves certify, iterates only
 over its own (finite, engine-built) argument, and closes over nothing mutable.
-A callable meeting all of these cannot loop forever and cannot reach outside the
-values it is handed — so running it inline without a timeout is sound.
+A callable meeting all of these has **its own control flow bounded and
+closed-world** — so running it inline without a timeout is sound. One residual
+assumption remains, and is *not* proven here: whitelisted method calls
+(``.get``, ``.startswith``, …) and every comparison (``==``, ``<``, and the
+``sorted(..., key=...)`` comparisons) dispatch on arbitrary user-supplied token
+*payload* objects, so termination still assumes those payload methods and
+comparisons themselves terminate and are side-effect-free. This is the same
+assumption the string sandbox always made (it, too, ran ``.get``/``==`` inline
+over payloads), so certification adds no risk relative to strings — but a
+payload whose ``__eq__``/``__lt__``/``.get`` diverges would do so inline, under
+the lock, with no timeout.
 
 This is deliberately a **whitelist** (closed-world), not the effect-detecting
 blocklist in :func:`cpnx.sandbox.verify_callable_purity`. Side effects cannot be
@@ -338,20 +347,46 @@ def _check_structural(node: ast.AST) -> Verdict | None:
 
 
 def _bound_names(node: ast.AST) -> frozenset[str]:
-    """Every name bound anywhere under *node* — assignment/target/nested-param.
+    """Names bound in *node*'s **own** scope — assignments/targets plus the names
+    of nested functions defined here.
 
     A ``Name`` read whose id is in this set refers to something the callable
     itself binds, so it is not external state. Store-context ``Name`` nodes cover
     assignments, augmented assignments, ``for``/comprehension targets and walrus
-    bindings; nested lambdas/defs contribute their parameter names and (for defs)
-    their own name.
+    bindings; a nested ``def`` also binds its own name in this scope.
+
+    Crucially this does **not** descend into nested ``Lambda``/``def`` bodies:
+    names bound only inside a nested scope (its parameters, its internal
+    assignments) are *not* bindings of this scope. Unioning them would let a
+    nested binding mask an outer read of an external — possibly mutable — name,
+    a false *accept* of exactly what :meth:`_Certifier._check_name` exists to
+    reject. A read of a genuine nested-scope local instead resolves to
+    :data:`_UNRESOLVED` in ``_check_name`` and passes safely, so leaving those
+    names out costs nothing; the only theoretical effect is that a nested local
+    *shadowing* a mutable global is conservatively rejected — the safe direction.
     """
     names: set[str] = set()
-    for child in ast.walk(node):
-        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
-            names.add(child.id)
-        elif isinstance(child, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)):
-            names |= _param_names(child)
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                names.add(child.name)
+    for child in ast.iter_child_nodes(node):
+        _collect_scope_bindings(child, names)
     return frozenset(names)
+
+
+def _collect_scope_bindings(node: ast.AST, names: set[str]) -> None:
+    """Accumulate the names *node* binds in the current scope, without recursing
+    into nested function/lambda bodies (whose bindings belong to *their* scope).
+
+    A nested ``def``'s own name is bound in this scope, so record it and stop; a
+    ``Lambda`` binds no name here, so stop without recording. Everything else
+    (including comprehensions, whose targets bind in this scope as before) is
+    walked through.
+    """
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+        names.add(node.id)
+        return
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        names.add(node.name)
+        return
+    if isinstance(node, ast.Lambda):
+        return
+    for child in ast.iter_child_nodes(node):
+        _collect_scope_bindings(child, names)

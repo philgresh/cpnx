@@ -42,6 +42,21 @@ def test_reads_mutable_list_module_global():
     _assert_rejected(lambda toks: _MUTABLE_LIST[0], "_MUTABLE_LIST")
 
 
+def test_nested_scope_binding_does_not_mask_outer_mutable_read():
+    # A name bound only inside a nested `def` body must NOT make an *outer* read
+    # of that same name (here, a mutable module global) look local. Regression
+    # for a `_bound_names` scope leak that flattened nested-scope bindings into
+    # the outer scope's bound set, wrongly certifying the outer mutable read.
+    def guard(toks):
+        def helper():
+            _MUTABLE_STATE = 1  # noqa: F841 — nested binding must not leak to the outer scope
+            return _MUTABLE_STATE
+
+        return _MUTABLE_STATE["allow"]  # outer read of the GLOBAL mutable dict
+
+    _assert_rejected(guard, "_MUTABLE_STATE")
+
+
 def test_for_statement_is_unbounded_iteration():
     def guard(toks):
         total = 0
