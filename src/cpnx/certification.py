@@ -201,6 +201,7 @@ class _Certifier:
         immutable or a certifying helper (see :meth:`_check_name`). This unified
         read check covers both closure cells and module globals.
         """
+        _strip_annotations(node)
         params = _param_names(node)
         bound = params | _bound_names(node)
         for child in ast.walk(node):
@@ -296,6 +297,24 @@ def _comp_target_names(target: ast.AST) -> list[str]:
     if isinstance(target, (ast.Tuple, ast.List)):
         return [name for element in target.elts for name in _comp_target_names(element)]
     return []
+
+
+def _strip_annotations(node: ast.AST) -> None:
+    """Blank out type annotations in-place before the certification walk.
+
+    Parameter/return/variable annotations (``tokens: list[Token]``, ``-> bool``)
+    reference *types* that are never evaluated when the callable is *called*, so
+    they must not disqualify it — otherwise every type-annotated guard would fail
+    on the class name in its own signature. The node comes from a fresh per-call
+    parse (:func:`_get_ast_node`), so mutating it is safe.
+    """
+    for child in ast.walk(node):
+        if isinstance(child, ast.arg):
+            child.annotation = None
+        elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            child.returns = None
+        elif isinstance(child, ast.AnnAssign):
+            child.annotation = ast.Constant(value=None)
 
 
 def _check_structural(node: ast.AST) -> Verdict | None:

@@ -3,11 +3,27 @@ import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, ClassVar
 
+from cpnx.certification import is_inline_safe
 from cpnx.sandbox import SandboxEvaluator, verify_callable_purity
 from cpnx.tokens import Token
 
 if TYPE_CHECKING:
     from cpnx.engine import PetriNet
+
+
+def _inline_safe_for(value) -> bool:
+    """Whether a guard/arc-expression value may be evaluated inline (no executor).
+
+    String expressions always run inline via the sandbox. A callable runs inline
+    only if it *certifies* closed-world (see :mod:`cpnx.certification`); an
+    uncertified callable falls back to the timeout-bounded executor. ``None`` (no
+    expression) is never evaluated, so its flag is immaterial — reported ``False``.
+    """
+    if isinstance(value, str):
+        return True
+    if callable(value):
+        return is_inline_safe(value)
+    return False
 
 
 class BindingPolicy(enum.Enum):
@@ -100,14 +116,15 @@ class InputArc:
     expression: Callable[[list[Token]], list[Token]] | str | None = field(default=None, compare=False)
 
     def __setattr__(self, name, value):
-        # Keep the pre-compiled code object in sync with ``expression``, including
-        # post-construction reassignment. Compile/verify before mutating so a bad
-        # value leaves the arc in its previous valid state.
+        # Keep the pre-compiled code object and the inline-safe flag in sync with
+        # ``expression``, including post-construction reassignment. Compile/verify
+        # before mutating so a bad value leaves the arc in its previous valid state.
         if name == "expression":
             compiled = SandboxEvaluator.maybe_compile(value)
             if callable(value):
                 verify_callable_purity(value)
             super().__setattr__("_compiled_expression", compiled)
+            super().__setattr__("_inline_safe", _inline_safe_for(value))
         super().__setattr__(name, value)
 
 
@@ -134,14 +151,15 @@ class OutputArc:
     expression: Callable[[list[Token]], bool] | str | None = field(default=None, compare=False)
 
     def __setattr__(self, name, value):
-        # Keep the pre-compiled code object in sync with ``expression``, including
-        # post-construction reassignment. Compile/verify before mutating so a bad
-        # value leaves the arc in its previous valid state.
+        # Keep the pre-compiled code object and the inline-safe flag in sync with
+        # ``expression``, including post-construction reassignment. Compile/verify
+        # before mutating so a bad value leaves the arc in its previous valid state.
         if name == "expression":
             compiled = SandboxEvaluator.maybe_compile(value)
             if callable(value):
                 verify_callable_purity(value)
             super().__setattr__("_compiled_expression", compiled)
+            super().__setattr__("_inline_safe", _inline_safe_for(value))
         super().__setattr__(name, value)
 
     @classmethod
@@ -261,6 +279,7 @@ class Transition:
             if callable(value):
                 verify_callable_purity(value)
             super().__setattr__("_compiled_guard", compiled)
+            super().__setattr__("_inline_safe", _inline_safe_for(value))
         elif name == "binding_priority_key" and value is not None:
             # String-expression keys are deferred (see ADR 0001), so reject non-callables
             # loudly rather than letting a truthy string be used as a key and raise on every

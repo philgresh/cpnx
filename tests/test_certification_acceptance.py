@@ -14,6 +14,12 @@ from cpnx.certification import certify, is_inline_safe
 THRESHOLD = 19
 
 
+class _Token:
+    """Stand-in for cpnx.Token, used only as a parameter annotation below."""
+
+    payload: dict
+
+
 def _assert_certified(fn) -> None:
     verdict = certify(fn)
     assert verdict.certified is True
@@ -143,6 +149,32 @@ def test_transitive_call_to_certifying_helper_function():
 
     fn = lambda toks: any(_is_lead(t) for t in toks)  # noqa: E731
     _assert_certified(fn)
+
+
+def test_type_annotations_do_not_disqualify():
+    # A guard annotated `tokens: list[_Token]) -> bool` references the class name
+    # `_Token` in its signature. Annotations are never evaluated at call time, so
+    # they must be ignored — otherwise every type-annotated guard (the whole real
+    # corpus) would fail on the class name in its own signature.
+    def guard(tokens: list[_Token]) -> bool:
+        return len(tokens) > 0
+
+    _assert_certified(guard)
+
+
+def test_annotated_guard_reading_immutable_global_default():
+    # Mirrors the Concurrency Cafe dose guard: annotated def, `next` over the
+    # parameter, `.get` with an immutable module-global default, closure floats.
+    TARGET = 18.0
+
+    def make(low: float, high: float):
+        def dose_ok(tokens: list[_Token]) -> bool:
+            first = next(t for t in tokens if t.payload)
+            return low <= first.payload.get("w", TARGET) <= high
+
+        return dose_ok
+
+    _assert_certified(make(17.0, 19.0))
 
 
 def test_none_and_bool_literal_and_no_arg_builtin_calls():
