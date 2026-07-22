@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 
-- **Executor batching stays deferred.** A certification hit-rate of **88.7%** across the combined corpus (81.7% of cpnx's own tests, 100% of the downstream causal-trader consumer) clears the ~80% go/no-go threshold, so inline certification already covers the common case and chunked-submit batching for uncertified callables is not being pursued now.
+- **Executor batching stays deferred.** A certification hit-rate of **88.7%** across the combined corpus (81.7% of cpnx's own tests, 100% of a private downstream consumer) clears the ~80% go/no-go threshold, so inline certification already covers the common case and chunked-submit batching for uncertified callables is not being pursued now.
 
 ### Fixed
 

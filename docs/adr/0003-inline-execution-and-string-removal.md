@@ -157,7 +157,7 @@ second security model, a documentation section, and a dispatch branch.
 **Neutral / deferred**
 
 - **Executor batching stays deferred.** A corpus certification hit-rate of **88.7% combined**
-  (81.7% across cpnx's own tests, 100% across the causal-trader downstream consumer) is
+  (81.7% across cpnx's own tests, 100% across a private downstream consumer) is
   comfortably over the ~80% go/no-go threshold set for this decision. Certification therefore
   covers the common case well enough that chunked-submit batching for the remaining uncertified
   callables is not worth building now; it remains available to revisit if the residual after
