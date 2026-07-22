@@ -1613,8 +1613,13 @@ class PetriNet:
           token makes the two disagree forever: the timed view succeeds and clears, the
           untimed view fails and reports, once per poll.
 
-        Cost: one frozenset of token-id references per *faulted* arc, so it is proportional to
-        the pool of an arc that is actually broken, and empty otherwise.
+        Cost: the witness set is built only when a report is actually emitted. The ongoing-fault
+        check short-circuits on the first token still present, which matters because a broken
+        arc can never fire — so `run()` polls it indefinitely, and materialising the witnesses
+        eagerly on each poll made that O(pool) per enabling check, under the lock (1.7 ms per
+        check on a 20k-deep place). Steady-state is now a dict lookup and one membership test.
+        Memory is one frozenset of token-id *references* per faulted arc, and nothing for a
+        healthy one.
 
         Mirrors `_signal_priority_key_failure` deliberately: `binding_priority_key` is the
         closest analogue to `InputArc.key` and already reported, so the two now behave alike.
@@ -1624,11 +1629,10 @@ class PetriNet:
         the same callable over the same pool and arrives here, carrying the transition context
         the index does not have. A broken key therefore reports exactly once, from one place.
         """
-        witnesses = frozenset(token.id for token in pool)
         previous = self._selection_faulted.get(fault_id)
-        if previous is not None and previous & witnesses:
+        if previous is not None and any(token.id in previous for token in pool):
             return  # the same offending tokens are still here — one ongoing fault, stay quiet
-        self._selection_faulted[fault_id] = witnesses
+        self._selection_faulted[fault_id] = frozenset(token.id for token in pool)
         self._pending_selection_failures[fault_id] = exc
 
     def _flush_selection_failures(self) -> None:
