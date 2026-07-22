@@ -739,7 +739,7 @@ class SinkPlace(Place):
 
     Note:
         A sink is a terminal ring buffer, not a retrievable queue, so it does NOT use
-        [`_TokenStore`][cpnx.places._TokenStore] internally — it keeps its own bounded
+        `_TokenStore` internally — it keeps its own bounded
         `collections.deque(maxlen=keep_last)` and overrides every method that would
         otherwise touch the base class's store.
 
