@@ -1,22 +1,23 @@
-"""Informational benchmark: what fraction of the repo's real guards/expressions certify.
+"""Informational benchmark: what fraction of the repo's real guards/selectors certify.
 
-``cpnx.certification.certify`` proves a callable guard, arc expression, or
-``binding_priority_key`` is closed-world and provably terminating, which lets the engine
-dispatch it *inline* (no ``ThreadPoolExecutor`` round trip -- see ``bench_enablement.py``
-for how much that dispatch choice costs). A callable that fails certification simply falls
-back to the timeout-bounded executor; nothing breaks, it's just slower.
+``cpnx.certification.certify`` proves a callable guard, arc selector (``InputArc.key``,
+``InputArc.filter``, ``OutputArc.condition``), or ``binding_priority_key`` is closed-world
+and provably terminating, which lets the engine dispatch it *inline* (no
+``ThreadPoolExecutor`` round trip -- see ``bench_enablement.py`` for how much that dispatch
+choice costs). A callable that fails certification simply falls back to the timeout-bounded
+executor; nothing breaks, it's just slower.
 
 This script does **not** hand-write toy guards. It builds the two real benchmark nets --
 ``benchmarks/bench_enablement.py``'s ``build_net`` (both ``guard_kind`` variants) and
-``benchmarks/concurrency_cafe.py``'s ``build_cafe`` -- and certifies every guard, output-arc
-expression, input-arc expression, and binding-priority key actually attached to their
-transitions. It reports the certification *hit rate* across that corpus: the fraction of
-real callables that certify for inline execution.
+``benchmarks/concurrency_cafe.py``'s ``build_cafe`` -- and certifies every guard, input-arc
+``key``, input-arc ``filter``, output-arc ``condition``, and binding-priority key actually
+attached to their transitions. It reports the certification *hit rate* across that corpus:
+the fraction of real callables that certify for inline execution.
 
 This is **purely informational** -- there is no assertion, no exit code, no CI gate. A high
 hit rate is the empirical justification for *not* prioritizing further work on the executor
 fallback path: if inline certification already covers the overwhelming majority of real
-guards/expressions, the uncertified/executor path matters less for typical workloads. A
+guards/selectors, the uncertified/executor path matters less for typical workloads. A
 low hit rate would suggest the opposite. Either way this script only reports the number; it
 never fails the build.
 
@@ -49,12 +50,13 @@ class Callable_(NamedTuple):
 
 
 def _collect_callables(net: PetriNet, net_label: str) -> list[Callable_]:
-    """Collect every guard/expression/priority-key attached to *net*'s transitions.
+    """Collect every guard/selector/priority-key attached to *net*'s transitions.
 
     Walks ``net.transitions.values()`` and, for each transition, gathers ``guard``,
-    ``binding_priority_key``, and every input/output arc's ``expression`` -- whichever of
-    those attributes is not ``None``. These are the real callables the engine actually has
-    to dispatch (inline or via the executor) when the net runs.
+    ``binding_priority_key``, every input arc's ``key`` and ``filter``, and every output
+    arc's ``condition`` -- whichever of those attributes is not ``None``. These are the real
+    callables the engine actually has to dispatch (inline or via the executor) when the net
+    runs.
     """
     found: list[Callable_] = []
     for transition in net.transitions.values():
@@ -64,11 +66,13 @@ def _collect_callables(net: PetriNet, net_label: str) -> list[Callable_]:
         if transition.binding_priority_key is not None:
             found.append(Callable_(f"{prefix}.binding_priority_key", transition.binding_priority_key))
         for i, arc in enumerate(transition.inputs):
-            if arc.expression is not None:
-                found.append(Callable_(f"{prefix}.inputs[{i}:{arc.place}].expression", arc.expression))
+            if arc.key is not None:
+                found.append(Callable_(f"{prefix}.inputs[{i}:{arc.place}].key", arc.key))
+            if arc.filter is not None:
+                found.append(Callable_(f"{prefix}.inputs[{i}:{arc.place}].filter", arc.filter))
         for i, arc in enumerate(transition.outputs):
-            if arc.expression is not None:
-                found.append(Callable_(f"{prefix}.outputs[{i}:{arc.place}].expression", arc.expression))
+            if arc.condition is not None:
+                found.append(Callable_(f"{prefix}.outputs[{i}:{arc.place}].condition", arc.condition))
     return found
 
 
@@ -81,7 +85,7 @@ def _build_corpus() -> list[Callable_]:
     - ``concurrency_cafe.build_cafe``: the default configuration, which installs the dose
       guard (``T_Weigh_And_Grind``), its complement (``T_Rework_Dose``), the
       mobile-pickup-first ``binding_priority_key``, and the ``OutputArc.on_color``
-      expressions on ``T_Steam_Milk``.
+      conditions on ``T_Steam_Milk``.
     """
     corpus: list[Callable_] = []
 
@@ -91,7 +95,7 @@ def _build_corpus() -> list[Callable_]:
     net_uncertified, _ = build_net(guard_kind="uncertified")
     corpus += _collect_callables(net_uncertified, "bench_enablement[uncertified]")
 
-    # Default config installs the dose guard/rework guard/priority key/on_color expressions
+    # Default config installs the dose guard/rework guard/priority key/on_color conditions
     # described in the module docstring above.
     cafe_net = build_cafe()
     corpus += _collect_callables(cafe_net, "concurrency_cafe")
@@ -112,7 +116,7 @@ def _build_corpus() -> list[Callable_]:
 def main() -> None:
     corpus = _build_corpus()
 
-    print("-- Certification hit rate over the repo's real guards/expressions --")
+    print("-- Certification hit rate over the repo's real guards/selectors --")
     print(f"{'label':55} {'certified':10} reason (if rejected)")
     print("-" * 100)
 

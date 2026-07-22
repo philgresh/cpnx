@@ -148,6 +148,11 @@ all-or-nothing based on a predicate on the whole output list.
 not CPN arc expressions.  Consider a future `OutputArc` mode that accepts a
 `Callable[[list[Token]], list[Token]]` producing the exact multiset to deposit.
 
+> **Update (2026-07-21):** acted on. The field was renamed `expression` → **`condition`**,
+> so the API now says what the audit found it to be: an arc *activation* predicate, not a
+> token-producing expression. Semantics are unchanged. See
+> [`adr/0004-arc-selection-key-filter.md`](adr/0004-arc-selection-key-filter.md).
+
 ---
 
 ### Finding 2 — InputArc.expression is a Token-Ordering Function, not an Arc Expression
@@ -176,6 +181,14 @@ guarantee that the consumed multiset is always exactly `E(p,t)⟨b⟩` for some 
 
 **Recommendation:** Document as "inspired by CPN arc expressions, adapted for
 identity-bearing tokens."
+
+> **Update (2026-07-21):** acted on, and pushed further. The opaque
+> `list[Token] -> list[Token]` transform was replaced by two *per-token* parameters —
+> **`InputArc.key`** (a total order over eligible tokens, ascending, insertion-order
+> tiebreak) and **`InputArc.filter`** (an eligibility predicate). The selection remains
+> token-identity-aware, so this finding's divergence from `E(p,t)⟨b⟩` stands; what changed
+> is that the selection is no longer a black box, which is the precondition for indexing
+> it. See [`adr/0004-arc-selection-key-filter.md`](adr/0004-arc-selection-key-filter.md).
 
 ---
 
@@ -524,8 +537,8 @@ No semantic error, but users should be aware this guard is hidden inside the pla
 
 | # | Area | Severity | Status |
 |---|------|----------|--------|
-| 1 | OutputArc.expression is a bool predicate | Deliberate (§0) | Documentation gap |
-| 2 | InputArc.expression is a token-ordering function | Deliberate (§0) | Documentation gap; HoL symptom |
+| 1 | OutputArc.expression is a bool predicate | Deliberate (§0) | **Addressed** — renamed `condition` (ADR 0004) |
+| 2 | InputArc.expression is a token-ordering function | Deliberate (§0) | **Addressed** — split into `key`/`filter` (ADR 0004) |
 | 3 | No binding concept | Deliberate (§0) | Deferred feature; documentation gap |
 | 4 | Back-pressure in enabling rule | Minor extension | Correct; well-commented |
 | 5 | Token UUID identity | Extension | Intentional; documented |

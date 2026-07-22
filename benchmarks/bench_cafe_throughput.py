@@ -34,7 +34,7 @@ Two more regimes, added after the three above and swept separately at ``DEEP_ORD
 (500/2000/20000 — deliberately deeper than ``ORDER_COUNTS`` tops out, since both regimes exist
 specifically to show what happens as their place gets genuinely deep): ``cold-brew`` exercises
 ``concurrency_cafe.build_cafe(cold_brew=True)``'s deep *timed* place, and ``batch-triage``
-exercises ``build_cafe(batch_triage=True)``'s only ``InputArc(expression=...)``. Both are
+exercises ``build_cafe(batch_triage=True)``'s only ``InputArc(key=...)``. Both are
 isolated single-station workloads (they deposit straight into the new place, bypassing
 ``P_Ticket_Line``/the grind-pull-steam pipeline entirely) so their numbers measure exactly the
 new code path, uncontaminated by the rest of the topology. See ``concurrency_cafe.py``'s module
@@ -194,10 +194,10 @@ def _run_batch_triage(n_orders: int) -> None:
     """Stock `P_Batch_Triage_Queue` with `n_orders` tickets (deep, all at once) and drain it.
 
     Deposited directly into the triage queue (bypassing P_Ticket_Line entirely — see the
-    module docstring), so this measures exactly the `InputArc.expression` code path re-sorting
+    module docstring), so this measures exactly the `InputArc.key` code path re-sorting
     a deep pool every firing, nothing else. Records the order tokens actually reach `P_Served`
     in (via `on_token_deposited`) so the printed line can confirm the barista triage
-    (`_batch_triage_order`) genuinely reordered them rather than passing FIFO through unchanged.
+    (`_batch_triage_key`) genuinely reordered them rather than passing FIFO through unchanged.
     """
     with build_cafe(batch_triage=True, seed=NET_SEED, max_workers=1) as net:
         served_order: list[int] = []
@@ -249,14 +249,14 @@ def main() -> None:
         print()
 
     # Two more regimes, each isolating one of the two shapes ORDER_COUNTS never exercised: a
-    # genuinely deep *timed* place, and this net's only InputArc(expression=...). See the
+    # genuinely deep *timed* place, and this net's only InputArc(key=...). See the
     # module docstring and concurrency_cafe.py's for what each demonstrates and why.
     print("Concurrency Cafe throughput — cold-brew steeping tower (logical clock, workers=1):")
     for n in DEEP_ORDER_COUNTS:
         _run_cold_brew(n)
     print()
 
-    print("Concurrency Cafe throughput — batch-triage (expression-ordered) (logical clock, workers=1):")
+    print("Concurrency Cafe throughput — batch-triage (key-ordered) (logical clock, workers=1):")
     for n in DEEP_ORDER_COUNTS:
         _run_batch_triage(n)
     print()

@@ -99,14 +99,19 @@ default off) exercise the shapes the base net never did, and show where the win 
 | regime (20 000 orders) | before | after | note |
 | --- | ---: | ---: | --- |
 | cold-brew (deep **timed** place) | 1 048.8 µs/order | **228.2** | 4.6× — the cooling min-heap |
-| batch-triage (deep **expression**-ordered arc) | 3 677.5 µs/order | 2 440.7 | still ≈ O(N²) |
+| batch-triage (deep **key**-sorted arc) | 3 677.5 µs/order | 2 440.7 | still ≈ O(N²) |
 
-The batch-triage arc's `expression` is an opaque `list[Token] → list[Token]` transform
-re-run over the whole pool every firing (`engine._order_available`), so its cost is
-inherent to that shape, not the place store — it is the one retrieval shape that stays
-non-linear, and it lives in the engine, not `places.py`. Making it sub-quadratic needs a
-persistent per-arc sorted index (a `key=`-based arc API), tracked in
-[#25](https://github.com/philgresh/cpnx/issues/25).
+The batch-triage arc's per-firing cost is a `filter`-then-`key`-sort over the whole
+eligible pool (`engine._order_available`), re-run every firing, so its cost is inherent to
+that shape, not the place store — it is the one retrieval shape that stays non-linear, and
+it lives in the engine, not `places.py`. Unlike the old opaque `list[Token] ->
+list[Token]` arc expression, the per-token `InputArc.key` (see
+[ADR 0004](../docs/adr/0004-arc-selection-key-filter.md)) is indexable — it's what makes a
+*persistent* per-arc sorted index possible in principle, turning this per-firing
+linear-scan-and-sort into an incremental O(log n) insert/removal. That index is a
+follow-up, not implemented yet: today the whole eligible pool is still re-sorted from
+scratch on every firing, so the µs/order figure above is unchanged by the key/filter API
+landing. Tracked in [#25](https://github.com/philgresh/cpnx/issues/25).
 
 **Step counts are now identical across every repeat**, which was not true of any
 previously published table here. Two instrument defects had to be fixed first:

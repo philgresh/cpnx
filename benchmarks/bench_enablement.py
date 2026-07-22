@@ -62,9 +62,13 @@ def guard_uncertified(tokens: list[Token]) -> bool:
     return len(tokens) >= 1 and bool(tokens[0].color == _EXPECTED["color"])
 
 
-def _identity_expression(tokens: list[Token]) -> list[Token]:
-    # Certified identity input-arc expression (runs inline); returns tokens unchanged.
-    return tokens
+def _accept_all_filter(token: Token) -> bool:
+    # Certified identity input-arc filter (runs inline); accepts every token unchanged.
+    # Setting it (even to an always-true predicate) routes the arc through the
+    # per-token filter/sort path (`engine._order_available`) instead of the count==1
+    # fast-path bypass that applies when both `key` and `filter` are `None`, matching
+    # this benchmark's original intent of exercising that path.
+    return True
 
 
 def build_net(
@@ -90,7 +94,7 @@ def build_net(
 
     transition = Transition(
         name="t",
-        inputs=[InputArc("input", count=1, expression=_identity_expression)],
+        inputs=[InputArc("input", count=1, filter=_accept_all_filter)],
         outputs=[OutputArc("output")],
         action=lambda tokens: tokens,
         guard=guard_certified if guard_kind == "certified" else guard_uncertified,

@@ -307,7 +307,7 @@ class Place:
     def retrieve_specific(self, tokens: list[Token], model_time: float | None = None) -> list[Token]:
         """Remove and return exactly the given *tokens*, matched by ``id`` rather than FIFO order.
 
-        Used by the engine when an [`InputArc`][cpnx.InputArc] has an ``expression`` that
+        Used by the engine when an [`InputArc`][cpnx.InputArc] has a ``key``/``filter`` that
         selects a specific subset of tokens to consume rather than the head of the queue.
 
         Args:

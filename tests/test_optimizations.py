@@ -184,13 +184,25 @@ def test_string_guard_reassignment_is_rejected():
     assert net._is_transition_enabled(transition) is True
 
 
-def test_arc_expression_reassignment_recertifies():
-    """An arc expression reassigned after construction re-certifies; a string is rejected."""
-    arc = OutputArc(place="output", expression=lambda tokens: bool(tokens))
+def test_arc_condition_reassignment_recertifies():
+    """An arc condition reassigned after construction re-certifies; a string is rejected."""
+    arc = OutputArc(place="output", condition=lambda tokens: bool(tokens))
     assert arc._inline_safe is True
 
-    arc.expression = _reads_mutable_state
+    arc.condition = _reads_mutable_state
     assert arc._inline_safe is False
 
     with pytest.raises(TypeError, match="callable"):
-        arc.expression = "bool(tokens)"
+        arc.condition = "bool(tokens)"
+
+
+def test_input_arc_key_reassignment_recertifies():
+    """An InputArc.key reassigned after construction re-certifies and updates `_key_inline_safe`."""
+    arc = InputArc(place="input", key=lambda tok: tok.payload["w"])
+    assert arc._key_inline_safe is True
+
+    arc.key = _reads_mutable_state
+    assert arc._key_inline_safe is False
+
+    with pytest.raises(TypeError, match="callable"):
+        arc.key = "tok.payload['w']"

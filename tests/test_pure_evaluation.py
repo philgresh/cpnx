@@ -137,12 +137,12 @@ def test_find_target_node_outside_span():
 def test_callable_expression_timeout():
     import time
 
-    def slow_expression(tokens):
+    def slow_key(tok):
         # Busy-wait: time.sleep is on the purity denylist, so use a spin loop instead.
         deadline = time.monotonic() + 0.5
         while time.monotonic() < deadline:
             pass
-        return tokens
+        return tok.id
 
     with PetriNet(timeout_secs=0.1) as net:
         p_in = Place("in")
@@ -150,13 +150,15 @@ def test_callable_expression_timeout():
         net.add_transition(
             Transition(
                 name="t",
-                inputs=[InputArc("in", expression=slow_expression)],
+                inputs=[InputArc("in", key=slow_key)],
                 outputs=[],
                 action=lambda tokens: tokens,
             )
         )
+        # Keep only one token in the place so the per-token dispatch to the
+        # timeout-bounded executor doesn't multiply the wall-clock cost of the test.
         net.deposit("in", Token())
-        # W1 fix: a timed-out expression disables the transition rather than crashing
+        # W1 fix: a timed-out key disables the transition rather than crashing
         # step()/run(). The token stays in place; step() returns False.
         result = net.step()
         assert result is False

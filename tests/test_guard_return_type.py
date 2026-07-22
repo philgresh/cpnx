@@ -2,11 +2,11 @@
 
 ``cpnx.transitions._reject_non_bool_return`` enforces that a boolean-predicate
 callable's *annotated* return type resolves to ``bool`` (or something that can be
-``bool``, e.g. a union containing ``bool``) before it is wired into ``Transition.guard``
-or ``OutputArc.expression``. It is deliberately conservative: unannotated callables
-(all lambdas), ``Any``, bool-containing unions, and unresolvable annotations all pass;
+``bool``, e.g. a union containing ``bool``) before it is wired into ``Transition.guard``,
+``OutputArc.condition``, or ``InputArc.filter``. It is deliberately conservative: unannotated
+callables (all lambdas), ``Any``, bool-containing unions, and unresolvable annotations all pass;
 only an unambiguous non-bool annotation raises ``TypeError``. It is NOT applied to
-``InputArc.expression`` (which legitimately returns ``list[Token]``) nor to
+``InputArc.key`` (which legitimately returns any comparable value, not a bool) nor to
 ``binding_priority_key``.
 
 All annotated ``def`` guards/predicates are defined at module level (never nested
@@ -70,10 +70,6 @@ def output_predicate_literal_true(toks: list[Token]) -> Literal[True]:
     return True
 
 
-def ie(toks: list[Token]) -> list[Token]:
-    return toks
-
-
 # ---------------------------------------------------------------------------
 # Module-level annotated guards/predicates used in the rejection cases.
 # ---------------------------------------------------------------------------
@@ -101,6 +97,35 @@ def guard_literal_int(toks: list[Token]) -> Literal[1]:
 
 def output_predicate_int(toks: list[Token]) -> int:
     return len(toks)
+
+
+# ---------------------------------------------------------------------------
+# Module-level annotated InputArc.key / InputArc.filter callables.
+# ---------------------------------------------------------------------------
+
+
+def key_int(tok: Token) -> int:
+    return len(tok.id)
+
+
+def key_str(tok: Token) -> str:
+    return tok.id
+
+
+def filter_unannotated(tok):
+    return bool(tok.id)
+
+
+def filter_bool(tok: Token) -> bool:
+    return bool(tok.id)
+
+
+def filter_literal_true(tok: Token) -> Literal[True]:
+    return True
+
+
+def filter_int(tok: Token) -> int:
+    return len(tok.id)
 
 
 def _build_transition(guard=None, binding_priority_key=None) -> Transition:
@@ -151,17 +176,17 @@ class TestGuardReturnTypeAcceptance:
 
 
 class TestOutputArcReturnTypeAcceptance:
-    """`OutputArc.expression` acceptance mirrors the guard acceptance cases."""
+    """`OutputArc.condition` acceptance mirrors the guard acceptance cases."""
 
-    def test_unannotated_lambda_expression_constructs(self):
-        OutputArc("b", expression=output_predicate_unannotated)
+    def test_unannotated_lambda_condition_constructs(self):
+        OutputArc("b", condition=output_predicate_unannotated)
 
-    def test_bool_annotated_expression_constructs(self):
-        OutputArc("b", expression=output_predicate_bool)
+    def test_bool_annotated_condition_constructs(self):
+        OutputArc("b", condition=output_predicate_bool)
 
-    def test_literal_true_expression_constructs(self):
+    def test_literal_true_condition_constructs(self):
         # Literal[True] is a valid boolean predicate return type.
-        OutputArc("b", expression=output_predicate_literal_true)
+        OutputArc("b", condition=output_predicate_literal_true)
 
 
 class TestGuardReturnTypeRejection:
@@ -195,24 +220,55 @@ class TestGuardReturnTypeRejection:
 
 
 class TestOutputArcReturnTypeRejection:
-    """`OutputArc.expression` rejection mirrors the guard rejection cases."""
+    """`OutputArc.condition` rejection mirrors the guard rejection cases."""
 
-    def test_int_annotated_expression_raises(self):
-        with pytest.raises(TypeError, match="OutputArc.expression must return bool"):
-            OutputArc("b", expression=output_predicate_int)
+    def test_int_annotated_condition_raises(self):
+        with pytest.raises(TypeError, match="OutputArc.condition must return bool"):
+            OutputArc("b", condition=output_predicate_int)
 
-    def test_reassignment_of_bad_expression_raises(self):
-        arc = OutputArc("b", expression=output_predicate_bool)
-        with pytest.raises(TypeError, match="OutputArc.expression must return bool"):
-            arc.expression = output_predicate_int
+    def test_reassignment_of_bad_condition_raises(self):
+        arc = OutputArc("b", condition=output_predicate_bool)
+        with pytest.raises(TypeError, match="OutputArc.condition must return bool"):
+            arc.condition = output_predicate_int
 
 
 class TestReturnTypeScope:
     """The check must not bleed into callables it is not meant to cover."""
 
-    def test_input_arc_expression_returning_list_of_tokens_constructs(self):
-        # InputArc.expression legitimately returns list[Token]; never bool-checked.
-        InputArc("a", expression=ie)
+    def test_input_arc_key_returning_int_constructs(self):
+        # InputArc.key legitimately returns any comparable value; never bool-checked.
+        InputArc("a", key=key_int)
+
+    def test_input_arc_key_returning_str_constructs(self):
+        # Same rule, a different non-bool comparable return type.
+        InputArc("a", key=key_str)
 
     def test_bool_guard_with_valid_binding_priority_key_constructs(self):
         _build_transition(guard=guard_bool, binding_priority_key=lambda toks: 0)
+
+
+class TestInputArcFilterReturnTypeAcceptance:
+    """`InputArc.filter` acceptance mirrors the guard/condition acceptance cases."""
+
+    def test_unannotated_lambda_filter_constructs(self):
+        InputArc("a", filter=filter_unannotated)
+
+    def test_bool_annotated_filter_constructs(self):
+        InputArc("a", filter=filter_bool)
+
+    def test_literal_true_filter_constructs(self):
+        # Literal[True] is a valid boolean predicate return type.
+        InputArc("a", filter=filter_literal_true)
+
+
+class TestInputArcFilterReturnTypeRejection:
+    """`InputArc.filter` rejection mirrors the guard/condition rejection cases."""
+
+    def test_int_annotated_filter_raises(self):
+        with pytest.raises(TypeError, match="InputArc.filter must return bool"):
+            InputArc("a", filter=filter_int)
+
+    def test_reassignment_of_bad_filter_raises(self):
+        arc = InputArc("a", filter=filter_bool)
+        with pytest.raises(TypeError, match="InputArc.filter must return bool"):
+            arc.filter = filter_int

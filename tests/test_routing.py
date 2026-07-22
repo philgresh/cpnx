@@ -18,8 +18,8 @@ class TestOutputArcGuard:
                     name="filter",
                     inputs=[InputArc("input")],
                     outputs=[
-                        OutputArc("passed", expression=lambda tokens: tokens[0].payload.get("ok")),
-                        OutputArc("rejected", expression=lambda tokens: not tokens[0].payload.get("ok")),
+                        OutputArc("passed", condition=lambda tokens: tokens[0].payload.get("ok")),
+                        OutputArc("rejected", condition=lambda tokens: not tokens[0].payload.get("ok")),
                     ],
                     action=lambda tokens: tokens,
                 )
@@ -40,7 +40,7 @@ class TestOutputArcGuard:
                 Transition(
                     name="t",
                     inputs=[InputArc("input")],
-                    outputs=[OutputArc("output", expression=lambda tokens: False)],
+                    outputs=[OutputArc("output", condition=lambda tokens: False)],
                     action=lambda tokens: tokens,
                 )
             ],
@@ -62,7 +62,7 @@ class TestOutputArcGuard:
                     inputs=[InputArc("input", count=2)],
                     outputs=[
                         OutputArc("always"),  # no guard — fires for every token
-                        OutputArc("sometimes", expression=lambda tokens: tokens[0].payload.get("extra")),
+                        OutputArc("sometimes", condition=lambda tokens: tokens[0].payload.get("extra")),
                     ],
                     # action returns two tokens; only first goes to "always", second to "sometimes" if guard passes
                     action=lambda tokens: tokens,
@@ -86,7 +86,7 @@ class TestOutputArcGuard:
                     name="t",
                     inputs=[InputArc("input"), InputArc("slot")],
                     outputs=[
-                        OutputArc("output", expression=lambda tokens: False),  # always skip
+                        OutputArc("output", condition=lambda tokens: False),  # always skip
                         OutputArc("slot"),  # resource return — no guard
                     ],
                     action=lambda tokens: [t for t in tokens if not t.is_resource],
@@ -110,8 +110,8 @@ class TestOutputArcGuard:
                     name="broadcast",
                     inputs=[InputArc("input")],
                     outputs=[
-                        OutputArc("a", expression=lambda tokens: True),
-                        OutputArc("b", expression=lambda tokens: True),
+                        OutputArc("a", condition=lambda tokens: True),
+                        OutputArc("b", condition=lambda tokens: True),
                     ],
                     action=lambda tokens: tokens + [Token()],  # produce 2 data tokens
                 )

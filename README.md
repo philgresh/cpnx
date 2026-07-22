@@ -121,7 +121,7 @@ A transition is **enabled** when all input places contain sufficient tokens and 
 
 ### Canonical Error Handling (Colour Routing)
 
-The most robust and mathematically sound way to handle errors in Coloured Petri Nets is to catch exceptions inside the action and return an **error-coloured token**. Output arcs can then use expression guards to route success tokens to normal places and error tokens to an error sink. This preserves token conservation (1-in-1-out) and keeps the firing rules pure.
+The most robust and mathematically sound way to handle errors in Coloured Petri Nets is to catch exceptions inside the action and return an **error-coloured token**. Output arcs can then use `condition` predicates to route success tokens to normal places and error tokens to an error sink. This preserves token conservation (1-in-1-out) and keeps the firing rules pure.
 
 ```python
 from cpnx import PetriNet, Place, Token, Transition, InputArc, OutputArc, ERROR_COLOR
@@ -153,17 +153,19 @@ net.add_transition(Transition(
 ))
 ```
 
-### Arc Expressions
+### Arc Selection: `key`, `filter`, `condition`
 
-Both `InputArc` and `OutputArc` accept an `expression` — a callable that filters or orders token consumption (input) or gates token deposit (output):
+`InputArc` accepts two **per-token** callables that together select which tokens a firing consumes: `key` orders the eligible tokens (ascending, min-first — negate the key for descending order) and `filter` decides which tokens are eligible at all (rejected tokens simply stay in the place). `OutputArc` accepts `condition` — a predicate over the action's output tokens that gates whether the arc deposits anything:
 
 ```python
-# Consume the highest-priority lead first
-InputArc("leads", count=1,
-         expression=lambda tokens: sorted(tokens, key=lambda t: -t.payload.get("score", 0)))
+# Consume the highest-priority lead first (higher score first, so negate for descending)
+InputArc("leads", count=1, key=lambda t: -t.payload.get("score", 0))
 
-# Only deposit to the output place if processing succeeded
-OutputArc("results", expression=lambda tokens: bool(tokens))
+# Only pull tokens that are actually ready for processing
+InputArc("leads", count=1, filter=lambda t: not t.payload.get("on_hold", False))
+
+# Only deposit to the output place if processing produced any tokens
+OutputArc("results", condition=lambda tokens: bool(tokens))
 ```
 
 ### Marking
@@ -240,11 +242,12 @@ SinkPlace(name: str, *, keep_last: int = 0, color_set: set[str] | None = None)
 
 ```python
 InputArc(place: str, count: int = 1, consume_all: bool = False,
-         settle_secs: float = 0.0,
-         expression: Callable[[list[Token]], list[Token]] | None = None)
+         settle_secs: float = 0.0, *,
+         key: Callable[[Token], object] | None = None,
+         filter: Callable[[Token], bool] | None = None)
 
 OutputArc(place: str, count: int = 1,
-          expression: Callable[[list[Token]], bool] | str | None = None)
+          condition: Callable[[list[Token]], bool] | None = None)
 
 # Helper for color-routed error handling
 OutputArc.on_color(color: str, place: str, count: int = 1) -> OutputArc
@@ -311,9 +314,9 @@ class PetriNet:
 
 ---
 
-## Guards & Arc Expressions: Certification and the Inline Fast Path
+## Guards & Arc Selectors: Certification and the Inline Fast Path
 
-Guards and arc expressions are Python callables — `def`s or lambdas — full stop. Passing a `str` to `guard=` or `expression=` raises `TypeError` at construction. This replaced an earlier string-expression surface; cpnx now has one authoring surface and one security model to reason about, not two.
+Guards and arc selectors (`InputArc.key`, `InputArc.filter`, `OutputArc.condition`) are Python callables — `def`s or lambdas — full stop. Passing a `str` to `guard=`, `key=`, `filter=`, or `condition=` raises `TypeError` at construction. This replaced an earlier string-expression surface; cpnx now has one authoring surface and one security model to reason about, not two.
 
 Removing strings doesn't mean removing the fast path they enabled. Instead, cpnx **certifies** callables: a callable that draws only on a fixed, library-controlled vocabulary (a small whitelist of builtins and methods), iterates only over its own argument, calls only helpers that themselves certify, and closes over nothing mutable is *closed-world and provably terminating* — so it's safe to call **inline**, under the engine lock, with no timeout. A callable that can't be certified falls back to the **timeout-bounded executor** (`expr_timeout_secs`, default 100 ms), exactly as before. Certification never changes *whether* a callable is allowed — only *how* it runs. The difference matters on the hot path: guards are re-evaluated per transition on every `step()`, and per candidate binding under `RANDOM`/`PRIORITY` binding-selection — the executor round-trip costs roughly 90x the inline call.
 
@@ -326,7 +329,7 @@ threshold = config["max_weight"]                       # read once, at net-build
 guard = lambda toks: toks[0].payload["w"] <= threshold  # closes over an immutable float → certifies
 ```
 
-Finally, an *annotated* guard or output-arc expression (`-> bool`) is checked at construction time to actually return `bool`; unannotated callables (including all lambdas) pass through unchecked. See [ADR 0002](https://github.com/philgresh/cpnx/blob/main/docs/adr/0002-guard-type-checking-scope.md) for the exact rules.
+Finally, an *annotated* `guard`, `OutputArc.condition`, or `InputArc.filter` (`-> bool`) is checked at construction time to actually return `bool`; unannotated callables (including all lambdas) pass through unchecked. `InputArc.key` is **not** bool-checked — it returns an arbitrary comparable sort key, not a boolean. See [ADR 0002](https://github.com/philgresh/cpnx/blob/main/docs/adr/0002-guard-type-checking-scope.md) for the exact rules.
 
 ### Modelling external state
 
@@ -356,7 +359,7 @@ Structurally, yes — as long as resource tokens are always returned (which the 
 
 ## Theoretical Foundation
 
-cpnx's execution model is aligned with **Coloured Petri Nets (CPNs)** as formalised by Kurt Jensen's group at Aarhus University. The key CPN concepts — colour sets, arc expressions, transition guards, formal markings, and k-bounded places — map directly onto cpnx's API.
+cpnx's execution model is aligned with **Coloured Petri Nets (CPNs)** as formalised by Kurt Jensen's group at Aarhus University. The key CPN concepts — colour sets, transition guards, formal markings, and k-bounded places — map directly onto cpnx's API. The classic CPN *arc inscription* is what cpnx splits into its two honest per-token halves: `InputArc`'s `key` (order) and `filter` (eligibility) on the input side, and `OutputArc`'s `condition` (activation) on the output side.
 
 **References:**
 
