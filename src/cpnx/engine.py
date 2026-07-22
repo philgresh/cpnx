@@ -1289,6 +1289,13 @@ class PetriNet:
         With no expression, returns `available` unchanged (FIFO). Otherwise the callable
         expression is evaluated — inline if certified closed-world, else via the
         timed expression pool.
+
+        KNOWN LIMITATION (https://github.com/philgresh/cpnx/issues/25): an arc `expression`
+        is an opaque ``list[Token] -> list[Token]`` transform, so it is re-run over the whole
+        available pool on every firing — draining a *deep* expression-ordered place is
+        O(N^2 log N). Unlike the FIFO/timed paths (linearized via `places._TokenStore`), this
+        cannot be indexed without a `key=`-based API, since there is no per-token key to
+        maintain a persistent sorted structure on. See the issue for the proposed fix.
         """
         if arc.expression is None:
             return available

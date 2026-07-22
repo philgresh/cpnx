@@ -104,7 +104,9 @@ default off) exercise the shapes the base net never did, and show where the win 
 The batch-triage arc's `expression` is an opaque `list[Token] → list[Token]` transform
 re-run over the whole pool every firing (`engine._order_available`), so its cost is
 inherent to that shape, not the place store — it is the one retrieval shape that stays
-non-linear, and it lives in the engine, not `places.py`.
+non-linear, and it lives in the engine, not `places.py`. Making it sub-quadratic needs a
+persistent per-arc sorted index (a `key=`-based arc API), tracked in
+[#25](https://github.com/philgresh/cpnx/issues/25).
 
 **Step counts are now identical across every repeat**, which was not true of any
 previously published table here. Two instrument defects had to be fixed first:
