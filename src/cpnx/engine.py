@@ -451,9 +451,11 @@ class PetriNet:
         #: after the lock releases, so a broken key surfaces instead of failing silently.
         self._pending_key_failures: dict[str, Exception] = {}
         #: ``(transition, place)`` -> the first exception an `InputArc.key`/`filter` raised
-        #: while selecting for that arc. Buffered under the lock, dispatched via `on_error`
-        #: (de-duplicated) by `_flush_selection_failures` — see issue #29.
-        self._pending_selection_failures: dict[tuple[str, str], Exception] = {}
+        #: while selecting for that arc, paired with whether that arc's place key-index
+        #: disabled itself as a result (which decides whether the report carries the #34
+        #: caveat). Buffered under the lock, dispatched via `on_error` (de-duplicated) by
+        #: `_flush_selection_failures` — see issue #29.
+        self._pending_selection_failures: dict[tuple[str, str], tuple[Exception, bool]] = {}
         #: ``(transition, place)`` -> the ids of the tokens that were in the pool the last
         #: time it reported. A later fault sharing *any* of those tokens is the same ongoing
         #: fault and stays quiet; one sharing none is a new event and reports. Identifying the
@@ -1469,10 +1471,16 @@ class PetriNet:
         if arc.filter is None and arc.key is None:
             return available
         fault_id = (transition_name, arc.place)
-        pool = available  # the tokens this attempt saw — the witnesses if it fails
+        pool = available  # the tokens the *failing stage* saw — the witnesses if it fails
         try:
             if arc.filter is not None:
                 available = self._apply_filter(arc, available)
+                # Narrow the witnesses to the survivors: a token the filter rejects is not one
+                # the `key` ever saw, and a permanently-rejected one would otherwise sit in the
+                # witness set forever and mute every later fault on this arc. If the *filter*
+                # raised we never get here, so `pool` is still the pre-filter list — correct,
+                # since that is what the filter was handed.
+                pool = available
             if arc.key is not None:
                 available = self._sort_by_key(arc, available)
         except Exception as exc:
@@ -1480,7 +1488,7 @@ class PetriNet:
             # but say so rather than merely looking disabled. Only a *raising* callable reaches
             # here — a `filter` that legitimately rejects every token returns an empty list,
             # which is an ordinary "not enabled", not an error, and stays silent.
-            self._signal_selection_failure(fault_id, exc, pool)
+            self._signal_selection_failure(fault_id, exc, pool, arc)
             return None
         return available
 
@@ -1588,7 +1596,9 @@ class PetriNet:
             except Exception:
                 pass
 
-    def _signal_selection_failure(self, fault_id: tuple[str, str], exc: Exception, pool: list[Token]) -> None:
+    def _signal_selection_failure(
+        self, fault_id: tuple[str, str], exc: Exception, pool: list[Token], arc: InputArc
+    ) -> None:
         """Buffer a raising `InputArc.key`/`filter` for off-lock `on_error` dispatch (issue #29).
 
         Called from `_order_available` under the engine lock, so this only records; the
@@ -1599,9 +1609,10 @@ class PetriNet:
         still fires on all of them, and selection re-runs on every enabling check for as long
         as the offending token sits in the place.
 
-        The edge is identified by **witnesses**: the ids of the tokens the failing attempt
-        saw. A later fault sharing any of them is the same ongoing fault; one sharing none is
-        a new event. This is deliberately not "clear the latch on the next success", which is
+        The edge is identified by **witnesses**: the ids of the tokens the failing *stage*
+        saw — which is why `_order_available` re-points `pool` after a successful filter. A
+        later fault sharing any of them is the same ongoing fault; one sharing none is a new
+        event. This is deliberately not "clear the latch on the next success", which is
         wrong in two ways that both silently break the feature:
 
         - the place can drain below `arc.count`, so `_gather_arc_pools` bails before selection
@@ -1621,19 +1632,29 @@ class PetriNet:
         Memory is one frozenset of token-id *references* per faulted arc, and nothing for a
         healthy one.
 
-        Mirrors `_signal_priority_key_failure` deliberately: `binding_priority_key` is the
-        closest analogue to `InputArc.key` and already reported, so the two now behave alike.
+        Reuses `_signal_priority_key_failure`'s buffer-under-lock/dispatch-off-lock template,
+        but not its *cadence*: that one de-duplicates only within a pass, so it re-reports
+        roughly once per `step()`. The difference is deliberate and documented on
+        `PetriNet.on_error`.
 
         A failure that first surfaces in a place key-index (`places._KeyIndex` disables itself
         and the engine falls back) needs no separate report: the fallback immediately re-runs
         the same callable over the same pool and arrives here, carrying the transition context
-        the index does not have. A broken key therefore reports exactly once, from one place.
+        the index does not have. A broken key therefore reports exactly once, from one place —
+        and since the index has already disabled itself by then, asking the place whether it
+        did is how the report decides to carry the #34 caveat, rather than guessing from
+        certification (a `filter` fault never touches the index at all).
         """
         previous = self._selection_faulted.get(fault_id)
         if previous is not None and any(token.id in previous for token in pool):
             return  # the same offending tokens are still here — one ongoing fault, stay quiet
         self._selection_faulted[fault_id] = frozenset(token.id for token in pool)
-        self._pending_selection_failures[fault_id] = exc
+        # Only reached on a genuinely new report, so this stays off the polled fault path.
+        # `.get` because the place always exists for a net that actually ran selection, but
+        # direct unit-test calls to `_resolve_input_tokens` need not have registered it.
+        place = self.places.get(arc.place)
+        index_lost = place is not None and place.key_index_disabled(id(arc))
+        self._pending_selection_failures[fault_id] = (exc, index_lost)
 
     def _flush_selection_failures(self) -> None:
         """Dispatch buffered selection failures via `on_error`. Must be called off the lock.
@@ -1642,6 +1663,12 @@ class PetriNet:
         once per distinct ``(transition, place)`` with a descriptive `RuntimeError` chaining
         the original, swallowing callback errors. Safe to call unconditionally; a no-op when
         nothing failed.
+
+        The key-index caveat is appended only when this arc's index *actually* disabled itself
+        (recorded at signal time). It is inapplicable to a `filter` fault, which never touches
+        the index, and to an uncertified key, for which no index is ever registered — the
+        majority of reports — so making it unconditional buried the real error under advice
+        about a mechanism that was not in play.
         """
         with self._lock:
             if not self._pending_selection_failures:
@@ -1651,14 +1678,18 @@ class PetriNet:
         callback = self.on_error
         if callback is None:
             return
-        for (name, place), first_exc in pending.items():
+        for (name, place), (first_exc, index_disabled) in pending.items():
+            caveat = (
+                "This also permanently disabled that arc's place key-index for the life of the "
+                "net, so selection stays correct but reverts to the per-firing sort even after "
+                "the fault clears (see issue #34). "
+                if index_disabled
+                else ""
+            )
             err = RuntimeError(
                 f"InputArc selection raised for transition '{name}' on place '{place}'; the arc "
                 f"is treated as unsatisfiable, so the transition will not fire while this "
-                f"persists. Note that a raising *certified* key also permanently disables that "
-                f"arc's place key-index for the life of the net, so selection stays correct but "
-                f"reverts to the per-firing sort even after the fault clears (see issue #34). "
-                f"First error: {first_exc!r}"
+                f"persists. {caveat}First error: {first_exc!r}"
             )
             err.__cause__ = first_exc
             try:

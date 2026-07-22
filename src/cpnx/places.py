@@ -525,6 +525,20 @@ class Place:
         with self._lock:
             self._store.register_key_index(index_id, key_fn)
 
+    def key_index_disabled(self, index_id: int) -> bool:
+        """Whether *index_id*'s index exists and has permanently disabled itself.
+
+        Distinct from "cannot answer right now" (see
+        [`peek_by_key`][cpnx.Place.peek_by_key], which also declines while the place holds
+        cooling tokens): this is specifically the irreversible state a keying failure leaves
+        behind. The engine reads it when reporting a selection fault, so the report mentions
+        the lost index only when one was actually lost — a raising `filter` never touches the
+        index, and an uncertified key never has one.
+        """
+        with self._lock:
+            index = self._store.key_index(index_id)
+            return index is not None and index.disabled
+
     def peek_by_key(
         self, index_id: int, count: int, predicate: Callable[[Token], bool] | None = None
     ) -> list[Token] | None:

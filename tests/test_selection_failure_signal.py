@@ -208,30 +208,78 @@ class TestLatchSurvivesPoolChanges:
         net.step()
         assert len(errors) == 2, "a distinct later fault must still be reported"
 
-    def test_one_cooling_poison_token_reports_once_across_repeated_polls(self):
+    def test_a_permanently_filtered_token_does_not_mask_later_faults(self):
+        """Witnesses are what the *key* saw, not what the filter was handed.
+
+        A token the `filter` rejects never leaves the place — that is what a filter is for —
+        so if it were recorded as a witness it would sit in the latch forever and every later
+        distinct fault, sharing that one token, would be silently swallowed. The fix narrows
+        the witness set to the filter's survivors, so a filtered-out token is never a witness.
+        """
+        net = PetriNet(max_workers=1)
+        net.add_place(Place("in"))
+        errors: list[Exception] = []
+        net.on_error = lambda name, exc, tok: errors.append(exc)
+        arc = InputArc(
+            "in",
+            filter=lambda t: t.payload["p"] != 999,  # 999 is never consumed -> lives forever
+            key=lambda t: 1 / 0 if t.payload["p"] < 0 else t.payload["p"],
+        )
+        net.add_transition(Transition("t", inputs=[arc], outputs=[], action=lambda toks: toks))
+
+        net.deposit("in", Token(payload={"p": 999}))  # permanently filtered, a would-be witness
+        first_poison = Token(payload={"p": -1})
+        net.deposit("in", first_poison)
+        net.step()
+        assert len(errors) == 1, "first fault reports"
+
+        net.places["in"].retrieve_specific([first_poison])  # operator removes the poison
+        net.step()  # selection succeeds over {999} being rejected -> ordinary not-enabled
+        assert len(errors) == 1, "recovery is not an event"
+
+        net.deposit("in", Token(payload={"p": -2}))  # a genuinely distinct poison token
+        net.step()
+        assert len(errors) == 2, "the filtered-out token must not have masked this fault"
+
+    def test_one_cooling_poison_token_reports_once_under_run(self):
         """`step()` and `is_quiescent()` see different pools; that must not re-arm the latch.
 
         `is_quiescent()` probes with `ignore_timing=True`, so it sees cooling tokens `step()`
         cannot. A poison token awaiting a retry is therefore invisible to one and visible to
         the other, and a success-based latch had them alternate — clear, report, clear,
-        report — for as long as healthy work kept flowing. `run()` polls quiescence every
-        loop, so this became a callback storm from a single unchanged token.
+        report — for as long as *anything* kept the net busy.
+
+        Driven through `run()` on purpose. `run` is `while not is_quiescent(): step()`, and it
+        is that interleaving, not either call alone, that produced the storm — thousands of
+        reports from one token in a fraction of a second. Choreographing the two by hand would
+        pin the latch but not the loop that exercises it, so a refactor of `run` could restore
+        the bug with the test still green.
+
+        Two things keep the storm alive. The `a`/`b` flywheel cycles a token forever so the
+        net never quiesces and the loop keeps polling. The `t` transition recirculates its
+        healthy token back onto `in`, so the *timed* view of that arc keeps succeeding on
+        every step — which is exactly what a success-clears-it latch treated as "the fault is
+        gone", re-arming it against the untimed view that still sees the cooling poison. On
+        the old mechanism this asserts in the thousands; on the fixed one, exactly 1.
         """
         net = PetriNet(max_workers=1)
-        net.add_place(Place("in"))
-        net.add_place(Place("out"))
+        for name in ("in", "a", "b"):
+            net.add_place(Place(name))
         errors: list[Exception] = []
         net.on_error = lambda name, exc, tok: errors.append(exc)
         arc = InputArc("in", key=lambda t: 1 / 0 if t.payload["p"] < 0 else t.payload["p"])
-        net.add_transition(Transition("t", inputs=[arc], outputs=[OutputArc("out")], action=lambda toks: toks))
-        # One poison token scheduled far in the future (a retry/backoff shape).
-        net.deposit("in", Token(payload={"p": -1}, available_at=time.monotonic() + 3600))
+        # Recirculate onto `in`: the healthy token stays selectable so the timed view keeps
+        # succeeding, which is what re-armed the broken latch.
+        net.add_transition(Transition("t", inputs=[arc], outputs=[OutputArc("in")], action=lambda toks: toks))
+        net.add_transition(Transition("a2b", inputs=[InputArc("a")], outputs=[OutputArc("b")], action=lambda t: t))
+        net.add_transition(Transition("b2a", inputs=[InputArc("b")], outputs=[OutputArc("a")], action=lambda t: t))
 
-        for i in range(20):
-            net.deposit("in", Token(payload={"p": i}))  # healthy work keeps flowing
-            net.deposit("in", Token(payload={"p": i}))
-            net._is_transition_enabled(net.transitions["t"])  # timed view: succeeds
-            net._flush_selection_failures()
-            net.is_quiescent()  # untimed view: sees the poison, fails
+        # A poison token scheduled far in the future (a retry/backoff shape) that `step()`
+        # cannot see but `is_quiescent()` can, plus one healthy token to recirculate.
+        net.deposit("in", Token(payload={"p": -1}, available_at=time.monotonic() + 3600))
+        net.deposit("in", Token(payload={"p": 1}))
+        net.deposit("a", Token(payload={}))  # the flywheel keeps the loop polling
+
+        net.run(deadline=time.monotonic() + 0.3)
 
         assert len(errors) == 1, f"one unchanged poison token must report once, got {len(errors)}"
