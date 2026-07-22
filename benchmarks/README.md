@@ -99,19 +99,38 @@ default off) exercise the shapes the base net never did, and show where the win 
 | regime (20 000 orders) | before | after | note |
 | --- | ---: | ---: | --- |
 | cold-brew (deep **timed** place) | 1 048.8 µs/order | **228.2** | 4.6× — the cooling min-heap |
-| batch-triage (deep **key**-sorted arc) | 3 677.5 µs/order | 2 440.7 | still ≈ O(N²) |
+| batch-triage (deep **key**-sorted arc) | 3 677.5 µs/order | 2 440.7 | still ≈ O(N²) at the time; see below |
 
-The batch-triage arc's per-firing cost is a `filter`-then-`key`-sort over the whole
-eligible pool (`engine._order_available`), re-run every firing, so its cost is inherent to
-that shape, not the place store — it is the one retrieval shape that stays non-linear, and
-it lives in the engine, not `places.py`. Unlike the old opaque `list[Token] ->
-list[Token]` arc expression, the per-token `InputArc.key` (see
-[ADR 0004](../docs/adr/0004-arc-selection-key-filter.md)) is indexable — it's what makes a
-*persistent* per-arc sorted index possible in principle, turning this per-firing
-linear-scan-and-sort into an incremental O(log n) insert/removal. That index is a
-follow-up, not implemented yet: today the whole eligible pool is still re-sorted from
-scratch on every firing, so the µs/order figure above is unchanged by the key/filter API
-landing. Tracked in [#25](https://github.com/philgresh/cpnx/issues/25).
+The batch-triage arc was the one retrieval shape that stayed non-linear: its per-firing
+cost was a `filter`-then-`key`-sort over the whole eligible pool (`engine._order_available`),
+re-run from scratch every firing. **That is now fixed.** Because the per-token
+`InputArc.key` (see [ADR 0004](../docs/adr/0004-arc-selection-key-filter.md)) exposes a
+value to index *on* — which the old opaque `list[Token] -> list[Token]` arc expression never
+did — a **certified** key is now served from a persistent `(key, seq)` min-heap maintained
+on the place across firings, so a firing reads only the leading tokens it can actually
+consume instead of sorting the marking:
+
+| orders | PR 1 (per-firing sort) | PR 2 (key-index) |
+| ---: | ---: | ---: |
+| 500 | 128.4 µs/order | **71.2** |
+| 2 000 | 299.4 | **76.8** |
+| 20 000 | 2 440.7 | **142.8** |
+
+Per-order cost now grows **2.0× across a 40× increase in depth** (it was 19×), i.e. the
+drain went from ≈ O(N²) to ≈ O(N log N) — a **17× speed-up at 20 000 orders**. Every
+retrieval shape in this net is now at worst log-linear.
+
+Two residuals remain, both deliberate and both falling back to the PR 1 cost rather than
+misbehaving:
+
+- **an uncertified `key`/`filter` is never indexed** — keying happens on the deposit path,
+  which cannot host an unbounded callable — so it keeps the per-firing sort;
+- **timed×key**: a keyed place that also holds cooling tokens cannot be served from the
+  index (the index covers ready tokens only, and a cooling token never migrates into the
+  ready set), so it keeps the per-firing sort too. No promotion pipeline was built, since
+  no such place exists in the corpus.
+
+Tracked in [#25](https://github.com/philgresh/cpnx/issues/25).
 
 **Step counts are now identical across every repeat**, which was not true of any
 previously published table here. Two instrument defects had to be fixed first:

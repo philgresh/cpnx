@@ -91,6 +91,18 @@ Building that index is deferred to
 [issue #25](https://github.com/philgresh/cpnx/issues/25) and is explicitly **not** part of
 this change — do not read this ADR as claiming the perf win has landed.
 
+> **Update — the index has since landed.** The follow-up work described above is
+> implemented: a *certified* `key` is served from a persistent `(key, seq)` min-heap on the
+> place (`places._KeyIndex`), and a deep keyed drain measured 2441 → 143 µs/order at 20 000
+> tokens, growing 2.0× across a 40× depth increase instead of 19×. The paragraph above is
+> preserved as written because it was true of *this* decision: the split was the
+> prerequisite, and shipping it without the index was the deliberate choice. What the index
+> confirmed is the claim this ADR rests on — that per-token `key` is indexable and an opaque
+> transform is not. It changes no semantics: `_order_available` still re-sorts whatever pool
+> it receives, so the index is a selection hint and never the authority on order, and it
+> declines to an identical slow path for an uncertified callable, a keying failure, or a
+> place holding timed tokens. See the CHANGELOG entry and `tests/test_key_index.py`.
+
 ### 2. `OutputArc.expression` is renamed to `condition`
 
 Same type (`Callable[[list[Token]], bool] | None`), same skip-the-arc-on-`False` semantics,
