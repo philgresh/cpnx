@@ -30,6 +30,16 @@ dispatch overhead dominates parallelism; that conclusion was unfounded — the b
 never gave the pool anything to parallelise. Measuring real concurrency needs a different
 driver, not a different knob.
 
+Two more regimes, added after the three above and swept separately at ``DEEP_ORDER_COUNTS``
+(500/2000/20000 — deliberately deeper than ``ORDER_COUNTS`` tops out, since both regimes exist
+specifically to show what happens as their place gets genuinely deep): ``cold-brew`` exercises
+``concurrency_cafe.build_cafe(cold_brew=True)``'s deep *timed* place, and ``batch-triage``
+exercises ``build_cafe(batch_triage=True)``'s only ``InputArc(expression=...)``. Both are
+isolated single-station workloads (they deposit straight into the new place, bypassing
+``P_Ticket_Line``/the grind-pull-steam pipeline entirely) so their numbers measure exactly the
+new code path, uncontaminated by the rest of the topology. See ``concurrency_cafe.py``'s module
+docstring for why these two shapes were otherwise absent from the net.
+
 Run it on ``main`` and on a candidate branch and compare the reported ``us/order`` (report the
 ratio, not the raw microseconds — see benchmarks/README.md). Native stdlib only.
 
@@ -37,6 +47,7 @@ ratio, not the raw microseconds — see benchmarks/README.md). Native stdlib onl
 """
 
 import sys
+import time
 from pathlib import Path
 
 # Make ``src/`` (and this benchmarks/ dir, for ``_driver``) importable from a bare checkout.
@@ -112,6 +123,107 @@ def _run_once(n_orders: int, dose_tolerance_g: float | None, channel_rate: float
         )
 
 
+# Deliberately deeper than ORDER_COUNTS: both regimes below exist specifically to demonstrate
+# what happens once their place is genuinely deep (dozens-to-hundreds of concurrently-steeping
+# cold-brew batches; a thousands-deep triage backlog re-sorted every firing), so their sweep
+# needs a scale ORDER_COUNTS never reaches.
+DEEP_ORDER_COUNTS = (500, 2000, 20000)
+
+# Cold brew realistically steeps 12-20 real hours — on a wall clock that would make this
+# benchmark useless, but drive_to_quiescence's logical clock jumps straight to the next
+# availability boundary (see benchmarks/_driver.py), so the wait costs no wall-clock time at
+# all. What *does* cost real time is the engine re-scanning every still-steeping token's
+# `available_at` on every retrieval and every clock-boundary lookup (see
+# `Place.retrieve`/`PetriNet._earliest_cooldown_boundary`) — that linear scan, at depth, is
+# exactly what this regime measures.
+_STEEP_BASE_SECS = 12 * 3600
+_STEEP_SPREAD_SECS = 8 * 3600
+#: Distinct maturity times spread across the steep window. Coarser than "every token gets its
+#: own timestamp" on purpose: with N buckets the clock only needs N boundary jumps to drain the
+#: whole batch (each jump maturing ~n_orders/N tokens at once — a genuine cohort "co-steeping"),
+#: instead of one jump per token.
+_STEEP_BUCKETS = 40
+
+
+def _cold_brew_tokens(n_orders: int, base_time: float) -> list[Token]:
+    """`n_orders` cold-brew tokens, staggered across `_STEEP_BUCKETS` distinct future times.
+
+    `base_time` is captured once by the caller (not re-read per token) so depositing 20000
+    tokens doesn't smear the stagger against wall-clock drift accrued while building them.
+    """
+    spread_step = _STEEP_SPREAD_SECS / _STEEP_BUCKETS
+    return [
+        Token(
+            color="cold_brew",
+            payload={"batch": i},
+            available_at=base_time + _STEEP_BASE_SECS + (i % _STEEP_BUCKETS) * spread_step,
+        )
+        for i in range(n_orders)
+    ]
+
+
+def _run_cold_brew(n_orders: int) -> None:
+    """Stock `P_Cold_Brew_Steeping` with `n_orders` staggered-future tokens and drain it.
+
+    Deposited directly into the steeping place (bypassing P_Ticket_Line and the grind/pull/
+    steam pipeline entirely — see the module docstring), so this measures exactly the deep
+    timed-place code path, nothing else.
+    """
+    with build_cafe(cold_brew=True, seed=NET_SEED, max_workers=1) as net:
+        base_time = time.monotonic()
+        for token in _cold_brew_tokens(n_orders, base_time):
+            net.deposit("P_Cold_Brew_Steeping", token)
+
+        # Every token was deposited future-dated before a single one could possibly have
+        # matured, so this is the run's peak concurrent-steeping depth — retrieval can only
+        # shrink it from here. No need to sample mid-drive.
+        max_depth = len(net.places["P_Cold_Brew_Steeping"])
+
+        result = drive_to_quiescence(net)
+
+        served = net.places["P_Served"].stats()["absorbed"]
+        us_per_order = result.wall_secs / n_orders * 1e6
+        print(
+            f"  orders={n_orders:<5} served={served:<5} max_steeping_depth={max_depth:<6} "
+            f"ticks={result.ticks:<5}  "
+            f"{result.wall_secs * 1e3:9.2f} ms  ({us_per_order:8.1f} us/order)"
+        )
+
+
+def _run_batch_triage(n_orders: int) -> None:
+    """Stock `P_Batch_Triage_Queue` with `n_orders` tickets (deep, all at once) and drain it.
+
+    Deposited directly into the triage queue (bypassing P_Ticket_Line entirely — see the
+    module docstring), so this measures exactly the `InputArc.expression` code path re-sorting
+    a deep pool every firing, nothing else. Records the order tokens actually reach `P_Served`
+    in (via `on_token_deposited`) so the printed line can confirm the barista triage
+    (`_batch_triage_order`) genuinely reordered them rather than passing FIFO through unchanged.
+    """
+    with build_cafe(batch_triage=True, seed=NET_SEED, max_workers=1) as net:
+        served_order: list[int] = []
+
+        def _record(place_name: str, token: Token) -> None:
+            if place_name == "P_Served":
+                served_order.append(token.payload["triage_idx"])
+
+        net.on_token_deposited = _record
+
+        for i, payload in enumerate(_order_payloads(n_orders)):
+            net.deposit("P_Batch_Triage_Queue", Token(payload={**payload, "triage_idx": i}))
+        max_depth = len(net.places["P_Batch_Triage_Queue"])  # all deposited before any drain
+
+        result = drive_to_quiescence(net)
+
+        served = net.places["P_Served"].stats()["absorbed"]
+        reordered = served_order != list(range(n_orders))
+        us_per_order = result.wall_secs / n_orders * 1e6
+        print(
+            f"  orders={n_orders:<5} served={served:<5} max_queue_depth={max_depth:<6} "
+            f"reordered_vs_fifo={'yes' if reordered else 'NO (unexpected)':<16} "
+            f"{result.wall_secs * 1e3:9.2f} ms  ({us_per_order:8.1f} us/order)"
+        )
+
+
 def main() -> None:
     """Sweep three binding regimes, all single-worker (see the module docstring).
 
@@ -135,6 +247,19 @@ def main() -> None:
         for n in ORDER_COUNTS:
             _run_once(n, tolerance, channel_rate)
         print()
+
+    # Two more regimes, each isolating one of the two shapes ORDER_COUNTS never exercised: a
+    # genuinely deep *timed* place, and this net's only InputArc(expression=...). See the
+    # module docstring and concurrency_cafe.py's for what each demonstrates and why.
+    print("Concurrency Cafe throughput — cold-brew steeping tower (logical clock, workers=1):")
+    for n in DEEP_ORDER_COUNTS:
+        _run_cold_brew(n)
+    print()
+
+    print("Concurrency Cafe throughput — batch-triage (expression-ordered) (logical clock, workers=1):")
+    for n in DEEP_ORDER_COUNTS:
+        _run_batch_triage(n)
+    print()
 
 
 if __name__ == "__main__":
