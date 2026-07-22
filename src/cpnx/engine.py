@@ -1467,15 +1467,19 @@ class PetriNet:
         return self._binding_exists(transition, float("inf"), ignore_timing=True)
 
     def _earliest_cooldown_boundary(self, now: float) -> float | None:
-        """Smallest future `available_at` among tokens in non-sink places, or `None` if none."""
-        candidates = (
-            tok.available_at
+        """Smallest future `available_at` among tokens in non-sink places, or `None` if none.
+
+        Each place answers in O(1)/O(log n) from its cooling heap
+        (`Place.earliest_available_boundary`) rather than this method scanning the whole
+        marking of every place — otherwise a deep place makes each clock advance O(depth),
+        and the advance runs per tick, so draining is O(N^2).
+        """
+        boundaries = (
+            place.earliest_available_boundary(now)
             for place in self.places.values()
             if not isinstance(place, SinkPlace)
-            for tok in place.tokens
-            if tok.available_at > now
         )
-        return min(candidates, default=None)
+        return min((b for b in boundaries if b is not None), default=None)
 
     def _pending_settle_boundary(self, arc: InputArc, now: float) -> float | None:
         """Future boundary at which `arc`'s settle window becomes satisfied, or `None` if not pending."""

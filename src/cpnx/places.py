@@ -162,8 +162,38 @@ class _TokenStore:
         """Return the subset of `id(token)` values in *ids* that are not currently stored."""
         return set(ids) - self._seq_of.keys()
 
+    def earliest_cooling_after(self, now: float) -> float | None:
+        """Smallest cooling ``available_at`` strictly greater than *now*, or ``None``.
+
+        O(1) when nothing is cooling (the untimed common case — the heap is empty).
+        Otherwise skips stale heap entries permanently and buffers/restores any
+        matured-but-still-present entries, leaving the heap intact.
+        """
+        if not self._cooling:
+            return None
+        buffered: list[tuple[float, int]] = []
+        result: float | None = None
+        while self._cooling:
+            avail_at, seq = self._cooling[0]
+            if seq not in self._cooling_by_seq:
+                heapq.heappop(self._cooling)  # stale — discard for good
+                continue
+            if avail_at > now:
+                result = avail_at
+                break
+            buffered.append(heapq.heappop(self._cooling))  # matured but present — restore after
+        for item in buffered:
+            heapq.heappush(self._cooling, item)
+        return result
+
     def iter_insertion_order(self) -> Iterable[Token]:
-        """Yield ALL tokens (ready + cooling), sorted by insertion sequence. O(n log n)."""
+        """Yield ALL tokens (ready + cooling) in insertion-sequence order.
+
+        When nothing is cooling (the common case) `_ready` is already in seq order, so this
+        is O(n) with no sort; the merge-sort is paid only when timed tokens are present.
+        """
+        if not self._cooling_by_seq:
+            return list(self._ready.values())
         items = list(self._ready.items()) + list(self._cooling_by_seq.items())
         items.sort(key=lambda pair: pair[0])
         return [token for _, token in items]
@@ -359,6 +389,16 @@ class Place:
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
             return self._store.has_available(t_limit, count)
+
+    def earliest_available_boundary(self, now: float) -> float | None:
+        """Smallest future ``available_at`` (strictly greater than *now*) held here, or ``None``.
+
+        Backs the engine's logical-clock advance. O(1) for an untimed place (nothing is
+        cooling), and O(log n) amortized otherwise — via the store's cooling heap — so the
+        clock advance no longer scans the whole marking of every place on every tick.
+        """
+        with self._lock:
+            return self._store.earliest_cooling_after(now)
 
     def can_deposit(self, count: int = 1) -> bool:
         """Return ``True`` if the place can accept *count* more tokens without exceeding its bound.
