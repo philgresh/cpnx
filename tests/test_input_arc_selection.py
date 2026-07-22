@@ -418,6 +418,50 @@ class TestInputArcMultiplicity:
         # a raising filter -> None as well
         assert net._resolve_input_tokens(InputArc("p", count=1, filter=lambda t: 1 / 0), [a]) is None
 
+    def test_incomparable_keys_make_the_arc_unsatisfiable(self):
+        """A `key` returning mutually incomparable values disables the arc, and does not raise.
+
+        A *distinct* branch from a raising key: the `TypeError` originates in `list.sort`
+        while comparing two extracted values, not in the callable itself — so it is only
+        caught because the sort sits inside `_order_available`'s `try`. This is the shape a
+        user actually hits (a key returning `None` for some tokens and an `int` for others),
+        and it is the failure mode the "totally ordered *with each other*" requirement on
+        `InputArc.key` exists to warn about.
+        """
+        net = PetriNet()
+        a, b = Token(payload={"k": 1}), Token(payload={"k": "x"})
+        arc = InputArc("p", count=1, key=lambda t: t.payload["k"])
+
+        # int vs str have no ordering between them -> unsatisfiable, not an exception.
+        assert net._resolve_input_tokens(arc, [a, b]) is None
+        assert net._order_available(arc, [a, b]) is None
+
+        # The same key is fine when the values *are* mutually comparable.
+        c = Token(payload={"k": 0})
+        assert net._resolve_input_tokens(arc, [a, c]) == [c]
+
+    def test_incomparable_keys_disable_the_transition_without_raising(self):
+        """End-to-end: a poison token makes the transition unbindable, and `run()` still ends."""
+        net = PetriNet()
+        net.add_place(Place("p"))
+        net.add_place(Place("out"))
+        fired: list[object] = []
+        t = Transition(
+            "t",
+            inputs=[InputArc("p", count=1, key=lambda tok: tok.payload["k"])],
+            outputs=[OutputArc("out")],
+            action=lambda toks: fired.append(toks) or toks,
+        )
+        net.add_transition(t)
+        net.deposit("p", Token(payload={"k": 1}))
+        net.deposit("p", Token(payload={"k": "x"}))  # incomparable with the first
+
+        assert net._is_transition_enabled(t) is False
+        assert net.step() is False
+        net.run(deadline=time.monotonic() + 0.5)  # must not raise, must not spin forever
+        assert fired == []
+        assert len(net.places["p"]) == 2  # nothing consumed
+
     def test_consume_all_bypasses_key_and_filter(self):
         """`consume_all` drains everything — a filter-rejected token is consumed anyway.
 

@@ -287,15 +287,35 @@ class PetriNet:
                           action callables that declare no per-transition timeout
                           (run off the engine lock) (default: 1.0).
             expr_timeout_secs: Maximum allowed execution time in seconds for guard
-                               and arc expression callables. These are evaluated
+                               and arc selection callables. These are evaluated
                                while holding the engine lock, so this value caps how long a
-                               *single* guard/expression evaluation can block concurrent
+                               *single* evaluation can block concurrent
                                `deposit()` and `step()` calls. Note that under
                                `BindingPolicy.FIRST` one enabling check may evaluate a
                                callable guard up to `binding_search_limit` times in sequence,
                                so the worst-case lock-hold time is
                                `binding_search_limit * expr_timeout_secs` — size both
                                accordingly. Keep well under 1 s (default: 0.1).
+
+                               **An uncertified `InputArc.key`/`filter` is dispatched *per
+                               token* over the whole available pool, which
+                               `binding_search_limit` does not bound** — it truncates
+                               candidate *bindings*, after selection has already visited
+                               every token. The worst case is therefore
+                               `len(place) * expr_timeout_secs` per such arc, per enabling
+                               check. This is the one place the guard bound above does not
+                               generalise: a guard is evaluated once per *candidate binding*
+                               (bounded), `key`/`filter` once per *token in the pool*
+                               (unbounded). Prefer callables that certify (see
+                               [`cpnx.certification`]) on deep places — a certified callable
+                               runs inline with no executor round-trip at all.
+
+                               A second caveat applies only to an uncertified `key`: this
+                               timeout bounds the *key extraction*, not the **comparisons**.
+                               `_order_available` sorts inline under the lock, so a key whose
+                               values have a slow or diverging `__lt__` can hold the lock past
+                               any timeout. Keys should return plain comparables (numbers,
+                               strings, tuples thereof).
             retry_delay: Delay in seconds to apply to data tokens when rolling them
                          back to their source places on transient failure (default: 1.0).
             binding_policy: Net-wide default strategy for resolving which input tokens
@@ -1309,8 +1329,18 @@ class PetriNet:
 
         With neither set, `available` is returned unchanged (FIFO). Each callable is
         evaluated inline if certified closed-world, else via the timed expression pool. A
-        callable that raises — or a key whose values are mutually incomparable — returns
+        callable that raises — or a key whose values are mutually incomparable, which
+        surfaces as a `TypeError` out of `sort` rather than out of the callable — returns
         `None`, making the arc unsatisfiable rather than firing on a partial pool.
+
+        LOCK DISCIPLINE: both callables run **per token**, so an *uncertified* one costs a
+        thread round-trip per token and `expr_timeout_secs` bounds each dispatch, not the
+        loop — `binding_search_limit` does not apply here (it truncates candidate bindings
+        in `_iter_candidate_bindings`, downstream of this). The `sort` below is inline and
+        unbounded regardless of certification, so a key returning values with an expensive
+        `__lt__` holds the lock for as long as it takes. Both are documented on
+        `PetriNet.expr_timeout_secs` and `InputArc`; the residual is why certifying a
+        selection callable matters most on a deep place.
 
         KNOWN LIMITATION (https://github.com/philgresh/cpnx/issues/25): the sort is redone
         over the whole available pool on every firing, so draining a *deep* keyed place is

@@ -422,9 +422,7 @@ def test_resolve_input_tokens():
     a = Token(payload={"ok": True, "priority": 3})
     b = Token(payload={"ok": False, "priority": 1})
     c = Token(payload={"ok": True, "priority": 1})
-    arc_both = InputArc(
-        "p", count=2, filter=lambda t: t.payload["ok"], key=lambda t: t.payload["priority"]
-    )
+    arc_both = InputArc("p", count=2, filter=lambda t: t.payload["ok"], key=lambda t: t.payload["priority"])
     assert net._resolve_input_tokens(arc_both, [a, b, c]) == [c, a]
 
     # count not met (after filtering) → None, even though enough tokens are present overall

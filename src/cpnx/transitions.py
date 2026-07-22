@@ -214,8 +214,20 @@ class InputArc:
         Both callables are purity-verified at assignment, and each carries its own
         inline-safe flag: a **certified** callable (see [`cpnx.certification`]) runs
         inline under the engine lock, an uncertified one on the timeout-bounded
-        expression pool. Uncertified `key`/`filter` are allowed — they simply cost a pool
-        round-trip per evaluation.
+        expression pool.
+
+        Uncertified `key`/`filter` are allowed, but on a **deep place they are the one
+        thing worth certifying.** Both are evaluated *per token* over the whole available
+        pool, so an uncertified one costs a thread round-trip per token per enabling
+        check — where a guard costs one per *candidate binding*, bounded by
+        `binding_search_limit`. Nothing bounds the per-token count: worst-case lock-hold is
+        `len(place) * expr_timeout_secs` for that arc. A certified callable skips the
+        executor entirely and the concern disappears.
+
+        Separately, `expr_timeout_secs` bounds a `key`'s *extraction*, not the
+        **comparisons** between the values it returns — the sort runs inline under the
+        engine lock. Return plain comparables (numbers, strings, tuples thereof); a value
+        with a slow or diverging `__lt__` can hold the lock past any timeout.
 
     Example:
         ```python
