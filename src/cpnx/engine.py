@@ -223,9 +223,19 @@ class PetriNet:
             called when a data token is dead-lettered to `error_place` (retries exhausted, or
             `max_retries=0`). Fires outside the engine lock.
         on_error: Optional callback `(transition_name: str, exc: Exception, token: Token | None)
-            -> None`, called when a transition's action raises. `token` is the data token that
-            was routed to the error place or rolled back, or `None` if the transition consumed
-            no data tokens. Fires outside the engine lock.
+            -> None`. Fires outside the engine lock, for three kinds of event:
+
+            - a transition's **action raises** — `token` is the data token routed to the error
+              place or rolled back, or `None` if the transition consumed no data tokens;
+            - an [`InputArc`][cpnx.InputArc] **`key`/`filter` raises**, making that arc
+              unsatisfiable so the transition cannot fire (`token` is `None`);
+            - `binding_priority_key` raises for **every** candidate binding under
+              `BindingPolicy.PRIORITY`, so selection fell back to insertion order.
+
+            The latter two are **edge-triggered and de-duplicated**: selection re-runs on every
+            enabling check, so a persistent fault reports once when it starts rather than once
+            per `step()`, and reports again only if it recurs after recovering. Both wrap the
+            original exception in a descriptive `RuntimeError` and chain it as `__cause__`.
 
     Example:
         ```python
@@ -437,6 +447,14 @@ class PetriNet:
         #: fell back to insertion order). Drained and dispatched via `on_error` (de-duplicated)
         #: after the lock releases, so a broken key surfaces instead of failing silently.
         self._pending_key_failures: dict[str, Exception] = {}
+        #: ``(transition, place)`` -> the first exception an `InputArc.key`/`filter` raised
+        #: while selecting for that arc. Buffered under the lock, dispatched via `on_error`
+        #: (de-duplicated) by `_flush_selection_failures` — see issue #29.
+        self._pending_selection_failures: dict[tuple[str, str], Exception] = {}
+        #: ``(transition, place)`` pairs whose selection is *currently* failing. Latches the
+        #: edge so a persistent fault reports once rather than once per `step()`; cleared by
+        #: `_order_available` on the next successful selection.
+        self._selection_faulted: set[tuple[str, str]] = set()
 
         self.add_place(Place(error_place))
         for p in places or []:
@@ -697,6 +715,7 @@ class PetriNet:
             # even if consume/submit raised, so buffered signals are never delayed.
             self._flush_search_exhaustions()
             self._flush_priority_key_failures()
+            self._flush_selection_failures()
 
         return fired
 
@@ -899,6 +918,7 @@ class PetriNet:
                 result = not any(self._is_transition_potentially_enabled(t) for t in self.transitions.values())
         self._flush_search_exhaustions()
         self._flush_priority_key_failures()
+        self._flush_selection_failures()
         return result
 
     @property
@@ -934,6 +954,7 @@ class PetriNet:
             result = not any(self._is_transition_enabled(t) for t in self.transitions.values())
         self._flush_search_exhaustions()
         self._flush_priority_key_failures()
+        self._flush_selection_failures()
         return result
 
     def snapshot(self) -> dict:
@@ -1237,7 +1258,7 @@ class PetriNet:
         """Build the head binding (first `count` per arc) and accept it only if the guard holds."""
         binding: _Binding = []
         for arc, available in pools:
-            tokens = self._resolve_input_tokens(arc, available)
+            tokens = self._resolve_input_tokens(arc, available, transition.name)
             if tokens is None:
                 return None
             binding.append((arc, tokens))
@@ -1257,7 +1278,7 @@ class PetriNet:
         until the lock releases). This is the shared engine for every search policy: `FIRST`
         takes the first item, `RANDOM` samples, and `PRIORITY` takes the min-key item.
         """
-        for examined, binding in enumerate(self._iter_candidate_bindings(pools), start=1):
+        for examined, binding in enumerate(self._iter_candidate_bindings(pools, transition.name), start=1):
             if examined > self.binding_search_limit:
                 self._signal_search_exhausted(transition.name)
                 return
@@ -1340,7 +1361,9 @@ class PetriNet:
                     first_exc = exc
         return best, first, first_exc
 
-    def _iter_candidate_bindings(self, pools: list[tuple[InputArc, list[Token]]]) -> Iterator[_Binding]:
+    def _iter_candidate_bindings(
+        self, pools: list[tuple[InputArc, list[Token]]], transition_name: str = ""
+    ) -> Iterator[_Binding]:
         """Yield candidate bindings as the Cartesian product of each arc's token-group options.
 
         Options are generated in insertion order, so the first binding yielded is the head
@@ -1357,11 +1380,14 @@ class PetriNet:
         """
         arcs = [arc for arc, _ in pools]
         cap = self.binding_search_limit + 1
-        option_lists = [list(itertools.islice(self._arc_options(arc, available), cap)) for arc, available in pools]
+        option_lists = [
+            list(itertools.islice(self._arc_options(arc, available, transition_name), cap))
+            for arc, available in pools
+        ]
         for combo in itertools.product(*option_lists):
             yield list(zip(arcs, combo, strict=True))
 
-    def _arc_options(self, arc: InputArc, available: list[Token]) -> Iterator[list[Token]]:
+    def _arc_options(self, arc: InputArc, available: list[Token], transition_name: str = "") -> Iterator[list[Token]]:
         """Yield each `count`-sized token group one input `arc` could consume, in order.
 
         A `consume_all` arc has a single option: every available token, FIFO, with `key`
@@ -1374,7 +1400,7 @@ class PetriNet:
         if arc.consume_all:
             yield available
             return
-        ordered = self._order_available(arc, available)
+        ordered = self._order_available(arc, available, transition_name)
         if ordered is None or len(ordered) < arc.count:
             return
         if arc.count == 1:
@@ -1389,7 +1415,9 @@ class PetriNet:
         for combo in itertools.combinations(ordered, arc.count):
             yield list(combo)
 
-    def _order_available(self, arc: InputArc, available: list[Token]) -> list[Token] | None:
+    def _order_available(
+        self, arc: InputArc, available: list[Token], transition_name: str = ""
+    ) -> list[Token] | None:
         """Return the arc-eligible tokens in consumption order, or `None` if selection fails.
 
         Applies the arc's selection in two steps, mirroring the two halves of
@@ -1429,29 +1457,44 @@ class PetriNet:
         """
         if arc.filter is None and arc.key is None:
             return available
+        fault_id = (transition_name, arc.place)
         try:
             if arc.filter is not None:
                 available = self._apply_filter(arc, available)
-            if arc.key is None:
-                return available
-            # A *certified* callable is by definition called directly (that is all
-            # `_eval_expression` does for an inline-safe one), so hand it to `sorted` and let
-            # the sort drive the calls from C instead of paying an interpreted dispatch per
-            # token. `sorted(key=...)` is stable and never compares the tokens themselves, so
-            # this is exactly the `(key, seq)` ordering the decorated path below produces —
-            # measurably faster, identical result. This is the path a certified-but-unindexed
-            # arc takes (notably the timed×key residual), and without it the split would have
-            # left that case slower than the single opaque `sorted()` it replaced.
-            if arc._key_inline_safe:  # type: ignore[attr-defined]
-                return sorted(available, key=arc.key)
-            keyed = [
-                (self._eval_expression(arc.key, token, False), token)  # uncertified: via the pool
-                for token in available
-            ]
-            keyed.sort(key=_first)
-            return [token for _, token in keyed]
-        except Exception:
+            if arc.key is not None:
+                available = self._sort_by_key(arc, available)
+        except Exception as exc:
+            # Selection failed: the arc is unsatisfiable for this pass (unchanged behaviour),
+            # but say so rather than merely looking disabled. Only a *raising* callable reaches
+            # here — a `filter` that legitimately rejects every token returns an empty list,
+            # which is an ordinary "not enabled", not an error, and stays silent.
+            self._signal_selection_failure(fault_id, exc)
             return None
+        # Selection succeeded, so re-arm reporting: a fault that recurs after recovering is a
+        # new event and must be reported again, not swallowed as a duplicate of the old one.
+        self._selection_faulted.discard(fault_id)
+        return available
+
+    def _sort_by_key(self, arc: InputArc, available: list[Token]) -> list[Token]:
+        """Order *available* ascending by `arc.key`, dispatching as certification allows.
+
+        A *certified* callable is by definition called directly (that is all
+        `_eval_expression` does for an inline-safe one), so hand it to `sorted` and let the
+        sort drive the calls from C instead of paying an interpreted dispatch per token.
+        `sorted(key=...)` is stable and never compares the tokens themselves, so this is
+        exactly the `(key, seq)` ordering the decorated path produces — measurably faster,
+        identical result. This is the path a certified-but-unindexed arc takes (notably the
+        timed×key residual), and without it the split would have left that case slower than
+        the single opaque `sorted()` it replaced.
+        """
+        if arc._key_inline_safe:  # type: ignore[attr-defined]
+            return sorted(available, key=arc.key)
+        keyed = [
+            (self._eval_expression(arc.key, token, False), token)  # uncertified: via the pool
+            for token in available
+        ]
+        keyed.sort(key=_first)
+        return [token for _, token in keyed]
 
     def _apply_filter(self, arc: InputArc, available: list[Token]) -> list[Token]:
         """Drop the tokens `arc.filter` rejects, dispatching each call as certification allows.
@@ -1536,6 +1579,59 @@ class PetriNet:
             except Exception:
                 pass
 
+    def _signal_selection_failure(self, fault_id: tuple[str, str], exc: Exception) -> None:
+        """Buffer a raising `InputArc.key`/`filter` for off-lock `on_error` dispatch (issue #29).
+
+        Called from `_order_available` under the engine lock, so this only records; the
+        callback must run off the lock (it may call back into the net). Keyed by
+        ``(transition, place)`` and **edge-triggered**: a fault reports once when selection
+        starts failing and then stays quiet until it recovers. Buffering alone is not enough —
+        every `step()` drains the buffer, so a per-pass `setdefault` still fires on all of
+        them, and selection re-runs on every enabling check for as long as the offending token
+        sits in the place. `_selection_faulted` is the latch; `_order_available` clears it on
+        the next successful selection, so a recurrence is reported as a new event.
+
+        Mirrors `_signal_priority_key_failure` deliberately: `binding_priority_key` is the
+        closest analogue to `InputArc.key` and already reported, so the two now behave alike.
+
+        A failure that first surfaces in a place key-index (`places._KeyIndex` disables itself
+        and the engine falls back) needs no separate report: the fallback immediately re-runs
+        the same callable over the same pool and arrives here, carrying the transition context
+        the index does not have. A broken key therefore reports exactly once, from one place.
+        """
+        if fault_id in self._selection_faulted:
+            return  # already reported and not yet recovered — stay quiet
+        self._selection_faulted.add(fault_id)
+        self._pending_selection_failures[fault_id] = exc
+
+    def _flush_selection_failures(self) -> None:
+        """Dispatch buffered selection failures via `on_error`. Must be called off the lock.
+
+        Swaps out the pending map under a brief lock, then fires `on_error(name, exc, None)`
+        once per distinct ``(transition, place)`` with a descriptive `RuntimeError` chaining
+        the original, swallowing callback errors. Safe to call unconditionally; a no-op when
+        nothing failed.
+        """
+        with self._lock:
+            if not self._pending_selection_failures:
+                return
+            pending = self._pending_selection_failures
+            self._pending_selection_failures = {}
+        callback = self.on_error
+        if callback is None:
+            return
+        for (name, place), first_exc in pending.items():
+            err = RuntimeError(
+                f"InputArc selection raised for transition '{name}' on place '{place}'; the arc "
+                f"is treated as unsatisfiable, so the transition will not fire while this "
+                f"persists. First error: {first_exc!r}"
+            )
+            err.__cause__ = first_exc
+            try:
+                callback(name, err, None)
+            except Exception:
+                pass
+
     def _is_settle_time_met(self, place: Place, arc: InputArc) -> bool:
         if arc.settle_secs <= 0.0:
             return True
@@ -1567,7 +1663,9 @@ class PetriNet:
             return expression(arg)
         return self._call_expr(expression, arg, timeout=self.expr_timeout_secs)
 
-    def _resolve_input_tokens(self, arc: InputArc, available: list[Token]) -> list[Token] | None:
+    def _resolve_input_tokens(
+        self, arc: InputArc, available: list[Token], transition_name: str = ""
+    ) -> list[Token] | None:
         """Resolve which tokens input `arc` would consume from `available`.
 
         Returns the selected tokens, or `None` if the arc cannot be satisfied —
@@ -1590,7 +1688,7 @@ class PetriNet:
             # a footgun on `InputArc`; pinned by `test_consume_all_bypasses_key_and_filter`.
             tokens = available
         else:
-            ordered = self._order_available(arc, available)
+            ordered = self._order_available(arc, available, transition_name)
             if ordered is None:
                 return None
             tokens = ordered[: arc.count]
