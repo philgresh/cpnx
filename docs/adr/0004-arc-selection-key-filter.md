@@ -1,6 +1,6 @@
 # ADR 0004 — Splitting `InputArc.expression` into `key` + `filter`; Renaming `OutputArc.expression` to `condition`
 
-- **Status:** Accepted — shipped (breaking; lands in `[Unreleased]`, pre-1.0)
+- **Status:** Accepted — shipped in 0.4.0 (breaking; pre-1.0)
 - **Date:** 2026-07-21
 - **Deciders:** cpnx maintainers
 - **Related:** `docs/adr/0003-inline-execution-and-string-removal.md`;

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-07-22
+
 ### Removed
 
 - **String guards and arc expressions removed (BREAKING).** `guard=` and `InputArc`/`OutputArc` `expression=` now accept a `Callable` only; passing a `str` raises `TypeError` at construction, with a message pointing to the callable form and the config-via-closure pattern. The string-expression evaluator (`SandboxEvaluator.evaluate_compiled` and the string-eval entry point) was deleted. The former "two forms" model — a string whitelist-sandbox alongside a callable — is gone; callables are now the sole expression surface. Migration: replace `guard="expr"` with a lambda/`def`; parameterise from config by reading the value at construction time and closing over the immutable result (which certifies). See [`docs/adr/0003-inline-execution-and-string-removal.md`](docs/adr/0003-inline-execution-and-string-removal.md).
