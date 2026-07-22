@@ -99,19 +99,78 @@ default off) exercise the shapes the base net never did, and show where the win 
 | regime (20 000 orders) | before | after | note |
 | --- | ---: | ---: | --- |
 | cold-brew (deep **timed** place) | 1 048.8 µs/order | **228.2** | 4.6× — the cooling min-heap |
-| batch-triage (deep **key**-sorted arc) | 3 677.5 µs/order | 2 440.7 | still ≈ O(N²) |
+| batch-triage (deep **key**-sorted arc) | 3 677.5 µs/order | 2 440.7 | still ≈ O(N²) at the time; see below |
 
-The batch-triage arc's per-firing cost is a `filter`-then-`key`-sort over the whole
-eligible pool (`engine._order_available`), re-run every firing, so its cost is inherent to
-that shape, not the place store — it is the one retrieval shape that stays non-linear, and
-it lives in the engine, not `places.py`. Unlike the old opaque `list[Token] ->
-list[Token]` arc expression, the per-token `InputArc.key` (see
-[ADR 0004](../docs/adr/0004-arc-selection-key-filter.md)) is indexable — it's what makes a
-*persistent* per-arc sorted index possible in principle, turning this per-firing
-linear-scan-and-sort into an incremental O(log n) insert/removal. That index is a
-follow-up, not implemented yet: today the whole eligible pool is still re-sorted from
-scratch on every firing, so the µs/order figure above is unchanged by the key/filter API
-landing. Tracked in [#25](https://github.com/philgresh/cpnx/issues/25).
+The batch-triage arc was the one retrieval shape that stayed non-linear: its per-firing
+cost was a `filter`-then-`key`-sort over the whole eligible pool (`engine._order_available`),
+re-run from scratch every firing. **That is now fixed.** Because the per-token
+`InputArc.key` (see [ADR 0004](../docs/adr/0004-arc-selection-key-filter.md)) exposes a
+value to index *on* — which the old opaque `list[Token] -> list[Token]` arc expression never
+did — a **certified** key is now served from a persistent `(key, seq)` min-heap maintained
+on the place across firings, so a firing reads only the leading tokens it can actually
+consume instead of sorting the marking:
+
+| orders | PR 1 (per-firing sort) | PR 2 (key-index) |
+| ---: | ---: | ---: |
+| 500 | 128.4 µs/order | **71.2** |
+| 2 000 | 299.4 | **76.8** |
+| 20 000 | 2 440.7 | **142.8** |
+
+Per-order cost now grows **2.0× across a 40× increase in depth** (it was 19×), i.e. the
+drain went from ≈ O(N²) to ≈ O(N log N) — a **17× speed-up at 20 000 orders**. Every
+retrieval shape in this net is now at worst log-linear.
+
+Two residuals remain, both deliberate and both falling back to the PR 1 cost rather than
+misbehaving:
+
+- **an uncertified `key`/`filter` is never indexed** — keying happens on the deposit path,
+  which cannot host an unbounded callable — so it keeps the per-firing sort;
+- **timed×key**: a keyed place that also holds cooling tokens cannot be served from the
+  index (the index covers ready tokens only, and a cooling token never migrates into the
+  ready set), so it keeps the per-firing sort too. No promotion pipeline was built, since
+  no such place exists in the corpus.
+
+Tracked in [#25](https://github.com/philgresh/cpnx/issues/25).
+
+#### A/B against published v0.3.2
+
+The table above compares PR 1 to PR 2. The comparison users actually feel is against the
+last **published** release, so this one installs `cpnx==0.3.2` from PyPI and drains an
+identical workload through each engine's own API — `InputArc(expression=lambda tokens:
+sorted(tokens, key=k))` on 0.3.2, `InputArc(key=k)` today. Runs are interleaved
+(A/B/C, 3 repeats, one sitting) so thermal drift hits every variant equally, and every run
+is checked to consume tokens in the **same order** (identical SHA of the consumption
+sequence) — otherwise the timings would not be comparable.
+
+The middle row runs today's engine with the index switched off, which separates this work
+from everything else since 0.3.2 (#24 callables-only, #26 the linearized store, #28 the API
+split).
+
+This was a **one-off migration-era measurement, not a committed harness** — there is no
+script here to re-run. Pinning a comparison against one specific published version would
+bit-rot the moment the next release lands, and the half of the experiment that mattered
+(the isolated 0.3.2 environment, the interleaving, the order-hash check) is setup rather
+than code. The method above is described in enough detail to rebuild it if a future change
+warrants another cross-release comparison.
+
+| µs/order (median of 3) | 500 | 2 000 | 20 000 |
+| --- | ---: | ---: | ---: |
+| v0.3.2 (published) | 76.2 | 218.7 | 2 273.1 |
+| today, key-index **off** | 39.9 | 136.6 | 1 604.6 |
+| today, key-index **on** | **14.3** | **20.6** | **103.9** |
+| **speed-up vs 0.3.2** | **5.3×** | **10.6×** | **21.9×** |
+
+Growth across a 40× increase in depth: **29.8× → 7.3×**.
+
+This A/B is also what caught a regression the PR-1-vs-PR-2 comparison could not see. With
+the index off, the split had briefly made a deep certified-key drain *slower than 0.3.2*
+(3 053 vs 2 273 µs/order at 20 000): PR 1 replaced one C-level `sorted(tokens, key=k)` with
+N interpreted per-token dispatches plus a decorate-sort. Since a certified callable is
+called directly anyway, `_order_available` now hands it straight to `sorted(key=...)`,
+restoring the C-driven loop — that is the "index off" row above, now 1.42× *faster* than
+0.3.2 rather than 0.71× slower. It matters because it is the path the timed×key residual
+takes.
+
 
 **Step counts are now identical across every repeat**, which was not true of any
 previously published table here. Two instrument defects had to be fixed first:

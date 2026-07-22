@@ -428,6 +428,10 @@ class PetriNet:
         #: lock-holding enabling pass; drained and dispatched (de-duplicated) after the lock
         #: is released. A `set` so repeated exhaustions in one pass collapse to one callback.
         self._pending_exhaustions: set[str] = set()
+        #: ``id(InputArc)`` -> the ``key`` last registered as a place key-index for it.
+        #: Lets `_ensure_key_index` skip re-registering on the hot path, while still
+        #: rebuilding when an arc's ``key`` is reassigned after construction.
+        self._key_index_arcs: dict[int, Callable[[Token], object]] = {}
         #: Transition name -> first exception from a `binding_priority_key` that raised for
         #: *every* candidate binding during the current enabling pass (so `PRIORITY` silently
         #: fell back to insertion order). Drained and dispatched via `on_error` (de-duplicated)
@@ -1044,7 +1048,7 @@ class PetriNet:
         return self.binding_policy if transition.binding_policy is None else transition.binding_policy
 
     def _arc_available(
-        self, arc: InputArc, place: Place | None, m_time: float | None, ignore_timing: bool
+        self, arc: InputArc, place: Place | None, m_time: float | None, ignore_timing: bool, cap: int | None = None
     ) -> list[Token] | None:
         """Return the tokens eligible to satisfy one input `arc`, or `None` if it cannot be met.
 
@@ -1058,9 +1062,13 @@ class PetriNet:
             m_time: The current model time (used when `ignore_timing` is `False`).
             ignore_timing: When `True`, treat cooling-down/not-yet-settled tokens as available
                 (used by [`is_quiescent`][cpnx.PetriNet.is_quiescent]).
+            cap: How many ordered tokens the caller can actually consume (see
+                `_gather_arc_pools`). Only an upper bound on what a *key-index* read
+                materializes; `None` disables the index path entirely.
 
         Returns:
-            The eligible tokens in FIFO order, or `None` if the arc cannot be satisfied.
+            The eligible tokens — FIFO, or ascending-key when served from the index — or
+            `None` if the arc cannot be satisfied.
         """
         if place is None:
             return None
@@ -1069,25 +1077,91 @@ class PetriNet:
             return None
         if not ignore_timing and not self._is_settle_time_met(place, arc):
             return None
-        # Bound the materialized pool. For a single-token FIFO arc, each candidate is one
-        # token in FIFO order and the search consumes only the first `binding_search_limit + 1`
-        # of them (see `_iter_candidate_bindings`), so peeking the first that-many available
-        # tokens yields the identical candidate set while turning an O(marking-depth) scan into
-        # an O(limit) one — the fix for the O(N^2) deep-place drain. A `consume_all`, multi-token
-        # (`count > 1`, combinatorial), keyed, or filtered arc still needs the whole available
-        # pool — a `key` reorders it and a `filter` may reject the entire prefix — so those keep
-        # the full peek.
+        return self._materialize_pool(arc, place, t_limit, cap)
+
+    def _materialize_pool(self, arc: InputArc, place: Place, t_limit: float | None, cap: int | None) -> list[Token]:
+        """Read the arc's candidate pool, as narrowly as the arc's shape allows.
+
+        Three routes, cheapest first:
+
+        1. **Bounded FIFO peek.** For a single-token arc with no selection, each candidate is
+           one token in FIFO order and the search consumes only the first
+           `binding_search_limit + 1` of them (see `_iter_candidate_bindings`), so peeking
+           that many yields the identical candidate set while turning an O(marking-depth)
+           scan into an O(limit) one.
+        2. **Key-index read.** A keyed arc is not position-FIFO, so route 1's bound does not
+           apply — but a *certified* key is served from the place's persistent key-index,
+           which yields the same ascending-key prefix without materializing or sorting the
+           pool. This is what makes a deep keyed drain O(N log N) rather than O(N^2 log N).
+           The index declines whenever it cannot represent the whole available pool (none
+           registered, a keying failure, or timed tokens present) and we fall through.
+        3. **Full peek.** A `consume_all`, uncertified-keyed, or uncertified-filtered arc
+           still needs the whole available pool, and pays PR 1's per-firing sort.
+
+        Routes 2 and 3 return the same tokens in the same order; only the cost differs, so
+        falling through is always safe.
+        """
         if arc.key is None and arc.filter is None and not arc.consume_all and arc.count == 1:
             return place.peek(self.binding_search_limit + 1, model_time=t_limit)
+        if cap is not None and not arc.consume_all and self._ensure_key_index(arc, place):
+            ordered = place.peek_by_key(id(arc), cap, arc.filter)
+            if ordered is not None:
+                return ordered
         return place.peek(len(place), model_time=t_limit)
+
+    def _ensure_key_index(self, arc: InputArc, place: Place) -> bool:
+        """Whether `arc` may be served from a key-index on `place`, registering one if so.
+
+        Eligibility is deliberately narrow, because the index runs callables in two places
+        that cannot host an unbounded one — keying happens on the *deposit* path, and the
+        filter predicate runs under the place lock:
+
+        - the `key` must be **certified**. An uncertified key belongs on the
+          timeout-bounded executor, and a `deposit()` cannot wait on that.
+        - a `filter`, if present, must also be certified — and not merely for dispatch
+          reasons. Applying an uncertified filter *after* a capped index read would be
+          wrong: the read could return `cap` tokens that the filter then rejects while
+          eligible tokens sit deeper in the index, silently under-selecting. Either the
+          filter runs at pop (so the scan continues past rejects) or the index is not used.
+
+        Registration is lazy rather than done in `add_transition`, since a transition may be
+        registered before its places are. Re-registration is a dict-lookup no-op unless
+        `arc.key` has been reassigned since, in which case the index is rebuilt — so
+        post-construction reassignment cannot leave a stale ordering being served.
+        """
+        if arc.key is None or not arc._key_inline_safe:  # type: ignore[attr-defined]
+            return False
+        if arc.filter is not None and not arc._filter_inline_safe:  # type: ignore[attr-defined]
+            return False
+        if self._key_index_arcs.get(id(arc)) is not arc.key:
+            place.register_key_index(id(arc), arc.key)
+            self._key_index_arcs[id(arc)] = arc.key
+        return True
 
     def _gather_arc_pools(
         self, transition: Transition, m_time: float | None, ignore_timing: bool
     ) -> list[tuple[InputArc, list[Token]]] | None:
-        """Collect the eligible-token pool for every input arc, or `None` if any is unmet."""
+        """Collect the eligible-token pool for every input arc, or `None` if any is unmet.
+
+        Derives how many ordered tokens each arc could actually consume and passes it as the
+        key-index read cap. Reading only that many is what keeps a keyed drain proportional
+        to what the search will look at rather than to the depth of the place — the whole
+        point of the index. The two cases:
+
+        - **head-only** (`LEGACY`, or guard-free `FIRST`): `_resolve_input_tokens` takes the
+          leading `count`, so `count` tokens is exactly enough.
+        - **searching**: `_iter_candidate_bindings` keeps the first `binding_search_limit + 1`
+          *combinations* per arc, and for `count > 1` those reach further into the ordering
+          than that many *tokens* — the `(limit + 1)`-th `count`-sized combination spans
+          indices up to `limit + count - 1`. So the cap is `binding_search_limit + count`,
+          collapsing to the familiar `limit + 1` at `count == 1`. Reading short here would
+          silently truncate the candidate set, not merely cost time.
+        """
         pools: list[tuple[InputArc, list[Token]]] = []
+        head_only = self._is_head_only(transition, self._effective_policy(transition))
         for arc in transition.inputs:
-            available = self._arc_available(arc, self.places.get(arc.place), m_time, ignore_timing)
+            cap = arc.count if head_only else self.binding_search_limit + arc.count
+            available = self._arc_available(arc, self.places.get(arc.place), m_time, ignore_timing, cap)
             if available is None:
                 return None
             pools.append((arc, available))
@@ -1333,40 +1407,68 @@ class PetriNet:
         surfaces as a `TypeError` out of `sort` rather than out of the callable — returns
         `None`, making the arc unsatisfiable rather than firing on a partial pool.
 
-        LOCK DISCIPLINE: both callables run **per token**, so an *uncertified* one costs a
-        thread round-trip per token and `expr_timeout_secs` bounds each dispatch, not the
-        loop — `binding_search_limit` does not apply here (it truncates candidate bindings
-        in `_iter_candidate_bindings`, downstream of this). The `sort` below is inline and
-        unbounded regardless of certification, so a key returning values with an expensive
-        `__lt__` holds the lock for as long as it takes. Both are documented on
-        `PetriNet.expr_timeout_secs` and `InputArc`; the residual is why certifying a
-        selection callable matters most on a deep place.
+        COST: this filters and sorts whatever pool it is handed, every firing. What keeps
+        that cheap is `_materialize_pool` handing it a *bounded* pool: for a **certified**
+        key the place's persistent key-index supplies only the leading `cap` tokens in key
+        order, so the work here is O(cap log cap) — independent of how deep the place is —
+        and a deep keyed drain is O(N log N) overall. This method stays the authority on
+        ordering even then: it re-sorts what the index returned, so the index can only ever
+        be a selection hint, never a source of order.
 
-        KNOWN LIMITATION (https://github.com/philgresh/cpnx/issues/25): the sort is redone
-        over the whole available pool on every firing, so draining a *deep* keyed place is
-        still O(N^2 log N). Unlike the FIFO/timed paths (linearized via
-        `places._TokenStore`), that is fixed by a persistent per-arc key-index — which the
-        per-token `key` now makes possible. See the issue.
+        The **uncertified** case still pays PR 1's cost, and is the one to watch. The pool
+        is the whole available marking, so draining a deep place is O(N^2 log N), and both
+        callables run *per token*: `expr_timeout_secs` bounds each dispatch, not the loop,
+        and `binding_search_limit` does not apply (it truncates candidate bindings in
+        `_iter_candidate_bindings`, downstream of this). The `sort` below is inline and
+        unbounded regardless of certification, so a key returning values with an expensive
+        `__lt__` holds the lock for as long as it takes. Both limits are documented on
+        `PetriNet.expr_timeout_secs` and `InputArc` — together they are why certifying a
+        selection callable matters most exactly where it used to matter least, on a deep
+        place. The other residual is timed×key: a keyed place also holding cooling tokens
+        cannot be indexed (see `Place.peek_by_key`) and keeps the quadratic cost.
         """
         if arc.filter is None and arc.key is None:
             return available
         try:
             if arc.filter is not None:
-                available = [
-                    token
-                    for token in available
-                    if self._eval_expression(arc.filter, token, arc._filter_inline_safe)  # type: ignore[attr-defined]
-                ]
+                available = self._apply_filter(arc, available)
             if arc.key is None:
                 return available
+            # A *certified* callable is by definition called directly (that is all
+            # `_eval_expression` does for an inline-safe one), so hand it to `sorted` and let
+            # the sort drive the calls from C instead of paying an interpreted dispatch per
+            # token. `sorted(key=...)` is stable and never compares the tokens themselves, so
+            # this is exactly the `(key, seq)` ordering the decorated path below produces —
+            # measurably faster, identical result. This is the path a certified-but-unindexed
+            # arc takes (notably the timed×key residual), and without it the split would have
+            # left that case slower than the single opaque `sorted()` it replaced.
+            if arc._key_inline_safe:  # type: ignore[attr-defined]
+                return sorted(available, key=arc.key)
             keyed = [
-                (self._eval_expression(arc.key, token, arc._key_inline_safe), token)  # type: ignore[attr-defined]
+                (self._eval_expression(arc.key, token, False), token)  # uncertified: via the pool
                 for token in available
             ]
             keyed.sort(key=_first)
             return [token for _, token in keyed]
         except Exception:
             return None
+
+    def _apply_filter(self, arc: InputArc, available: list[Token]) -> list[Token]:
+        """Drop the tokens `arc.filter` rejects, dispatching each call as certification allows.
+
+        Split out so the certified case is a plain comprehension over a directly-called
+        predicate — the same reasoning as the `sorted` fast path above: for an inline-safe
+        callable `_eval_expression` *is* a direct call, so routing through it only adds an
+        interpreted frame per token.
+        """
+        if arc._filter_inline_safe:  # type: ignore[attr-defined]
+            predicate = arc.filter
+            return [token for token in available if predicate(token)]
+        return [
+            token
+            for token in available
+            if self._eval_expression(arc.filter, token, False)  # uncertified: via the pool
+        ]
 
     def _signal_search_exhausted(self, transition_name: str) -> None:
         """Record a search exhaustion for `transition_name` to dispatch after the lock releases.

@@ -18,9 +18,92 @@ import itertools
 import threading
 import time
 from collections import OrderedDict, deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from cpnx.tokens import AVAILABLE_NOW, Token
+
+
+class _KeyIndex:
+    """A persistent ``(key, seq)`` min-heap over one [`_TokenStore`][]'s ready tokens.
+
+    The same shape as the store's cooling heap, keyed by ``key_fn(token)`` instead of
+    ``available_at``: entries are pushed once at deposit (so each key is computed exactly
+    once, not re-derived per firing) and deleted **lazily** — an entry is stale once its
+    ``seq`` is gone from the store's ready set, and is discarded permanently the first time
+    it surfaces. ``seq`` is monotonic and never reused, so a stale entry can never be
+    mistaken for a live one.
+
+    Ordering is ``(key, seq)``: ascending key, insertion order within a tie — exactly what
+    PR 1's stable ascending sort produced, which is what lets the index be a pure
+    optimisation rather than a semantic change.
+
+    **Self-disabling.** Any failure to key or order a token (`key_fn` raises; two keys are
+    mutually incomparable, which surfaces from the heap comparison) permanently disables
+    the index. The engine then falls back to the per-firing filter+sort, which reproduces
+    the documented behaviour for those cases — including making the arc unsatisfiable. A
+    broken key must not turn a `deposit()` into an exception, and must not be able to
+    corrupt the ordering of a partially-built heap, so the heap is dropped outright.
+    """
+
+    __slots__ = ("key_fn", "_heap", "disabled")
+
+    def __init__(self, key_fn: Callable[[Token], object]) -> None:
+        self.key_fn = key_fn
+        self._heap: list[tuple[object, int]] = []
+        self.disabled = False
+
+    def add(self, seq: int, token: Token) -> bool:
+        """Index *token* under *seq*. Returns ``False`` (and disables) if it cannot be keyed."""
+        if self.disabled:
+            return False
+        try:
+            heapq.heappush(self._heap, (self.key_fn(token), seq))
+        except Exception:
+            self.disable()
+            return False
+        return True
+
+    def disable(self) -> None:
+        """Permanently stop serving this index and release its heap."""
+        self.disabled = True
+        self._heap = []
+
+    def peek_ordered(
+        self,
+        ready: "OrderedDict[int, Token]",
+        k: int,
+        predicate: Callable[[Token], bool] | None = None,
+    ) -> list[Token] | None:
+        """Return up to *k* live ready tokens in ascending key order, non-destructively.
+
+        ``None`` means "index unusable — fall back". *predicate* is applied at pop, so a
+        token it rejects is skipped but **stays indexed** (it may satisfy a different arc,
+        or the same arc later); scanning therefore continues past it rather than stopping,
+        and a highly selective predicate degrades to a full ordered walk rather than
+        silently returning short.
+
+        Entries popped during the scan are pushed back in a ``finally``, so an exception
+        out of *predicate* leaves the heap intact for the fallback path to re-derive.
+        """
+        if self.disabled:
+            return None
+        if k <= 0:
+            return []
+        popped: list[tuple[object, int]] = []
+        found: list[Token] = []
+        try:
+            while self._heap and len(found) < k:
+                entry = heapq.heappop(self._heap)
+                token = ready.get(entry[1])
+                if token is None:
+                    continue  # stale: the token left the ready set — drop the entry for good
+                popped.append(entry)
+                if predicate is None or predicate(token):
+                    found.append(token)
+        finally:
+            for entry in popped:
+                heapq.heappush(self._heap, entry)
+        return found
 
 
 class _TokenStore:
@@ -49,6 +132,28 @@ class _TokenStore:
         self._cooling_by_seq: dict[int, Token] = {}
         self._seq_of: dict[int, int] = {}
         self._next_seq: int = 0
+        self._key_indexes: dict[int, _KeyIndex] = {}
+
+    def register_key_index(self, index_id: int, key_fn: Callable[[Token], object]) -> None:
+        """Maintain a persistent ``(key, seq)`` min-heap over the ready set for *key_fn*.
+
+        Idempotent per *index_id*: re-registering the same id with the same function is a
+        no-op, and with a *different* function rebuilds from scratch (an arc's ``key`` may
+        be reassigned after construction). Registration back-fills from the tokens already
+        present, so an index can be added to a non-empty place.
+        """
+        existing = self._key_indexes.get(index_id)
+        if existing is not None and existing.key_fn is key_fn:
+            return
+        index = _KeyIndex(key_fn)
+        self._key_indexes[index_id] = index
+        for seq, token in self._ready.items():
+            if not index.add(seq, token):
+                break  # keying failed — the index disabled itself; leave it to fall back
+
+    def key_index(self, index_id: int) -> "_KeyIndex | None":
+        """Return the registered index for *index_id*, or ``None`` if there is none."""
+        return self._key_indexes.get(index_id)
 
     def append(self, token: Token) -> None:
         """Add *token*, routing it to the ready set or the cooling heap by `available_at`."""
@@ -57,6 +162,8 @@ class _TokenStore:
         self._seq_of[id(token)] = seq
         if token.available_at == AVAILABLE_NOW:
             self._ready[seq] = token
+            for index in self._key_indexes.values():
+                index.add(seq, token)
         else:
             heapq.heappush(self._cooling, (token.available_at, seq))
             self._cooling_by_seq[seq] = token
@@ -124,6 +231,32 @@ class _TokenStore:
         for item in matured:
             heapq.heappush(self._cooling, item)
         return result
+
+    def peek_by_key(
+        self, index_id: int, k: int, predicate: Callable[[Token], bool] | None = None
+    ) -> list[Token] | None:
+        """Return up to *k* available tokens in ascending key order, or ``None`` to fall back.
+
+        ``None`` is returned whenever the index cannot be trusted to represent the whole
+        available pool:
+
+        - no index is registered for *index_id*, or it disabled itself (see `_KeyIndex`);
+        - **the place holds cooling tokens.** A key index covers `_ready` only, and a
+          cooling token never migrates into `_ready` even after it matures — it is served
+          straight off the cooling heap — so any timed token in this place puts available
+          tokens outside the index's view. Rather than return a silently incomplete
+          ordering, defer to the caller's per-firing scan. This is the timed×key residual:
+          a keyed place that also holds timed tokens keeps PR 1's cost.
+
+        The check is dynamic, not decided at registration: a place that merely *might*
+        receive a timed token still gets the fast path for as long as it does not hold one.
+        """
+        if self._cooling_by_seq:
+            return None
+        index = self._key_indexes.get(index_id)
+        if index is None:
+            return None
+        return index.peek_ordered(self._ready, k, predicate)
 
     def take_available(self, k: int, t_limit: float) -> list[Token]:
         """Remove and return up to *k* available tokens in `(available_at, seq)` order."""
@@ -373,6 +506,41 @@ class Place:
             if count <= 0:
                 return []
             return self._store.peek_available(count, t_limit)
+
+    def register_key_index(self, index_id: int, key_fn: Callable[[Token], object]) -> None:
+        """Maintain a persistent ascending-key index over this place's ready tokens.
+
+        Registered by the engine at net-build time for each [`InputArc`][cpnx.InputArc]
+        whose `key` is *certified* (see [`cpnx.certification`]) — an uncertified key is not
+        indexed, because keying happens on the deposit path where an unbounded callable
+        cannot be allowed to run. *index_id* identifies the registering arc; re-registering
+        the same id with a different function rebuilds the index, so reassigning `arc.key`
+        after construction stays correct.
+
+        Registration back-fills from the tokens already present, so it is safe on a
+        non-empty place. This is a pure optimisation: every read through
+        [`peek_by_key`][cpnx.Place.peek_by_key] can decline, and the engine then computes
+        the same answer the slow way.
+        """
+        with self._lock:
+            self._store.register_key_index(index_id, key_fn)
+
+    def peek_by_key(
+        self, index_id: int, count: int, predicate: Callable[[Token], bool] | None = None
+    ) -> list[Token] | None:
+        """Return up to *count* available tokens in ascending key order, or ``None``.
+
+        ``None`` means the index cannot answer and the caller must fall back to its own
+        ordering — no index registered, the index disabled itself after a keying failure,
+        or the place currently holds timed (cooling) tokens the index does not cover.
+
+        *predicate* is applied at pop: a rejected token is skipped but stays indexed, and
+        the scan continues past it, so a `filter` never causes a short read.
+        """
+        with self._lock:
+            if count <= 0:
+                return []
+            return self._store.peek_by_key(index_id, count, predicate)
 
     def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
         """Return ``True`` if at least *count* tokens are currently available for retrieval.
