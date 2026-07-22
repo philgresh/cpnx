@@ -246,7 +246,18 @@ here is about validity alone.
   behavioral change; it is bundled into this ADR because it removes the naming confusion this
   ADR is otherwise about, not because it shares a mechanism with the input-side split.
 
-**Deferred, with the argument recorded**
+**Deferred at the time, since shipped**
+
+> **Update — this landed.** The signal described below was implemented in
+> [issue #29](https://github.com/philgresh/cpnx/issues/29): a raising `key`/`filter` now
+> reports through `on_error`, edge-triggered per `(transition, place)` so a persistent fault
+> reports once rather than once per `step()`, and re-arms if it recurs after recovering. The
+> paragraph is kept as written because its *argument* is what justified the change — in
+> particular that the per-token split removed the author's interception point. The two-sites
+> wrinkle resolved cleanly: `_KeyIndex` self-disabling stays silent because the engine's
+> fallback immediately re-runs the same callable and reports from there, with the transition
+> context the index does not have.
+
 
 - **Selection failure stays silent, and the split makes that harder to justify.**
   `_order_available` swallows any exception (`except Exception: return None`), so a
