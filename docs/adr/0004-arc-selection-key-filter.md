@@ -267,9 +267,15 @@ here is about validity alone.
   de-duplication design (selection runs on every enabling check, so a naive callback would
   fire on every `step()` for as long as the bad token sits in the place), and it wants a
   decision on distinguishing a *raising* filter from one that legitimately rejects
-  everything. The natural moment is issue #25's key-index work, which reworks this exact
-  path. Recorded here rather than filed separately so the reasoning survives next to the
-  decision that sharpened it. The *behavior* is pinned by
+  everything. The reasoning is recorded here so it survives next to the decision that
+  sharpened it, and tracked in
+  [issue #29](https://github.com/philgresh/cpnx/issues/29) so it stays actionable — an ADR
+  note is neither assignable nor schedulable. (This paragraph first pointed at #25's
+  key-index work as the natural moment to fix it; that work shipped in #30 without touching
+  this path, so the pointer was re-homed rather than left dangling. The index in fact adds a
+  wrinkle: `_KeyIndex` disables itself on a keying failure and the engine silently falls
+  back, so a broken key can now fail quietly in two places, and both should report once
+  rather than twice.) The *behavior* is pinned by
   `test_incomparable_keys_disable_the_transition_without_raising`; what is missing is the
   report, not the safety.
 
