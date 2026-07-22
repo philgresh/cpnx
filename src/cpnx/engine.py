@@ -1431,21 +1431,44 @@ class PetriNet:
             return available
         try:
             if arc.filter is not None:
-                available = [
-                    token
-                    for token in available
-                    if self._eval_expression(arc.filter, token, arc._filter_inline_safe)  # type: ignore[attr-defined]
-                ]
+                available = self._apply_filter(arc, available)
             if arc.key is None:
                 return available
+            # A *certified* callable is by definition called directly (that is all
+            # `_eval_expression` does for an inline-safe one), so hand it to `sorted` and let
+            # the sort drive the calls from C instead of paying an interpreted dispatch per
+            # token. `sorted(key=...)` is stable and never compares the tokens themselves, so
+            # this is exactly the `(key, seq)` ordering the decorated path below produces —
+            # measurably faster, identical result. This is the path a certified-but-unindexed
+            # arc takes (notably the timed×key residual), and without it the split would have
+            # left that case slower than the single opaque `sorted()` it replaced.
+            if arc._key_inline_safe:  # type: ignore[attr-defined]
+                return sorted(available, key=arc.key)
             keyed = [
-                (self._eval_expression(arc.key, token, arc._key_inline_safe), token)  # type: ignore[attr-defined]
+                (self._eval_expression(arc.key, token, False), token)  # uncertified: via the pool
                 for token in available
             ]
             keyed.sort(key=_first)
             return [token for _, token in keyed]
         except Exception:
             return None
+
+    def _apply_filter(self, arc: InputArc, available: list[Token]) -> list[Token]:
+        """Drop the tokens `arc.filter` rejects, dispatching each call as certification allows.
+
+        Split out so the certified case is a plain comprehension over a directly-called
+        predicate — the same reasoning as the `sorted` fast path above: for an inline-safe
+        callable `_eval_expression` *is* a direct call, so routing through it only adds an
+        interpreted frame per token.
+        """
+        if arc._filter_inline_safe:  # type: ignore[attr-defined]
+            predicate = arc.filter
+            return [token for token in available if predicate(token)]
+        return [
+            token
+            for token in available
+            if self._eval_expression(arc.filter, token, False)  # uncertified: via the pool
+        ]
 
     def _signal_search_exhausted(self, transition_name: str) -> None:
         """Record a search exhaustion for `transition_name` to dispatch after the lock releases.

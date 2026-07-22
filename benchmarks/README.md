@@ -132,6 +132,39 @@ misbehaving:
 
 Tracked in [#25](https://github.com/philgresh/cpnx/issues/25).
 
+#### A/B against published v0.3.2
+
+The table above compares PR 1 to PR 2. The comparison users actually feel is against the
+last **published** release, so this one installs `cpnx==0.3.2` from PyPI and drains an
+identical workload through each engine's own API — `InputArc(expression=lambda tokens:
+sorted(tokens, key=k))` on 0.3.2, `InputArc(key=k)` today. Runs are interleaved
+(A/B/C, 3 repeats, one sitting) so thermal drift hits every variant equally, and every run
+is checked to consume tokens in the **same order** (identical SHA of the consumption
+sequence) — otherwise the timings would not be comparable.
+
+The middle row runs today's engine with the index switched off, which separates this work
+from everything else since 0.3.2 (#24 callables-only, #26 the linearized store, #28 the API
+split).
+
+| µs/order (median of 3) | 500 | 2 000 | 20 000 |
+| --- | ---: | ---: | ---: |
+| v0.3.2 (published) | 76.2 | 218.7 | 2 273.1 |
+| today, key-index **off** | 39.9 | 136.6 | 1 604.6 |
+| today, key-index **on** | **14.3** | **20.6** | **103.9** |
+| **speed-up vs 0.3.2** | **5.3×** | **10.6×** | **21.9×** |
+
+Growth across a 40× increase in depth: **29.8× → 7.3×**.
+
+This A/B is also what caught a regression the PR-1-vs-PR-2 comparison could not see. With
+the index off, the split had briefly made a deep certified-key drain *slower than 0.3.2*
+(3 053 vs 2 273 µs/order at 20 000): PR 1 replaced one C-level `sorted(tokens, key=k)` with
+N interpreted per-token dispatches plus a decorate-sort. Since a certified callable is
+called directly anyway, `_order_available` now hands it straight to `sorted(key=...)`,
+restoring the C-driven loop — that is the "index off" row above, now 1.42× *faster* than
+0.3.2 rather than 0.71× slower. It matters because it is the path the timed×key residual
+takes.
+
+
 **Step counts are now identical across every repeat**, which was not true of any
 previously published table here. Two instrument defects had to be fixed first:
 
