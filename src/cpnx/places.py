@@ -63,6 +63,29 @@ class Place:
             self._tokens.append(token)
             self.last_deposit_time = time.monotonic()
 
+    def _has_available(self, t_limit: float, need: int) -> bool:
+        """Return ``True`` as soon as *need* tokens with ``available_at <= t_limit`` are seen.
+
+        Early-exits without scanning the rest of `_tokens` once *need* is reached, unlike
+        building the full available list first. Callers must already hold `self._lock`.
+
+        Args:
+            t_limit: Effective time; tokens with `available_at` at or before this are counted.
+            need: Number of available tokens required.
+
+        Returns:
+            ``True`` if at least *need* tokens are available, ``False`` otherwise.
+        """
+        seen = 0
+        if need <= 0:
+            return True
+        for t in self._tokens:
+            if t.available_at <= t_limit:
+                seen += 1
+                if seen >= need:
+                    return True
+        return False
+
     def deposit(self, token: Token, model_time: float | None = None) -> None:
         """Append *token* to the tail of the FIFO queue, enforcing the place's colour set.
 
@@ -124,8 +147,8 @@ class Place:
                     f"Place '{self.name}': cannot retrieve {count} token(s) — only {len(available)} available."
                 )
             to_return = available[:count]
-            remove_ids = {t.id for t in to_return}
-            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
+            remove_ids = {id(t) for t in to_return}
+            self._tokens = deque(t for t in self._tokens if id(t) not in remove_ids)
             return to_return
 
     def retrieve_specific(self, tokens: list[Token], model_time: float | None = None) -> list[Token]:
@@ -156,15 +179,17 @@ class Place:
                         f"Place '{self.name}': token {t.id} is not yet available at {t_limit} "
                         f"(available_at={t.available_at})."
                     )
-            remove_ids = {t.id for t in tokens}
-            present_ids = {t.id for t in self._tokens}
-            missing = remove_ids - present_ids
-            if missing:
+            requested_ids_by_identity = {id(t): t.id for t in tokens}
+            present_ids = {id(t) for t in self._tokens}
+            missing_identities = set(requested_ids_by_identity) - present_ids
+            if missing_identities:
+                missing = {requested_ids_by_identity[i] for i in missing_identities}
                 raise ValueError(
                     f"Place '{self.name}': token id(s) {missing} not found — "
                     f"cannot retrieve_specific tokens that are not present."
                 )
-            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
+            remove_ids = set(requested_ids_by_identity)
+            self._tokens = deque(t for t in self._tokens if id(t) not in remove_ids)
             return tokens
 
     def retrieve_all(self, model_time: float | None = None) -> list[Token]:
@@ -180,12 +205,15 @@ class Place:
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
             available = [t for t in self._tokens if t.available_at <= t_limit]
-            remove_ids = {t.id for t in available}
-            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
+            remove_ids = {id(t) for t in available}
+            self._tokens = deque(t for t in self._tokens if id(t) not in remove_ids)
             return available
 
     def peek(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Return up to *count* available tokens from the head without removing them.
+
+        Stops scanning `_tokens` as soon as *count* available tokens are collected
+        (early-exit) rather than building the full available list first.
 
         Args:
             count: Maximum number of tokens to inspect.
@@ -198,8 +226,15 @@ class Place:
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = [t for t in self._tokens if t.available_at <= t_limit]
-            return available[:count]
+            if count <= 0:
+                return []
+            result: list[Token] = []
+            for t in self._tokens:
+                if t.available_at <= t_limit:
+                    result.append(t)
+                    if len(result) >= count:
+                        break
+            return result
 
     def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
         """Return ``True`` if at least *count* tokens are currently available for retrieval.
@@ -215,8 +250,7 @@ class Place:
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = sum(1 for t in self._tokens if t.available_at <= t_limit)
-            return available >= count
+            return self._has_available(t_limit, count)
 
     def can_deposit(self, count: int = 1) -> bool:
         """Return ``True`` if the place can accept *count* more tokens without exceeding its bound.
@@ -379,8 +413,7 @@ class PacedResourcePlace(ResourcePlace):
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = sum(1 for t in self._tokens if t.available_at <= t_limit)
-            return available >= count
+            return self._has_available(t_limit, count)
 
     def retrieve(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Remove and return *count* tokens whose cooldown has expired, in expiry order.
@@ -412,16 +445,17 @@ class PacedResourcePlace(ResourcePlace):
                     f"(pacing_secs={self.pacing_secs})."
                 )
             to_return = available[:count]
-            remove_ids = {t.id for t in to_return}
+            remove_ids = {id(t) for t in to_return}
             # O(n) rebuild instead of O(n²) indexed deletion on deque
-            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
+            self._tokens = deque(t for t in self._tokens if id(t) not in remove_ids)
             return to_return
 
     def peek(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Return up to *count* cooled-down tokens without removing them.
 
         Behaves identically to [`Place.peek`][cpnx.Place.peek]; "available" specifically
-        means "cooldown has expired" for this class.
+        means "cooldown has expired" for this class. Early-exits once *count* cooled-down
+        tokens are collected.
 
         Args:
             count: Maximum number of tokens to inspect. Defaults to 1.
@@ -434,8 +468,15 @@ class PacedResourcePlace(ResourcePlace):
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = [t for t in self._tokens if t.available_at <= t_limit]
-            return available[:count]
+            if count <= 0:
+                return []
+            result: list[Token] = []
+            for t in self._tokens:
+                if t.available_at <= t_limit:
+                    result.append(t)
+                    if len(result) >= count:
+                        break
+            return result
 
 
 class ThresholdPlace(Place):
@@ -485,8 +526,7 @@ class ThresholdPlace(Place):
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = [t for t in self._tokens if t.available_at <= t_limit]
-            return len(available) >= self.threshold and len(available) >= count
+            return self._has_available(t_limit, max(self.threshold, count))
 
     def retrieve(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Remove and return *count* tokens from the head of the queue, but only if the threshold is met.
