@@ -1039,6 +1039,15 @@ class PetriNet:
             return None
         if not ignore_timing and not self._is_settle_time_met(place, arc):
             return None
+        # Bound the materialized pool. For a single-token FIFO arc, each candidate is one
+        # token in FIFO order and the search consumes only the first `binding_search_limit + 1`
+        # of them (see `_iter_candidate_bindings`), so peeking the first that-many available
+        # tokens yields the identical candidate set while turning an O(marking-depth) scan into
+        # an O(limit) one — the fix for the O(N^2) deep-place drain. A `consume_all`, multi-token
+        # (`count > 1`, combinatorial), or expression-ordered arc still needs the whole available
+        # pool, so those keep the full peek.
+        if arc.expression is None and not arc.consume_all and arc.count == 1:
+            return place.peek(self.binding_search_limit + 1, model_time=t_limit)
         return place.peek(len(place), model_time=t_limit)
 
     def _gather_arc_pools(
