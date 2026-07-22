@@ -66,7 +66,7 @@ class TestPacedResourcePlaceNonContiguous:
         t2 = Token(color="resource", available_at=50.0)
         t3 = Token(color="resource", available_at=0.0)
         for t in (t1, t2, t3):
-            rp._tokens.append(t)
+            rp._store.append(t)
         assert rp.can_retrieve(2, model_time=0.0)
         assert not rp.can_retrieve(3, model_time=0.0)
         assert rp.peek(2, model_time=0.0) == [t1, t3]
@@ -125,8 +125,8 @@ class TestIdSafeRemoval:
         assert future.id == available.id
         assert future is not available
 
-        p._tokens.append(available)
-        p._tokens.append(future)
+        p._store.append(available)
+        p._store.append(future)
 
         got = p.retrieve(1, model_time=0.0)
         assert got == [available]
@@ -139,8 +139,8 @@ class TestIdSafeRemoval:
         available = Token(available_at=0.0)
         future = available.evolve(available_at=100.0, id=available.id)
 
-        p._tokens.append(available)
-        p._tokens.append(future)
+        p._store.append(available)
+        p._store.append(future)
 
         got = p.retrieve_all(model_time=0.0)
         assert got == [available]
@@ -151,8 +151,8 @@ class TestIdSafeRemoval:
         available = Token(available_at=0.0)
         future = available.evolve(available_at=100.0, id=available.id)
 
-        p._tokens.append(available)
-        p._tokens.append(future)
+        p._store.append(available)
+        p._store.append(future)
 
         got = p.retrieve_specific([available], model_time=0.0)
         assert got == [available]
@@ -172,7 +172,7 @@ class TestIdSafeRemoval:
         # available is appended directly to simulate the collision scenario
         # precisely as described: two distinct instances, same id, different
         # available_at.
-        rp._tokens.append(taken.evolve(available_at=0.0, id=taken.id))
+        rp._store.append(taken.evolve(available_at=0.0, id=taken.id))
 
         assert rp.can_retrieve(1, model_time=0.0)
         got = rp.retrieve(1, model_time=0.0)
