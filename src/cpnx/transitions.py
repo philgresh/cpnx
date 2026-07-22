@@ -1,5 +1,6 @@
 import enum
 import typing
+import warnings
 import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Literal
@@ -13,7 +14,7 @@ if TYPE_CHECKING:
 
 
 def _reject_string_expression(field: str, value) -> None:
-    """Reject a string guard/arc-expression — callables are the only supported form.
+    """Reject a string guard/arc inscription — callables are the only supported form.
 
     String expressions (and their sandbox) were removed: a callable is provably as
     safe (see :mod:`cpnx.certification`) and, when certified, faster. To parameterise
@@ -31,11 +32,11 @@ def _reject_string_expression(field: str, value) -> None:
 
 
 def _inline_safe_for(value) -> bool:
-    """Whether a guard/arc-expression callable may be evaluated inline (no executor).
+    """Whether a guard/arc-inscription callable may be evaluated inline (no executor).
 
     A callable runs inline only if it *certifies* closed-world (see
     :mod:`cpnx.certification`); an uncertified callable falls back to the
-    timeout-bounded executor. ``None`` (no expression) is never evaluated, so its
+    timeout-bounded executor. ``None`` (no callable) is never evaluated, so its
     flag is immaterial — reported ``False``.
     """
     return is_inline_safe(value) if callable(value) else False
@@ -45,9 +46,10 @@ def _reject_non_bool_return(field: str, value) -> None:
     """Reject a boolean-predicate callable whose *return annotation* is not ``bool``.
 
     Enforces the CPN guard contract ``Type[G(t)] = Bool`` (see
-    ``docs/cpn-theory-audit.md``) at construction time, for the two callables that must
-    return a boolean: a transition ``guard`` and an ``OutputArc.expression`` (skip-arc
-    predicate). ``InputArc.expression`` returns ``list[Token]`` and is never passed here.
+    ``docs/cpn-theory-audit.md``) at construction time, for the callables that must
+    return a boolean: a transition ``guard``, an ``OutputArc.condition`` (skip-arc
+    predicate), and an ``InputArc.filter`` (per-token eligibility predicate).
+    ``InputArc.key`` returns an arbitrary comparable and is never passed here.
 
     The check is deliberately *conservative* — it only fires on an unambiguous mismatch,
     so it never punishes correct code:
@@ -96,7 +98,7 @@ class BindingPolicy(enum.Enum):
 
     In CPN theory a transition is enabled if *any* assignment of place tokens (a
     *binding*) satisfies its guard. cpnx historically tested only the head of each
-    input place (FIFO, or reordered by [`InputArc.expression`][cpnx.InputArc]), which
+    input place (FIFO, or reordered by [`InputArc.key`][cpnx.InputArc]), which
     causes **head-of-line blocking**: a place holding `[A, B]` whose guard wants `B`
     reports the transition disabled, because only `A` is ever tested. `BindingPolicy`
     selects how the engine resolves that binding. See the design record in
@@ -104,7 +106,7 @@ class BindingPolicy(enum.Enum):
 
     Attributes:
         LEGACY: Test only the first `count` tokens of each input place (FIFO, or the
-            leading tokens of the [`InputArc.expression`][cpnx.InputArc] ordering) and
+            leading tokens of the [`InputArc.key`][cpnx.InputArc] ordering) and
             evaluate the guard once against that single candidate set. This is the
             historical behavior and the default — reproducible, but subject to
             head-of-line blocking. Choose this to preserve pre-0.3.1 semantics exactly.
@@ -157,75 +159,168 @@ class BindingPolicy(enum.Enum):
 class InputArc:
     """Describe how a transition consumes tokens from one input place.
 
-    In CPN formalism an input arc carries an *arc expression* — a function
-    that, given the current tokens in the place, determines which tokens are
-    consumed and in what order. `expression` is that function.
+    In CPN formalism an input arc carries an *arc expression* — a function that, given
+    the current tokens in the place, determines which tokens are consumed and in what
+    order. cpnx splits that inscription into its two honest halves, both **per token**:
+
+    - `filter` — *eligibility*: which tokens this arc may consume at all;
+    - `key` — *order*: a total order over the eligible tokens, min-first.
+
+    The engine applies `filter`, orders what survives by `key` (ascending, ties broken by
+    insertion order), and consumes the first `count`. With neither set the arc is plain
+    FIFO. Per-token parameters are what make the selection *indexable*, which an opaque
+    `list[Token] -> list[Token]` transform can never be — see
+    `docs/adr/0004-arc-selection-key-filter.md`.
 
     Attributes:
         place: Name of the source place.
         count: Number of tokens to consume. Ignored when `consume_all=True`. Defaults to 1.
-        consume_all: Drain the entire place atomically. Defaults to `False`.
+        consume_all: Drain the entire place atomically. Defaults to `False`. **Overrides
+                     `key` and `filter`** — see the warning below.
         settle_secs: Wait for no new arrivals for this many seconds before
                      consuming. Defaults to `0.0` (no wait).
-        expression: CPN input arc expression. Receives all tokens currently
-                    in the place; returns them in desired consumption order.
-                    A pure `Callable`; certified callables run inline (see
-                    [`cpnx.certification`]). The engine consumes the first
-                    `count` tokens from the result. `None` (default) means FIFO order.
+        key: Per-token sort key — a pure `Callable[[Token], object]` mapping one token to a
+             comparable value. Eligible tokens are consumed in **ascending** key order
+             (min-first, mirroring [`Transition.binding_priority_key`][cpnx.Transition]),
+             ties broken by insertion order so the selection is deterministic. For
+             descending order, negate the key. The key must return values totally ordered
+             *with each other*; if it raises, or the ordering is undefined, the arc yields
+             no tokens and the transition is not enabled. `None` (default) means FIFO.
+        filter: Per-token eligibility predicate — a pure `Callable[[Token], bool]`. A token
+                is a candidate for this arc only when the predicate returns `True`; the
+                rest stay in the place. `None` (default) means every available token is
+                eligible. If annotated, the return type is checked to be `bool` at
+                construction (a non-`bool` annotation raises `TypeError`); unannotated
+                callables (including every lambda) are accepted unchecked. A filter that
+                raises makes the arc unsatisfiable rather than firing on a partial pool.
+
+    Warning:
+        **`consume_all=True` ignores both `key` and `filter`.** A draining arc takes every
+        available token, in FIFO order, whatever the selection callables say — a token the
+        `filter` rejects *is still consumed*. This preserves the pre-`key`/`filter`
+        behavior of the arc inscription it replaced, but it is a genuine footgun: `filter`
+        reads as a declaration of eligibility, and under `consume_all` it is not one. Do
+        not combine them expecting "drain everything eligible"; that pattern is not
+        supported today. To drain only eligible tokens, use a large `count` rather than
+        `consume_all`.
+
+        Because that combination is always a mistake rather than a style choice,
+        constructing (or reassigning into) such an arc emits a `UserWarning` naming the
+        ignored parameters. Silence it with
+        `warnings.filterwarnings("ignore", message="consume_all=True ignores")` if you
+        genuinely mean "drain everything, selection notwithstanding".
+
+    Note:
+        Both callables are purity-verified at assignment, and each carries its own
+        inline-safe flag: a **certified** callable (see [`cpnx.certification`]) runs
+        inline under the engine lock, an uncertified one on the timeout-bounded
+        expression pool. Uncertified `key`/`filter` are allowed — they simply cost a pool
+        round-trip per evaluation.
+
+    Example:
+        ```python
+        InputArc("inbox", count=2, key=lambda t: t.payload["priority"], filter=lambda t: not t.payload["held"])
+        ```
     """
 
     place: str
     count: int = 1
     consume_all: bool = False
     settle_secs: float = 0.0
-    expression: Callable[[list[Token]], list[Token]] | None = field(default=None, compare=False)
+    key: Callable[[Token], object] | None = field(default=None, compare=False, kw_only=True)
+    filter: Callable[[Token], bool] | None = field(default=None, compare=False, kw_only=True)
+
+    def __post_init__(self):
+        # Marks construction complete, so `__setattr__` can tell a field assignment made by
+        # the generated ``__init__`` (all of which this hook already covers, once) from a
+        # later reassignment by the caller (which must warn on its own).
+        self._constructed = True
+        self._warn_if_drain_ignores_selection(stacklevel=4)
 
     def __setattr__(self, name, value):
-        # Keep the inline-safe flag in sync with ``expression``, including
+        # Keep each selection callable's inline-safe flag in sync, including
         # post-construction reassignment. Reject/verify before mutating so a bad
         # value leaves the arc in its previous valid state.
-        if name == "expression":
-            _reject_string_expression("expression", value)
+        if name in ("key", "filter"):
+            _reject_string_expression(f"InputArc.{name}", value)
             if callable(value):
                 verify_callable_purity(value)
-            super().__setattr__("_inline_safe", _inline_safe_for(value))
+                if name == "filter":
+                    _reject_non_bool_return("InputArc.filter", value)
+            super().__setattr__(f"_{name}_inline_safe", _inline_safe_for(value))
         super().__setattr__(name, value)
+        # Re-check the drain/selection conflict after the value lands, so the warning
+        # reflects the arc as it now is. Skipped during ``__init__`` — `__post_init__`
+        # reports the finished arc once, rather than once per conflicting field.
+        if name in ("consume_all", "key", "filter") and getattr(self, "_constructed", False):
+            self._warn_if_drain_ignores_selection(stacklevel=3)
+
+    def _warn_if_drain_ignores_selection(self, *, stacklevel: int) -> None:
+        """Warn when this arc sets `key`/`filter` that `consume_all` will silently ignore.
+
+        The combination is never meaningful — a draining arc consumes the whole available
+        pool in FIFO order regardless — so it is far more likely to be a misreading of
+        `filter` as "drain everything eligible" than a deliberate choice. Engine behavior
+        is unaffected; this only makes the documented bypass audible at the call site.
+
+        `stacklevel` is passed in because the two callers sit at different depths: the
+        `__post_init__` path is reached through the generated `__init__`, the
+        `__setattr__` path directly from user code. Both aim the warning at the caller's
+        own line.
+        """
+        if not self.consume_all:
+            return
+        ignored = [name for name in ("key", "filter") if getattr(self, name, None) is not None]
+        if not ignored:
+            return
+        named = " and ".join(f"`{name}`" for name in ignored)
+        warnings.warn(
+            f"InputArc(place={self.place!r}): consume_all=True ignores {named} — a draining "
+            "arc consumes every available token in FIFO order, including tokens the filter "
+            "rejects. To drain only eligible tokens, use a large `count` instead of "
+            "`consume_all`; to drain unconditionally, drop the ignored parameter(s).",
+            UserWarning,
+            stacklevel=stacklevel,
+        )
 
 
 @dataclass
 class OutputArc:
     """Describe how a transition deposits tokens into one output place.
 
-    In CPN formalism an output arc carries an *arc expression* — a function
-    evaluated against the transition's output tokens that determines whether
-    tokens flow along this arc. `expression` is that predicate.
+    In CPN formalism an output arc carries an *arc expression* — a function evaluated
+    against the transition's output tokens that determines whether tokens flow along this
+    arc. On the output side that inscription is, in practice, always a boolean *activation*
+    predicate, so cpnx names it `condition` — a different mechanism from the input side's
+    token selection (see [`InputArc`][cpnx.InputArc] and
+    `docs/adr/0004-arc-selection-key-filter.md`).
 
     Attributes:
         place: Name of the target place.
         count: Number of tokens to deposit. Defaults to 1.
-        expression: CPN output arc expression. Receives the list of non-resource
-                    output tokens returned by the action; the arc is *skipped*
-                    (no tokens deposited) when it returns `False`. `None`
-                    (default) means the arc always fires. A pure `Callable`;
-                    certified callables run inline (see [`cpnx.certification`]).
-                    A boolean predicate: if annotated, its return type is checked to
-                    be `bool` at construction (a non-`bool` annotation raises
-                    `TypeError`); unannotated callables are accepted unchecked.
+        condition: Arc activation predicate. Receives the list of non-resource
+                   output tokens returned by the action; the arc is *skipped*
+                   (no tokens deposited) when it returns `False`. `None`
+                   (default) means the arc always fires. A pure `Callable`;
+                   certified callables run inline (see [`cpnx.certification`]).
+                   A boolean predicate: if annotated, its return type is checked to
+                   be `bool` at construction (a non-`bool` annotation raises
+                   `TypeError`); unannotated callables are accepted unchecked.
     """
 
     place: str
     count: int = 1
-    expression: Callable[[list[Token]], bool] | None = field(default=None, compare=False)
+    condition: Callable[[list[Token]], bool] | None = field(default=None, compare=False)
 
     def __setattr__(self, name, value):
-        # Keep the inline-safe flag in sync with ``expression``, including
+        # Keep the inline-safe flag in sync with ``condition``, including
         # post-construction reassignment. Reject/verify before mutating so a bad
         # value leaves the arc in its previous valid state.
-        if name == "expression":
-            _reject_string_expression("expression", value)
+        if name == "condition":
+            _reject_string_expression("OutputArc.condition", value)
             if callable(value):
                 verify_callable_purity(value)
-                _reject_non_bool_return("OutputArc.expression", value)
+                _reject_non_bool_return("OutputArc.condition", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         super().__setattr__(name, value)
 
@@ -233,7 +328,7 @@ class OutputArc:
     def on_color(cls, color: str, place: str, count: int = 1) -> "OutputArc":
         """Build an [`OutputArc`][cpnx.OutputArc] that only fires for a matching first token color.
 
-        The returned arc's `expression` is a callable that checks whether the action's
+        The returned arc's `condition` is a callable that checks whether the action's
         output tokens are non-empty and the first token's color equals `color`. It closes
         over `color` (an immutable string), so it certifies for inline evaluation.
 
@@ -243,7 +338,7 @@ class OutputArc:
             count: Number of tokens to deposit when the arc fires. Defaults to 1.
 
         Returns:
-            A new `OutputArc` bound to `place` whose expression evaluates to `True` only
+            A new `OutputArc` bound to `place` whose condition evaluates to `True` only
             when the first token in the action's output has color `color`.
 
         Example:
@@ -251,7 +346,7 @@ class OutputArc:
             OutputArc.on_color("success", place="done", count=1)
             ```
         """
-        return cls(place=place, count=count, expression=lambda tokens: bool(tokens and tokens[0].color == color))
+        return cls(place=place, count=count, condition=lambda tokens: bool(tokens and tokens[0].color == color))
 
 
 @dataclass
@@ -260,8 +355,8 @@ class Transition:
 
     In CPN formalism a transition has:
 
-    - **Input arcs** with arc expressions determining which tokens are consumed
-    - **Output arcs** with arc expressions determining which tokens are produced
+    - **Input arcs** whose `key`/`filter` determine which tokens are consumed
+    - **Output arcs** whose `condition` determines whether tokens are produced
     - A **guard** — a boolean predicate over the binding that must hold for the
       transition to be enabled (evaluated before the action runs)
 

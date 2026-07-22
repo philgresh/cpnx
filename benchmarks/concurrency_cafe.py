@@ -63,16 +63,16 @@ unless you ask for more:
 | Place                     | cpnx type | Cafe role                                                       |
 |---------------------------|-----------|------------------------------------------------------------------|
 | ``P_Cold_Brew_Steeping``  | ``Place`` | Cold-brew batches steeping, each future-dated by ``available_at``|
-| ``P_Batch_Triage_Queue``  | ``Place`` | Rush-hour ticket backlog, drained via an ``InputArc`` expression |
+| ``P_Batch_Triage_Queue``  | ``Place`` | Rush-hour ticket backlog, drained via an ``InputArc.key`` sort   |
 
 ``P_Cold_Brew_Steeping`` (``cold_brew=True``) is a genuinely **deep timed** place: unlike
 ``P_Burr_Grinder``'s shallow (capacity 2-3) cooldown pool, a cold-brew tower can have
 dozens-to-hundreds of batches steeping concurrently, each with its own future
 ``available_at``. ``P_Batch_Triage_Queue`` (``batch_triage=True``) is this net's only
-``InputArc(expression=...)`` — everywhere else that reorders (``binding_priority_key`` on
+``InputArc(key=...)`` — everywhere else that reorders (``binding_priority_key`` on
 ``T_Weigh_And_Grind``) is a *different* mechanism (a transition-level tie-break among
 enumerated bindings, not a per-arc token-pool reorder); this queue exercises the engine's
-``_order_available`` arc-expression path instead, and does so over a deep backlog so the cost
+``_order_available`` key-sort path instead, and does so over a deep backlog so the cost
 of re-sorting the whole pool every firing is actually visible. Both exist so a later phase can
 benchmark a heap-based replacement for the naive linear ``available_at`` scan / per-firing
 resort these places currently rely on (see ``cpnx.places.Place``).
@@ -280,8 +280,8 @@ def _pull_cold_brew(tokens: list[Token]) -> list[Token]:
     return [steeped.evolve(payload_updates={"stage": "cold_brew"}, color="drink")]
 
 
-def _batch_triage_order(tokens: list[Token]) -> list[Token]:
-    """``T_Batch_Triage_Serve``'s ``InputArc.expression``: how a barista triages a deep rush.
+def _batch_triage_key(token: Token) -> tuple[int, int, float]:
+    """``T_Batch_Triage_Serve``'s ``InputArc.key``: how a barista triages a deep rush.
 
     Not a random shuffle — a real batching heuristic. Two groupings, in priority order:
 
@@ -292,21 +292,21 @@ def _batch_triage_order(tokens: list[Token]) -> list[Token]:
        ahead of one that's out of spec and likely to bounce through rework — a rush doesn't
        want to get stuck behind a slow ticket.
 
-    Ties within a group fall back to ``created_at`` (oldest first), so this reorders the
-    *groups*, not the tickets within them — every ticket is still consumed eventually, just
-    not in strict arrival order. A plain closure over each token's own ``payload``/
+    Ties within a group fall back to ``created_at`` (oldest first): the engine sorts the
+    eligible pool by this key in **ascending** order (min-first) and breaks any remaining tie
+    by insertion order, so an on-target oat-milk ticket (key ``(0, 0, created_at)``) always
+    sorts ahead of an out-of-spec dairy one (key ``(1, 1, created_at)``) — this reorders the
+    *groups*, not the tickets within them, so every ticket is still consumed eventually, just
+    not in strict arrival order. A plain per-token closure over the token's own ``payload``/
     ``created_at`` with no closed-over mutable state, so it certifies for the engine's inline
     path (see ``cpnx.certification``) instead of round-tripping through the sandboxed
     expression executor — the same reason ``_mobile_pickup_first`` above is a callable, not a
     string.
     """
-    return sorted(
-        tokens,
-        key=lambda t: (
-            0 if t.payload.get("dairy_free") else 1,
-            0 if t.payload.get("weight_g", _DOSE_TARGET_G) == _DOSE_TARGET_G else 1,
-            t.created_at,
-        ),
+    return (
+        0 if token.payload.get("dairy_free") else 1,
+        0 if token.payload.get("weight_g", _DOSE_TARGET_G) == _DOSE_TARGET_G else 1,
+        token.created_at,
     )
 
 
@@ -314,7 +314,7 @@ def _serve_batch_triage(tokens: list[Token]) -> list[Token]:
     """``T_Batch_Triage_Serve``'s action: hand a triaged ticket straight to the tray as a drink.
 
     Deliberately skips the grind/pull/steam machinery — this queue exists to exercise
-    ``InputArc.expression`` over a deep pool (see ``_batch_triage_order``), not to re-model
+    ``InputArc.key`` over a deep pool (see ``_batch_triage_key``), not to re-model
     the full pipeline a second time.
     """
     ticket = tokens[0]
@@ -399,7 +399,7 @@ def build_cafe(
             shape a heap-based timed store (a later phase) would target.
         batch_triage: Opt-in (default `False`, structure-preserving when off). Adds
             ``P_Batch_Triage_Queue`` and ``T_Batch_Triage_Serve``, whose input arc carries
-            this net's only ``InputArc(expression=...)`` (see ``_batch_triage_order``) — a
+            this net's only ``InputArc(key=...)`` (see ``_batch_triage_key``) — a
             different mechanism from ``T_Weigh_And_Grind``'s ``binding_priority_key`` above
             (that reorders enumerated *bindings*; this reorders one arc's token *pool*).
             Like ``P_Cold_Brew_Steeping``, nothing deposits here from inside this function;
@@ -443,8 +443,8 @@ def build_cafe(
         places.append(Place("P_Cold_Brew_Steeping", color_set={"cold_brew"}))
     if batch_triage:
         # Unbounded FIFO, same shape as `P_Ticket_Line` — a rush-hour ticket backlog that
-        # `T_Batch_Triage_Serve`'s InputArc.expression reorders every firing (see
-        # `_batch_triage_order`).
+        # `T_Batch_Triage_Serve`'s InputArc.key reorders every firing (see
+        # `_batch_triage_key`).
         places.append(Place("P_Batch_Triage_Queue"))
     # ThresholdPlace's constructor doesn't expose `bound` (threshold and k-bound are
     # orthogonal CPN concepts), but `bound` is a plain, settable attribute inherited from
@@ -557,7 +557,7 @@ def build_cafe(
         transitions.append(
             Transition(
                 name="T_Pull_Cold_Brew",
-                # No guard, no expression, default (LEGACY) binding policy: `Place.retrieve`
+                # No guard, no key/filter, default (LEGACY) binding policy: `Place.retrieve`
                 # already filters to matured tokens (`available_at <= now`) before this arc
                 # ever sees them, so plain FIFO over "whatever's matured" is all this needs.
                 inputs=[InputArc("P_Cold_Brew_Steeping")],
@@ -571,7 +571,7 @@ def build_cafe(
         transitions.append(
             Transition(
                 name="T_Batch_Triage_Serve",
-                inputs=[InputArc("P_Batch_Triage_Queue", expression=_batch_triage_order)],
+                inputs=[InputArc("P_Batch_Triage_Queue", key=_batch_triage_key)],
                 outputs=[OutputArc("P_Served")],
                 action=_with_work(work_secs, _serve_batch_triage),
                 action_timeout_secs=0.5,

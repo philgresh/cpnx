@@ -297,8 +297,8 @@ def test_evaluate_output_guards():
     net.add_place(p_data)
 
     arc_always = OutputArc("p_data")
-    arc_true = OutputArc("p_data", expression=lambda tokens: len(tokens) > 0)
-    arc_false = OutputArc("p_data", expression=lambda tokens: False)
+    arc_true = OutputArc("p_data", condition=lambda tokens: len(tokens) > 0)
+    arc_false = OutputArc("p_data", condition=lambda tokens: False)
 
     transition = Transition(
         "t",
@@ -311,7 +311,7 @@ def test_evaluate_output_guards():
     active = net._evaluate_output_guards(transition, [token])
 
     assert len(active) == 2
-    # OutputArc.expression has compare=False, so use identity checks
+    # OutputArc.condition has compare=False, so use identity checks
     active_arcs = [a for a, _ in active]
     assert any(a is arc_always for a in active_arcs)
     assert any(a is arc_true for a in active_arcs)
@@ -322,8 +322,8 @@ def test_evaluate_output_guards():
     assert len(active_empty) == 1
     assert active_empty[0][0] is arc_always
 
-    # Callable expression
-    arc_callable = OutputArc("p_data", expression=lambda tokens: len(tokens) == 0)
+    # Callable condition
+    arc_callable = OutputArc("p_data", condition=lambda tokens: len(tokens) == 0)
     t2 = Transition("t2", inputs=[], outputs=[arc_callable], action=lambda t: t)
     assert len(net._evaluate_output_guards(t2, [token])) == 0
     assert len(net._evaluate_output_guards(t2, [])) == 1
@@ -389,14 +389,47 @@ def test_resolve_input_tokens():
     arc = InputArc("p", consume_all=True)
     assert net._resolve_input_tokens(arc, available) == available
 
-    # identity expression
-    arc2 = InputArc("p", expression=lambda tokens: tokens)
+    # a filter that changes nothing still returns the (unchanged) pool
+    arc2 = InputArc("p", filter=lambda t: True)
     res = net._resolve_input_tokens(arc2, available)
     assert res == available[:1]  # count is 1 by default
 
-    # exception in expression
-    arc3 = InputArc("p", expression=lambda tokens: 1 / 0)
+    # exception in key
+    arc3 = InputArc("p", key=lambda t: 1 / 0)
     assert net._resolve_input_tokens(arc3, available) is None
+
+    # exception in filter
+    arc4 = InputArc("p", filter=lambda t: 1 / 0)
+    assert net._resolve_input_tokens(arc4, available) is None
+
+    # no key and no filter → FIFO passthrough
+    arc5 = InputArc("p")
+    assert net._resolve_input_tokens(arc5, available) == available[:1]
+
+    # key-only: consumed in ascending key order (min-first), not insertion order
+    hi = Token(payload={"priority": 2})
+    lo = Token(payload={"priority": 1})
+    arc_key = InputArc("p", count=2, key=lambda t: t.payload["priority"])
+    assert net._resolve_input_tokens(arc_key, [hi, lo]) == [lo, hi]
+
+    # filter-only: ineligible tokens are excluded, eligible ones keep insertion order
+    keep = Token(payload={"ok": True})
+    drop = Token(payload={"ok": False})
+    arc_filter = InputArc("p", count=1, filter=lambda t: t.payload["ok"])
+    assert net._resolve_input_tokens(arc_filter, [drop, keep]) == [keep]
+
+    # both filter and key: filter first, then order what survives
+    a = Token(payload={"ok": True, "priority": 3})
+    b = Token(payload={"ok": False, "priority": 1})
+    c = Token(payload={"ok": True, "priority": 1})
+    arc_both = InputArc(
+        "p", count=2, filter=lambda t: t.payload["ok"], key=lambda t: t.payload["priority"]
+    )
+    assert net._resolve_input_tokens(arc_both, [a, b, c]) == [c, a]
+
+    # count not met (after filtering) → None, even though enough tokens are present overall
+    arc_short = InputArc("p", count=2, filter=lambda t: t.payload["ok"])
+    assert net._resolve_input_tokens(arc_short, [a, b]) is None
 
 
 def test_check_output_capacity():
@@ -414,7 +447,7 @@ def test_check_output_capacity():
     assert not net._check_output_capacity(t)
 
     # guarded arc ignores capacity
-    t2 = Transition("t", inputs=[], outputs=[OutputArc("p_out", expression=lambda tokens: True)], action=lambda t: t)
+    t2 = Transition("t", inputs=[], outputs=[OutputArc("p_out", condition=lambda tokens: True)], action=lambda t: t)
     assert net._check_output_capacity(t2)
 
 
@@ -777,8 +810,8 @@ def test_is_arc_active():
     arc_none = OutputArc("p1")
     assert net._is_arc_active(arc_none, []) is True
 
-    # Expressions are callables only; a None expression means the arc is always active.
-    arc_callable = OutputArc("p1", expression=lambda t: len(t) > 0)
+    # Conditions are callables only; a None condition means the arc is always active.
+    arc_callable = OutputArc("p1", condition=lambda t: len(t) > 0)
     assert net._is_arc_active(arc_callable, []) is False
     assert net._is_arc_active(arc_callable, [Token()]) is True
 

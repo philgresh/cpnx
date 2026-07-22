@@ -3,6 +3,7 @@
 import concurrent.futures
 import itertools
 import math
+import operator
 import random
 import threading
 import time
@@ -35,6 +36,15 @@ class DriveResult:
 def _flatten_binding(binding: _Binding) -> list[Token]:
     """Flatten a resolved binding into a single guard-candidate token list, in arc order."""
     return [t for _, tokens in binding for t in tokens]
+
+
+_first = operator.itemgetter(0)
+"""Sort key selecting only the key half of a ``(key, token)`` pair.
+
+`InputArc.key` ordering sorts decorated pairs, and a plain tuple sort would fall through to
+comparing the `Token`s themselves whenever two keys tie — `Token` is not ordered, so that
+would raise on the very ties the stable sort is meant to resolve by insertion order.
+"""
 
 
 def _default_priority_key(tokens: list[Token]) -> float:
@@ -177,8 +187,8 @@ class PetriNet:
     error-handling dispositions:
 
     - **A. Colour-routed error (primary/canonical)** — the action catches its own
-      exception, returns an error-coloured token, and output-arc expressions (e.g. using
-      `OutputArc.expression`) route success vs error tokens to different places. This
+      exception, returns an error-coloured token, and output-arc conditions (e.g. using
+      `OutputArc.condition`) route success vs error tokens to different places. This
       preserves firing rules and token conservation (1-in-1-out).
     - **B. Bounded atomic-retry** — on action failure/exception, the data token is rolled
       back to its source place with a delay (`retry_delay`) and an incremented `attempts`
@@ -582,7 +592,7 @@ class PetriNet:
 
         Each arc's tokens were already resolved (and its guard satisfied) by
         `_resolve_binding`, so consumption is a straight `retrieve_specific` by id — no
-        arc expression is re-evaluated here. If a token has vanished (e.g. a concurrent
+        arc `key`/`filter` is re-evaluated here. If a token has vanished (e.g. a concurrent
         consumer removed it between resolution and consumption), the already-consumed
         tokens are returned to their source places before the error propagates, so none
         are silently lost.
@@ -1044,9 +1054,10 @@ class PetriNet:
         # of them (see `_iter_candidate_bindings`), so peeking the first that-many available
         # tokens yields the identical candidate set while turning an O(marking-depth) scan into
         # an O(limit) one — the fix for the O(N^2) deep-place drain. A `consume_all`, multi-token
-        # (`count > 1`, combinatorial), or expression-ordered arc still needs the whole available
-        # pool, so those keep the full peek.
-        if arc.expression is None and not arc.consume_all and arc.count == 1:
+        # (`count > 1`, combinatorial), keyed, or filtered arc still needs the whole available
+        # pool — a `key` reorders it and a `filter` may reject the entire prefix — so those keep
+        # the full peek.
+        if arc.key is None and arc.filter is None and not arc.consume_all and arc.count == 1:
             return place.peek(self.binding_search_limit + 1, model_time=t_limit)
         return place.peek(len(place), model_time=t_limit)
 
@@ -1082,7 +1093,7 @@ class PetriNet:
         according to the transition's effective [`BindingPolicy`][cpnx.BindingPolicy]:
 
         - `LEGACY` (and guard-free `FIRST`): take the first `count` tokens of each arc (its
-          head, or the leading tokens of the arc-expression ordering) and accept it only if
+          head, or the leading tokens of the arc's `key` ordering) and accept it only if
           the guard holds — the historical behavior, O(1).
         - `FIRST`: return the first guard-satisfying combination in insertion order.
         - `RANDOM`: return a uniformly-random guard-satisfying combination (drawing from the
@@ -1259,11 +1270,12 @@ class PetriNet:
     def _arc_options(self, arc: InputArc, available: list[Token]) -> Iterator[list[Token]]:
         """Yield each `count`-sized token group one input `arc` could consume, in order.
 
-        A `consume_all` arc has a single option (every eligible token). Otherwise the tokens
-        are ordered (by the arc expression, else FIFO) and every `count`-sized combination is
-        yielded in index order — so the first yielded group is the arc's head selection. An
-        arc whose expression raises, or that has fewer than `count` eligible tokens, yields
-        nothing (making the transition unbindable).
+        A `consume_all` arc has a single option: every available token, FIFO, with `key`
+        and `filter` deliberately bypassed (see the warning on `InputArc`). Otherwise the tokens
+        are filtered and ordered (by the arc's `filter`/`key`, else FIFO) and every
+        `count`-sized combination is yielded in index order — so the first yielded group is
+        the arc's head selection. An arc whose `key`/`filter` raises, or that has fewer than
+        `count` eligible tokens, yields nothing (making the transition unbindable).
         """
         if arc.consume_all:
             yield available
@@ -1284,23 +1296,45 @@ class PetriNet:
             yield list(combo)
 
     def _order_available(self, arc: InputArc, available: list[Token]) -> list[Token] | None:
-        """Return `available` ordered by the arc's selection expression, or `None` if it raises.
+        """Return the arc-eligible tokens in consumption order, or `None` if selection fails.
 
-        With no expression, returns `available` unchanged (FIFO). Otherwise the callable
-        expression is evaluated — inline if certified closed-world, else via the
-        timed expression pool.
+        Applies the arc's selection in two steps, mirroring the two halves of
+        [`InputArc`][cpnx.InputArc]:
 
-        KNOWN LIMITATION (https://github.com/philgresh/cpnx/issues/25): an arc `expression`
-        is an opaque ``list[Token] -> list[Token]`` transform, so it is re-run over the whole
-        available pool on every firing — draining a *deep* expression-ordered place is
-        O(N^2 log N). Unlike the FIFO/timed paths (linearized via `places._TokenStore`), this
-        cannot be indexed without a `key=`-based API, since there is no per-token key to
-        maintain a persistent sorted structure on. See the issue for the proposed fix.
+        1. **`filter`** — drop every token the per-token predicate rejects (they stay in
+           the place, merely ineligible for this arc);
+        2. **`key`** — order what survives **ascending** by the per-token key. Python's
+           sort is stable, so equal keys retain the incoming FIFO (insertion-`seq`) order
+           — the tiebreak that keeps a keyed drain deterministic.
+
+        With neither set, `available` is returned unchanged (FIFO). Each callable is
+        evaluated inline if certified closed-world, else via the timed expression pool. A
+        callable that raises — or a key whose values are mutually incomparable — returns
+        `None`, making the arc unsatisfiable rather than firing on a partial pool.
+
+        KNOWN LIMITATION (https://github.com/philgresh/cpnx/issues/25): the sort is redone
+        over the whole available pool on every firing, so draining a *deep* keyed place is
+        still O(N^2 log N). Unlike the FIFO/timed paths (linearized via
+        `places._TokenStore`), that is fixed by a persistent per-arc key-index — which the
+        per-token `key` now makes possible. See the issue.
         """
-        if arc.expression is None:
+        if arc.filter is None and arc.key is None:
             return available
         try:
-            return list(self._eval_expression(arc.expression, available, arc._inline_safe))  # type: ignore[attr-defined]
+            if arc.filter is not None:
+                available = [
+                    token
+                    for token in available
+                    if self._eval_expression(arc.filter, token, arc._filter_inline_safe)  # type: ignore[attr-defined]
+                ]
+            if arc.key is None:
+                return available
+            keyed = [
+                (self._eval_expression(arc.key, token, arc._key_inline_safe), token)  # type: ignore[attr-defined]
+                for token in available
+            ]
+            keyed.sort(key=_first)
+            return [token for _, token in keyed]
         except Exception:
             return None
 
@@ -1379,12 +1413,13 @@ class PetriNet:
             elapsed = time.monotonic() - place.last_deposit_time
         return elapsed >= arc.settle_secs
 
-    def _eval_expression(self, expression, tokens: list[Token], inline_safe: bool = False):
-        """Evaluate a callable `expression` over `tokens`.
+    def _eval_expression(self, expression, arg: Token | list[Token], inline_safe: bool = False):
+        """Evaluate a callable `expression` over `arg`.
 
-        Centralizes the dispatch shared by input-arc ordering/selection
-        (`_order_available`, `_resolve_input_tokens`), output-arc guards
-        (`_is_arc_active`), and transition guards (`_check_transition_guard`).
+        Centralizes the dispatch shared by input-arc selection (`_order_available`'s
+        per-**token** `key`/`filter`), output-arc conditions (`_is_arc_active`), and
+        transition guards (`_check_transition_guard`) — hence the widened `arg`: the
+        input-arc callables take one `Token`, the rest take the candidate token list.
         Two execution modes, chosen by what was proven at construction:
 
         - **certified callable** (`inline_safe`) — called directly, no executor. It
@@ -1397,14 +1432,14 @@ class PetriNet:
         Callers coerce/bound the result and handle exceptions.
         """
         if inline_safe:
-            return expression(tokens)
-        return self._call_expr(expression, tokens, timeout=self.expr_timeout_secs)
+            return expression(arg)
+        return self._call_expr(expression, arg, timeout=self.expr_timeout_secs)
 
     def _resolve_input_tokens(self, arc: InputArc, available: list[Token]) -> list[Token] | None:
         """Resolve which tokens input `arc` would consume from `available`.
 
         Returns the selected tokens, or `None` if the arc cannot be satisfied —
-        either its selection expression raised, or fewer than `arc.count` tokens
+        either its `key`/`filter` raised, or fewer than `arc.count` tokens
         are eligible. In CPN semantics arc multiplicity is all-or-nothing: an arc
         demanding `count` tokens is not enabled unless at least `count` are
         resolved, so a selection that yields fewer (or none) disables the
@@ -1418,25 +1453,25 @@ class PetriNet:
         rather than firing with too few tokens.
         """
         if arc.consume_all:
+            # A draining arc takes the whole available pool untouched — `key` and `filter`
+            # are bypassed, exactly as the arc inscription they replaced was. Documented as
+            # a footgun on `InputArc`; pinned by `test_consume_all_bypasses_key_and_filter`.
             tokens = available
-        elif arc.expression is not None:
-            try:
-                ordered = self._eval_expression(arc.expression, available, arc._inline_safe)  # type: ignore[attr-defined]
-                tokens = ordered[: arc.count]
-            except Exception:
-                return None
         else:
-            tokens = available[: arc.count]
+            ordered = self._order_available(arc, available)
+            if ordered is None:
+                return None
+            tokens = ordered[: arc.count]
         if len(tokens) < arc.count:
             return None
         return tokens
 
     def _check_output_capacity(self, transition: Transition) -> bool:
-        # Back-pressure: refuse to fire if an unguarded output arc's target place is full.
-        # Guarded arcs are skipped — their target may never receive a token, so checking
+        # Back-pressure: refuse to fire if an unconditional output arc's target place is full.
+        # Conditional arcs are skipped — their target may never receive a token, so checking
         # capacity speculatively would cause spurious blocking.
         for arc in transition.outputs:
-            if arc.expression is not None:
+            if arc.condition is not None:
                 continue
             place = self.places.get(arc.place)
             if place is not None and not place.can_deposit(arc.count):
@@ -1682,10 +1717,10 @@ class PetriNet:
         return success, output_tokens, error
 
     def _is_arc_active(self, arc: OutputArc, output_tokens_data: list[Token]) -> bool:
-        if arc.expression is None:
+        if arc.condition is None:
             return True
         return bool(
-            self._eval_expression(arc.expression, output_tokens_data, arc._inline_safe)  # type: ignore[attr-defined]
+            self._eval_expression(arc.condition, output_tokens_data, arc._inline_safe)  # type: ignore[attr-defined]
         )
 
     def _evaluate_output_guards(

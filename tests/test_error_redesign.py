@@ -88,9 +88,9 @@ def test_resource_safety():
 
 
 def test_color_routing_canonical_path():
-    """Action returns an error-coloured token; an OutputArc(expression=is_error)
+    """Action returns an error-coloured token; an OutputArc(condition=is_error)
 
-    routes it to error_place while OutputArc(expression=is_success) routes a success
+    routes it to error_place while OutputArc(condition=is_success) routes a success
     token to the normal place. Assert correct place for each, and 1-in-1-out.
     """
     net = PetriNet(max_workers=2)

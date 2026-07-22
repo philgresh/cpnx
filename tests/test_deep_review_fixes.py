@@ -23,13 +23,19 @@ class TestC1TokenRollbackOnConsumptionError:
     consumes it — tokens already consumed from earlier arcs must be returned.
     """
 
-    def test_arc_expression_evaluated_once_per_firing(self):
-        """An input-arc expression is evaluated once during resolution, never again at consume."""
+    def test_arc_key_evaluated_once_per_token_at_resolve_not_at_consume(self):
+        """An input-arc `key` is evaluated once per eligible token during resolution — and
+        never again when the resolved token is actually consumed (by id, in `_consume_binding`).
+
+        Selection (`_order_available`, called once from `_resolve_binding` inside `step()`)
+        and consumption (`_consume_binding`'s `retrieve_specific` by id) are distinct phases;
+        this test pins down that the second phase does not re-invoke the arc's `key`.
+        """
         calls = {"b": 0}
 
-        def b_expr(tokens):
+        def b_key(token):
             calls["b"] += 1
-            return tokens
+            return token.payload.get("seq", 0)
 
         net = PetriNet(
             places=[Place("a"), Place("b"), Place("out")],
@@ -38,7 +44,7 @@ class TestC1TokenRollbackOnConsumptionError:
                     name="t",
                     inputs=[
                         InputArc("a"),
-                        InputArc("b", expression=b_expr),
+                        InputArc("b", key=b_key),
                     ],
                     outputs=[OutputArc("out", count=2)],
                     action=lambda tokens: tokens,
@@ -49,9 +55,11 @@ class TestC1TokenRollbackOnConsumptionError:
         net.deposit("b", Token())
 
         assert net.step() is True
-        assert calls["b"] == 1, "expression must be evaluated exactly once per firing (resolve, not consume)"
+        assert calls["b"] == 1, "key evaluated once per eligible token during resolution"
+        calls_after_resolve = calls["b"]
         net.run(deadline=time.monotonic() + 1.0)
         assert len(net.places["out"].tokens) == 2
+        assert calls_after_resolve == calls["b"], "consuming the resolved token by id must not re-invoke key"
 
     def test_earlier_arc_tokens_rolled_back_when_later_arc_consume_fails(self):
         """If a later arc cannot consume its resolved tokens, earlier-arc tokens are returned."""
@@ -89,7 +97,7 @@ class TestC1TokenRollbackOnConsumptionError:
         assert len(net.places["out"].tokens) == 0
 
     def test_no_partial_consumption_when_all_expressions_raise_at_enable_check(self):
-        """When expression raises at _is_transition_enabled, transition is disabled — no
+        """When filter raises at _is_transition_enabled, transition is disabled — no
         tokens are consumed at all, so there is nothing to roll back."""
         net = PetriNet(
             places=[Place("a"), Place("out")],
@@ -99,7 +107,7 @@ class TestC1TokenRollbackOnConsumptionError:
                     inputs=[
                         InputArc(
                             "a",
-                            expression=lambda tokens: (_ for _ in ()).throw(ValueError("always")),
+                            filter=lambda token: (_ for _ in ()).throw(ValueError("always")),
                         ),
                     ],
                     outputs=[OutputArc("out")],
@@ -116,7 +124,7 @@ class TestC1TokenRollbackOnConsumptionError:
 
 
 class TestW1ArcExpressionExceptionDisablesTransition:
-    """W1: A raising arc expression in _is_transition_enabled must disable the transition
+    """W1: A raising arc key/filter in _is_transition_enabled must disable the transition
     rather than propagate through step() and crash run()."""
 
     def test_raising_expression_disables_not_crashes(self):
@@ -126,7 +134,7 @@ class TestW1ArcExpressionExceptionDisablesTransition:
 
         call_count = {"n": 0}
 
-        def boom(tokens):
+        def boom(token):
             call_count["n"] += 1
             raise RuntimeError("expression exploded")
 
@@ -135,7 +143,7 @@ class TestW1ArcExpressionExceptionDisablesTransition:
             transitions=[
                 Transition(
                     name="broken",
-                    inputs=[InputArc("bad", expression=boom)],
+                    inputs=[InputArc("bad", filter=boom)],
                     outputs=[OutputArc("out")],
                     action=lambda tokens: tokens,
                 ),
@@ -164,7 +172,7 @@ class TestW1ArcExpressionExceptionDisablesTransition:
             transitions=[
                 Transition(
                     name="t",
-                    inputs=[InputArc("p", expression=lambda tokens: 1 / 0)],
+                    inputs=[InputArc("p", filter=lambda token: 1 / 0)],
                     outputs=[OutputArc("out")],
                     action=lambda tokens: tokens,
                 )
@@ -223,14 +231,17 @@ class TestM2ExprTimeoutDoesNotStallEngineLock:
         assert net.expr_timeout_secs == 0.05
 
     def test_slow_expression_times_out_with_expr_timeout(self):
-        """Expression that busy-waits past expr_timeout_secs disables the transition (W1 path)."""
+        """A slow, uncertified per-token filter that busy-waits past expr_timeout_secs
+        disables the transition (W1 path). Per-token dispatch means the filter is called
+        once per candidate token, so a single deposited token keeps the wall-clock bound
+        realistic — this is not a re-run of the old whole-pool-in-one-call timing."""
 
-        def slow_expr(tokens):
+        def slow_filter(token) -> bool:
             # Busy-wait without calling time.sleep (which is on the purity denylist)
             deadline = time.monotonic() + 0.5
             while time.monotonic() < deadline:
                 pass
-            return tokens
+            return True
 
         net = PetriNet(
             expr_timeout_secs=0.05,
@@ -238,14 +249,14 @@ class TestM2ExprTimeoutDoesNotStallEngineLock:
             transitions=[
                 Transition(
                     name="t",
-                    inputs=[InputArc("p", expression=slow_expr)],
+                    inputs=[InputArc("p", filter=slow_filter)],
                     outputs=[OutputArc("out")],
                     action=lambda tokens: tokens,
                 )
             ],
         )
         net.deposit("p", Token())
-        # Slow expression times out → transition disabled → step() returns False quickly
+        # Slow filter times out → transition disabled → step() returns False quickly
         start = time.monotonic()
         result = net.step()
         elapsed = time.monotonic() - start
@@ -254,7 +265,7 @@ class TestM2ExprTimeoutDoesNotStallEngineLock:
         assert elapsed < 0.5, f"step() took {elapsed:.2f}s — lock held too long"
 
     def test_fast_expression_uses_expr_timeout_not_action_timeout(self):
-        """A fast expression is not penalised by the larger action timeout_secs."""
+        """A fast per-token filter is not penalised by the larger action timeout_secs."""
         net = PetriNet(
             timeout_secs=10.0,  # large action timeout
             expr_timeout_secs=0.1,
@@ -262,7 +273,7 @@ class TestM2ExprTimeoutDoesNotStallEngineLock:
             transitions=[
                 Transition(
                     name="t",
-                    inputs=[InputArc("p", expression=lambda tokens: tokens)],
+                    inputs=[InputArc("p", filter=lambda token: True)],
                     outputs=[OutputArc("out")],
                     action=lambda tokens: tokens,
                 )

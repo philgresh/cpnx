@@ -1,17 +1,18 @@
 """Behaviour-equivalence tests for the Phase 2 inline-dispatch fast path.
 
-``cpnx.certification.certify`` decides whether a callable guard/arc-expression
-is closed-world safe. At construction, ``InputArc``/``OutputArc``/``Transition``
-each compute a boolean ``_inline_safe`` attribute. The engine's
-``_eval_expression`` then dispatches a certified callable straight through
-(``expression(tokens)``, no executor) instead of the old timeout-bounded
-``ThreadPoolExecutor`` round-trip (``_call_expr``) that every callable used
-before Phase 2 and that every *uncertified* callable still uses.
+``cpnx.certification.certify`` decides whether a callable guard/arc-inscription
+is closed-world safe. At construction, ``InputArc`` computes two independent
+flags — ``_key_inline_safe`` and ``_filter_inline_safe`` — one per per-token
+callable, while ``OutputArc``/``Transition`` each compute a single boolean
+``_inline_safe``. The engine's ``_eval_expression`` then dispatches a certified
+callable straight through (``expression(arg)``, no executor) instead of the old
+timeout-bounded ``ThreadPoolExecutor`` round-trip (``_call_expr``) that every
+callable used before Phase 2 and that every *uncertified* callable still uses.
 
 Every test here builds the exact same net/scenario twice — once left at the
-certifier's verdict (``_inline_safe is True``, runs inline) and once with the
-flag force-flipped to ``False`` immediately after construction (so the very
-same callable is dispatched through the old executor path instead) — and
+certifier's verdict (inline-safe flag is ``True``, runs inline) and once with
+the flag force-flipped to ``False`` immediately after construction (so the
+very same callable is dispatched through the old executor path instead) — and
 asserts the two runs produce identical observable engine behaviour. This
 proves the new fast path is a pure dispatch optimization, not a semantic
 change.
@@ -58,14 +59,14 @@ def guard_divide_by_zero(toks: list[Token]) -> bool:
     return bool(toks) and 1 / 0 == 0
 
 
-def order_by_priority_desc(toks: list[Token]) -> list[Token]:
-    """Certified input-arc expression: sort candidates by descending priority payload."""
-    return sorted(toks, key=lambda t: -t.payload["priority"])
+def priority_key(token: Token) -> object:
+    """Certified per-token key: descending priority (negate to invert the default ascending order)."""
+    return -token.payload["priority"]
 
 
-def select_high_priority_only(toks: list[Token]) -> list[Token]:
-    """Certified input-arc expression: keep only priority >= 10, preserving order."""
-    return [t for t in toks if t.payload["priority"] >= 10]
+def high_priority_filter(token: Token) -> bool:
+    """Certified per-token filter: keep only priority >= 10."""
+    return token.payload["priority"] >= 10
 
 
 def output_predicate_even_count(toks: list[Token]) -> bool:
@@ -141,38 +142,69 @@ class TestGuardEquivalence:
         assert produced == ["MSFT"]
 
 
-class TestInputArcExpressionEquivalence:
-    """`_order_available` / `_resolve_input_tokens`: certified selection picks the same tokens."""
+class TestInputArcKeyEquivalence:
+    """`_order_available`'s per-token `key`: certified key picks the same head token."""
 
-    def _build(self, expression, force_inline: bool) -> PetriNet:
+    def _build(self, key, force_inline: bool) -> PetriNet:
         net = PetriNet(
             max_workers=1,
             places=[Place("input"), Place("output")],
             transitions=[
                 Transition(
                     name="t",
-                    inputs=[InputArc("input", expression=expression)],
+                    inputs=[InputArc("input", key=key)],
                     outputs=[OutputArc("output")],
                     action=lambda toks: toks,
                 )
             ],
         )
         arc = net.transitions["t"].inputs[0]
-        assert arc._inline_safe is True
+        assert arc._key_inline_safe is True
         if not force_inline:
-            arc._inline_safe = False
+            arc._key_inline_safe = False
         return net
 
     def _run_ordering(self, force_inline: bool):
-        net = self._build(order_by_priority_desc, force_inline)
+        net = self._build(priority_key, force_inline)
         net.deposit("input", Token(payload={"priority": 1, "label": "low"}))
         net.deposit("input", Token(payload={"priority": 9, "label": "high"}))
         net.step()
         _drain(net)
         return [t.payload["label"] for t in net.places["output"].tokens]
 
+    def test_priority_key_picks_same_head_token_inline_and_executor(self):
+        # count=1 with no guard eventually drains both tokens (one per firing);
+        # the key determines the *firing order*, so "high" (priority 9, key -9)
+        # is consumed before "low" (priority 1, key -1) either way, since it
+        # sorts ascending by key.
+        assert self._run_ordering(force_inline=True) == self._run_ordering(force_inline=False)
+        assert self._run_ordering(force_inline=True) == ["high", "low"]
+
+
+class TestInputArcFilterEquivalence:
+    """`_order_available`'s per-token `filter`: certified filter selects the same tokens."""
+
+    def _build(self, filt, force_inline: bool) -> PetriNet:
+        net = PetriNet(
+            max_workers=1,
+            places=[Place("input"), Place("output")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input", filter=filt)],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                )
+            ],
+        )
+        arc = net.transitions["t"].inputs[0]
+        assert arc._filter_inline_safe is True
+        if not force_inline:
+            arc._filter_inline_safe = False
+        return net
+
     def _run_selection(self, force_inline: bool):
-        net = self._build(select_high_priority_only, force_inline)
+        net = self._build(high_priority_filter, force_inline)
         net.deposit("input", Token(payload={"priority": 5, "label": "low"}))
         net.deposit("input", Token(payload={"priority": 10, "label": "high"}))
         net.step()
@@ -181,21 +213,14 @@ class TestInputArcExpressionEquivalence:
         consumed = sorted(t.payload["label"] for t in net.places["output"].tokens)
         return consumed, remaining
 
-    def test_ordering_expression_picks_same_head_token_inline_and_executor(self):
-        # count=1 with no guard eventually drains both tokens (one per firing);
-        # the ordering expression determines the *firing order*, so "high"
-        # (priority 9) is consumed before "low" (priority 1) either way.
-        assert self._run_ordering(force_inline=True) == self._run_ordering(force_inline=False)
-        assert self._run_ordering(force_inline=True) == ["high", "low"]
-
-    def test_selection_expression_picks_same_tokens_inline_and_executor(self):
+    def test_high_priority_filter_picks_same_tokens_inline_and_executor(self):
         assert self._run_selection(force_inline=True) == self._run_selection(force_inline=False)
         consumed, remaining = self._run_selection(force_inline=True)
         assert consumed == ["high"]
         assert remaining == ["low"]
 
 
-class TestOutputArcExpressionEquivalence:
+class TestOutputArcConditionEquivalence:
     """`_is_arc_active`: certified output predicate routes tokens to the same places."""
 
     def _build(self, force_inline: bool) -> PetriNet:
@@ -207,7 +232,7 @@ class TestOutputArcExpressionEquivalence:
                     name="t",
                     inputs=[InputArc("input", count=2)],
                     outputs=[
-                        OutputArc("even_out", count=2, expression=output_predicate_even_count),
+                        OutputArc("even_out", count=2, condition=output_predicate_even_count),
                         OutputArc("overflow", count=0),
                     ],
                     action=lambda toks: toks,
@@ -279,7 +304,7 @@ class TestRaisesAtRuntimeParity:
         assert remaining == 1
 
     def test_output_arc_raise_propagates_identically_inline_and_executor(self):
-        # `_is_arc_active` has NO try/except, so an output-arc expression that
+        # `_is_arc_active` has NO try/except, so an output-arc condition that
         # raises propagates out of the firing machinery on both paths. We
         # assert the propagation itself (same exception type) is identical
         # inline vs executor, rather than picking a non-raising case, since the
@@ -292,7 +317,7 @@ class TestRaisesAtRuntimeParity:
                     Transition(
                         name="t",
                         inputs=[InputArc("input")],
-                        outputs=[OutputArc("output", expression=output_predicate_first_token)],
+                        outputs=[OutputArc("output", condition=output_predicate_first_token)],
                         # Action returns an empty list, so `output_predicate_first_token`
                         # is called with `toks == []` and `toks[0]` raises IndexError.
                         action=lambda toks: [],
@@ -366,28 +391,38 @@ class TestStringExpressionsRejected:
         with pytest.raises(TypeError, match="callable"):
             Transition(name="t", inputs=[], outputs=[], action=lambda toks: toks, guard="bool(tokens)")
 
-    def test_string_input_arc_expression_raises_type_error(self):
+    def test_string_input_arc_key_raises_type_error(self):
         with pytest.raises(TypeError, match="callable"):
-            InputArc("p", expression="tokens")
+            InputArc("p", key="tokens")
 
-    def test_string_output_arc_expression_raises_type_error(self):
+    def test_string_input_arc_filter_raises_type_error(self):
         with pytest.raises(TypeError, match="callable"):
-            OutputArc("q", expression="bool(tokens)")
+            InputArc("p", filter="tokens")
 
-    def test_string_reassignment_raises_type_error(self):
-        arc = InputArc("p", expression=lambda toks: toks)
+    def test_string_output_arc_condition_raises_type_error(self):
         with pytest.raises(TypeError, match="callable"):
-            arc.expression = "tokens"
+            OutputArc("q", condition="bool(tokens)")
+
+    def test_string_reassignment_key_raises_type_error(self):
+        arc = InputArc("p", key=lambda token: token.payload.get("priority", 0))
+        with pytest.raises(TypeError, match="callable"):
+            arc.key = "tokens"
+
+    def test_string_reassignment_filter_raises_type_error(self):
+        arc = InputArc("p", filter=lambda token: True)
+        with pytest.raises(TypeError, match="callable"):
+            arc.filter = "tokens"
 
 
 class TestInlineSafeFlagAlwaysPresent:
-    """Every arc/transition has `_inline_safe` set, even with no guard/expression at all."""
+    """Every arc/transition has its inline-safe flag(s) set, even with no guard/key/filter at all."""
 
-    def test_input_arc_no_expression_flag_is_false(self):
+    def test_input_arc_no_key_or_filter_flags_are_false(self):
         arc = InputArc("p")
-        assert arc._inline_safe is False
+        assert arc._key_inline_safe is False
+        assert arc._filter_inline_safe is False
 
-    def test_output_arc_no_expression_flag_is_false(self):
+    def test_output_arc_no_condition_flag_is_false(self):
         arc = OutputArc("q")
         assert arc._inline_safe is False
 
