@@ -66,6 +66,48 @@ Run-to-run spread was 5–8% on this pass, higher than an earlier quieter run
 managed, so treat differences under ~10% as unresolved. The n=10 row is a ~4 ms
 workload dominated by fixed setup cost — indicative only.
 
+### Deep-place drain: from O(N²) to linear
+
+Sweeping an order of magnitude further — 20 000 orders, all deposited up front so a
+place gets genuinely deep — exposed that draining a deep place was **O(N²)**: every
+enabling check and every logical-clock advance scanned the whole marking. Three
+independent O(depth) terms were involved, all now removed:
+
+1. `Place.can_retrieve` counted *all* available tokens to answer "≥ count?" → early-exit.
+2. `_arc_available` materialised the whole pool via `peek(len(place))` → bounded to the
+   binding-search limit for single-token FIFO arcs.
+3. The `_TokenStore` (a seq-keyed `OrderedDict` for ready tokens + a lazy min-heap for
+   cooling ones) gives O(1) arbitrary removal and O(1) earliest-available, and the
+   engine's clock advance (`_earliest_cooldown_boundary`) now reads that heap per place
+   instead of scanning `place.tokens` on every tick.
+
+Guard-free FIFO µs/step, same machine, before vs after (read the **shape** — flat is the
+goal):
+
+| orders | main (before) | after |
+| ---: | ---: | ---: |
+| 500 | 290.9 | 259.2 |
+| 2 000 | 410.7 | 329.2 |
+| 20 000 | 1 189.1 | **366.5** |
+
+Per-10×-orders growth fell from **2.9× → 1.11×** (≈ flat: the drain is now linear), a
+**3.2× speed-up at 20 000 orders**.
+
+Two opt-in regimes (`build_cafe(cold_brew=True)` / `build_cafe(batch_triage=True)`, both
+default off) exercise the shapes the base net never did, and show where the win lands:
+
+| regime (20 000 orders) | before | after | note |
+| --- | ---: | ---: | --- |
+| cold-brew (deep **timed** place) | 1 048.8 µs/order | **228.2** | 4.6× — the cooling min-heap |
+| batch-triage (deep **expression**-ordered arc) | 3 677.5 µs/order | 2 440.7 | still ≈ O(N²) |
+
+The batch-triage arc's `expression` is an opaque `list[Token] → list[Token]` transform
+re-run over the whole pool every firing (`engine._order_available`), so its cost is
+inherent to that shape, not the place store — it is the one retrieval shape that stays
+non-linear, and it lives in the engine, not `places.py`. Making it sub-quadratic needs a
+persistent per-arc sorted index (a `key=`-based arc API), tracked in
+[#25](https://github.com/philgresh/cpnx/issues/25).
+
 **Step counts are now identical across every repeat**, which was not true of any
 previously published table here. Two instrument defects had to be fixed first:
 

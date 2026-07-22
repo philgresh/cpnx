@@ -1039,6 +1039,15 @@ class PetriNet:
             return None
         if not ignore_timing and not self._is_settle_time_met(place, arc):
             return None
+        # Bound the materialized pool. For a single-token FIFO arc, each candidate is one
+        # token in FIFO order and the search consumes only the first `binding_search_limit + 1`
+        # of them (see `_iter_candidate_bindings`), so peeking the first that-many available
+        # tokens yields the identical candidate set while turning an O(marking-depth) scan into
+        # an O(limit) one — the fix for the O(N^2) deep-place drain. A `consume_all`, multi-token
+        # (`count > 1`, combinatorial), or expression-ordered arc still needs the whole available
+        # pool, so those keep the full peek.
+        if arc.expression is None and not arc.consume_all and arc.count == 1:
+            return place.peek(self.binding_search_limit + 1, model_time=t_limit)
         return place.peek(len(place), model_time=t_limit)
 
     def _gather_arc_pools(
@@ -1280,6 +1289,13 @@ class PetriNet:
         With no expression, returns `available` unchanged (FIFO). Otherwise the callable
         expression is evaluated — inline if certified closed-world, else via the
         timed expression pool.
+
+        KNOWN LIMITATION (https://github.com/philgresh/cpnx/issues/25): an arc `expression`
+        is an opaque ``list[Token] -> list[Token]`` transform, so it is re-run over the whole
+        available pool on every firing — draining a *deep* expression-ordered place is
+        O(N^2 log N). Unlike the FIFO/timed paths (linearized via `places._TokenStore`), this
+        cannot be indexed without a `key=`-based API, since there is no per-token key to
+        maintain a persistent sorted structure on. See the issue for the proposed fix.
         """
         if arc.expression is None:
             return available
@@ -1458,15 +1474,19 @@ class PetriNet:
         return self._binding_exists(transition, float("inf"), ignore_timing=True)
 
     def _earliest_cooldown_boundary(self, now: float) -> float | None:
-        """Smallest future `available_at` among tokens in non-sink places, or `None` if none."""
-        candidates = (
-            tok.available_at
+        """Smallest future `available_at` among tokens in non-sink places, or `None` if none.
+
+        Each place answers in O(1)/O(log n) from its cooling heap
+        (`Place.earliest_available_boundary`) rather than this method scanning the whole
+        marking of every place — otherwise a deep place makes each clock advance O(depth),
+        and the advance runs per tick, so draining is O(N^2).
+        """
+        boundaries = (
+            place.earliest_available_boundary(now)
             for place in self.places.values()
             if not isinstance(place, SinkPlace)
-            for tok in place.tokens
-            if tok.available_at > now
         )
-        return min(candidates, default=None)
+        return min((b for b in boundaries if b is not None), default=None)
 
     def _pending_settle_boundary(self, arc: InputArc, now: float) -> float | None:
         """Future boundary at which `arc`'s settle window becomes satisfied, or `None` if not pending."""

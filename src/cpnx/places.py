@@ -13,11 +13,190 @@ the type of tokens it accepts. `color_set` exposes this directly.
 shorthands for a place whose colour set is ``{"resource"}`` with a pre-filled initial marking.
 """
 
+import heapq
+import itertools
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
+from collections.abc import Iterable
 
-from cpnx.tokens import Token
+from cpnx.tokens import AVAILABLE_NOW, Token
+
+
+class _TokenStore:
+    """Backing store for [`Place`][cpnx.Place] giving O(1) arbitrary removal and O(1)
+    (amortized) earliest-available checks, in place of an O(n)-per-firing deque rebuild.
+
+    Tokens whose ``available_at == AVAILABLE_NOW`` (always available — the overwhelming
+    common case) live in `_ready`, an `OrderedDict` keyed by a monotonic insertion
+    sequence number so iteration order is insertion order. Future-dated ("cooling")
+    tokens live in a `heapq` min-heap of ``(available_at, seq)`` (`_cooling`), lazily
+    deleted: a heap entry is stale once its ``seq`` is no longer in `_cooling_by_seq`
+    (the authoritative membership for cooling tokens). `_seq_of` maps ``id(token)`` to
+    its seq for O(1) removal by object identity.
+
+    **Ordering contract:** every read yields available tokens in ``(available_at, seq)``
+    order. Because `AVAILABLE_NOW` (`0.0`) sorts below any real timestamp, a store
+    holding only ready tokens yields pure insertion order — identical to the FIFO
+    deque semantics this replaces.
+
+    Not internally synchronized: callers must hold the owning place's lock.
+    """
+
+    def __init__(self) -> None:
+        self._ready: OrderedDict[int, Token] = OrderedDict()
+        self._cooling: list[tuple[float, int]] = []
+        self._cooling_by_seq: dict[int, Token] = {}
+        self._seq_of: dict[int, int] = {}
+        self._next_seq: int = 0
+
+    def append(self, token: Token) -> None:
+        """Add *token*, routing it to the ready set or the cooling heap by `available_at`."""
+        seq = self._next_seq
+        self._next_seq += 1
+        self._seq_of[id(token)] = seq
+        if token.available_at == AVAILABLE_NOW:
+            self._ready[seq] = token
+        else:
+            heapq.heappush(self._cooling, (token.available_at, seq))
+            self._cooling_by_seq[seq] = token
+
+    def __len__(self) -> int:
+        return len(self._ready) + len(self._cooling_by_seq)
+
+    def _pop_matured_cooling(self, t_limit: float, limit: int) -> list[tuple[float, int]]:
+        """Pop up to *limit* live, matured ``(available_at, seq)`` entries off the heap,
+        discarding stale entries permanently along the way. Does NOT restore anything —
+        callers that need a non-destructive read must push matured entries back themselves.
+        """
+        matured: list[tuple[float, int]] = []
+        while self._cooling and len(matured) < limit:
+            avail_at, seq = self._cooling[0]
+            if seq not in self._cooling_by_seq:
+                heapq.heappop(self._cooling)  # stale — discard for good
+                continue
+            if avail_at > t_limit:
+                break
+            heapq.heappop(self._cooling)
+            matured.append((avail_at, seq))
+        return matured
+
+    def has_available(self, t_limit: float, need: int) -> bool:
+        """Return ``True`` as soon as *need* available tokens are known to exist.
+
+        `_ready` tokens are always available, so if `need` is already covered by
+        `len(_ready)` this is O(1). Otherwise pops just enough matured cooling
+        entries off the heap to decide, then pushes them back (non-destructive).
+        """
+        if need <= 0:
+            return True
+        if need <= len(self._ready):
+            return True
+        shortfall = need - len(self._ready)
+        matured = self._pop_matured_cooling(t_limit, shortfall)
+        for item in matured:
+            heapq.heappush(self._cooling, item)
+        return len(matured) >= shortfall
+
+    def count_available(self, t_limit: float) -> int:
+        """Return the exact number of currently available tokens.
+
+        Not O(1) — walks all matured cooling entries. Intended for diagnostic
+        messages on the (rare) error/raise path, not the hot success path.
+        """
+        count = len(self._ready)
+        matured = self._pop_matured_cooling(t_limit, len(self._cooling_by_seq))
+        count += len(matured)
+        for item in matured:
+            heapq.heappush(self._cooling, item)
+        return count
+
+    def peek_available(self, k: int, t_limit: float) -> list[Token]:
+        """Return up to *k* available tokens in `(available_at, seq)` order, non-destructively."""
+        if k <= 0:
+            return []
+        result = list(itertools.islice(self._ready.values(), k))
+        remaining = k - len(result)
+        if remaining <= 0:
+            return result
+        matured = self._pop_matured_cooling(t_limit, remaining)
+        result.extend(self._cooling_by_seq[seq] for _, seq in matured)
+        for item in matured:
+            heapq.heappush(self._cooling, item)
+        return result
+
+    def take_available(self, k: int, t_limit: float) -> list[Token]:
+        """Remove and return up to *k* available tokens in `(available_at, seq)` order."""
+        if k <= 0:
+            return []
+        taken: list[Token] = []
+        ready_pairs = list(itertools.islice(self._ready.items(), k))
+        for seq, token in ready_pairs:
+            del self._ready[seq]
+            del self._seq_of[id(token)]
+            taken.append(token)
+        remaining = k - len(taken)
+        if remaining > 0:
+            matured = self._pop_matured_cooling(t_limit, remaining)
+            for _, seq in matured:
+                token = self._cooling_by_seq.pop(seq)
+                del self._seq_of[id(token)]
+                taken.append(token)
+        return taken
+
+    def drop(self, seq: int) -> None:
+        """Remove the token at *seq* from whichever set holds it (heap entry left lazily stale)."""
+        if seq in self._ready:
+            del self._ready[seq]
+        else:
+            self._cooling_by_seq.pop(seq, None)
+
+    def remove_identity(self, tokens: Iterable[Token]) -> None:
+        """Remove each of *tokens* by object identity. Callers must validate presence first."""
+        for token in tokens:
+            seq = self._seq_of.pop(id(token), None)
+            if seq is not None:
+                self.drop(seq)
+
+    def missing_identities(self, ids: set[int]) -> set[int]:
+        """Return the subset of `id(token)` values in *ids* that are not currently stored."""
+        return set(ids) - self._seq_of.keys()
+
+    def earliest_cooling_after(self, now: float) -> float | None:
+        """Smallest cooling ``available_at`` strictly greater than *now*, or ``None``.
+
+        O(1) when nothing is cooling (the untimed common case — the heap is empty).
+        Otherwise skips stale heap entries permanently and buffers/restores any
+        matured-but-still-present entries, leaving the heap intact.
+        """
+        if not self._cooling:
+            return None
+        buffered: list[tuple[float, int]] = []
+        result: float | None = None
+        while self._cooling:
+            avail_at, seq = self._cooling[0]
+            if seq not in self._cooling_by_seq:
+                heapq.heappop(self._cooling)  # stale — discard for good
+                continue
+            if avail_at > now:
+                result = avail_at
+                break
+            buffered.append(heapq.heappop(self._cooling))  # matured but present — restore after
+        for item in buffered:
+            heapq.heappush(self._cooling, item)
+        return result
+
+    def iter_insertion_order(self) -> Iterable[Token]:
+        """Yield ALL tokens (ready + cooling) in insertion-sequence order.
+
+        When nothing is cooling (the common case) `_ready` is already in seq order, so this
+        is O(n) with no sort; the merge-sort is paid only when timed tokens are present.
+        """
+        if not self._cooling_by_seq:
+            return list(self._ready.values())
+        items = list(self._ready.items()) + list(self._cooling_by_seq.items())
+        items.sort(key=lambda pair: pair[0])
+        return [token for _, token in items]
 
 
 class Place:
@@ -54,13 +233,13 @@ class Place:
         self.name = name
         self.bound = bound
         self.color_set = color_set
-        self._tokens: deque[Token] = deque()
+        self._store = _TokenStore()
         self._lock = threading.Lock()
         self.last_deposit_time: float = 0.0
         self.last_deposit_time_model: float = 0.0
 
         for token in initial_marking or []:
-            self._tokens.append(token)
+            self._store.append(token)
             self.last_deposit_time = time.monotonic()
 
     def deposit(self, token: Token, model_time: float | None = None) -> None:
@@ -83,7 +262,7 @@ class Place:
                     f"Place '{self.name}' has color_set {self.color_set!r} — "
                     f"cannot deposit token with color {token.color!r}."
                 )
-            self._tokens.append(token)
+            self._store.append(token)
             self.last_deposit_time = time.monotonic()
             if model_time is not None:
                 self.last_deposit_time_model = model_time
@@ -118,22 +297,18 @@ class Place:
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = [t for t in self._tokens if t.available_at <= t_limit]
-            if len(available) < count:
+            if not self._store.has_available(t_limit, count):
+                available_count = self._store.count_available(t_limit)
                 raise ValueError(
-                    f"Place '{self.name}': cannot retrieve {count} token(s) — only {len(available)} available."
+                    f"Place '{self.name}': cannot retrieve {count} token(s) — only {available_count} available."
                 )
-            to_return = available[:count]
-            remove_ids = {t.id for t in to_return}
-            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
-            return to_return
+            return self._store.take_available(count, t_limit)
 
     def retrieve_specific(self, tokens: list[Token], model_time: float | None = None) -> list[Token]:
         """Remove and return exactly the given *tokens*, matched by ``id`` rather than FIFO order.
 
         Used by the engine when an [`InputArc`][cpnx.InputArc] has an ``expression`` that
         selects a specific subset of tokens to consume rather than the head of the queue.
-        Rebuilds the internal deque in O(n) rather than removing tokens one at a time.
 
         Args:
             tokens: Tokens to remove, identified by their ``id``. Each must currently be
@@ -156,15 +331,15 @@ class Place:
                         f"Place '{self.name}': token {t.id} is not yet available at {t_limit} "
                         f"(available_at={t.available_at})."
                     )
-            remove_ids = {t.id for t in tokens}
-            present_ids = {t.id for t in self._tokens}
-            missing = remove_ids - present_ids
-            if missing:
+            requested_ids_by_identity = {id(t): t.id for t in tokens}
+            missing_identities = self._store.missing_identities(set(requested_ids_by_identity))
+            if missing_identities:
+                missing = {requested_ids_by_identity[i] for i in missing_identities}
                 raise ValueError(
                     f"Place '{self.name}': token id(s) {missing} not found — "
                     f"cannot retrieve_specific tokens that are not present."
                 )
-            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
+            self._store.remove_identity(tokens)
             return tokens
 
     def retrieve_all(self, model_time: float | None = None) -> list[Token]:
@@ -179,10 +354,7 @@ class Place:
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = [t for t in self._tokens if t.available_at <= t_limit]
-            remove_ids = {t.id for t in available}
-            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
-            return available
+            return self._store.take_available(len(self._store), t_limit)
 
     def peek(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Return up to *count* available tokens from the head without removing them.
@@ -198,8 +370,9 @@ class Place:
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = [t for t in self._tokens if t.available_at <= t_limit]
-            return available[:count]
+            if count <= 0:
+                return []
+            return self._store.peek_available(count, t_limit)
 
     def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
         """Return ``True`` if at least *count* tokens are currently available for retrieval.
@@ -215,8 +388,17 @@ class Place:
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = sum(1 for t in self._tokens if t.available_at <= t_limit)
-            return available >= count
+            return self._store.has_available(t_limit, count)
+
+    def earliest_available_boundary(self, now: float) -> float | None:
+        """Smallest future ``available_at`` (strictly greater than *now*) held here, or ``None``.
+
+        Backs the engine's logical-clock advance. O(1) for an untimed place (nothing is
+        cooling), and O(log n) amortized otherwise — via the store's cooling heap — so the
+        clock advance no longer scans the whole marking of every place on every tick.
+        """
+        with self._lock:
+            return self._store.earliest_cooling_after(now)
 
     def can_deposit(self, count: int = 1) -> bool:
         """Return ``True`` if the place can accept *count* more tokens without exceeding its bound.
@@ -235,7 +417,7 @@ class Place:
         with self._lock:
             if self.bound is None:
                 return True
-            return len(self._tokens) + count <= self.bound
+            return len(self._store) + count <= self.bound
 
     def can_accept(self, token: Token) -> bool:
         """Return ``True`` if *token*'s colour is compatible with this place's colour set.
@@ -261,12 +443,12 @@ class Place:
         Does not filter by `available_at` and does not consume or remove any tokens.
         """
         with self._lock:
-            return tuple(self._tokens)
+            return tuple(self._store.iter_insertion_order())
 
     def __len__(self) -> int:
         """Return the number of tokens currently in the place."""
         with self._lock:
-            return len(self._tokens)
+            return len(self._store)
 
     def __bool__(self) -> bool:
         """A Place is always truthy, even when it contains no tokens."""
@@ -356,7 +538,7 @@ class PacedResourcePlace(ResourcePlace):
             ref_time = model_time if model_time is not None else time.monotonic()
             # Create a new token with updated availability timestamp (stateless place cooldown)
             timed_token = token.evolve(available_at=ref_time + self.pacing_secs, id=token.id)
-            self._tokens.append(timed_token)
+            self._store.append(timed_token)
             self.last_deposit_time = time.monotonic()
             if model_time is not None:
                 self.last_deposit_time_model = model_time
@@ -379,15 +561,13 @@ class PacedResourcePlace(ResourcePlace):
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = sum(1 for t in self._tokens if t.available_at <= t_limit)
-            return available >= count
+            return self._store.has_available(t_limit, count)
 
     def retrieve(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Remove and return *count* tokens whose cooldown has expired, in expiry order.
 
         Behaves like [`Place.retrieve`][cpnx.Place.retrieve] but the error message reports
         how many tokens are still cooling down, which is specific to this class's semantics.
-        Uses an O(n) rebuild rather than O(n^2) indexed deletion.
 
         Args:
             count: Number of cooled-down tokens to retrieve. Defaults to 1.
@@ -403,19 +583,15 @@ class PacedResourcePlace(ResourcePlace):
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = [t for t in self._tokens if t.available_at <= t_limit]
-            if len(available) < count:
-                cooling = len(self._tokens) - len(available)
+            if not self._store.has_available(t_limit, count):
+                available_count = self._store.count_available(t_limit)
+                cooling = len(self._store) - available_count
                 raise ValueError(
-                    f"PacedResourcePlace '{self.name}': {len(available)} token(s) ready, "
+                    f"PacedResourcePlace '{self.name}': {available_count} token(s) ready, "
                     f"{count} requested — {cooling} token(s) still in cooldown "
                     f"(pacing_secs={self.pacing_secs})."
                 )
-            to_return = available[:count]
-            remove_ids = {t.id for t in to_return}
-            # O(n) rebuild instead of O(n²) indexed deletion on deque
-            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
-            return to_return
+            return self._store.take_available(count, t_limit)
 
     def peek(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Return up to *count* cooled-down tokens without removing them.
@@ -434,8 +610,9 @@ class PacedResourcePlace(ResourcePlace):
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = [t for t in self._tokens if t.available_at <= t_limit]
-            return available[:count]
+            if count <= 0:
+                return []
+            return self._store.peek_available(count, t_limit)
 
 
 class ThresholdPlace(Place):
@@ -485,8 +662,7 @@ class ThresholdPlace(Place):
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = [t for t in self._tokens if t.available_at <= t_limit]
-            return len(available) >= self.threshold and len(available) >= count
+            return self._store.has_available(t_limit, max(self.threshold, count))
 
     def retrieve(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Remove and return *count* tokens from the head of the queue, but only if the threshold is met.
@@ -511,21 +687,18 @@ class ThresholdPlace(Place):
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = [t for t in self._tokens if t.available_at <= t_limit]
-            if len(available) < self.threshold:
+            if self._store.has_available(t_limit, max(self.threshold, count)):
+                return self._store.take_available(count, t_limit)
+            available_count = self._store.count_available(t_limit)
+            if available_count < self.threshold:
                 raise ValueError(
                     f"ThresholdPlace '{self.name}': threshold of {self.threshold} not met "
-                    f"({len(available)} token(s) available — need {self.threshold - len(available)} more)."
+                    f"({available_count} token(s) available — need {self.threshold - available_count} more)."
                 )
-            if len(available) < count:
-                raise ValueError(
-                    f"ThresholdPlace '{self.name}': threshold met but only {len(available)} "
-                    f"token(s) available, {count} requested."
-                )
-            to_return = available[:count]
-            remove_ids = {t.id for t in to_return}
-            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
-            return to_return
+            raise ValueError(
+                f"ThresholdPlace '{self.name}': threshold met but only {available_count} "
+                f"token(s) available, {count} requested."
+            )
 
     def retrieve_all(self, model_time: float | None = None) -> list[Token]:
         """Remove and return every available token, but only if the threshold has been met.
@@ -546,15 +719,13 @@ class ThresholdPlace(Place):
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
-            available = [t for t in self._tokens if t.available_at <= t_limit]
-            if len(available) < self.threshold:
-                raise ValueError(
-                    f"ThresholdPlace '{self.name}': threshold of {self.threshold} not met "
-                    f"({len(available)} token(s) available — need {self.threshold - len(available)} more)."
-                )
-            remove_ids = {t.id for t in available}
-            self._tokens = deque(t for t in self._tokens if t.id not in remove_ids)
-            return available
+            if self._store.has_available(t_limit, self.threshold):
+                return self._store.take_available(len(self._store), t_limit)
+            available_count = self._store.count_available(t_limit)
+            raise ValueError(
+                f"ThresholdPlace '{self.name}': threshold of {self.threshold} not met "
+                f"({available_count} token(s) available — need {self.threshold - available_count} more)."
+            )
 
 
 class SinkPlace(Place):
@@ -565,6 +736,12 @@ class SinkPlace(Place):
     via `tokens`/`stats`/`drain_stats` — but they can never be consumed onward by a transition.
     Useful for streaming pipelines (e.g. logging sinks, dead-letter/error places) to avoid
     accumulating memory indefinitely while still exposing aggregate statistics.
+
+    Note:
+        A sink is a terminal ring buffer, not a retrievable queue, so it does NOT use
+        `_TokenStore` internally — it keeps its own bounded
+        `collections.deque(maxlen=keep_last)` and overrides every method that would
+        otherwise touch the base class's store.
 
     Warning:
         Avoid setting a restrictive `color_set` if this place is used as an `error_place`.
@@ -585,7 +762,7 @@ class SinkPlace(Place):
         """
         super().__init__(name, bound=None, color_set=color_set)
         self.keep_last = keep_last
-        self._tokens = deque(maxlen=keep_last)
+        self._kept: deque[Token] = deque(maxlen=keep_last)
         self._absorbed = 0
         self._by_color: dict[str | None, int] = {}
         self._first_deposit_time: float | None = None
@@ -612,7 +789,7 @@ class SinkPlace(Place):
                     f"Place '{self.name}' has color_set {self.color_set!r} — "
                     f"cannot deposit token with color {token.color!r}."
                 )
-            self._tokens.append(token)
+            self._kept.append(token)
             now = time.monotonic()
             self.last_deposit_time = now
             if self._first_deposit_time is None:
@@ -725,6 +902,27 @@ class SinkPlace(Place):
         """
         return True
 
+    @property
+    def tokens(self) -> tuple[Token, ...]:
+        """Snapshot of the ring buffer's currently-kept tokens (most recent `keep_last`), as a tuple.
+
+        Differs from [`Place.tokens`][cpnx.Place.tokens]: reads the sink's own bounded
+        `deque` ring buffer rather than a `_TokenStore` (a sink never routes deposits
+        through the store).
+        """
+        with self._lock:
+            return tuple(self._kept)
+
+    def __len__(self) -> int:
+        """Return the number of tokens currently kept in the ring buffer (at most `keep_last`).
+
+        Differs from [`Place.__len__`][cpnx.Place.__len__]: reflects the ring buffer's
+        size, not a `_TokenStore`'s — a sink's "length" is its sample size, not its
+        (unbounded) absorbed count (see `stats()["absorbed"]` for that).
+        """
+        with self._lock:
+            return len(self._kept)
+
     def stats(self) -> dict:
         """Return a snapshot of cumulative statistics of absorbed tokens, without resetting any counters.
 
@@ -749,7 +947,7 @@ class SinkPlace(Place):
                 "name": self.name,
                 "absorbed": self._absorbed,
                 "by_color": dict(self._by_color),
-                "kept": len(self._tokens),
+                "kept": len(self._kept),
                 "first_deposit_time": self._first_deposit_time,
                 "last_deposit_time": self.last_deposit_time,
             }
@@ -772,7 +970,7 @@ class SinkPlace(Place):
                 "name": self.name,
                 "absorbed": self._absorbed,
                 "by_color": dict(self._by_color),
-                "kept": len(self._tokens),
+                "kept": len(self._kept),
                 "first_deposit_time": self._first_deposit_time,
                 "last_deposit_time": self.last_deposit_time,
             }
