@@ -146,6 +146,13 @@ The middle row runs today's engine with the index switched off, which separates 
 from everything else since 0.3.2 (#24 callables-only, #26 the linearized store, #28 the API
 split).
 
+This was a **one-off migration-era measurement, not a committed harness** — there is no
+script here to re-run. Pinning a comparison against one specific published version would
+bit-rot the moment the next release lands, and the half of the experiment that mattered
+(the isolated 0.3.2 environment, the interleaving, the order-hash check) is setup rather
+than code. The method above is described in enough detail to rebuild it if a future change
+warrants another cross-release comparison.
+
 | µs/order (median of 3) | 500 | 2 000 | 20 000 |
 | --- | ---: | ---: | ---: |
 | v0.3.2 (published) | 76.2 | 218.7 | 2 273.1 |
