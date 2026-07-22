@@ -232,10 +232,13 @@ class PetriNet:
             - `binding_priority_key` raises for **every** candidate binding under
               `BindingPolicy.PRIORITY`, so selection fell back to insertion order.
 
-            The latter two are **edge-triggered and de-duplicated**: selection re-runs on every
+            The **`key`/`filter`** report is *edge-triggered*: selection re-runs on every
             enabling check, so a persistent fault reports once when it starts rather than once
-            per `step()`, and reports again only if it recurs after recovering. Both wrap the
-            original exception in a descriptive `RuntimeError` and chain it as `__cause__`.
+            per `step()`, and reports again only when a fault appears that involves none of
+            the tokens the last one did. The **`binding_priority_key`** report is not — it is
+            de-duplicated only within a single pass, so a persistent one fires about once per
+            `step()` that resolves that transition. Both wrap the original exception in a
+            descriptive `RuntimeError` and chain it as `__cause__`.
 
     Example:
         ```python
@@ -451,10 +454,15 @@ class PetriNet:
         #: while selecting for that arc. Buffered under the lock, dispatched via `on_error`
         #: (de-duplicated) by `_flush_selection_failures` — see issue #29.
         self._pending_selection_failures: dict[tuple[str, str], Exception] = {}
-        #: ``(transition, place)`` pairs whose selection is *currently* failing. Latches the
-        #: edge so a persistent fault reports once rather than once per `step()`; cleared by
-        #: `_order_available` on the next successful selection.
-        self._selection_faulted: set[tuple[str, str]] = set()
+        #: ``(transition, place)`` -> the ids of the tokens that were in the pool the last
+        #: time it reported. A later fault sharing *any* of those tokens is the same ongoing
+        #: fault and stays quiet; one sharing none is a new event and reports. Identifying the
+        #: fault by its witnesses rather than by a success-clears-it flag is what makes this
+        #: correct when selection is never reached (the place drained below `count`, so
+        #: `_gather_arc_pools` bailed first) and when two *different* views of the pool
+        #: alternate (`step()` excludes cooling tokens, `is_quiescent()` includes them) — the
+        #: latter otherwise cleared and re-armed the latch on every poll.
+        self._selection_faulted: dict[tuple[str, str], frozenset[str]] = {}
 
         self.add_place(Place(error_place))
         for p in places or []:
@@ -1258,7 +1266,7 @@ class PetriNet:
         """Build the head binding (first `count` per arc) and accept it only if the guard holds."""
         binding: _Binding = []
         for arc, available in pools:
-            tokens = self._resolve_input_tokens(arc, available, transition.name)
+            tokens = self._resolve_input_tokens(arc, available, transition_name=transition.name)
             if tokens is None:
                 return None
             binding.append((arc, tokens))
@@ -1278,7 +1286,8 @@ class PetriNet:
         until the lock releases). This is the shared engine for every search policy: `FIRST`
         takes the first item, `RANDOM` samples, and `PRIORITY` takes the min-key item.
         """
-        for examined, binding in enumerate(self._iter_candidate_bindings(pools, transition.name), start=1):
+        candidates = self._iter_candidate_bindings(pools, transition_name=transition.name)
+        for examined, binding in enumerate(candidates, start=1):
             if examined > self.binding_search_limit:
                 self._signal_search_exhausted(transition.name)
                 return
@@ -1362,7 +1371,7 @@ class PetriNet:
         return best, first, first_exc
 
     def _iter_candidate_bindings(
-        self, pools: list[tuple[InputArc, list[Token]]], transition_name: str = ""
+        self, pools: list[tuple[InputArc, list[Token]]], *, transition_name: str = ""
     ) -> Iterator[_Binding]:
         """Yield candidate bindings as the Cartesian product of each arc's token-group options.
 
@@ -1381,13 +1390,15 @@ class PetriNet:
         arcs = [arc for arc, _ in pools]
         cap = self.binding_search_limit + 1
         option_lists = [
-            list(itertools.islice(self._arc_options(arc, available, transition_name), cap))
+            list(itertools.islice(self._arc_options(arc, available, transition_name=transition_name), cap))
             for arc, available in pools
         ]
         for combo in itertools.product(*option_lists):
             yield list(zip(arcs, combo, strict=True))
 
-    def _arc_options(self, arc: InputArc, available: list[Token], transition_name: str = "") -> Iterator[list[Token]]:
+    def _arc_options(
+        self, arc: InputArc, available: list[Token], *, transition_name: str = ""
+    ) -> Iterator[list[Token]]:
         """Yield each `count`-sized token group one input `arc` could consume, in order.
 
         A `consume_all` arc has a single option: every available token, FIFO, with `key`
@@ -1400,7 +1411,7 @@ class PetriNet:
         if arc.consume_all:
             yield available
             return
-        ordered = self._order_available(arc, available, transition_name)
+        ordered = self._order_available(arc, available, transition_name=transition_name)
         if ordered is None or len(ordered) < arc.count:
             return
         if arc.count == 1:
@@ -1416,7 +1427,7 @@ class PetriNet:
             yield list(combo)
 
     def _order_available(
-        self, arc: InputArc, available: list[Token], transition_name: str = ""
+        self, arc: InputArc, available: list[Token], *, transition_name: str = ""
     ) -> list[Token] | None:
         """Return the arc-eligible tokens in consumption order, or `None` if selection fails.
 
@@ -1458,6 +1469,7 @@ class PetriNet:
         if arc.filter is None and arc.key is None:
             return available
         fault_id = (transition_name, arc.place)
+        pool = available  # the tokens this attempt saw — the witnesses if it fails
         try:
             if arc.filter is not None:
                 available = self._apply_filter(arc, available)
@@ -1468,11 +1480,8 @@ class PetriNet:
             # but say so rather than merely looking disabled. Only a *raising* callable reaches
             # here — a `filter` that legitimately rejects every token returns an empty list,
             # which is an ordinary "not enabled", not an error, and stays silent.
-            self._signal_selection_failure(fault_id, exc)
+            self._signal_selection_failure(fault_id, exc, pool)
             return None
-        # Selection succeeded, so re-arm reporting: a fault that recurs after recovering is a
-        # new event and must be reported again, not swallowed as a duplicate of the old one.
-        self._selection_faulted.discard(fault_id)
         return available
 
     def _sort_by_key(self, arc: InputArc, available: list[Token]) -> list[Token]:
@@ -1579,17 +1588,33 @@ class PetriNet:
             except Exception:
                 pass
 
-    def _signal_selection_failure(self, fault_id: tuple[str, str], exc: Exception) -> None:
+    def _signal_selection_failure(self, fault_id: tuple[str, str], exc: Exception, pool: list[Token]) -> None:
         """Buffer a raising `InputArc.key`/`filter` for off-lock `on_error` dispatch (issue #29).
 
         Called from `_order_available` under the engine lock, so this only records; the
         callback must run off the lock (it may call back into the net). Keyed by
         ``(transition, place)`` and **edge-triggered**: a fault reports once when selection
-        starts failing and then stays quiet until it recovers. Buffering alone is not enough —
-        every `step()` drains the buffer, so a per-pass `setdefault` still fires on all of
-        them, and selection re-runs on every enabling check for as long as the offending token
-        sits in the place. `_selection_faulted` is the latch; `_order_available` clears it on
-        the next successful selection, so a recurrence is reported as a new event.
+        starts failing and then stays quiet while the *same* tokens keep failing. Buffering
+        alone is not enough — every `step()` drains the buffer, so a per-pass `setdefault`
+        still fires on all of them, and selection re-runs on every enabling check for as long
+        as the offending token sits in the place.
+
+        The edge is identified by **witnesses**: the ids of the tokens the failing attempt
+        saw. A later fault sharing any of them is the same ongoing fault; one sharing none is
+        a new event. This is deliberately not "clear the latch on the next success", which is
+        wrong in two ways that both silently break the feature:
+
+        - the place can drain below `arc.count`, so `_gather_arc_pools` bails before selection
+          runs at all and a success never comes. Removing the poison token is the *most
+          likely* response to the report this raises, so that path is common, and it would
+          mute the arc permanently.
+        - `step()` and `is_quiescent()` evaluate *different* pools (the latter passes
+          `ignore_timing=True`, so it sees cooling tokens the former cannot). A cooling poison
+          token makes the two disagree forever: the timed view succeeds and clears, the
+          untimed view fails and reports, once per poll.
+
+        Cost: one frozenset of token-id references per *faulted* arc, so it is proportional to
+        the pool of an arc that is actually broken, and empty otherwise.
 
         Mirrors `_signal_priority_key_failure` deliberately: `binding_priority_key` is the
         closest analogue to `InputArc.key` and already reported, so the two now behave alike.
@@ -1599,9 +1624,11 @@ class PetriNet:
         the same callable over the same pool and arrives here, carrying the transition context
         the index does not have. A broken key therefore reports exactly once, from one place.
         """
-        if fault_id in self._selection_faulted:
-            return  # already reported and not yet recovered — stay quiet
-        self._selection_faulted.add(fault_id)
+        witnesses = frozenset(token.id for token in pool)
+        previous = self._selection_faulted.get(fault_id)
+        if previous is not None and previous & witnesses:
+            return  # the same offending tokens are still here — one ongoing fault, stay quiet
+        self._selection_faulted[fault_id] = witnesses
         self._pending_selection_failures[fault_id] = exc
 
     def _flush_selection_failures(self) -> None:
@@ -1624,7 +1651,10 @@ class PetriNet:
             err = RuntimeError(
                 f"InputArc selection raised for transition '{name}' on place '{place}'; the arc "
                 f"is treated as unsatisfiable, so the transition will not fire while this "
-                f"persists. First error: {first_exc!r}"
+                f"persists. Note that a raising *certified* key also permanently disables that "
+                f"arc's place key-index for the life of the net, so selection stays correct but "
+                f"reverts to the per-firing sort even after the fault clears (see issue #34). "
+                f"First error: {first_exc!r}"
             )
             err.__cause__ = first_exc
             try:
@@ -1664,7 +1694,7 @@ class PetriNet:
         return self._call_expr(expression, arg, timeout=self.expr_timeout_secs)
 
     def _resolve_input_tokens(
-        self, arc: InputArc, available: list[Token], transition_name: str = ""
+        self, arc: InputArc, available: list[Token], *, transition_name: str = ""
     ) -> list[Token] | None:
         """Resolve which tokens input `arc` would consume from `available`.
 
@@ -1688,7 +1718,7 @@ class PetriNet:
             # a footgun on `InputArc`; pinned by `test_consume_all_bypasses_key_and_filter`.
             tokens = available
         else:
-            ordered = self._order_available(arc, available, transition_name)
+            ordered = self._order_available(arc, available, transition_name=transition_name)
             if ordered is None:
                 return None
             tokens = ordered[: arc.count]

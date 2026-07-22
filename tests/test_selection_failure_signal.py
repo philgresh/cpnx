@@ -168,3 +168,70 @@ class TestOrdinaryEmptySelectionStaysSilent:
             net.step()
 
         assert errors == []
+
+
+class TestLatchSurvivesPoolChanges:
+    """The two ways a success-clears-it latch silently broke (review of #33).
+
+    Both are regressions in *opposite* directions — one mutes a real fault forever, the
+    other reports one unchanged fault repeatedly — and both come from the same mistake:
+    treating "selection succeeded" as proof the fault is gone. The latch instead records the
+    tokens a failing attempt saw, so a fault is "the same one" when it still involves any of
+    them.
+    """
+
+    def test_a_new_fault_after_the_place_drains_is_still_reported(self):
+        """Removing the poison token is the likeliest response to the report — it must not mute.
+
+        `_gather_arc_pools` bails as soon as the place holds fewer than `count` eligible
+        tokens, so `_order_available` is never reached and a success-based latch never
+        re-arms. Draining the place therefore silenced the arc permanently — the exact
+        silent failure #29 exists to remove.
+        """
+        net = PetriNet(max_workers=1)
+        net.add_place(Place("in"))
+        errors: list[Exception] = []
+        net.on_error = lambda name, exc, tok: errors.append(exc)
+        arc = InputArc("in", key=lambda t: 1 / 0 if t.payload["p"] < 0 else t.payload["p"])
+        net.add_transition(Transition("t", inputs=[arc], outputs=[], action=lambda toks: toks))
+
+        first = Token(payload={"p": -1})
+        net.deposit("in", first)
+        net.step()
+        assert len(errors) == 1, "first fault reports"
+
+        net.places["in"].retrieve_specific([first])  # operator removes the poison
+        assert len(net.places["in"]) == 0
+        net.step()  # nothing to select — selection is never even reached
+
+        net.deposit("in", Token(payload={"p": -2}))  # a *different* poison token
+        net.step()
+        assert len(errors) == 2, "a distinct later fault must still be reported"
+
+    def test_one_cooling_poison_token_reports_once_across_repeated_polls(self):
+        """`step()` and `is_quiescent()` see different pools; that must not re-arm the latch.
+
+        `is_quiescent()` probes with `ignore_timing=True`, so it sees cooling tokens `step()`
+        cannot. A poison token awaiting a retry is therefore invisible to one and visible to
+        the other, and a success-based latch had them alternate — clear, report, clear,
+        report — for as long as healthy work kept flowing. `run()` polls quiescence every
+        loop, so this became a callback storm from a single unchanged token.
+        """
+        net = PetriNet(max_workers=1)
+        net.add_place(Place("in"))
+        net.add_place(Place("out"))
+        errors: list[Exception] = []
+        net.on_error = lambda name, exc, tok: errors.append(exc)
+        arc = InputArc("in", key=lambda t: 1 / 0 if t.payload["p"] < 0 else t.payload["p"])
+        net.add_transition(Transition("t", inputs=[arc], outputs=[OutputArc("out")], action=lambda toks: toks))
+        # One poison token scheduled far in the future (a retry/backoff shape).
+        net.deposit("in", Token(payload={"p": -1}, available_at=time.monotonic() + 3600))
+
+        for i in range(20):
+            net.deposit("in", Token(payload={"p": i}))  # healthy work keeps flowing
+            net.deposit("in", Token(payload={"p": i}))
+            net._is_transition_enabled(net.transitions["t"])  # timed view: succeeds
+            net._flush_selection_failures()
+            net.is_quiescent()  # untimed view: sees the poison, fails
+
+        assert len(errors) == 1, f"one unchanged poison token must report once, got {len(errors)}"
