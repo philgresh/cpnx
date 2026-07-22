@@ -70,7 +70,10 @@ inline-safe flag (`_key_inline_safe` / `_filter_inline_safe`), computed the same
 0003 computes it for guards: a callable that certifies as closed-world runs inline, under
 the engine lock, with no timeout; an uncertified one runs on the existing timeout-bounded
 expression pool, per token. Certification remains optional and additive — an uncertified
-`key` or `filter` is fully supported, just costlier per evaluation. `filter` is a boolean
+`key` or `filter` is fully supported, but "costlier" here means costlier *per token*, not
+per firing: on a deep place that is a qualitative difference from the old whole-pool
+dispatch, not a constant factor (see the per-token dispatch cost under Consequences).
+`filter` is a boolean
 predicate, so it is subject to the same construction-time annotated-`-> bool` check as
 `Transition.guard`/`OutputArc.condition` (ADR 0002): an annotated `-> int` filter raises
 `TypeError` at construction, an unannotated one (every lambda) passes through unchecked.
@@ -149,8 +152,16 @@ Callers who want "drain everything eligible" should use a large `count` rather t
 Consistent with ADR 0003's certified-is-strictly-additive posture: certification changes
 *how* a callable runs (inline vs. pooled), never *whether* it is accepted. Requiring
 certification for `key`/`filter` is a possible later tightening — nothing here forecloses
-it — but it is not today's rule, and an uncertified selection callable is exactly as valid
-as an uncertified guard.
+it — but it is not today's rule, and an uncertified selection callable is exactly as
+*valid* as an uncertified guard.
+
+It is not, however, as *cheap* as one, and this decision should not be read as saying it
+is. Acceptance is symmetric; cost is not. A guard is evaluated once per candidate binding
+and bounded by `binding_search_limit`; `key`/`filter` is evaluated once per **token** in
+the available pool, which nothing bounds. On a deep place an uncertified selection callable
+is therefore materially more expensive than an uncertified guard — see the per-token
+dispatch cost under Consequences. The decision to allow it stands; the equivalence claimed
+here is about validity alone.
 
 ## Consequences
 
@@ -163,9 +174,13 @@ as an uncertified guard.
   closing a gap where a mis-annotated selection callable on the input side previously had no
   return-type check at all (the old `expression` was `list[Token] -> list[Token]`, a shape
   ADR 0002's boolean check never covered).
-- `key` and `filter` are independently certifiable and independently timeout-bounded — a
-  cheap certifying `filter` paired with an expensive uncertified `key` (or vice versa) no
-  longer forces both through the pool, the way one opaque `expression` necessarily did.
+- `key` and `filter` are independently certifiable, and each *dispatch* is independently
+  timeout-bounded — a cheap certifying `filter` paired with an expensive uncertified `key`
+  (or vice versa) no longer forces both through the pool, the way one opaque `expression`
+  necessarily did. Note the precise scope of "timeout-bounded": `expr_timeout_secs` bounds
+  each individual dispatch, not the per-token loop over the pool, and for a `key` it bounds
+  extraction but **not** the comparisons between extracted values (the sort runs inline).
+  Both limits are spelled out under Consequences and on `PetriNet.expr_timeout_secs`.
 - Lays the necessary (but not sufficient) groundwork for a persistent per-arc key-index
   (issue #25): the per-token `key` is now a value, not a hidden step inside an opaque
   closure, so an index has something concrete to be built on.
@@ -186,12 +201,65 @@ as an uncertified guard.
 - The `O(N^2 log N)` deep-drain cost for a keyed/filtered place is **unchanged** by this ADR.
   Anyone hoping this change alone fixes that performance characteristic will be disappointed;
   it is the prerequisite for issue #25, not the fix.
+- **An uncertified `key`/`filter` is now dispatched per token, and the worst-case lock-hold
+  grew with it.** The old `expression` received the whole pool, so an uncertified one cost
+  *one* executor round-trip per enabling check. Per-token callables cost `len(pool)` of
+  them, each bounded by `expr_timeout_secs` individually but not collectively — and
+  `binding_search_limit` does **not** cap the count, because it truncates candidate
+  *bindings* in `_iter_candidate_bindings`, downstream of selection, after every token has
+  already been visited. Keyed/filtered arcs also deliberately take `place.peek(len(place))`
+  (they are not position-FIFO, so they cannot use the bounded peek from #26), so nothing
+  caps N. Measured on a 300-token place: 300 dispatches for one enabling check, and via
+  `step()` a concurrent `deposit()` blocked 145 ms behind a 100-token pool. The bound is
+  `len(place) * expr_timeout_secs` per such arc, per enabling check.
+
+  This is the sharpest edge the decomposition introduced, and it is a real trade, not a
+  free win: the split bought indexability and honest naming at the cost of turning one
+  bounded dispatch into an unbounded sequence of them. It is survivable because
+  certification removes it entirely — a certified callable never touches the executor — but
+  that turns "prefer certified callables" from a performance nicety into something closer to
+  a requirement on deep places, which the old API did not ask for.
+- **A second, subtler bound was lost.** An uncertified `expression` ran
+  `sorted(tokens, key=...)` *inside* `_call_expr`'s future, so the `__lt__` comparisons were
+  behind `expr_timeout_secs` too. Now only key extraction goes through the executor;
+  `_order_available` sorts inline under the engine lock, so a key returning values with a
+  slow or diverging `__lt__` holds the lock past any timeout (measured: 950 ms of sorting
+  under a 10 ms budget). Restoring the bound would mean moving the sort into the executor,
+  which ships the whole token list across a thread boundary every firing — judged not worth
+  it. Documented instead, with the guidance that keys should return plain comparables.
 
 **Neutral**
 
 - `OutputArc`'s rename (`expression` → `condition`) is a pure breaking rename with no
   behavioral change; it is bundled into this ADR because it removes the naming confusion this
   ADR is otherwise about, not because it shares a mechanism with the input-side split.
+
+**Deferred, with the argument recorded**
+
+- **Selection failure stays silent, and the split makes that harder to justify.**
+  `_order_available` swallows any exception (`except Exception: return None`), so a
+  transition whose `key`/`filter` raises simply looks disabled: `run()` reaches quiescence
+  with work still pending in the place and nothing reported. This is pre-existing — the old
+  `expression` path did the same — but two things changed underneath it. First, the engine
+  elsewhere goes out of its way *not* to degrade silently: `_signal_search_exhausted` fires
+  `on_binding_search_exhausted`, and `_min_key_pick` maintains `_pending_key_failures`
+  specifically so a wholly-broken sort key is not silent — and `binding_priority_key`, the
+  closest analogue to `InputArc.key`, already gets exactly the treatment `InputArc.key` does
+  not. Second, and more to the point, the per-token split **removed the author's
+  interception point**: an opaque `expression` received the whole pool and could `try/except`
+  internally to drop a bad token, whereas a per-token callable's exception escapes straight
+  into the engine's blanket handler, so one poison token now wedges the entire arc
+  indefinitely.
+
+  Not fixed here: it is a behavior change rather than an API one, it needs a
+  de-duplication design (selection runs on every enabling check, so a naive callback would
+  fire on every `step()` for as long as the bad token sits in the place), and it wants a
+  decision on distinguishing a *raising* filter from one that legitimately rejects
+  everything. The natural moment is issue #25's key-index work, which reworks this exact
+  path. Recorded here rather than filed separately so the reasoning survives next to the
+  decision that sharpened it. The *behavior* is pinned by
+  `test_incomparable_keys_disable_the_transition_without_raising`; what is missing is the
+  report, not the safety.
 
 ## Migration
 
