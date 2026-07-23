@@ -28,6 +28,50 @@ Two tiers:
 | `bench_cafe_concurrency.py` | macro | Wall-clock **makespan** against `max_workers`, swept over queue depth and guard regime. The only script here that says anything about parallelism. |
 | `profile_cafe.py` | dev tool | `cProfile` a large cafe run and rank engine functions by cumulative / own time. Not a committed benchmark — a pointer to what to optimise. |
 
+## The fixture: `cafe/`
+
+The ☕ Concurrency Cafe topology lives in the `cafe/` package, split so that every place,
+transition, guard, key, filter, and action is an individually documented symbol — each one
+carrying both its *cafe role* and the *net feature* it exists to exercise. It renders as a
+page on the docs site; start at `cafe/__init__.py` for the tour.
+
+| Module | Holds |
+| --- | --- |
+| `cafe.places` / `cafe.transitions` | The core topology, one factory per entity |
+| `cafe.inscriptions` | Guards and binding keys — pure, run under the engine lock |
+| `cafe.actions` | Transition actions — side effects allowed, run off the lock |
+| `cafe.stations` | Opt-in stations, one self-contained module each |
+| `cafe.net` | `build_cafe`, which only chooses among the above |
+
+`concurrency_cafe.py` remains as the runnable demo and a back-compatible
+`from concurrency_cafe import build_cafe` shim.
+
+### Opt-in stations
+
+Every station is default-off and structure-preserving when off, so `build_cafe()` with no
+flags is exactly the base topology and the numbers below stay comparable. Each exists
+because there is an engine cost path the base net never touches:
+
+| Flag | Station | Exercises |
+| --- | --- | --- |
+| `cold_brew` | 🧊 Cold-brew tower | A deep **timed** place |
+| `cold_brew_key` | ↳ with a keyed arc | The timed×key residual ([#25]) |
+| `batch_triage` | 📋 Rush-hour triage | A certified `InputArc.key` at depth |
+| `decaf` | ☕ Decaf-only barista | `filter` **without** `key` — never indexed |
+| `knock_box` | 🥁 Knock box | `consume_all` re-scanned behind a false guard |
+| `specials_board` | 🧾 Specials board | An **uncertified** `key` (A/B vs `batch_triage`) |
+| `eighty_six` | 🚫 86 board | Certified `key` + **uncertified** `filter` |
+| `cupping` | 🥄 Cupping table | `count > 1` and the candidate space |
+| `pastry_case` | 🥐 Pastry case | The only `SubstitutionTransition` |
+
+Two knobs on `build_cafe` are not stations but are newly sweepable:
+`binding_search_limit` (previously fixed at the engine default) and
+`resource_arcs_first`, which reorders `T_Weigh_And_Grind`'s input arcs into the order
+`BindingPolicy`'s documentation recommends.
+
+**None of these are measured yet.** They are fixtures — the experiments they enable are
+listed in "Unmeasured combinations" below.
+
 Supporting module: `_driver.py` — two drivers, `drive_to_quiescence` (logical
 clock, deliberately serialized, measures engine CPU) and `drive_saturating`
 (wall clock, deliberately concurrent, measures makespan). They answer different
@@ -381,6 +425,56 @@ with the fast path both present and reverted, which is a much stronger check tha
 the ad-hoc fingerprint used at the time. It is kept because it is nine lines and
 directionally faster on the guard-free path. But treat ~1% guard-free / ~0%
 guarded as the honest figure, not 3.3%.
+
+## Unmeasured combinations
+
+An audit of which API-element combinations affect performance, and which the corpus
+actually covers, turned up the gaps below. Fixtures now exist for every one of them (see
+"Opt-in stations"); **no numbers have been taken yet**, so nothing here is a claim about
+cost — only about what is currently unmeasured.
+
+The routing decision that drives nearly all of it is `engine._materialize_pool`, which
+picks between three costs per enabling check:
+
+| Route | Condition | Cost |
+| --- | --- | --- |
+| 1 — bounded FIFO peek | `key is None and filter is None and not consume_all and count == 1` | O(limit) |
+| 2 — key index | certified `key`, `filter` absent or certified, not `consume_all`, no cooling tokens | O(cap log cap) |
+| 3 — full peek + per-firing sort | **everything else** | O(N) peek + O(N) dispatches + O(N log N) sort |
+
+Route 3 runs **per `step()`, per transition** — including steps where the guard then
+rejects — so on a deep place it is the O(N²) drain the key-index work removed.
+
+1. **`filter` without `key` is never indexed** (`decaf`). `_ensure_key_index` bails as soon
+   as `arc.key is None`, so even a fully certified filter takes route 3. Worth noting
+   because the `InputArc` docs advise certifying selection callables on a deep place —
+   advice that rescues a `key` but not a filter-only arc.
+2. **`consume_all` is unmeasured everywhere** (`knock_box`). It forces route 3
+   unconditionally, and pools are gathered *before* the guard is evaluated, so a rarely-firing
+   drain is scanned in full on every step.
+3. **Uncertified `key`** (`specials_board`) and **certified `key` + uncertified `filter`**
+   (`eighty_six`). Both documented as falling back to the per-firing sort; neither has a
+   committed reproducer, only the one-off migration A/B that was deliberately not kept.
+4. **timed×key** (`cold_brew_key`) — [#25], previously documented but not reproducible.
+5. **`count > 1` at depth** (`cupping`). The token pool stays bounded, but `C(pool, count)`
+   candidate combinations do not; the search-limit prefix can leave a transition disabled
+   while a valid binding sits deeper.
+6. **`SubstitutionTransition`** (`pastry_case`). Zero coverage previously. The first thing
+   to check is whether the parent's engine lock is held across the child's run.
+7. **`binding_search_limit` was never swept**, only ever left at the default.
+8. **Arc ordering.** `BindingPolicy`'s docs recommend listing resource arcs *before* data
+   arcs, since `itertools.product` varies the last arc fastest. `T_Weigh_And_Grind` does the
+   opposite, and its own comment records the symptom — mobile-pickup preference holding only
+   to depth ~166 ≈ `limit / (scales × grinders)`, i.e. [#18]. `resource_arcs_first=True`
+   flips it; whether that raises effective depth as the docstring predicts is **untested**,
+   and it is the cheapest experiment on this list.
+9. **Concurrency is only swept against guards.** A guard holds the lock for one round-trip
+   per *candidate binding*; an uncertified `key`/`filter` holds it for one per *token*,
+   unbounded. `specials_board` and `eighty_six` are the regimes to run through
+   `bench_cafe_concurrency.py`.
+
+[#18]: https://github.com/philgresh/cpnx/issues/18
+[#25]: https://github.com/philgresh/cpnx/issues/25
 
 ## Scope
 

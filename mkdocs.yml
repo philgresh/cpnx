@@ -44,7 +44,11 @@ plugins:
   - mkdocstrings:
       handlers:
         python:
-          paths: [src]
+          # ``benchmarks`` joins ``src`` on the path so the ☕ Concurrency Cafe fixture
+          # (``benchmarks/cafe/``) can be rendered on its own page. The cafe is not part
+          # of the shipped package, but each of its stations is documented as a worked
+          # example of one net feature, which is worth surfacing on the site.
+          paths: [src, benchmarks]
           options:
             docstring_style: google
             show_source: true
@@ -73,6 +77,8 @@ plugins:
       sections:
         Home:
           - index.md
+        Worked example:
+          - cafe.md
         API reference:
           - reference/core.md
           - reference/transitions.md
@@ -109,6 +115,7 @@ markdown_extensions:
 
 nav:
   - Home: index.md
+  - The Concurrency Cafe: cafe.md
   - API Reference:
       - Core: reference/core.md
       - Transitions: reference/transitions.md
