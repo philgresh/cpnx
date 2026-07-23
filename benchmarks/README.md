@@ -27,6 +27,7 @@ Two tiers:
 | `bench_cafe_throughput.py` | macro | End-to-end throughput (`us/order`, `us/step`) of the cafe net processing N orders, swept over `N` and the binding regime. Reveals how per-step engine cost scales with marking depth. Single-worker by construction. |
 | `bench_cafe_concurrency.py` | macro | Wall-clock **makespan** against `max_workers`, swept over queue depth and guard regime. The only script here that says anything about parallelism. |
 | `bench_station_costs.py` | macro | µs/order against queue depth for each opt-in station's selection shape (certified vs. uncertified `key`, filter-only, timed×key), plus the arc-ordering and `binding_search_limit` search-budget sweeps. Answers the "Unmeasured combinations" audit below. |
+| `bench_subnet.py` | macro | Per-firing `SubstitutionTransition` overhead (wrapped vs. inlined, swept over subnet size) and the wall-clock-friction leak — a subnet's cooldowns are paid in real time even under the logical driver. |
 | `profile_cafe.py` | dev tool | `cProfile` a large cafe run and rank engine functions by cumulative / own time. Not a committed benchmark — a pointer to what to optimise. |
 
 ## The fixture: `cafe/`
@@ -501,13 +502,58 @@ preference reached the bottom, ≈N means the budget ran out and it fell to FIFO
 - **`count > 1` at depth** (`cupping`) — the token pool stays bounded but `C(pool, count)`
   candidate combinations do not; the search-limit prefix can disable a transition while a
   valid binding sits deeper. Needs a candidate-space sweep, not a depth sweep.
-- **`SubstitutionTransition`** (`pastry_case`) — the parent lock is *not* held across the
-  child's run (traced in `engine._execute_substitution_transition`), so per-firing subnet
-  overhead is the thing to measure, against subnet size.
 - **Concurrency against uncertified selection.** A guard holds the lock per *candidate
   binding*; an uncertified `key`/`filter` holds it per *token*, unbounded — a far worse
   contention shape than any `bench_cafe_concurrency.py` regime currently exercises.
   `specials_board`/`eighty_six` are the regimes to run through it.
+
+## `SubstitutionTransition` cost (`bench_subnet.py`)
+
+A subnet fires like any pooled action, but its "action" is *drive a whole nested net to
+quiescence*. `bench_subnet.py` measures what that abstraction costs, wrapping a chain of K
+instant transitions in a subnet vs. inlining the identical K transitions (Apple M4 Pro /
+CPython 3.14.3, min-of-three, 1000 tokens):
+
+| subnet depth K | flat µs/tok | wrapped µs/tok | overhead µs/firing |
+| ---: | ---: | ---: | ---: |
+| 1 | 22.0 | 78.0 | **56.0** |
+| 3 | 78.3 | 152.9 | 74.5 |
+| 10 | 349.6 | 454.8 | 105.2 |
+| 30 | 1817.0 | 2241.6 | 424.6 |
+
+Two facts:
+
+- **A fixed ~50-56 µs per firing** (read at K=1, where the shared per-step cost is smallest) —
+  the deposit-into-ports, spin-up-`run()`, retrieve, sync-clock machinery. That is the flat
+  tax for wrapping, paid once per firing regardless of workload depth.
+- **On top of that, a subnet re-runs its own run/quiescence loop per internal step**, which is
+  heavier than an inlined step — so the overhead *grows* with K (56→425 µs). A subnet does not
+  make a large internal workflow cheaper; it multiplies its per-step cost. (The flat baseline
+  is itself super-linear in K — per-step enablement scan grows with transition count — and both
+  sides pay that; the *delta* is the subnet-specific part.)
+
+**The wall-clock leak — the one that bites.** A subnet's internal `run()` waits out its own
+cooldowns on the **real** clock, and the parent's logical-clock driver cannot reach across the
+boundary. The same 0.05 s cooldown, 8 tokens:
+
+| cooldown location | driver | wall time |
+| --- | --- | ---: |
+| in the parent | logical (`drive_to_quiescence`) | 0.6 ms (skipped) |
+| inside a subnet | wall (`run`) | 397.6 ms (paid in full) |
+
+That is **~660×**, landing on the `n × pacing` real-time floor. The trick that makes the
+cafe's 8-second grinder cooldown cost nothing in a benchmark does not extend into a subnet —
+any subnet with real internal friction burns real wall time per firing, and it cannot be
+driven away.
+
+**Finding: `drive_to_quiescence` strands tokens in a subnet.** Driving a wrapped net on the
+logical clock leaves tokens stuck in the subnet's input port (measured: 14 of 20), returns
+`is_quiescent() == True`, and reports a fast, wrong result — a silent correctness failure. The
+subnet runs on the wall clock while the parent's logical clock is frozen and jumped, and the
+two time models do not reconcile. It had never surfaced because `pastry_case` is not in the
+throughput sweep, so no logical-clock run had ever met a subnet. `bench_subnet.py` drives on
+the wall clock for exactly this reason. The engine should either reconcile the clocks or refuse
+loudly rather than strand silently.
 
 [#18]: https://github.com/philgresh/cpnx/issues/18
 [#25]: https://github.com/philgresh/cpnx/issues/25
