@@ -26,6 +26,7 @@ Two tiers:
 | `bench_enablement.py` | micro | Cost of one `_is_transition_enabled` check (and `_resolve_binding` across binding policies), for a **string** guard and a **callable** guard computing the identical predicate — the per-transition, per-`step()` hot path, and the dispatch gap between the two flavours. |
 | `bench_cafe_throughput.py` | macro | End-to-end throughput (`us/order`, `us/step`) of the cafe net processing N orders, swept over `N` and the binding regime. Reveals how per-step engine cost scales with marking depth. Single-worker by construction. |
 | `bench_cafe_concurrency.py` | macro | Wall-clock **makespan** against `max_workers`, swept over queue depth and guard regime. The only script here that says anything about parallelism. |
+| `bench_station_costs.py` | macro | µs/order against queue depth for each opt-in station's selection shape (certified vs. uncertified `key`, filter-only, timed×key), plus the arc-ordering and `binding_search_limit` search-budget sweeps. Answers the "Unmeasured combinations" audit below. |
 | `profile_cafe.py` | dev tool | `cProfile` a large cafe run and rank engine functions by cumulative / own time. Not a committed benchmark — a pointer to what to optimise. |
 
 ## The fixture: `cafe/`
@@ -426,15 +427,13 @@ the ad-hoc fingerprint used at the time. It is kept because it is nine lines and
 directionally faster on the guard-free path. But treat ~1% guard-free / ~0%
 guarded as the honest figure, not 3.3%.
 
-## Unmeasured combinations
+## API-combination audit: what each selection shape costs
 
 An audit of which API-element combinations affect performance, and which the corpus
-actually covers, turned up the gaps below. Fixtures now exist for every one of them (see
-"Opt-in stations"); **no numbers have been taken yet**, so nothing here is a claim about
-cost — only about what is currently unmeasured.
-
-The routing decision that drives nearly all of it is `engine._materialize_pool`, which
-picks between three costs per enabling check:
+covered, turned up the gaps below. Fixtures exist for every one (see "Opt-in stations"),
+and `bench_station_costs.py` now measures the selection-shape and search-budget ones. The
+routing decision that drives nearly all of it is `engine._materialize_pool`, which picks
+between three costs per enabling check:
 
 | Route | Condition | Cost |
 | --- | --- | --- |
@@ -445,33 +444,70 @@ picks between three costs per enabling check:
 Route 3 runs **per `step()`, per transition** — including steps where the guard then
 rejects — so on a deep place it is the O(N²) drain the key-index work removed.
 
-1. **`filter` without `key` is never indexed** (`decaf`). `_ensure_key_index` bails as soon
-   as `arc.key is None`, so even a fully certified filter takes route 3. Worth noting
-   because the `InputArc` docs advise certifying selection callables on a deep place —
-   advice that rescues a `key` but not a filter-only arc.
-2. **`consume_all` is unmeasured everywhere** (`knock_box`). It forces route 3
-   unconditionally, and pools are gathered *before* the guard is evaluated, so a rarely-firing
-   drain is scanned in full on every step.
-3. **Uncertified `key`** (`specials_board`) and **certified `key` + uncertified `filter`**
-   (`eighty_six`). Both documented as falling back to the per-firing sort; neither has a
-   committed reproducer, only the one-off migration A/B that was deliberately not kept.
-4. **timed×key** (`cold_brew_key`) — [#25], previously documented but not reproducible.
-5. **`count > 1` at depth** (`cupping`). The token pool stays bounded, but `C(pool, count)`
-   candidate combinations do not; the search-limit prefix can leave a transition disabled
-   while a valid binding sits deeper.
-6. **`SubstitutionTransition`** (`pastry_case`). Zero coverage previously. The first thing
-   to check is whether the parent's engine lock is held across the child's run.
-7. **`binding_search_limit` was never swept**, only ever left at the default.
-8. **Arc ordering.** `BindingPolicy`'s docs recommend listing resource arcs *before* data
-   arcs, since `itertools.product` varies the last arc fastest. `T_Weigh_And_Grind` does the
-   opposite, and its own comment records the symptom — mobile-pickup preference holding only
-   to depth ~166 ≈ `limit / (scales × grinders)`, i.e. [#18]. `resource_arcs_first=True`
-   flips it; whether that raises effective depth as the docstring predicts is **untested**,
-   and it is the cheapest experiment on this list.
-9. **Concurrency is only swept against guards.** A guard holds the lock for one round-trip
-   per *candidate binding*; an uncertified `key`/`filter` holds it for one per *token*,
-   unbounded. `specials_board` and `eighty_six` are the regimes to run through
-   `bench_cafe_concurrency.py`.
+### Results
+
+µs/order draining one deep single-arc place, min-of-two, one machine
+(Apple M4 Pro / CPython 3.14.3). Read the **growth** column (last÷first over an 8× depth
+increase — ~1× is linear) and the **ratio to the certified-key control**, not the absolute
+µs. Run-to-run spread was 2.5–5.4% on this pass, so treat anything under ~10% as unresolved.
+
+| regime | arc shape | route | 250 | 2000 | growth | ×control@2000 |
+| --- | --- | :-: | ---: | ---: | ---: | ---: |
+| `batch_triage` | certified `key` | 2 | 75.6 | 82.0 | **1.1×** | 1× (control) |
+| `decaf` | certified `filter`, no `key` | 3 | 94.1 | 178.7 | 1.9× | **2.1×** |
+| `cold_brew` | no selection, timed | 1 | 149.9 | 409.2 | 2.7× | 4.4× |
+| `cold_brew_key` | certified `key`, timed | 3 | 180.7 | 597.6 | 3.3× | 7.4× |
+| `specials_board` | **uncertified** `key` | 3 | 1411.7 | 11039.4 | **7.8×** | **134.8×** |
+| `eighty_six` | certified `key` + uncertified `filter` | 3 | 1439.3 | 11036.4 | 7.7× | 133.9× |
+
+The headline: **an uncertified selection callable is the dominant resource-suck in the
+API, by two orders of magnitude.** Certifying the `batch_triage` key keeps the drain flat
+(1.1× over 8× depth); an *identical ordering* read off a mutable dict (`specials_board`)
+grows 7.8× and lands **135× slower** at depth 2000 — and rising, since it is genuinely
+O(N²) in N with a ~10 µs thread-hop constant per token. `eighty_six` confirms the
+asymmetry it was built to show: one uncertified `filter` disqualifies the arc from indexing
+*even though the key certifies*, landing right on top of the uncertified-key curve.
+
+The three route-3 cases that stay cheap (`decaf`, both `cold_brew` arms) do so only because
+their callables are certified/absent: route 3 costs an O(N) scan but no thread hop, so they
+grow ~2–3× rather than ~8×. `cold_brew_key` (the timed×key residual, [#25]) is the most
+expensive *certified* regime — the timed marking blocks the index, so a fully-certified key
+still pays the per-firing sort — but at 7.4× it is a rounding error next to the uncertified
+cliff.
+
+### Search budget
+
+Both search-budget hypotheses **confirmed**, on the pipeline (`T_Weigh_And_Grind`'s
+three-arc product). "Deep-mobile rank" places one mobile-pickup ticket at the bottom of the
+line and reports where `binding_priority_key` actually gets it ground — 0 means the
+preference reached the bottom, ≈N means the budget ran out and it fell to FIFO.
+
+- **Arc ordering ([#18]).** Listing the permit arcs *before* the deep data arc
+  (`resource_arcs_first=True`) holds the deep-mobile rank at **0 through 800 orders**, while
+  the cafe's historical data-first order lets it slip to 45 at 400 and 325 at 800 — the
+  `limit / (scales × grinders)` cutoff the transition's own comment predicts. The one-line
+  reorder dissolves the symptom, at a ~10% µs/order cost from the wider effective search.
+  **This is the cheapest available fix for #18** and the reorder is semantics-preserving.
+- **`binding_search_limit`.** A clean cost-vs-reach trade: at 800 orders, `limit=100` runs
+  at 610 µs/order but strands the mobile ticket at rank 535; `limit=10000` reaches it
+  (rank 0) at 2879 µs/order — 4.7× the cost for full-depth preference. The default 1000
+  sits in between (rank 325), i.e. already past the cutoff for this depth.
+
+### Still unmeasured (fixtures exist, numbers do not)
+
+- **`consume_all`** (`knock_box`) — forces route 3, and pools are gathered *before* the
+  guard, so a rarely-firing drain is re-scanned in full every step. Not on the
+  `bench_station_costs.py` sweep because its cost depends on lull frequency, not depth.
+- **`count > 1` at depth** (`cupping`) — the token pool stays bounded but `C(pool, count)`
+  candidate combinations do not; the search-limit prefix can disable a transition while a
+  valid binding sits deeper. Needs a candidate-space sweep, not a depth sweep.
+- **`SubstitutionTransition`** (`pastry_case`) — the parent lock is *not* held across the
+  child's run (traced in `engine._execute_substitution_transition`), so per-firing subnet
+  overhead is the thing to measure, against subnet size.
+- **Concurrency against uncertified selection.** A guard holds the lock per *candidate
+  binding*; an uncertified `key`/`filter` holds it per *token*, unbounded — a far worse
+  contention shape than any `bench_cafe_concurrency.py` regime currently exercises.
+  `specials_board`/`eighty_six` are the regimes to run through it.
 
 [#18]: https://github.com/philgresh/cpnx/issues/18
 [#25]: https://github.com/philgresh/cpnx/issues/25
