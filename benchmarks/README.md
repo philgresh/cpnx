@@ -532,28 +532,32 @@ Two facts:
   is itself super-linear in K — per-step enablement scan grows with transition count — and both
   sides pay that; the *delta* is the subnet-specific part.)
 
-**The wall-clock leak — the one that bites.** A subnet's internal `run()` waits out its own
-cooldowns on the **real** clock, and the parent's logical-clock driver cannot reach across the
-boundary. The same 0.05 s cooldown, 8 tokens:
+**The wall-clock leak — the one that bites.** A subnet is clock-isolated: its internal `run()`
+waits out its own cooldowns on the **real** clock, and the parent's logical-clock driver cannot
+reach across the boundary. The same 0.05 s cooldown, 8 tokens, both under `drive_to_quiescence`:
 
-| cooldown location | driver | wall time |
-| --- | --- | ---: |
-| in the parent | logical (`drive_to_quiescence`) | 0.6 ms (skipped) |
-| inside a subnet | wall (`run`) | 397.6 ms (paid in full) |
+| cooldown location | wall time |
+| --- | ---: |
+| in the parent | 0.6 ms (logical driver skips it) |
+| inside a subnet | 394.5 ms (isolated, waited in full) |
 
 That is **~660×**, landing on the `n × pacing` real-time floor. The trick that makes the
 cafe's 8-second grinder cooldown cost nothing in a benchmark does not extend into a subnet —
 any subnet with real internal friction burns real wall time per firing, and it cannot be
-driven away.
+driven away. This is intentional (see below), not a driver limitation.
 
-**Finding: `drive_to_quiescence` strands tokens in a subnet.** Driving a wrapped net on the
-logical clock leaves tokens stuck in the subnet's input port (measured: 14 of 20), returns
-`is_quiescent() == True`, and reports a fast, wrong result — a silent correctness failure. The
-subnet runs on the wall clock while the parent's logical clock is frozen and jumped, and the
-two time models do not reconcile. It had never surfaced because `pastry_case` is not in the
-throughput sweep, so no logical-clock run had ever met a subnet. `bench_subnet.py` drives on
-the wall clock for exactly this reason. The engine should either reconcile the clocks or refuse
-loudly rather than strand silently.
+**Fixed along the way: `drive_to_quiescence` used to strand tokens in a subnet.** Driving a
+wrapped net on the logical clock left tokens stuck in the subnet's input port (measured: 14 of
+20), returned `is_quiescent() == True`, and reported a fast, wrong result — a silent
+correctness failure. The cause was clock *coupling*: the parent pushed its logical time onto the
+subnet via `advance_time`, but a subnet fires once per binding, so the second firing at the same
+instant moved the subnet clock backward-or-equal, which `advance_time` rejects; the resulting
+error rolled the firing back and stranded the already-deposited copy. It had never surfaced
+because `pastry_case` is not in the throughput sweep, so no logical-clock run had ever met a
+subnet. The fix isolates the subnet's clock entirely (a subnet is an atomic wall-clock
+sub-process; the parent's clock is parent context and does not cross the port boundary) —
+`src/cpnx/engine.py`, regression tests in `tests/test_subnet.py`. The wall-clock leak above is
+the intended residual of that isolation, not a bug.
 
 [#18]: https://github.com/philgresh/cpnx/issues/18
 [#25]: https://github.com/philgresh/cpnx/issues/25

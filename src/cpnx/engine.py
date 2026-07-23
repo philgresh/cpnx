@@ -2202,12 +2202,6 @@ class PetriNet:
             for port_name in socket_to_ports[socket_name]:
                 subnet.deposit(port_name, token.evolve())
 
-    def _sync_subnet_time(self, subnet: "PetriNet") -> None:
-        with self._lock:
-            current_model_time = self._model_time
-        if current_model_time is not None:
-            subnet.advance_time(current_model_time)
-
     def _retrieve_subnet_outputs(
         self, subnet: "PetriNet", port_socket_map: dict[str, str], parent_outputs: list[str]
     ) -> list[Token]:
@@ -2233,8 +2227,22 @@ class PetriNet:
         socket_to_ports = self._map_sockets_to_ports(transition.port_socket_map)
         self._verify_port_socket_boundaries(token_sources, socket_to_ports)
         self._deposit_into_subnet(subnet, token_sources, socket_to_ports)
-        self._sync_subnet_time(subnet)
 
+        # Clock isolation: the subnet runs entirely on its own wall clock, never the parent's
+        # logical clock. Pushing the parent's logical time onto the subnet was unsound — a subnet
+        # fires once per binding, so the second firing at the same parent instant tried to move the
+        # subnet clock backward-or-equal, which `advance_time` rejects; that ValueError surfaced as
+        # a firing failure and rolled the transition back, stranding the deposited token inside the
+        # subnet (silently, with `is_quiescent()` still reporting True). Even guarded to advance
+        # only forward it would break: `subnet.run()` waits on the wall clock, so a subnet frozen at
+        # a fixed logical time could never mature its own cooldowns. A subnet is an atomic
+        # wall-clock sub-process; the parent's clock is parent context and does not cross the port
+        # boundary, exactly as no other parent state does. See `tests/test_subnet.py`.
+        #
+        # Consequence, by design: under `drive_to_quiescence` the parent's logical clock skips the
+        # parent's own cooldowns for free, but a subnet's *internal* friction is still waited out in
+        # real time here (measured in `benchmarks/bench_subnet.py`). The result marking stays a
+        # deterministic fixed point; only the wall time is real.
         subnet.run(deadline=time.monotonic() + transition.subnet_deadline_secs)
 
         parent_outputs = [arc.place for arc in transition.outputs]

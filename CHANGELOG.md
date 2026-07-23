@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`drive_to_quiescence` no longer strands tokens inside a `SubstitutionTransition`'s subnet.** Driving a net that contains a subnet on the **logical** clock silently produced a wrong result: tokens stuck in the subnet's input port (measured: 14 of 20), `is_quiescent()` reporting `True`, and a normal `DriveResult` returned. The cause was clock *coupling* — the parent pushed its logical time onto the subnet via `advance_time` on every firing, but a `SubstitutionTransition` fires once per binding, so the second firing at the same parent instant moved the subnet clock backward-or-equal, which `advance_time` rejects; that `ValueError` surfaced as a firing failure and rolled the transition back, leaving the already-deposited token copy inside the subnet. It had never surfaced because the only subnet in the corpus (`benchmarks/cafe/stations/pastry_case.py`) was exercised only via wall-clock `run()`, where the coupling is a no-op. The fix **isolates the subnet's clock entirely**: a subnet is an atomic wall-clock sub-process, and the parent's clock — like all other parent context — does not cross the port boundary. Consequence, by design: under `drive_to_quiescence` the parent's logical clock still skips the parent's own cooldowns for free, but a subnet's *internal* friction is waited out in real wall time (the result marking remains a deterministic fixed point; only the timing is real). The previously-tested behaviour that the parent *does* push its clock onto the subnet was itself the bug and has been removed. Regression tests in [`tests/test_subnet.py`](tests/test_subnet.py); per-firing cost and the wall-clock residual are measured by [`benchmarks/bench_subnet.py`](benchmarks/bench_subnet.py).
+
 ## [0.4.0] — 2026-07-22
 
 ### Removed
