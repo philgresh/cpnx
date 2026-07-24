@@ -186,6 +186,8 @@ class InputArc:
              descending order, negate the key. The key must return values totally ordered
              *with each other*; if it raises, or the ordering is undefined, the arc yields
              no tokens and the transition is not enabled. `None` (default) means FIFO.
+             **Make it closed-world (certified) or a deep place drains in O(N²)** — see the
+             performance warning below.
         filter: Per-token eligibility predicate — a pure `Callable[[Token], bool]`. A token
                 is a candidate for this arc only when the predicate returns `True`; the
                 rest stay in the place. `None` (default) means every available token is
@@ -193,6 +195,8 @@ class InputArc:
                 construction (a non-`bool` annotation raises `TypeError`); unannotated
                 callables (including every lambda) are accepted unchecked. A filter that
                 raises makes the arc unsatisfiable rather than firing on a partial pool.
+                **Same performance warning as `key`** — an uncertified filter is quadratic
+                on a deep place, and (unlike `key`) a certified `key` cannot rescue it.
 
     Warning:
         **`consume_all=True` ignores both `key` and `filter`.** A draining arc takes every
@@ -210,19 +214,47 @@ class InputArc:
         `warnings.filterwarnings("ignore", message="consume_all=True ignores")` if you
         genuinely mean "drain everything, selection notwithstanding".
 
+    Warning:
+        **On a deep place, make your `key`/`filter` closed-world (certified) — or pay a
+        quadratic drain.** A *certified* selection callable is served from a persistent
+        `(key, seq)` index maintained on the place, so the drain stays roughly linear in
+        place depth. An *uncertified* one cannot be indexed — keying happens on the
+        `deposit()` path, which cannot host an unbounded callable — so every enabling
+        check re-reads and re-sorts the whole available pool **and** dispatches the
+        callable through the timeout-bounded executor once per token. Both costs are
+        per-token-per-firing, so draining a deep place is **O(N²)**: worst-case lock-hold
+        for the arc is `len(place) * expr_timeout_secs`, and `benchmarks/bench_station_costs.py`
+        measures an uncertified `key` at over **100×** a certified key computing the
+        *identical* order at depth 2000 — a gap that widens with depth. A `filter` is
+        worse to get wrong than a `key`: a single uncertified `filter` disqualifies the
+        whole arc from indexing *even when the `key` is certified*, because applying an
+        uncertified predicate after a capped index read could silently under-select.
+
+        **To certify, close over immutable values — never read mutable state at call
+        time.** A callable certifies (see [`cpnx.certification`]) only when it draws on a
+        fixed vocabulary and closes over nothing mutable. In practice: read configuration
+        at construction and capture the *value*. A callable that reads a module global, an
+        instance attribute, or any `list`/`dict`/`set` on each call does **not** certify —
+        that is exactly the pattern that lands on the O(N²) path. Captured values must be
+        immutable leaves (numbers, strings, `bytes`, `bool`, `None`) or `tuple`/`frozenset`
+        thereof — a `frozenset` certifies, a `set` does not::
+
+            cutoff = config["vip_cutoff"]                        # an int, read once at construction
+            key = lambda t: (t.payload["spend"] < cutoff, t.created_at)   # closes over an int -> certifies
+
+        If the ordering *genuinely* depends on state that changes at run time — a live
+        priority a human retunes mid-run — it cannot certify by construction, and the
+        quadratic cost is **intrinsic, not a bug**: an index needs a key it can compute
+        once, at deposit, and a value that changes afterward would sort already-deposited
+        tokens wrong. There is no engine fix for that case. Restructure so the key is
+        closed-world (snapshot the state into an immutable at construction and rebuild the
+        arc when it changes), or accept the O(N²) on a shallow place only.
+
     Note:
         Both callables are purity-verified at assignment, and each carries its own
-        inline-safe flag: a **certified** callable (see [`cpnx.certification`]) runs
-        inline under the engine lock, an uncertified one on the timeout-bounded
-        expression pool.
-
-        Uncertified `key`/`filter` are allowed, but on a **deep place they are the one
-        thing worth certifying.** Both are evaluated *per token* over the whole available
-        pool, so an uncertified one costs a thread round-trip per token per enabling
-        check — where a guard costs one per *candidate binding*, bounded by
-        `binding_search_limit`. Nothing bounds the per-token count: worst-case lock-hold is
-        `len(place) * expr_timeout_secs` for that arc. A certified callable skips the
-        executor entirely and the concern disappears.
+        inline-safe flag: a **certified** callable runs inline under the engine lock, an
+        uncertified one on the timeout-bounded expression pool (the source of the cost in
+        the warning above).
 
         Separately, `expr_timeout_secs` bounds a `key`'s *extraction*, not the
         **comparisons** between the values it returns — the sort runs inline under the
@@ -385,7 +417,13 @@ class Transition:
                the CPN guard contract `Type[G(t)] = Bool`: if the callable is annotated,
                its return type is checked to be `bool` at construction and a non-`bool`
                annotation (e.g. `-> int`) raises `TypeError`; unannotated guards (including
-               every lambda) are accepted unchecked.
+               every lambda) are accepted unchecked. **Prefer a closed-world (certified)
+               guard**: an uncertified one pays a thread round-trip per *candidate binding*
+               on every enabling check (bounded by `binding_search_limit`, so less severe
+               than an uncertified arc `key`/`filter`, which is per *token* and unbounded —
+               see [`InputArc`][cpnx.InputArc]). Certify it the same way: close over
+               immutable values read at construction, never mutable module or instance
+               state.
         priority: Lower value fires first when multiple transitions are enabled. Defaults to 10.
         action_timeout_secs: Maximum wall-clock seconds the action may run. When `None`
                (default), the action runs without a deadline — fully backward compatible.

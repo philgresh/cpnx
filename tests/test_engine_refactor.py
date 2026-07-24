@@ -584,19 +584,40 @@ def test_deposit_into_subnet():
     assert subnet.places["p1"].tokens[0].id != src_token.id
 
 
-def test_sync_subnet_time():
-    net = PetriNet()
-    subnet = PetriNet()
+def test_subnet_clock_value_is_decoupled_from_parent():
+    """The parent's logical *time value* never crosses the port boundary. (This replaces an
+    earlier `test_sync_subnet_time`, which asserted the opposite — that the parent pushed its
+    logical time onto the subnet. That coupling stranded tokens under `drive_to_quiescence`,
+    because a subnet fires once per binding and the repeated push moved the subnet clock
+    backward-or-equal, which `advance_time` rejects. The subnet may hold its *own* clock; it must
+    never be the parent's value. See `tests/test_subnet.py`.)"""
+    import time
 
-    # model_time None — advance_time must not be called (_model_time stays unset)
-    assert net._model_time is None
-    net._sync_subnet_time(subnet)
-    assert subnet._model_time is None
+    from cpnx.transitions import InputArc, SubstitutionTransition
 
-    # model_time set — subnet advances to match
-    net._model_time = 10.0
-    net._sync_subnet_time(subnet)
-    assert subnet._model_time == 10.0
+    subnet = PetriNet(places=[Place("port_in"), Place("port_out")])
+    subnet.add_transition(
+        Transition(name="pass", inputs=[InputArc("port_in")], outputs=[OutputArc("port_out")], action=lambda t: t)
+    )
+    net = PetriNet(
+        places=[Place("socket_in"), Place("socket_out")],
+        transitions=[
+            SubstitutionTransition(
+                name="sub",
+                inputs=[InputArc("socket_in")],
+                outputs=[OutputArc("socket_out")],
+                action=lambda t: t,
+                subnet=subnet,
+                port_socket_map={"port_in": "socket_in", "port_out": "socket_out"},
+            )
+        ],
+    )
+    net.advance_time(1000.0)  # parent far out on the logical clock
+    with net:
+        net.deposit("socket_in", Token())
+        net.run(deadline=time.monotonic() + 2.0)
+    assert subnet._model_time != 1000.0, "parent's logical time value leaked into the subnet"
+    assert len(net.places["socket_out"].tokens) == 1
 
 
 def test_retrieve_subnet_outputs():
