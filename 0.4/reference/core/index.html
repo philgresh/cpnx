@@ -13,7 +13,7 @@
         <link rel="canonical" href="https://philgresh.github.io/cpnx/latest/reference/core/">
       
       
-        <link rel="prev" href="../..">
+        <link rel="prev" href="../../cafe/">
       
       
         <link rel="next" href="../transitions/">
@@ -298,6 +298,33 @@
       
   
   
+  
+  
+    <li class="md-nav__item">
+      <a href="../../cafe/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The Concurrency Cafe
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
     
   
   
@@ -316,10 +343,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
         
           
-          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
             
   
   
@@ -337,8 +364,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="true">
-          <label class="md-nav__title" for="__nav_2">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -3111,7 +3138,23 @@ with PetriNet(max_workers=4) as net:
 <span class="normal"><a href="#__codelineno-0-2238">2238</a></span>
 <span class="normal"><a href="#__codelineno-0-2239">2239</a></span>
 <span class="normal"><a href="#__codelineno-0-2240">2240</a></span>
-<span class="normal"><a href="#__codelineno-0-2241">2241</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-173" name="__codelineno-0-173"></a><span class="k">class</span><span class="w"> </span><span class="nc">PetriNet</span><span class="p">:</span>
+<span class="normal"><a href="#__codelineno-0-2241">2241</a></span>
+<span class="normal"><a href="#__codelineno-0-2242">2242</a></span>
+<span class="normal"><a href="#__codelineno-0-2243">2243</a></span>
+<span class="normal"><a href="#__codelineno-0-2244">2244</a></span>
+<span class="normal"><a href="#__codelineno-0-2245">2245</a></span>
+<span class="normal"><a href="#__codelineno-0-2246">2246</a></span>
+<span class="normal"><a href="#__codelineno-0-2247">2247</a></span>
+<span class="normal"><a href="#__codelineno-0-2248">2248</a></span>
+<span class="normal"><a href="#__codelineno-0-2249">2249</a></span>
+<span class="normal"><a href="#__codelineno-0-2250">2250</a></span>
+<span class="normal"><a href="#__codelineno-0-2251">2251</a></span>
+<span class="normal"><a href="#__codelineno-0-2252">2252</a></span>
+<span class="normal"><a href="#__codelineno-0-2253">2253</a></span>
+<span class="normal"><a href="#__codelineno-0-2254">2254</a></span>
+<span class="normal"><a href="#__codelineno-0-2255">2255</a></span>
+<span class="normal"><a href="#__codelineno-0-2256">2256</a></span>
+<span class="normal"><a href="#__codelineno-0-2257">2257</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-173" name="__codelineno-0-173"></a><span class="k">class</span><span class="w"> </span><span class="nc">PetriNet</span><span class="p">:</span>
 <a id="__codelineno-0-174" name="__codelineno-0-174"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;A concurrent, thread-safe executor for coloured Petri nets.</span>
 <a id="__codelineno-0-175" name="__codelineno-0-175"></a>
 <a id="__codelineno-0-176" name="__codelineno-0-176"></a><span class="sd">    A [`PetriNet`][cpnx.PetriNet] owns a collection of named</span>
@@ -5143,43 +5186,59 @@ with PetriNet(max_workers=4) as net:
 <a id="__codelineno-0-2202" name="__codelineno-0-2202"></a>            <span class="k">for</span> <span class="n">port_name</span> <span class="ow">in</span> <span class="n">socket_to_ports</span><span class="p">[</span><span class="n">socket_name</span><span class="p">]:</span>
 <a id="__codelineno-0-2203" name="__codelineno-0-2203"></a>                <span class="n">subnet</span><span class="o">.</span><span class="n">deposit</span><span class="p">(</span><span class="n">port_name</span><span class="p">,</span> <span class="n">token</span><span class="o">.</span><span class="n">evolve</span><span class="p">())</span>
 <a id="__codelineno-0-2204" name="__codelineno-0-2204"></a>
-<a id="__codelineno-0-2205" name="__codelineno-0-2205"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">_sync_subnet_time</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">subnet</span><span class="p">:</span> <span class="s2">&quot;PetriNet&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<a id="__codelineno-0-2206" name="__codelineno-0-2206"></a>        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
-<a id="__codelineno-0-2207" name="__codelineno-0-2207"></a>            <span class="n">current_model_time</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_time</span>
-<a id="__codelineno-0-2208" name="__codelineno-0-2208"></a>        <span class="k">if</span> <span class="n">current_model_time</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-<a id="__codelineno-0-2209" name="__codelineno-0-2209"></a>            <span class="n">subnet</span><span class="o">.</span><span class="n">advance_time</span><span class="p">(</span><span class="n">current_model_time</span><span class="p">)</span>
-<a id="__codelineno-0-2210" name="__codelineno-0-2210"></a>
-<a id="__codelineno-0-2211" name="__codelineno-0-2211"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">_retrieve_subnet_outputs</span><span class="p">(</span>
-<a id="__codelineno-0-2212" name="__codelineno-0-2212"></a>        <span class="bp">self</span><span class="p">,</span> <span class="n">subnet</span><span class="p">:</span> <span class="s2">&quot;PetriNet&quot;</span><span class="p">,</span> <span class="n">port_socket_map</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="n">parent_outputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
-<a id="__codelineno-0-2213" name="__codelineno-0-2213"></a>    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">]:</span>
-<a id="__codelineno-0-2214" name="__codelineno-0-2214"></a>        <span class="n">output_tokens</span> <span class="o">=</span> <span class="p">[]</span>
-<a id="__codelineno-0-2215" name="__codelineno-0-2215"></a>        <span class="k">for</span> <span class="n">port</span><span class="p">,</span> <span class="n">socket</span> <span class="ow">in</span> <span class="n">port_socket_map</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-<a id="__codelineno-0-2216" name="__codelineno-0-2216"></a>            <span class="k">if</span> <span class="n">socket</span> <span class="ow">in</span> <span class="n">parent_outputs</span><span class="p">:</span>
-<a id="__codelineno-0-2217" name="__codelineno-0-2217"></a>                <span class="n">port_place</span> <span class="o">=</span> <span class="n">subnet</span><span class="o">.</span><span class="n">places</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">port</span><span class="p">)</span>
-<a id="__codelineno-0-2218" name="__codelineno-0-2218"></a>                <span class="k">if</span> <span class="n">port_place</span><span class="p">:</span>
-<a id="__codelineno-0-2219" name="__codelineno-0-2219"></a>                    <span class="c1"># Retrieve all available tokens</span>
-<a id="__codelineno-0-2220" name="__codelineno-0-2220"></a>                    <span class="n">tokens</span> <span class="o">=</span> <span class="n">port_place</span><span class="o">.</span><span class="n">retrieve_all</span><span class="p">(</span><span class="n">model_time</span><span class="o">=</span><span class="n">subnet</span><span class="o">.</span><span class="n">model_time</span><span class="p">)</span>
-<a id="__codelineno-0-2221" name="__codelineno-0-2221"></a>                    <span class="n">output_tokens</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">tokens</span><span class="p">)</span>
-<a id="__codelineno-0-2222" name="__codelineno-0-2222"></a>        <span class="k">return</span> <span class="n">output_tokens</span>
-<a id="__codelineno-0-2223" name="__codelineno-0-2223"></a>
-<a id="__codelineno-0-2224" name="__codelineno-0-2224"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">_execute_substitution_transition</span><span class="p">(</span>
-<a id="__codelineno-0-2225" name="__codelineno-0-2225"></a>        <span class="bp">self</span><span class="p">,</span>
-<a id="__codelineno-0-2226" name="__codelineno-0-2226"></a>        <span class="n">transition</span><span class="p">:</span> <span class="n">SubstitutionTransition</span><span class="p">,</span>
-<a id="__codelineno-0-2227" name="__codelineno-0-2227"></a>        <span class="n">consumed_tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">],</span>
-<a id="__codelineno-0-2228" name="__codelineno-0-2228"></a>        <span class="n">token_sources</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Token</span><span class="p">]],</span>
-<a id="__codelineno-0-2229" name="__codelineno-0-2229"></a>    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">]:</span>
-<a id="__codelineno-0-2230" name="__codelineno-0-2230"></a><span class="w">        </span><span class="sd">&quot;&quot;&quot;Run a hierarchical sub-net and return its output tokens, isolated from parent context.&quot;&quot;&quot;</span>
-<a id="__codelineno-0-2231" name="__codelineno-0-2231"></a>        <span class="n">subnet</span> <span class="o">=</span> <span class="n">transition</span><span class="o">.</span><span class="n">subnet</span>
-<a id="__codelineno-0-2232" name="__codelineno-0-2232"></a>
-<a id="__codelineno-0-2233" name="__codelineno-0-2233"></a>        <span class="n">socket_to_ports</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_map_sockets_to_ports</span><span class="p">(</span><span class="n">transition</span><span class="o">.</span><span class="n">port_socket_map</span><span class="p">)</span>
-<a id="__codelineno-0-2234" name="__codelineno-0-2234"></a>        <span class="bp">self</span><span class="o">.</span><span class="n">_verify_port_socket_boundaries</span><span class="p">(</span><span class="n">token_sources</span><span class="p">,</span> <span class="n">socket_to_ports</span><span class="p">)</span>
-<a id="__codelineno-0-2235" name="__codelineno-0-2235"></a>        <span class="bp">self</span><span class="o">.</span><span class="n">_deposit_into_subnet</span><span class="p">(</span><span class="n">subnet</span><span class="p">,</span> <span class="n">token_sources</span><span class="p">,</span> <span class="n">socket_to_ports</span><span class="p">)</span>
-<a id="__codelineno-0-2236" name="__codelineno-0-2236"></a>        <span class="bp">self</span><span class="o">.</span><span class="n">_sync_subnet_time</span><span class="p">(</span><span class="n">subnet</span><span class="p">)</span>
-<a id="__codelineno-0-2237" name="__codelineno-0-2237"></a>
-<a id="__codelineno-0-2238" name="__codelineno-0-2238"></a>        <span class="n">subnet</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">deadline</span><span class="o">=</span><span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">+</span> <span class="n">transition</span><span class="o">.</span><span class="n">subnet_deadline_secs</span><span class="p">)</span>
-<a id="__codelineno-0-2239" name="__codelineno-0-2239"></a>
-<a id="__codelineno-0-2240" name="__codelineno-0-2240"></a>        <span class="n">parent_outputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">arc</span><span class="o">.</span><span class="n">place</span> <span class="k">for</span> <span class="n">arc</span> <span class="ow">in</span> <span class="n">transition</span><span class="o">.</span><span class="n">outputs</span><span class="p">]</span>
-<a id="__codelineno-0-2241" name="__codelineno-0-2241"></a>        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_retrieve_subnet_outputs</span><span class="p">(</span><span class="n">subnet</span><span class="p">,</span> <span class="n">transition</span><span class="o">.</span><span class="n">port_socket_map</span><span class="p">,</span> <span class="n">parent_outputs</span><span class="p">)</span>
+<a id="__codelineno-0-2205" name="__codelineno-0-2205"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">_retrieve_subnet_outputs</span><span class="p">(</span>
+<a id="__codelineno-0-2206" name="__codelineno-0-2206"></a>        <span class="bp">self</span><span class="p">,</span> <span class="n">subnet</span><span class="p">:</span> <span class="s2">&quot;PetriNet&quot;</span><span class="p">,</span> <span class="n">port_socket_map</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="n">parent_outputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
+<a id="__codelineno-0-2207" name="__codelineno-0-2207"></a>    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">]:</span>
+<a id="__codelineno-0-2208" name="__codelineno-0-2208"></a>        <span class="n">output_tokens</span> <span class="o">=</span> <span class="p">[]</span>
+<a id="__codelineno-0-2209" name="__codelineno-0-2209"></a>        <span class="k">for</span> <span class="n">port</span><span class="p">,</span> <span class="n">socket</span> <span class="ow">in</span> <span class="n">port_socket_map</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+<a id="__codelineno-0-2210" name="__codelineno-0-2210"></a>            <span class="k">if</span> <span class="n">socket</span> <span class="ow">in</span> <span class="n">parent_outputs</span><span class="p">:</span>
+<a id="__codelineno-0-2211" name="__codelineno-0-2211"></a>                <span class="n">port_place</span> <span class="o">=</span> <span class="n">subnet</span><span class="o">.</span><span class="n">places</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">port</span><span class="p">)</span>
+<a id="__codelineno-0-2212" name="__codelineno-0-2212"></a>                <span class="k">if</span> <span class="n">port_place</span><span class="p">:</span>
+<a id="__codelineno-0-2213" name="__codelineno-0-2213"></a>                    <span class="c1"># Retrieve all available tokens</span>
+<a id="__codelineno-0-2214" name="__codelineno-0-2214"></a>                    <span class="n">tokens</span> <span class="o">=</span> <span class="n">port_place</span><span class="o">.</span><span class="n">retrieve_all</span><span class="p">(</span><span class="n">model_time</span><span class="o">=</span><span class="n">subnet</span><span class="o">.</span><span class="n">model_time</span><span class="p">)</span>
+<a id="__codelineno-0-2215" name="__codelineno-0-2215"></a>                    <span class="n">output_tokens</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">tokens</span><span class="p">)</span>
+<a id="__codelineno-0-2216" name="__codelineno-0-2216"></a>        <span class="k">return</span> <span class="n">output_tokens</span>
+<a id="__codelineno-0-2217" name="__codelineno-0-2217"></a>
+<a id="__codelineno-0-2218" name="__codelineno-0-2218"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">_execute_substitution_transition</span><span class="p">(</span>
+<a id="__codelineno-0-2219" name="__codelineno-0-2219"></a>        <span class="bp">self</span><span class="p">,</span>
+<a id="__codelineno-0-2220" name="__codelineno-0-2220"></a>        <span class="n">transition</span><span class="p">:</span> <span class="n">SubstitutionTransition</span><span class="p">,</span>
+<a id="__codelineno-0-2221" name="__codelineno-0-2221"></a>        <span class="n">consumed_tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">],</span>
+<a id="__codelineno-0-2222" name="__codelineno-0-2222"></a>        <span class="n">token_sources</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Token</span><span class="p">]],</span>
+<a id="__codelineno-0-2223" name="__codelineno-0-2223"></a>    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">]:</span>
+<a id="__codelineno-0-2224" name="__codelineno-0-2224"></a><span class="w">        </span><span class="sd">&quot;&quot;&quot;Run a hierarchical sub-net and return its output tokens, isolated from parent context.&quot;&quot;&quot;</span>
+<a id="__codelineno-0-2225" name="__codelineno-0-2225"></a>        <span class="n">subnet</span> <span class="o">=</span> <span class="n">transition</span><span class="o">.</span><span class="n">subnet</span>
+<a id="__codelineno-0-2226" name="__codelineno-0-2226"></a>
+<a id="__codelineno-0-2227" name="__codelineno-0-2227"></a>        <span class="n">socket_to_ports</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_map_sockets_to_ports</span><span class="p">(</span><span class="n">transition</span><span class="o">.</span><span class="n">port_socket_map</span><span class="p">)</span>
+<a id="__codelineno-0-2228" name="__codelineno-0-2228"></a>        <span class="bp">self</span><span class="o">.</span><span class="n">_verify_port_socket_boundaries</span><span class="p">(</span><span class="n">token_sources</span><span class="p">,</span> <span class="n">socket_to_ports</span><span class="p">)</span>
+<a id="__codelineno-0-2229" name="__codelineno-0-2229"></a>        <span class="bp">self</span><span class="o">.</span><span class="n">_deposit_into_subnet</span><span class="p">(</span><span class="n">subnet</span><span class="p">,</span> <span class="n">token_sources</span><span class="p">,</span> <span class="n">socket_to_ports</span><span class="p">)</span>
+<a id="__codelineno-0-2230" name="__codelineno-0-2230"></a>
+<a id="__codelineno-0-2231" name="__codelineno-0-2231"></a>        <span class="c1"># Fire the subnet in the parent&#39;s clock *regime*, but on the subnet&#39;s OWN clock. The</span>
+<a id="__codelineno-0-2232" name="__codelineno-0-2232"></a>        <span class="c1"># subnet&#39;s clock is isolated — the parent&#39;s logical time is never pushed onto it (doing so</span>
+<a id="__codelineno-0-2233" name="__codelineno-0-2233"></a>        <span class="c1"># was unsound: a subnet fires once per binding, so a second firing at the same parent</span>
+<a id="__codelineno-0-2234" name="__codelineno-0-2234"></a>        <span class="c1"># instant moved the subnet clock backward-or-equal, which `advance_time` rejects; that</span>
+<a id="__codelineno-0-2235" name="__codelineno-0-2235"></a>        <span class="c1"># ValueError surfaced as a firing failure, rolled the transition back, and stranded the</span>
+<a id="__codelineno-0-2236" name="__codelineno-0-2236"></a>        <span class="c1"># deposited token inside the subnet while `is_quiescent()` still reported True). What the</span>
+<a id="__codelineno-0-2237" name="__codelineno-0-2237"></a>        <span class="c1"># subnet *does* inherit is whether time is logical or real:</span>
+<a id="__codelineno-0-2238" name="__codelineno-0-2238"></a>        <span class="c1">#</span>
+<a id="__codelineno-0-2239" name="__codelineno-0-2239"></a>        <span class="c1">#   - parent on the logical clock (`drive_to_quiescence`): drive the subnet logically too,</span>
+<a id="__codelineno-0-2240" name="__codelineno-0-2240"></a>        <span class="c1">#     so its internal cooldowns/settles are jumped for free and the firing is deterministic</span>
+<a id="__codelineno-0-2241" name="__codelineno-0-2241"></a>        <span class="c1">#     and cheap (the tight `drive_to_quiescence` loop, not `run()`&#39;s wall-clock wait). The</span>
+<a id="__codelineno-0-2242" name="__codelineno-0-2242"></a>        <span class="c1">#     subnet anchors and advances its own logical clock, unrelated to the parent&#39;s value.</span>
+<a id="__codelineno-0-2243" name="__codelineno-0-2243"></a>        <span class="c1">#   - parent on the wall clock (`run()`, production): run the subnet on the wall clock, so</span>
+<a id="__codelineno-0-2244" name="__codelineno-0-2244"></a>        <span class="c1">#     real cooldowns are genuinely waited out — the correct production semantics.</span>
+<a id="__codelineno-0-2245" name="__codelineno-0-2245"></a>        <span class="c1">#</span>
+<a id="__codelineno-0-2246" name="__codelineno-0-2246"></a>        <span class="c1"># `subnet_deadline_secs` bounds only the wall-clock path; a logically-driven subnet is</span>
+<a id="__codelineno-0-2247" name="__codelineno-0-2247"></a>        <span class="c1"># bounded by `drive_to_quiescence`&#39;s own `max_ticks`/`max_spins`. See `tests/test_subnet.py`</span>
+<a id="__codelineno-0-2248" name="__codelineno-0-2248"></a>        <span class="c1"># and `benchmarks/bench_subnet.py`.</span>
+<a id="__codelineno-0-2249" name="__codelineno-0-2249"></a>        <span class="k">with</span> <span class="bp">self</span><span class="o">.</span><span class="n">_lock</span><span class="p">:</span>
+<a id="__codelineno-0-2250" name="__codelineno-0-2250"></a>            <span class="n">parent_on_logical_clock</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_model_time</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+<a id="__codelineno-0-2251" name="__codelineno-0-2251"></a>        <span class="k">if</span> <span class="n">parent_on_logical_clock</span><span class="p">:</span>
+<a id="__codelineno-0-2252" name="__codelineno-0-2252"></a>            <span class="n">subnet</span><span class="o">.</span><span class="n">drive_to_quiescence</span><span class="p">()</span>
+<a id="__codelineno-0-2253" name="__codelineno-0-2253"></a>        <span class="k">else</span><span class="p">:</span>
+<a id="__codelineno-0-2254" name="__codelineno-0-2254"></a>            <span class="n">subnet</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">deadline</span><span class="o">=</span><span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span> <span class="o">+</span> <span class="n">transition</span><span class="o">.</span><span class="n">subnet_deadline_secs</span><span class="p">)</span>
+<a id="__codelineno-0-2255" name="__codelineno-0-2255"></a>
+<a id="__codelineno-0-2256" name="__codelineno-0-2256"></a>        <span class="n">parent_outputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">arc</span><span class="o">.</span><span class="n">place</span> <span class="k">for</span> <span class="n">arc</span> <span class="ow">in</span> <span class="n">transition</span><span class="o">.</span><span class="n">outputs</span><span class="p">]</span>
+<a id="__codelineno-0-2257" name="__codelineno-0-2257"></a>        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_retrieve_subnet_outputs</span><span class="p">(</span><span class="n">subnet</span><span class="p">,</span> <span class="n">transition</span><span class="o">.</span><span class="n">port_socket_map</span><span class="p">,</span> <span class="n">parent_outputs</span><span class="p">)</span>
 </code></pre></div></td></tr></table></div>
               </details>
 

@@ -298,6 +298,33 @@
       
   
   
+  
+  
+    <li class="md-nav__item">
+      <a href="../../cafe/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The Concurrency Cafe
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
     
   
   
@@ -316,10 +343,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
         
           
-          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
             
   
   
@@ -337,8 +364,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="true">
-          <label class="md-nav__title" for="__nav_2">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -761,7 +788,18 @@
    the CPN guard contract <code>Type[G(t)] = Bool</code>: if the callable is annotated,
    its return type is checked to be <code>bool</code> at construction and a non-<code>bool</code>
    annotation (e.g. <code>-&gt; int</code>) raises <code>TypeError</code>; unannotated guards (including
-   every lambda) are accepted unchecked.</p>
+   every lambda) are accepted unchecked. <strong>Prefer a closed-world (certified)
+   guard</strong>: an uncertified one pays a thread round-trip per <em>candidate binding</em>
+   on every enabling check (bounded by <code>binding_search_limit</code>, so less severe
+   than an uncertified arc <code>key</code>/<code>filter</code>, which is per <em>token</em> and unbounded —
+   see <a class="autorefs autorefs-internal" title="            cpnx.InputArc
+
+
+  
+      dataclass
+  " href="#cpnx.InputArc"><code>InputArc</code></a>). Certify it the same way: close over
+   immutable values read at construction, never mutable module or instance
+   state.</p>
               </div>
             </td>
           </tr>
@@ -879,39 +917,7 @@
 
               <details class="mkdocstrings-source">
                 <summary>Source code in <code>src/cpnx/transitions.py</code></summary>
-                <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-364">364</a></span>
-<span class="normal"><a href="#__codelineno-0-365">365</a></span>
-<span class="normal"><a href="#__codelineno-0-366">366</a></span>
-<span class="normal"><a href="#__codelineno-0-367">367</a></span>
-<span class="normal"><a href="#__codelineno-0-368">368</a></span>
-<span class="normal"><a href="#__codelineno-0-369">369</a></span>
-<span class="normal"><a href="#__codelineno-0-370">370</a></span>
-<span class="normal"><a href="#__codelineno-0-371">371</a></span>
-<span class="normal"><a href="#__codelineno-0-372">372</a></span>
-<span class="normal"><a href="#__codelineno-0-373">373</a></span>
-<span class="normal"><a href="#__codelineno-0-374">374</a></span>
-<span class="normal"><a href="#__codelineno-0-375">375</a></span>
-<span class="normal"><a href="#__codelineno-0-376">376</a></span>
-<span class="normal"><a href="#__codelineno-0-377">377</a></span>
-<span class="normal"><a href="#__codelineno-0-378">378</a></span>
-<span class="normal"><a href="#__codelineno-0-379">379</a></span>
-<span class="normal"><a href="#__codelineno-0-380">380</a></span>
-<span class="normal"><a href="#__codelineno-0-381">381</a></span>
-<span class="normal"><a href="#__codelineno-0-382">382</a></span>
-<span class="normal"><a href="#__codelineno-0-383">383</a></span>
-<span class="normal"><a href="#__codelineno-0-384">384</a></span>
-<span class="normal"><a href="#__codelineno-0-385">385</a></span>
-<span class="normal"><a href="#__codelineno-0-386">386</a></span>
-<span class="normal"><a href="#__codelineno-0-387">387</a></span>
-<span class="normal"><a href="#__codelineno-0-388">388</a></span>
-<span class="normal"><a href="#__codelineno-0-389">389</a></span>
-<span class="normal"><a href="#__codelineno-0-390">390</a></span>
-<span class="normal"><a href="#__codelineno-0-391">391</a></span>
-<span class="normal"><a href="#__codelineno-0-392">392</a></span>
-<span class="normal"><a href="#__codelineno-0-393">393</a></span>
-<span class="normal"><a href="#__codelineno-0-394">394</a></span>
-<span class="normal"><a href="#__codelineno-0-395">395</a></span>
-<span class="normal"><a href="#__codelineno-0-396">396</a></span>
+                <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-396">396</a></span>
 <span class="normal"><a href="#__codelineno-0-397">397</a></span>
 <span class="normal"><a href="#__codelineno-0-398">398</a></span>
 <span class="normal"><a href="#__codelineno-0-399">399</a></span>
@@ -987,115 +993,159 @@
 <span class="normal"><a href="#__codelineno-0-469">469</a></span>
 <span class="normal"><a href="#__codelineno-0-470">470</a></span>
 <span class="normal"><a href="#__codelineno-0-471">471</a></span>
-<span class="normal"><a href="#__codelineno-0-472">472</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-364" name="__codelineno-0-364"></a><span class="nd">@dataclass</span>
-<a id="__codelineno-0-365" name="__codelineno-0-365"></a><span class="k">class</span><span class="w"> </span><span class="nc">Transition</span><span class="p">:</span>
-<a id="__codelineno-0-366" name="__codelineno-0-366"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;A CPN transition that fires when all its input places are enabled.</span>
-<a id="__codelineno-0-367" name="__codelineno-0-367"></a>
-<a id="__codelineno-0-368" name="__codelineno-0-368"></a><span class="sd">    In CPN formalism a transition has:</span>
-<a id="__codelineno-0-369" name="__codelineno-0-369"></a>
-<a id="__codelineno-0-370" name="__codelineno-0-370"></a><span class="sd">    - **Input arcs** whose `key`/`filter` determine which tokens are consumed</span>
-<a id="__codelineno-0-371" name="__codelineno-0-371"></a><span class="sd">    - **Output arcs** whose `condition` determines whether tokens are produced</span>
-<a id="__codelineno-0-372" name="__codelineno-0-372"></a><span class="sd">    - A **guard** — a boolean predicate over the binding that must hold for the</span>
-<a id="__codelineno-0-373" name="__codelineno-0-373"></a><span class="sd">      transition to be enabled (evaluated before the action runs)</span>
-<a id="__codelineno-0-374" name="__codelineno-0-374"></a>
-<a id="__codelineno-0-375" name="__codelineno-0-375"></a><span class="sd">    Attributes:</span>
-<a id="__codelineno-0-376" name="__codelineno-0-376"></a><span class="sd">        name: Unique identifier within a [`PetriNet`][cpnx.PetriNet].</span>
-<a id="__codelineno-0-377" name="__codelineno-0-377"></a><span class="sd">        inputs: Input arcs (place to transition).</span>
-<a id="__codelineno-0-378" name="__codelineno-0-378"></a><span class="sd">        outputs: Output arcs (transition to place).</span>
-<a id="__codelineno-0-379" name="__codelineno-0-379"></a><span class="sd">        action: Callable consuming input tokens and returning output tokens.</span>
-<a id="__codelineno-0-380" name="__codelineno-0-380"></a><span class="sd">                Runs on the thread pool outside the engine lock.</span>
-<a id="__codelineno-0-381" name="__codelineno-0-381"></a><span class="sd">        guard: CPN transition guard — a `Callable[[list[Token]], bool]` (a string raises</span>
-<a id="__codelineno-0-382" name="__codelineno-0-382"></a><span class="sd">               `TypeError`). Evaluated while holding the engine lock; return `False` to</span>
-<a id="__codelineno-0-383" name="__codelineno-0-383"></a><span class="sd">               block firing. `None` (default) means always enabled. A certified guard</span>
-<a id="__codelineno-0-384" name="__codelineno-0-384"></a><span class="sd">               runs inline; an uncertified one runs on the timeout-bounded pool. Enforces</span>
-<a id="__codelineno-0-385" name="__codelineno-0-385"></a><span class="sd">               the CPN guard contract `Type[G(t)] = Bool`: if the callable is annotated,</span>
-<a id="__codelineno-0-386" name="__codelineno-0-386"></a><span class="sd">               its return type is checked to be `bool` at construction and a non-`bool`</span>
-<a id="__codelineno-0-387" name="__codelineno-0-387"></a><span class="sd">               annotation (e.g. `-&gt; int`) raises `TypeError`; unannotated guards (including</span>
-<a id="__codelineno-0-388" name="__codelineno-0-388"></a><span class="sd">               every lambda) are accepted unchecked.</span>
-<a id="__codelineno-0-389" name="__codelineno-0-389"></a><span class="sd">        priority: Lower value fires first when multiple transitions are enabled. Defaults to 10.</span>
-<a id="__codelineno-0-390" name="__codelineno-0-390"></a><span class="sd">        action_timeout_secs: Maximum wall-clock seconds the action may run. When `None`</span>
-<a id="__codelineno-0-391" name="__codelineno-0-391"></a><span class="sd">               (default), the action runs without a deadline — fully backward compatible.</span>
-<a id="__codelineno-0-392" name="__codelineno-0-392"></a><span class="sd">               When set, the engine triggers atomic rollback if the action does not return</span>
-<a id="__codelineno-0-393" name="__codelineno-0-393"></a><span class="sd">               within this duration: all consumed tokens are returned to their source places</span>
-<a id="__codelineno-0-394" name="__codelineno-0-394"></a><span class="sd">               (data tokens with a 1-second `available_at` delay to prevent livelock), and</span>
-<a id="__codelineno-0-395" name="__codelineno-0-395"></a><span class="sd">               the `on_error` callback fires with a `RuntimeError` that names the</span>
-<a id="__codelineno-0-396" name="__codelineno-0-396"></a><span class="sd">               transition and the elapsed timeout.</span>
-<a id="__codelineno-0-397" name="__codelineno-0-397"></a>
-<a id="__codelineno-0-398" name="__codelineno-0-398"></a><span class="sd">               **This does not kill the underlying OS thread.** The timed-out action</span>
-<a id="__codelineno-0-399" name="__codelineno-0-399"></a><span class="sd">               continues running in the background until it completes or the process exits;</span>
-<a id="__codelineno-0-400" name="__codelineno-0-400"></a><span class="sd">               its return value is silently discarded. Callers must apply native I/O</span>
-<a id="__codelineno-0-401" name="__codelineno-0-401"></a><span class="sd">               timeouts inside their actions (e.g. `requests.get(timeout=...)`,</span>
-<a id="__codelineno-0-402" name="__codelineno-0-402"></a><span class="sd">               `httpx` client timeouts) to prevent zombie thread accumulation.</span>
-<a id="__codelineno-0-403" name="__codelineno-0-403"></a><span class="sd">               `action_timeout_secs` is defense-in-depth, not a substitute for proper</span>
-<a id="__codelineno-0-404" name="__codelineno-0-404"></a><span class="sd">               I/O timeout discipline.</span>
-<a id="__codelineno-0-405" name="__codelineno-0-405"></a><span class="sd">        max_retries: Maximum number of times to retry the transition action on failure</span>
-<a id="__codelineno-0-406" name="__codelineno-0-406"></a><span class="sd">               before dead-lettering the data tokens.</span>
-<a id="__codelineno-0-407" name="__codelineno-0-407"></a><span class="sd">               `None` means infinite retry (today&#39;s behavior; forfeits the quiescence guarantee).</span>
-<a id="__codelineno-0-408" name="__codelineno-0-408"></a><span class="sd">               `0` means route data token(s) to `error_place` on the first failure.</span>
-<a id="__codelineno-0-409" name="__codelineno-0-409"></a><span class="sd">               `N &gt; 0` means retry up to `N` times, then route to `error_place`. Default is 5.</span>
-<a id="__codelineno-0-410" name="__codelineno-0-410"></a><span class="sd">        binding_policy: How the engine resolves which input tokens bind this transition</span>
-<a id="__codelineno-0-411" name="__codelineno-0-411"></a><span class="sd">               when checking enablement — see [`BindingPolicy`][cpnx.BindingPolicy].</span>
-<a id="__codelineno-0-412" name="__codelineno-0-412"></a><span class="sd">               `None` (default) inherits the net-wide default set on</span>
-<a id="__codelineno-0-413" name="__codelineno-0-413"></a><span class="sd">               [`PetriNet`][cpnx.PetriNet] (itself `BindingPolicy.LEGACY` by default), so</span>
-<a id="__codelineno-0-414" name="__codelineno-0-414"></a><span class="sd">               an unset transition behaves exactly as before. Set</span>
-<a id="__codelineno-0-415" name="__codelineno-0-415"></a><span class="sd">               `BindingPolicy.FIRST` to enable deterministic-complete binding search</span>
-<a id="__codelineno-0-416" name="__codelineno-0-416"></a><span class="sd">               (fixing head-of-line blocking) for this transition only.</span>
-<a id="__codelineno-0-417" name="__codelineno-0-417"></a><span class="sd">        binding_priority_key: Sort key used only under `BindingPolicy.PRIORITY`. A pure</span>
-<a id="__codelineno-0-418" name="__codelineno-0-418"></a><span class="sd">               `Callable[[list[Token]], object]` (must be callable or `None` — string</span>
-<a id="__codelineno-0-419" name="__codelineno-0-419"></a><span class="sd">               expressions are not supported and raise `TypeError` at assignment) mapping a</span>
-<a id="__codelineno-0-420" name="__codelineno-0-420"></a><span class="sd">               candidate binding (the flat list of tokens it would consume) to a comparable</span>
-<a id="__codelineno-0-421" name="__codelineno-0-421"></a><span class="sd">               value; the binding with the **minimum** key is selected, ties broken by</span>
-<a id="__codelineno-0-422" name="__codelineno-0-422"></a><span class="sd">               insertion order. `None` (default) means oldest-first — the minimum</span>
-<a id="__codelineno-0-423" name="__codelineno-0-423"></a><span class="sd">               `Token.created_at` across the binding&#39;s **data** tokens (resource tokens are</span>
-<a id="__codelineno-0-424" name="__codelineno-0-424"></a><span class="sd">               excluded, since a permit created at net construction is older than any data</span>
-<a id="__codelineno-0-425" name="__codelineno-0-425"></a><span class="sd">               token and would otherwise tie every candidate and collapse selection to</span>
-<a id="__codelineno-0-426" name="__codelineno-0-426"></a><span class="sd">               insertion order; a resource-only binding falls back to all tokens). The key must</span>
-<a id="__codelineno-0-427" name="__codelineno-0-427"></a><span class="sd">               return values that are totally ordered *with each other*; a candidate whose key</span>
-<a id="__codelineno-0-428" name="__codelineno-0-428"></a><span class="sd">               raises or is incomparable with the running best is skipped. If **every**</span>
-<a id="__codelineno-0-429" name="__codelineno-0-429"></a><span class="sd">               candidate is skipped, the first satisfying binding is used *and* `on_error` fires</span>
-<a id="__codelineno-0-430" name="__codelineno-0-430"></a><span class="sd">               (once per enabling pass, off the lock) so a wholly-broken key is not silent.</span>
-<a id="__codelineno-0-431" name="__codelineno-0-431"></a>
-<a id="__codelineno-0-432" name="__codelineno-0-432"></a><span class="sd">               **Performance / lock discipline:** unlike a callable `guard` (which runs on</span>
-<a id="__codelineno-0-433" name="__codelineno-0-433"></a><span class="sd">               the expression thread pool under `expr_timeout_secs`), the key is invoked</span>
-<a id="__codelineno-0-434" name="__codelineno-0-434"></a><span class="sd">               **inline while holding the engine lock, with no timeout**, once per candidate</span>
-<a id="__codelineno-0-435" name="__codelineno-0-435"></a><span class="sd">               — up to `binding_search_limit` times per resolution. It is purity-verified</span>
-<a id="__codelineno-0-436" name="__codelineno-0-436"></a><span class="sd">               (no I/O) but *not* time-bounded, so it must be trivially cheap; an expensive</span>
-<a id="__codelineno-0-437" name="__codelineno-0-437"></a><span class="sd">               key stalls every concurrent `deposit`/`step`/probe on the net.</span>
-<a id="__codelineno-0-438" name="__codelineno-0-438"></a><span class="sd">    &quot;&quot;&quot;</span>
-<a id="__codelineno-0-439" name="__codelineno-0-439"></a>
-<a id="__codelineno-0-440" name="__codelineno-0-440"></a>    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>
-<a id="__codelineno-0-441" name="__codelineno-0-441"></a>    <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">InputArc</span><span class="p">]</span>
-<a id="__codelineno-0-442" name="__codelineno-0-442"></a>    <span class="n">outputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">OutputArc</span><span class="p">]</span>
-<a id="__codelineno-0-443" name="__codelineno-0-443"></a>    <span class="n">action</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">]],</span> <span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">]]</span>
-<a id="__codelineno-0-444" name="__codelineno-0-444"></a>    <span class="n">guard</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">]],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-<a id="__codelineno-0-445" name="__codelineno-0-445"></a>    <span class="n">priority</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10</span>
-<a id="__codelineno-0-446" name="__codelineno-0-446"></a>    <span class="n">action_timeout_secs</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-<a id="__codelineno-0-447" name="__codelineno-0-447"></a>    <span class="n">max_retries</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="mi">5</span>
-<a id="__codelineno-0-448" name="__codelineno-0-448"></a>    <span class="n">binding_policy</span><span class="p">:</span> <span class="n">BindingPolicy</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-<a id="__codelineno-0-449" name="__codelineno-0-449"></a>    <span class="n">binding_priority_key</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">]],</span> <span class="nb">object</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-<a id="__codelineno-0-450" name="__codelineno-0-450"></a>
-<a id="__codelineno-0-451" name="__codelineno-0-451"></a>    <span class="k">def</span><span class="w"> </span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
-<a id="__codelineno-0-452" name="__codelineno-0-452"></a>        <span class="c1"># Keep the inline-safe flag in sync with ``guard``, including post-construction</span>
-<a id="__codelineno-0-453" name="__codelineno-0-453"></a>        <span class="c1"># reassignment. Actions are explicitly allowed side effects (DB writes, API calls,</span>
-<a id="__codelineno-0-454" name="__codelineno-0-454"></a>        <span class="c1"># I/O), so guards and the PRIORITY sort key — both evaluated under the engine lock —</span>
-<a id="__codelineno-0-455" name="__codelineno-0-455"></a>        <span class="c1"># are purity-verified; actions are not.</span>
-<a id="__codelineno-0-456" name="__codelineno-0-456"></a>        <span class="k">if</span> <span class="n">name</span> <span class="o">==</span> <span class="s2">&quot;guard&quot;</span><span class="p">:</span>
-<a id="__codelineno-0-457" name="__codelineno-0-457"></a>            <span class="n">_reject_string_expression</span><span class="p">(</span><span class="s2">&quot;guard&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
-<a id="__codelineno-0-458" name="__codelineno-0-458"></a>            <span class="k">if</span> <span class="nb">callable</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
-<a id="__codelineno-0-459" name="__codelineno-0-459"></a>                <span class="n">verify_callable_purity</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
-<a id="__codelineno-0-460" name="__codelineno-0-460"></a>                <span class="n">_reject_non_bool_return</span><span class="p">(</span><span class="s2">&quot;guard&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
-<a id="__codelineno-0-461" name="__codelineno-0-461"></a>            <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="s2">&quot;_inline_safe&quot;</span><span class="p">,</span> <span class="n">_inline_safe_for</span><span class="p">(</span><span class="n">value</span><span class="p">))</span>
-<a id="__codelineno-0-462" name="__codelineno-0-462"></a>        <span class="k">elif</span> <span class="n">name</span> <span class="o">==</span> <span class="s2">&quot;binding_priority_key&quot;</span> <span class="ow">and</span> <span class="n">value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-<a id="__codelineno-0-463" name="__codelineno-0-463"></a>            <span class="c1"># String-expression keys are deferred (see ADR 0001), so reject non-callables</span>
-<a id="__codelineno-0-464" name="__codelineno-0-464"></a>            <span class="c1"># loudly rather than letting a truthy string be used as a key and raise on every</span>
-<a id="__codelineno-0-465" name="__codelineno-0-465"></a>            <span class="c1"># candidate at run time (which would silently livelock the engine).</span>
-<a id="__codelineno-0-466" name="__codelineno-0-466"></a>            <span class="k">if</span> <span class="ow">not</span> <span class="nb">callable</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
-<a id="__codelineno-0-467" name="__codelineno-0-467"></a>                <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span>
-<a id="__codelineno-0-468" name="__codelineno-0-468"></a>                    <span class="s2">&quot;binding_priority_key must be a callable or None; &quot;</span>
-<a id="__codelineno-0-469" name="__codelineno-0-469"></a>                    <span class="sa">f</span><span class="s2">&quot;got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">value</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">. String-expression keys are not supported.&quot;</span>
-<a id="__codelineno-0-470" name="__codelineno-0-470"></a>                <span class="p">)</span>
-<a id="__codelineno-0-471" name="__codelineno-0-471"></a>            <span class="n">verify_callable_purity</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
-<a id="__codelineno-0-472" name="__codelineno-0-472"></a>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+<span class="normal"><a href="#__codelineno-0-472">472</a></span>
+<span class="normal"><a href="#__codelineno-0-473">473</a></span>
+<span class="normal"><a href="#__codelineno-0-474">474</a></span>
+<span class="normal"><a href="#__codelineno-0-475">475</a></span>
+<span class="normal"><a href="#__codelineno-0-476">476</a></span>
+<span class="normal"><a href="#__codelineno-0-477">477</a></span>
+<span class="normal"><a href="#__codelineno-0-478">478</a></span>
+<span class="normal"><a href="#__codelineno-0-479">479</a></span>
+<span class="normal"><a href="#__codelineno-0-480">480</a></span>
+<span class="normal"><a href="#__codelineno-0-481">481</a></span>
+<span class="normal"><a href="#__codelineno-0-482">482</a></span>
+<span class="normal"><a href="#__codelineno-0-483">483</a></span>
+<span class="normal"><a href="#__codelineno-0-484">484</a></span>
+<span class="normal"><a href="#__codelineno-0-485">485</a></span>
+<span class="normal"><a href="#__codelineno-0-486">486</a></span>
+<span class="normal"><a href="#__codelineno-0-487">487</a></span>
+<span class="normal"><a href="#__codelineno-0-488">488</a></span>
+<span class="normal"><a href="#__codelineno-0-489">489</a></span>
+<span class="normal"><a href="#__codelineno-0-490">490</a></span>
+<span class="normal"><a href="#__codelineno-0-491">491</a></span>
+<span class="normal"><a href="#__codelineno-0-492">492</a></span>
+<span class="normal"><a href="#__codelineno-0-493">493</a></span>
+<span class="normal"><a href="#__codelineno-0-494">494</a></span>
+<span class="normal"><a href="#__codelineno-0-495">495</a></span>
+<span class="normal"><a href="#__codelineno-0-496">496</a></span>
+<span class="normal"><a href="#__codelineno-0-497">497</a></span>
+<span class="normal"><a href="#__codelineno-0-498">498</a></span>
+<span class="normal"><a href="#__codelineno-0-499">499</a></span>
+<span class="normal"><a href="#__codelineno-0-500">500</a></span>
+<span class="normal"><a href="#__codelineno-0-501">501</a></span>
+<span class="normal"><a href="#__codelineno-0-502">502</a></span>
+<span class="normal"><a href="#__codelineno-0-503">503</a></span>
+<span class="normal"><a href="#__codelineno-0-504">504</a></span>
+<span class="normal"><a href="#__codelineno-0-505">505</a></span>
+<span class="normal"><a href="#__codelineno-0-506">506</a></span>
+<span class="normal"><a href="#__codelineno-0-507">507</a></span>
+<span class="normal"><a href="#__codelineno-0-508">508</a></span>
+<span class="normal"><a href="#__codelineno-0-509">509</a></span>
+<span class="normal"><a href="#__codelineno-0-510">510</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-396" name="__codelineno-0-396"></a><span class="nd">@dataclass</span>
+<a id="__codelineno-0-397" name="__codelineno-0-397"></a><span class="k">class</span><span class="w"> </span><span class="nc">Transition</span><span class="p">:</span>
+<a id="__codelineno-0-398" name="__codelineno-0-398"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;A CPN transition that fires when all its input places are enabled.</span>
+<a id="__codelineno-0-399" name="__codelineno-0-399"></a>
+<a id="__codelineno-0-400" name="__codelineno-0-400"></a><span class="sd">    In CPN formalism a transition has:</span>
+<a id="__codelineno-0-401" name="__codelineno-0-401"></a>
+<a id="__codelineno-0-402" name="__codelineno-0-402"></a><span class="sd">    - **Input arcs** whose `key`/`filter` determine which tokens are consumed</span>
+<a id="__codelineno-0-403" name="__codelineno-0-403"></a><span class="sd">    - **Output arcs** whose `condition` determines whether tokens are produced</span>
+<a id="__codelineno-0-404" name="__codelineno-0-404"></a><span class="sd">    - A **guard** — a boolean predicate over the binding that must hold for the</span>
+<a id="__codelineno-0-405" name="__codelineno-0-405"></a><span class="sd">      transition to be enabled (evaluated before the action runs)</span>
+<a id="__codelineno-0-406" name="__codelineno-0-406"></a>
+<a id="__codelineno-0-407" name="__codelineno-0-407"></a><span class="sd">    Attributes:</span>
+<a id="__codelineno-0-408" name="__codelineno-0-408"></a><span class="sd">        name: Unique identifier within a [`PetriNet`][cpnx.PetriNet].</span>
+<a id="__codelineno-0-409" name="__codelineno-0-409"></a><span class="sd">        inputs: Input arcs (place to transition).</span>
+<a id="__codelineno-0-410" name="__codelineno-0-410"></a><span class="sd">        outputs: Output arcs (transition to place).</span>
+<a id="__codelineno-0-411" name="__codelineno-0-411"></a><span class="sd">        action: Callable consuming input tokens and returning output tokens.</span>
+<a id="__codelineno-0-412" name="__codelineno-0-412"></a><span class="sd">                Runs on the thread pool outside the engine lock.</span>
+<a id="__codelineno-0-413" name="__codelineno-0-413"></a><span class="sd">        guard: CPN transition guard — a `Callable[[list[Token]], bool]` (a string raises</span>
+<a id="__codelineno-0-414" name="__codelineno-0-414"></a><span class="sd">               `TypeError`). Evaluated while holding the engine lock; return `False` to</span>
+<a id="__codelineno-0-415" name="__codelineno-0-415"></a><span class="sd">               block firing. `None` (default) means always enabled. A certified guard</span>
+<a id="__codelineno-0-416" name="__codelineno-0-416"></a><span class="sd">               runs inline; an uncertified one runs on the timeout-bounded pool. Enforces</span>
+<a id="__codelineno-0-417" name="__codelineno-0-417"></a><span class="sd">               the CPN guard contract `Type[G(t)] = Bool`: if the callable is annotated,</span>
+<a id="__codelineno-0-418" name="__codelineno-0-418"></a><span class="sd">               its return type is checked to be `bool` at construction and a non-`bool`</span>
+<a id="__codelineno-0-419" name="__codelineno-0-419"></a><span class="sd">               annotation (e.g. `-&gt; int`) raises `TypeError`; unannotated guards (including</span>
+<a id="__codelineno-0-420" name="__codelineno-0-420"></a><span class="sd">               every lambda) are accepted unchecked. **Prefer a closed-world (certified)</span>
+<a id="__codelineno-0-421" name="__codelineno-0-421"></a><span class="sd">               guard**: an uncertified one pays a thread round-trip per *candidate binding*</span>
+<a id="__codelineno-0-422" name="__codelineno-0-422"></a><span class="sd">               on every enabling check (bounded by `binding_search_limit`, so less severe</span>
+<a id="__codelineno-0-423" name="__codelineno-0-423"></a><span class="sd">               than an uncertified arc `key`/`filter`, which is per *token* and unbounded —</span>
+<a id="__codelineno-0-424" name="__codelineno-0-424"></a><span class="sd">               see [`InputArc`][cpnx.InputArc]). Certify it the same way: close over</span>
+<a id="__codelineno-0-425" name="__codelineno-0-425"></a><span class="sd">               immutable values read at construction, never mutable module or instance</span>
+<a id="__codelineno-0-426" name="__codelineno-0-426"></a><span class="sd">               state.</span>
+<a id="__codelineno-0-427" name="__codelineno-0-427"></a><span class="sd">        priority: Lower value fires first when multiple transitions are enabled. Defaults to 10.</span>
+<a id="__codelineno-0-428" name="__codelineno-0-428"></a><span class="sd">        action_timeout_secs: Maximum wall-clock seconds the action may run. When `None`</span>
+<a id="__codelineno-0-429" name="__codelineno-0-429"></a><span class="sd">               (default), the action runs without a deadline — fully backward compatible.</span>
+<a id="__codelineno-0-430" name="__codelineno-0-430"></a><span class="sd">               When set, the engine triggers atomic rollback if the action does not return</span>
+<a id="__codelineno-0-431" name="__codelineno-0-431"></a><span class="sd">               within this duration: all consumed tokens are returned to their source places</span>
+<a id="__codelineno-0-432" name="__codelineno-0-432"></a><span class="sd">               (data tokens with a 1-second `available_at` delay to prevent livelock), and</span>
+<a id="__codelineno-0-433" name="__codelineno-0-433"></a><span class="sd">               the `on_error` callback fires with a `RuntimeError` that names the</span>
+<a id="__codelineno-0-434" name="__codelineno-0-434"></a><span class="sd">               transition and the elapsed timeout.</span>
+<a id="__codelineno-0-435" name="__codelineno-0-435"></a>
+<a id="__codelineno-0-436" name="__codelineno-0-436"></a><span class="sd">               **This does not kill the underlying OS thread.** The timed-out action</span>
+<a id="__codelineno-0-437" name="__codelineno-0-437"></a><span class="sd">               continues running in the background until it completes or the process exits;</span>
+<a id="__codelineno-0-438" name="__codelineno-0-438"></a><span class="sd">               its return value is silently discarded. Callers must apply native I/O</span>
+<a id="__codelineno-0-439" name="__codelineno-0-439"></a><span class="sd">               timeouts inside their actions (e.g. `requests.get(timeout=...)`,</span>
+<a id="__codelineno-0-440" name="__codelineno-0-440"></a><span class="sd">               `httpx` client timeouts) to prevent zombie thread accumulation.</span>
+<a id="__codelineno-0-441" name="__codelineno-0-441"></a><span class="sd">               `action_timeout_secs` is defense-in-depth, not a substitute for proper</span>
+<a id="__codelineno-0-442" name="__codelineno-0-442"></a><span class="sd">               I/O timeout discipline.</span>
+<a id="__codelineno-0-443" name="__codelineno-0-443"></a><span class="sd">        max_retries: Maximum number of times to retry the transition action on failure</span>
+<a id="__codelineno-0-444" name="__codelineno-0-444"></a><span class="sd">               before dead-lettering the data tokens.</span>
+<a id="__codelineno-0-445" name="__codelineno-0-445"></a><span class="sd">               `None` means infinite retry (today&#39;s behavior; forfeits the quiescence guarantee).</span>
+<a id="__codelineno-0-446" name="__codelineno-0-446"></a><span class="sd">               `0` means route data token(s) to `error_place` on the first failure.</span>
+<a id="__codelineno-0-447" name="__codelineno-0-447"></a><span class="sd">               `N &gt; 0` means retry up to `N` times, then route to `error_place`. Default is 5.</span>
+<a id="__codelineno-0-448" name="__codelineno-0-448"></a><span class="sd">        binding_policy: How the engine resolves which input tokens bind this transition</span>
+<a id="__codelineno-0-449" name="__codelineno-0-449"></a><span class="sd">               when checking enablement — see [`BindingPolicy`][cpnx.BindingPolicy].</span>
+<a id="__codelineno-0-450" name="__codelineno-0-450"></a><span class="sd">               `None` (default) inherits the net-wide default set on</span>
+<a id="__codelineno-0-451" name="__codelineno-0-451"></a><span class="sd">               [`PetriNet`][cpnx.PetriNet] (itself `BindingPolicy.LEGACY` by default), so</span>
+<a id="__codelineno-0-452" name="__codelineno-0-452"></a><span class="sd">               an unset transition behaves exactly as before. Set</span>
+<a id="__codelineno-0-453" name="__codelineno-0-453"></a><span class="sd">               `BindingPolicy.FIRST` to enable deterministic-complete binding search</span>
+<a id="__codelineno-0-454" name="__codelineno-0-454"></a><span class="sd">               (fixing head-of-line blocking) for this transition only.</span>
+<a id="__codelineno-0-455" name="__codelineno-0-455"></a><span class="sd">        binding_priority_key: Sort key used only under `BindingPolicy.PRIORITY`. A pure</span>
+<a id="__codelineno-0-456" name="__codelineno-0-456"></a><span class="sd">               `Callable[[list[Token]], object]` (must be callable or `None` — string</span>
+<a id="__codelineno-0-457" name="__codelineno-0-457"></a><span class="sd">               expressions are not supported and raise `TypeError` at assignment) mapping a</span>
+<a id="__codelineno-0-458" name="__codelineno-0-458"></a><span class="sd">               candidate binding (the flat list of tokens it would consume) to a comparable</span>
+<a id="__codelineno-0-459" name="__codelineno-0-459"></a><span class="sd">               value; the binding with the **minimum** key is selected, ties broken by</span>
+<a id="__codelineno-0-460" name="__codelineno-0-460"></a><span class="sd">               insertion order. `None` (default) means oldest-first — the minimum</span>
+<a id="__codelineno-0-461" name="__codelineno-0-461"></a><span class="sd">               `Token.created_at` across the binding&#39;s **data** tokens (resource tokens are</span>
+<a id="__codelineno-0-462" name="__codelineno-0-462"></a><span class="sd">               excluded, since a permit created at net construction is older than any data</span>
+<a id="__codelineno-0-463" name="__codelineno-0-463"></a><span class="sd">               token and would otherwise tie every candidate and collapse selection to</span>
+<a id="__codelineno-0-464" name="__codelineno-0-464"></a><span class="sd">               insertion order; a resource-only binding falls back to all tokens). The key must</span>
+<a id="__codelineno-0-465" name="__codelineno-0-465"></a><span class="sd">               return values that are totally ordered *with each other*; a candidate whose key</span>
+<a id="__codelineno-0-466" name="__codelineno-0-466"></a><span class="sd">               raises or is incomparable with the running best is skipped. If **every**</span>
+<a id="__codelineno-0-467" name="__codelineno-0-467"></a><span class="sd">               candidate is skipped, the first satisfying binding is used *and* `on_error` fires</span>
+<a id="__codelineno-0-468" name="__codelineno-0-468"></a><span class="sd">               (once per enabling pass, off the lock) so a wholly-broken key is not silent.</span>
+<a id="__codelineno-0-469" name="__codelineno-0-469"></a>
+<a id="__codelineno-0-470" name="__codelineno-0-470"></a><span class="sd">               **Performance / lock discipline:** unlike a callable `guard` (which runs on</span>
+<a id="__codelineno-0-471" name="__codelineno-0-471"></a><span class="sd">               the expression thread pool under `expr_timeout_secs`), the key is invoked</span>
+<a id="__codelineno-0-472" name="__codelineno-0-472"></a><span class="sd">               **inline while holding the engine lock, with no timeout**, once per candidate</span>
+<a id="__codelineno-0-473" name="__codelineno-0-473"></a><span class="sd">               — up to `binding_search_limit` times per resolution. It is purity-verified</span>
+<a id="__codelineno-0-474" name="__codelineno-0-474"></a><span class="sd">               (no I/O) but *not* time-bounded, so it must be trivially cheap; an expensive</span>
+<a id="__codelineno-0-475" name="__codelineno-0-475"></a><span class="sd">               key stalls every concurrent `deposit`/`step`/probe on the net.</span>
+<a id="__codelineno-0-476" name="__codelineno-0-476"></a><span class="sd">    &quot;&quot;&quot;</span>
+<a id="__codelineno-0-477" name="__codelineno-0-477"></a>
+<a id="__codelineno-0-478" name="__codelineno-0-478"></a>    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>
+<a id="__codelineno-0-479" name="__codelineno-0-479"></a>    <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">InputArc</span><span class="p">]</span>
+<a id="__codelineno-0-480" name="__codelineno-0-480"></a>    <span class="n">outputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">OutputArc</span><span class="p">]</span>
+<a id="__codelineno-0-481" name="__codelineno-0-481"></a>    <span class="n">action</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">]],</span> <span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">]]</span>
+<a id="__codelineno-0-482" name="__codelineno-0-482"></a>    <span class="n">guard</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">]],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<a id="__codelineno-0-483" name="__codelineno-0-483"></a>    <span class="n">priority</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10</span>
+<a id="__codelineno-0-484" name="__codelineno-0-484"></a>    <span class="n">action_timeout_secs</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<a id="__codelineno-0-485" name="__codelineno-0-485"></a>    <span class="n">max_retries</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="mi">5</span>
+<a id="__codelineno-0-486" name="__codelineno-0-486"></a>    <span class="n">binding_policy</span><span class="p">:</span> <span class="n">BindingPolicy</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<a id="__codelineno-0-487" name="__codelineno-0-487"></a>    <span class="n">binding_priority_key</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">]],</span> <span class="nb">object</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<a id="__codelineno-0-488" name="__codelineno-0-488"></a>
+<a id="__codelineno-0-489" name="__codelineno-0-489"></a>    <span class="k">def</span><span class="w"> </span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
+<a id="__codelineno-0-490" name="__codelineno-0-490"></a>        <span class="c1"># Keep the inline-safe flag in sync with ``guard``, including post-construction</span>
+<a id="__codelineno-0-491" name="__codelineno-0-491"></a>        <span class="c1"># reassignment. Actions are explicitly allowed side effects (DB writes, API calls,</span>
+<a id="__codelineno-0-492" name="__codelineno-0-492"></a>        <span class="c1"># I/O), so guards and the PRIORITY sort key — both evaluated under the engine lock —</span>
+<a id="__codelineno-0-493" name="__codelineno-0-493"></a>        <span class="c1"># are purity-verified; actions are not.</span>
+<a id="__codelineno-0-494" name="__codelineno-0-494"></a>        <span class="k">if</span> <span class="n">name</span> <span class="o">==</span> <span class="s2">&quot;guard&quot;</span><span class="p">:</span>
+<a id="__codelineno-0-495" name="__codelineno-0-495"></a>            <span class="n">_reject_string_expression</span><span class="p">(</span><span class="s2">&quot;guard&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+<a id="__codelineno-0-496" name="__codelineno-0-496"></a>            <span class="k">if</span> <span class="nb">callable</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
+<a id="__codelineno-0-497" name="__codelineno-0-497"></a>                <span class="n">verify_callable_purity</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+<a id="__codelineno-0-498" name="__codelineno-0-498"></a>                <span class="n">_reject_non_bool_return</span><span class="p">(</span><span class="s2">&quot;guard&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+<a id="__codelineno-0-499" name="__codelineno-0-499"></a>            <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="s2">&quot;_inline_safe&quot;</span><span class="p">,</span> <span class="n">_inline_safe_for</span><span class="p">(</span><span class="n">value</span><span class="p">))</span>
+<a id="__codelineno-0-500" name="__codelineno-0-500"></a>        <span class="k">elif</span> <span class="n">name</span> <span class="o">==</span> <span class="s2">&quot;binding_priority_key&quot;</span> <span class="ow">and</span> <span class="n">value</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+<a id="__codelineno-0-501" name="__codelineno-0-501"></a>            <span class="c1"># String-expression keys are deferred (see ADR 0001), so reject non-callables</span>
+<a id="__codelineno-0-502" name="__codelineno-0-502"></a>            <span class="c1"># loudly rather than letting a truthy string be used as a key and raise on every</span>
+<a id="__codelineno-0-503" name="__codelineno-0-503"></a>            <span class="c1"># candidate at run time (which would silently livelock the engine).</span>
+<a id="__codelineno-0-504" name="__codelineno-0-504"></a>            <span class="k">if</span> <span class="ow">not</span> <span class="nb">callable</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
+<a id="__codelineno-0-505" name="__codelineno-0-505"></a>                <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span>
+<a id="__codelineno-0-506" name="__codelineno-0-506"></a>                    <span class="s2">&quot;binding_priority_key must be a callable or None; &quot;</span>
+<a id="__codelineno-0-507" name="__codelineno-0-507"></a>                    <span class="sa">f</span><span class="s2">&quot;got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">value</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">. String-expression keys are not supported.&quot;</span>
+<a id="__codelineno-0-508" name="__codelineno-0-508"></a>                <span class="p">)</span>
+<a id="__codelineno-0-509" name="__codelineno-0-509"></a>            <span class="n">verify_callable_purity</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+<a id="__codelineno-0-510" name="__codelineno-0-510"></a>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
 </code></pre></div></td></tr></table></div>
               </details>
 
@@ -1224,45 +1274,7 @@ exist in the subnet raises <code>ValueError</code>.</p>
 
               <details class="mkdocstrings-source">
                 <summary>Source code in <code>src/cpnx/transitions.py</code></summary>
-                <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-475">475</a></span>
-<span class="normal"><a href="#__codelineno-0-476">476</a></span>
-<span class="normal"><a href="#__codelineno-0-477">477</a></span>
-<span class="normal"><a href="#__codelineno-0-478">478</a></span>
-<span class="normal"><a href="#__codelineno-0-479">479</a></span>
-<span class="normal"><a href="#__codelineno-0-480">480</a></span>
-<span class="normal"><a href="#__codelineno-0-481">481</a></span>
-<span class="normal"><a href="#__codelineno-0-482">482</a></span>
-<span class="normal"><a href="#__codelineno-0-483">483</a></span>
-<span class="normal"><a href="#__codelineno-0-484">484</a></span>
-<span class="normal"><a href="#__codelineno-0-485">485</a></span>
-<span class="normal"><a href="#__codelineno-0-486">486</a></span>
-<span class="normal"><a href="#__codelineno-0-487">487</a></span>
-<span class="normal"><a href="#__codelineno-0-488">488</a></span>
-<span class="normal"><a href="#__codelineno-0-489">489</a></span>
-<span class="normal"><a href="#__codelineno-0-490">490</a></span>
-<span class="normal"><a href="#__codelineno-0-491">491</a></span>
-<span class="normal"><a href="#__codelineno-0-492">492</a></span>
-<span class="normal"><a href="#__codelineno-0-493">493</a></span>
-<span class="normal"><a href="#__codelineno-0-494">494</a></span>
-<span class="normal"><a href="#__codelineno-0-495">495</a></span>
-<span class="normal"><a href="#__codelineno-0-496">496</a></span>
-<span class="normal"><a href="#__codelineno-0-497">497</a></span>
-<span class="normal"><a href="#__codelineno-0-498">498</a></span>
-<span class="normal"><a href="#__codelineno-0-499">499</a></span>
-<span class="normal"><a href="#__codelineno-0-500">500</a></span>
-<span class="normal"><a href="#__codelineno-0-501">501</a></span>
-<span class="normal"><a href="#__codelineno-0-502">502</a></span>
-<span class="normal"><a href="#__codelineno-0-503">503</a></span>
-<span class="normal"><a href="#__codelineno-0-504">504</a></span>
-<span class="normal"><a href="#__codelineno-0-505">505</a></span>
-<span class="normal"><a href="#__codelineno-0-506">506</a></span>
-<span class="normal"><a href="#__codelineno-0-507">507</a></span>
-<span class="normal"><a href="#__codelineno-0-508">508</a></span>
-<span class="normal"><a href="#__codelineno-0-509">509</a></span>
-<span class="normal"><a href="#__codelineno-0-510">510</a></span>
-<span class="normal"><a href="#__codelineno-0-511">511</a></span>
-<span class="normal"><a href="#__codelineno-0-512">512</a></span>
-<span class="normal"><a href="#__codelineno-0-513">513</a></span>
+                <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-513">513</a></span>
 <span class="normal"><a href="#__codelineno-0-514">514</a></span>
 <span class="normal"><a href="#__codelineno-0-515">515</a></span>
 <span class="normal"><a href="#__codelineno-0-516">516</a></span>
@@ -1280,63 +1292,101 @@ exist in the subnet raises <code>ValueError</code>.</p>
 <span class="normal"><a href="#__codelineno-0-528">528</a></span>
 <span class="normal"><a href="#__codelineno-0-529">529</a></span>
 <span class="normal"><a href="#__codelineno-0-530">530</a></span>
-<span class="normal"><a href="#__codelineno-0-531">531</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-475" name="__codelineno-0-475"></a><span class="nd">@dataclass</span>
-<a id="__codelineno-0-476" name="__codelineno-0-476"></a><span class="k">class</span><span class="w"> </span><span class="nc">SubstitutionTransition</span><span class="p">(</span><span class="n">Transition</span><span class="p">):</span>
-<a id="__codelineno-0-477" name="__codelineno-0-477"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;A [`Transition`][cpnx.Transition] that encapsulates an entire sub-PetriNet (Hierarchical CPN).</span>
-<a id="__codelineno-0-478" name="__codelineno-0-478"></a>
-<a id="__codelineno-0-479" name="__codelineno-0-479"></a><span class="sd">    Unlike a plain `Transition`, whose `action` is an arbitrary callable, a</span>
-<a id="__codelineno-0-480" name="__codelineno-0-480"></a><span class="sd">    `SubstitutionTransition` delegates firing to a nested [`PetriNet`][cpnx.PetriNet] (the</span>
-<a id="__codelineno-0-481" name="__codelineno-0-481"></a><span class="sd">    `subnet`): named port places inside the subnet are bound to named socket places in the</span>
-<a id="__codelineno-0-482" name="__codelineno-0-482"></a><span class="sd">    parent net via `port_socket_map`, and `subnet_deadline_secs` bounds how long the subnet</span>
-<a id="__codelineno-0-483" name="__codelineno-0-483"></a><span class="sd">    is given to reach quiescence. The child subnet is fully insulated from the parent net —</span>
-<a id="__codelineno-0-484" name="__codelineno-0-484"></a><span class="sd">    it carries no reference to its parent. Communication occurs strictly through the</span>
-<a id="__codelineno-0-485" name="__codelineno-0-485"></a><span class="sd">    `port_socket_map`.</span>
-<a id="__codelineno-0-486" name="__codelineno-0-486"></a>
-<a id="__codelineno-0-487" name="__codelineno-0-487"></a><span class="sd">    A subnet instance may only be wrapped by one `SubstitutionTransition` at a</span>
-<a id="__codelineno-0-488" name="__codelineno-0-488"></a><span class="sd">    time; this is tracked process-wide via a weak set. Attempting to wrap the same subnet</span>
-<a id="__codelineno-0-489" name="__codelineno-0-489"></a><span class="sd">    twice raises `ValueError`. Constructing with a non-dict `port_socket_map`, or with</span>
-<a id="__codelineno-0-490" name="__codelineno-0-490"></a><span class="sd">    non-string port/socket names, raises `TypeError`. Referencing a port place that does not</span>
-<a id="__codelineno-0-491" name="__codelineno-0-491"></a><span class="sd">    exist in the subnet raises `ValueError`.</span>
-<a id="__codelineno-0-492" name="__codelineno-0-492"></a>
-<a id="__codelineno-0-493" name="__codelineno-0-493"></a><span class="sd">    Attributes:</span>
-<a id="__codelineno-0-494" name="__codelineno-0-494"></a><span class="sd">        subnet: The nested `PetriNet` this transition wraps and fires as a unit.</span>
-<a id="__codelineno-0-495" name="__codelineno-0-495"></a><span class="sd">        port_socket_map: Mapping of port place names (in `subnet`) to socket place names</span>
-<a id="__codelineno-0-496" name="__codelineno-0-496"></a><span class="sd">                         (in the parent net). Every key must name a place that already</span>
-<a id="__codelineno-0-497" name="__codelineno-0-497"></a><span class="sd">                         exists in `subnet`. Defaults to an empty dict.</span>
-<a id="__codelineno-0-498" name="__codelineno-0-498"></a><span class="sd">        subnet_deadline_secs: Maximum wall-clock seconds allowed for the subnet to reach</span>
-<a id="__codelineno-0-499" name="__codelineno-0-499"></a><span class="sd">                         quiescence when this transition fires. Defaults to `30.0`.</span>
-<a id="__codelineno-0-500" name="__codelineno-0-500"></a><span class="sd">    &quot;&quot;&quot;</span>
-<a id="__codelineno-0-501" name="__codelineno-0-501"></a>
-<a id="__codelineno-0-502" name="__codelineno-0-502"></a>    <span class="n">_mapped_subnets</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="n">weakref</span><span class="o">.</span><span class="n">WeakSet</span><span class="p">]</span> <span class="o">=</span> <span class="n">weakref</span><span class="o">.</span><span class="n">WeakSet</span><span class="p">()</span>
-<a id="__codelineno-0-503" name="__codelineno-0-503"></a>
-<a id="__codelineno-0-504" name="__codelineno-0-504"></a>    <span class="n">subnet</span><span class="p">:</span> <span class="s2">&quot;PetriNet&quot;</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>  <span class="c1"># type: ignore[assignment]</span>
-<a id="__codelineno-0-505" name="__codelineno-0-505"></a>    <span class="n">port_socket_map</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
-<a id="__codelineno-0-506" name="__codelineno-0-506"></a>    <span class="n">subnet_deadline_secs</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">30.0</span>
-<a id="__codelineno-0-507" name="__codelineno-0-507"></a>
-<a id="__codelineno-0-508" name="__codelineno-0-508"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-<a id="__codelineno-0-509" name="__codelineno-0-509"></a>        <span class="c1"># Guard purity/inline-safety is handled by Transition.__setattr__ during field</span>
-<a id="__codelineno-0-510" name="__codelineno-0-510"></a>        <span class="c1"># assignment; here we only validate the substitution-specific structure.</span>
-<a id="__codelineno-0-511" name="__codelineno-0-511"></a>        <span class="c1"># Validate that the ports and sockets are structurally valid mapping names</span>
-<a id="__codelineno-0-512" name="__codelineno-0-512"></a>        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">port_socket_map</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
-<a id="__codelineno-0-513" name="__codelineno-0-513"></a>            <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span><span class="s2">&quot;port_socket_map must be a dictionary.&quot;</span><span class="p">)</span>
-<a id="__codelineno-0-514" name="__codelineno-0-514"></a>        <span class="c1"># Ensure context isolation: child subnet cannot refer directly to parent places</span>
-<a id="__codelineno-0-515" name="__codelineno-0-515"></a>        <span class="c1"># that are not formally mapped.</span>
-<a id="__codelineno-0-516" name="__codelineno-0-516"></a>        <span class="k">for</span> <span class="n">port</span><span class="p">,</span> <span class="n">socket</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">port_socket_map</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-<a id="__codelineno-0-517" name="__codelineno-0-517"></a>            <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">port</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">socket</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
-<a id="__codelineno-0-518" name="__codelineno-0-518"></a>                <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span><span class="s2">&quot;Port and socket mapping names must be strings.&quot;</span><span class="p">)</span>
-<a id="__codelineno-0-519" name="__codelineno-0-519"></a>
-<a id="__codelineno-0-520" name="__codelineno-0-520"></a>        <span class="n">missing</span> <span class="o">=</span> <span class="p">[</span><span class="n">p</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">port_socket_map</span> <span class="k">if</span> <span class="n">p</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">subnet</span><span class="o">.</span><span class="n">places</span><span class="p">]</span>
-<a id="__codelineno-0-521" name="__codelineno-0-521"></a>        <span class="k">if</span> <span class="n">missing</span><span class="p">:</span>
-<a id="__codelineno-0-522" name="__codelineno-0-522"></a>            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-<a id="__codelineno-0-523" name="__codelineno-0-523"></a>                <span class="sa">f</span><span class="s2">&quot;SubstitutionTransition &#39;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">&#39;: subnet has no places for ports </span><span class="si">{</span><span class="n">missing</span><span class="si">}</span><span class="s2">. &quot;</span>
-<a id="__codelineno-0-524" name="__codelineno-0-524"></a>                <span class="s2">&quot;Pre-declare port places in the subnet before wrapping it.&quot;</span>
-<a id="__codelineno-0-525" name="__codelineno-0-525"></a>            <span class="p">)</span>
-<a id="__codelineno-0-526" name="__codelineno-0-526"></a>
-<a id="__codelineno-0-527" name="__codelineno-0-527"></a>        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">subnet</span> <span class="ow">in</span> <span class="n">SubstitutionTransition</span><span class="o">.</span><span class="n">_mapped_subnets</span><span class="p">:</span>
-<a id="__codelineno-0-528" name="__codelineno-0-528"></a>            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-<a id="__codelineno-0-529" name="__codelineno-0-529"></a>                <span class="sa">f</span><span class="s2">&quot;SubstitutionTransition &#39;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">&#39;: child subnet is already mapped to another transition.&quot;</span>
-<a id="__codelineno-0-530" name="__codelineno-0-530"></a>            <span class="p">)</span>
-<a id="__codelineno-0-531" name="__codelineno-0-531"></a>        <span class="n">SubstitutionTransition</span><span class="o">.</span><span class="n">_mapped_subnets</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">subnet</span><span class="p">)</span>
+<span class="normal"><a href="#__codelineno-0-531">531</a></span>
+<span class="normal"><a href="#__codelineno-0-532">532</a></span>
+<span class="normal"><a href="#__codelineno-0-533">533</a></span>
+<span class="normal"><a href="#__codelineno-0-534">534</a></span>
+<span class="normal"><a href="#__codelineno-0-535">535</a></span>
+<span class="normal"><a href="#__codelineno-0-536">536</a></span>
+<span class="normal"><a href="#__codelineno-0-537">537</a></span>
+<span class="normal"><a href="#__codelineno-0-538">538</a></span>
+<span class="normal"><a href="#__codelineno-0-539">539</a></span>
+<span class="normal"><a href="#__codelineno-0-540">540</a></span>
+<span class="normal"><a href="#__codelineno-0-541">541</a></span>
+<span class="normal"><a href="#__codelineno-0-542">542</a></span>
+<span class="normal"><a href="#__codelineno-0-543">543</a></span>
+<span class="normal"><a href="#__codelineno-0-544">544</a></span>
+<span class="normal"><a href="#__codelineno-0-545">545</a></span>
+<span class="normal"><a href="#__codelineno-0-546">546</a></span>
+<span class="normal"><a href="#__codelineno-0-547">547</a></span>
+<span class="normal"><a href="#__codelineno-0-548">548</a></span>
+<span class="normal"><a href="#__codelineno-0-549">549</a></span>
+<span class="normal"><a href="#__codelineno-0-550">550</a></span>
+<span class="normal"><a href="#__codelineno-0-551">551</a></span>
+<span class="normal"><a href="#__codelineno-0-552">552</a></span>
+<span class="normal"><a href="#__codelineno-0-553">553</a></span>
+<span class="normal"><a href="#__codelineno-0-554">554</a></span>
+<span class="normal"><a href="#__codelineno-0-555">555</a></span>
+<span class="normal"><a href="#__codelineno-0-556">556</a></span>
+<span class="normal"><a href="#__codelineno-0-557">557</a></span>
+<span class="normal"><a href="#__codelineno-0-558">558</a></span>
+<span class="normal"><a href="#__codelineno-0-559">559</a></span>
+<span class="normal"><a href="#__codelineno-0-560">560</a></span>
+<span class="normal"><a href="#__codelineno-0-561">561</a></span>
+<span class="normal"><a href="#__codelineno-0-562">562</a></span>
+<span class="normal"><a href="#__codelineno-0-563">563</a></span>
+<span class="normal"><a href="#__codelineno-0-564">564</a></span>
+<span class="normal"><a href="#__codelineno-0-565">565</a></span>
+<span class="normal"><a href="#__codelineno-0-566">566</a></span>
+<span class="normal"><a href="#__codelineno-0-567">567</a></span>
+<span class="normal"><a href="#__codelineno-0-568">568</a></span>
+<span class="normal"><a href="#__codelineno-0-569">569</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-513" name="__codelineno-0-513"></a><span class="nd">@dataclass</span>
+<a id="__codelineno-0-514" name="__codelineno-0-514"></a><span class="k">class</span><span class="w"> </span><span class="nc">SubstitutionTransition</span><span class="p">(</span><span class="n">Transition</span><span class="p">):</span>
+<a id="__codelineno-0-515" name="__codelineno-0-515"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;A [`Transition`][cpnx.Transition] that encapsulates an entire sub-PetriNet (Hierarchical CPN).</span>
+<a id="__codelineno-0-516" name="__codelineno-0-516"></a>
+<a id="__codelineno-0-517" name="__codelineno-0-517"></a><span class="sd">    Unlike a plain `Transition`, whose `action` is an arbitrary callable, a</span>
+<a id="__codelineno-0-518" name="__codelineno-0-518"></a><span class="sd">    `SubstitutionTransition` delegates firing to a nested [`PetriNet`][cpnx.PetriNet] (the</span>
+<a id="__codelineno-0-519" name="__codelineno-0-519"></a><span class="sd">    `subnet`): named port places inside the subnet are bound to named socket places in the</span>
+<a id="__codelineno-0-520" name="__codelineno-0-520"></a><span class="sd">    parent net via `port_socket_map`, and `subnet_deadline_secs` bounds how long the subnet</span>
+<a id="__codelineno-0-521" name="__codelineno-0-521"></a><span class="sd">    is given to reach quiescence. The child subnet is fully insulated from the parent net —</span>
+<a id="__codelineno-0-522" name="__codelineno-0-522"></a><span class="sd">    it carries no reference to its parent. Communication occurs strictly through the</span>
+<a id="__codelineno-0-523" name="__codelineno-0-523"></a><span class="sd">    `port_socket_map`.</span>
+<a id="__codelineno-0-524" name="__codelineno-0-524"></a>
+<a id="__codelineno-0-525" name="__codelineno-0-525"></a><span class="sd">    A subnet instance may only be wrapped by one `SubstitutionTransition` at a</span>
+<a id="__codelineno-0-526" name="__codelineno-0-526"></a><span class="sd">    time; this is tracked process-wide via a weak set. Attempting to wrap the same subnet</span>
+<a id="__codelineno-0-527" name="__codelineno-0-527"></a><span class="sd">    twice raises `ValueError`. Constructing with a non-dict `port_socket_map`, or with</span>
+<a id="__codelineno-0-528" name="__codelineno-0-528"></a><span class="sd">    non-string port/socket names, raises `TypeError`. Referencing a port place that does not</span>
+<a id="__codelineno-0-529" name="__codelineno-0-529"></a><span class="sd">    exist in the subnet raises `ValueError`.</span>
+<a id="__codelineno-0-530" name="__codelineno-0-530"></a>
+<a id="__codelineno-0-531" name="__codelineno-0-531"></a><span class="sd">    Attributes:</span>
+<a id="__codelineno-0-532" name="__codelineno-0-532"></a><span class="sd">        subnet: The nested `PetriNet` this transition wraps and fires as a unit.</span>
+<a id="__codelineno-0-533" name="__codelineno-0-533"></a><span class="sd">        port_socket_map: Mapping of port place names (in `subnet`) to socket place names</span>
+<a id="__codelineno-0-534" name="__codelineno-0-534"></a><span class="sd">                         (in the parent net). Every key must name a place that already</span>
+<a id="__codelineno-0-535" name="__codelineno-0-535"></a><span class="sd">                         exists in `subnet`. Defaults to an empty dict.</span>
+<a id="__codelineno-0-536" name="__codelineno-0-536"></a><span class="sd">        subnet_deadline_secs: Maximum wall-clock seconds allowed for the subnet to reach</span>
+<a id="__codelineno-0-537" name="__codelineno-0-537"></a><span class="sd">                         quiescence when this transition fires. Defaults to `30.0`.</span>
+<a id="__codelineno-0-538" name="__codelineno-0-538"></a><span class="sd">    &quot;&quot;&quot;</span>
+<a id="__codelineno-0-539" name="__codelineno-0-539"></a>
+<a id="__codelineno-0-540" name="__codelineno-0-540"></a>    <span class="n">_mapped_subnets</span><span class="p">:</span> <span class="n">ClassVar</span><span class="p">[</span><span class="n">weakref</span><span class="o">.</span><span class="n">WeakSet</span><span class="p">]</span> <span class="o">=</span> <span class="n">weakref</span><span class="o">.</span><span class="n">WeakSet</span><span class="p">()</span>
+<a id="__codelineno-0-541" name="__codelineno-0-541"></a>
+<a id="__codelineno-0-542" name="__codelineno-0-542"></a>    <span class="n">subnet</span><span class="p">:</span> <span class="s2">&quot;PetriNet&quot;</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>  <span class="c1"># type: ignore[assignment]</span>
+<a id="__codelineno-0-543" name="__codelineno-0-543"></a>    <span class="n">port_socket_map</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
+<a id="__codelineno-0-544" name="__codelineno-0-544"></a>    <span class="n">subnet_deadline_secs</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">30.0</span>
+<a id="__codelineno-0-545" name="__codelineno-0-545"></a>
+<a id="__codelineno-0-546" name="__codelineno-0-546"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<a id="__codelineno-0-547" name="__codelineno-0-547"></a>        <span class="c1"># Guard purity/inline-safety is handled by Transition.__setattr__ during field</span>
+<a id="__codelineno-0-548" name="__codelineno-0-548"></a>        <span class="c1"># assignment; here we only validate the substitution-specific structure.</span>
+<a id="__codelineno-0-549" name="__codelineno-0-549"></a>        <span class="c1"># Validate that the ports and sockets are structurally valid mapping names</span>
+<a id="__codelineno-0-550" name="__codelineno-0-550"></a>        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">port_socket_map</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+<a id="__codelineno-0-551" name="__codelineno-0-551"></a>            <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span><span class="s2">&quot;port_socket_map must be a dictionary.&quot;</span><span class="p">)</span>
+<a id="__codelineno-0-552" name="__codelineno-0-552"></a>        <span class="c1"># Ensure context isolation: child subnet cannot refer directly to parent places</span>
+<a id="__codelineno-0-553" name="__codelineno-0-553"></a>        <span class="c1"># that are not formally mapped.</span>
+<a id="__codelineno-0-554" name="__codelineno-0-554"></a>        <span class="k">for</span> <span class="n">port</span><span class="p">,</span> <span class="n">socket</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">port_socket_map</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+<a id="__codelineno-0-555" name="__codelineno-0-555"></a>            <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">port</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">socket</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+<a id="__codelineno-0-556" name="__codelineno-0-556"></a>                <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span><span class="s2">&quot;Port and socket mapping names must be strings.&quot;</span><span class="p">)</span>
+<a id="__codelineno-0-557" name="__codelineno-0-557"></a>
+<a id="__codelineno-0-558" name="__codelineno-0-558"></a>        <span class="n">missing</span> <span class="o">=</span> <span class="p">[</span><span class="n">p</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">port_socket_map</span> <span class="k">if</span> <span class="n">p</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">subnet</span><span class="o">.</span><span class="n">places</span><span class="p">]</span>
+<a id="__codelineno-0-559" name="__codelineno-0-559"></a>        <span class="k">if</span> <span class="n">missing</span><span class="p">:</span>
+<a id="__codelineno-0-560" name="__codelineno-0-560"></a>            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+<a id="__codelineno-0-561" name="__codelineno-0-561"></a>                <span class="sa">f</span><span class="s2">&quot;SubstitutionTransition &#39;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">&#39;: subnet has no places for ports </span><span class="si">{</span><span class="n">missing</span><span class="si">}</span><span class="s2">. &quot;</span>
+<a id="__codelineno-0-562" name="__codelineno-0-562"></a>                <span class="s2">&quot;Pre-declare port places in the subnet before wrapping it.&quot;</span>
+<a id="__codelineno-0-563" name="__codelineno-0-563"></a>            <span class="p">)</span>
+<a id="__codelineno-0-564" name="__codelineno-0-564"></a>
+<a id="__codelineno-0-565" name="__codelineno-0-565"></a>        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">subnet</span> <span class="ow">in</span> <span class="n">SubstitutionTransition</span><span class="o">.</span><span class="n">_mapped_subnets</span><span class="p">:</span>
+<a id="__codelineno-0-566" name="__codelineno-0-566"></a>            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+<a id="__codelineno-0-567" name="__codelineno-0-567"></a>                <span class="sa">f</span><span class="s2">&quot;SubstitutionTransition &#39;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">&#39;: child subnet is already mapped to another transition.&quot;</span>
+<a id="__codelineno-0-568" name="__codelineno-0-568"></a>            <span class="p">)</span>
+<a id="__codelineno-0-569" name="__codelineno-0-569"></a>        <span class="n">SubstitutionTransition</span><span class="o">.</span><span class="n">_mapped_subnets</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">subnet</span><span class="p">)</span>
 </code></pre></div></td></tr></table></div>
               </details>
 
@@ -1474,7 +1524,9 @@ FIFO. Per-token parameters are what make the selection <em>indexable</em>, which
  ties broken by insertion order so the selection is deterministic. For
  descending order, negate the key. The key must return values totally ordered
  <em>with each other</em>; if it raises, or the ordering is undefined, the arc yields
- no tokens and the transition is not enabled. <code>None</code> (default) means FIFO.</p>
+ no tokens and the transition is not enabled. <code>None</code> (default) means FIFO.
+ <strong>Make it closed-world (certified) or a deep place drains in O(N²)</strong> — see the
+ performance warning below.</p>
               </div>
             </td>
           </tr>
@@ -1496,7 +1548,9 @@ FIFO. Per-token parameters are what make the selection <em>indexable</em>, which
     eligible. If annotated, the return type is checked to be <code>bool</code> at
     construction (a non-<code>bool</code> annotation raises <code>TypeError</code>); unannotated
     callables (including every lambda) are accepted unchecked. A filter that
-    raises makes the arc unsatisfiable rather than firing on a partial pool.</p>
+    raises makes the arc unsatisfiable rather than firing on a partial pool.
+    <strong>Same performance warning as <code>key</code></strong> — an uncertified filter is quadratic
+    on a deep place, and (unlike <code>key</code>) a certified <code>key</code> cannot rescue it.</p>
               </div>
             </td>
           </tr>
@@ -1521,19 +1575,48 @@ ignored parameters. Silence it with
 genuinely mean "drain everything, selection notwithstanding".</p>
 </details>
 
+<details class="warning" open>
+  <summary>Warning</summary>
+  <p><strong>On a deep place, make your <code>key</code>/<code>filter</code> closed-world (certified) — or pay a
+quadratic drain.</strong> A <em>certified</em> selection callable is served from a persistent
+<code>(key, seq)</code> index maintained on the place, so the drain stays roughly linear in
+place depth. An <em>uncertified</em> one cannot be indexed — keying happens on the
+<code>deposit()</code> path, which cannot host an unbounded callable — so every enabling
+check re-reads and re-sorts the whole available pool <strong>and</strong> dispatches the
+callable through the timeout-bounded executor once per token. Both costs are
+per-token-per-firing, so draining a deep place is <strong>O(N²)</strong>: worst-case lock-hold
+for the arc is <code>len(place) * expr_timeout_secs</code>, and <code>benchmarks/bench_station_costs.py</code>
+measures an uncertified <code>key</code> at over <strong>100×</strong> a certified key computing the
+<em>identical</em> order at depth 2000 — a gap that widens with depth. A <code>filter</code> is
+worse to get wrong than a <code>key</code>: a single uncertified <code>filter</code> disqualifies the
+whole arc from indexing <em>even when the <code>key</code> is certified</em>, because applying an
+uncertified predicate after a capped index read could silently under-select.</p>
+<p><strong>To certify, close over immutable values — never read mutable state at call
+time.</strong> A callable certifies (see [<code>cpnx.certification</code>]) only when it draws on a
+fixed vocabulary and closes over nothing mutable. In practice: read configuration
+at construction and capture the <em>value</em>. A callable that reads a module global, an
+instance attribute, or any <code>list</code>/<code>dict</code>/<code>set</code> on each call does <strong>not</strong> certify —
+that is exactly the pattern that lands on the O(N²) path. Captured values must be
+immutable leaves (numbers, strings, <code>bytes</code>, <code>bool</code>, <code>None</code>) or <code>tuple</code>/<code>frozenset</code>
+thereof — a <code>frozenset</code> certifies, a <code>set</code> does not::</p>
+<div class="highlight"><pre><span></span><code>cutoff = config[&quot;vip_cutoff&quot;]                        # an int, read once at construction
+key = lambda t: (t.payload[&quot;spend&quot;] &lt; cutoff, t.created_at)   # closes over an int -&gt; certifies
+</code></pre></div>
+<p>If the ordering <em>genuinely</em> depends on state that changes at run time — a live
+priority a human retunes mid-run — it cannot certify by construction, and the
+quadratic cost is <strong>intrinsic, not a bug</strong>: an index needs a key it can compute
+once, at deposit, and a value that changes afterward would sort already-deposited
+tokens wrong. There is no engine fix for that case. Restructure so the key is
+closed-world (snapshot the state into an immutable at construction and rebuild the
+arc when it changes), or accept the O(N²) on a shallow place only.</p>
+</details>
+
 <details class="note" open>
   <summary>Note</summary>
   <p>Both callables are purity-verified at assignment, and each carries its own
-inline-safe flag: a <strong>certified</strong> callable (see [<code>cpnx.certification</code>]) runs
-inline under the engine lock, an uncertified one on the timeout-bounded
-expression pool.</p>
-<p>Uncertified <code>key</code>/<code>filter</code> are allowed, but on a <strong>deep place they are the one
-thing worth certifying.</strong> Both are evaluated <em>per token</em> over the whole available
-pool, so an uncertified one costs a thread round-trip per token per enabling
-check — where a guard costs one per <em>candidate binding</em>, bounded by
-<code>binding_search_limit</code>. Nothing bounds the per-token count: worst-case lock-hold is
-<code>len(place) * expr_timeout_secs</code> for that arc. A certified callable skips the
-executor entirely and the concern disappears.</p>
+inline-safe flag: a <strong>certified</strong> callable runs inline under the engine lock, an
+uncertified one on the timeout-bounded expression pool (the source of the cost in
+the warning above).</p>
 <p>Separately, <code>expr_timeout_secs</code> bounds a <code>key</code>'s <em>extraction</em>, not the
 <strong>comparisons</strong> between the values it returns — the sort runs inline under the
 engine lock. Return plain comparables (numbers, strings, tuples thereof); a value
@@ -1692,7 +1775,39 @@ with a slow or diverging <code>__lt__</code> can hold the lock past any timeout.
 <span class="normal"><a href="#__codelineno-0-293">293</a></span>
 <span class="normal"><a href="#__codelineno-0-294">294</a></span>
 <span class="normal"><a href="#__codelineno-0-295">295</a></span>
-<span class="normal"><a href="#__codelineno-0-296">296</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-158" name="__codelineno-0-158"></a><span class="nd">@dataclass</span>
+<span class="normal"><a href="#__codelineno-0-296">296</a></span>
+<span class="normal"><a href="#__codelineno-0-297">297</a></span>
+<span class="normal"><a href="#__codelineno-0-298">298</a></span>
+<span class="normal"><a href="#__codelineno-0-299">299</a></span>
+<span class="normal"><a href="#__codelineno-0-300">300</a></span>
+<span class="normal"><a href="#__codelineno-0-301">301</a></span>
+<span class="normal"><a href="#__codelineno-0-302">302</a></span>
+<span class="normal"><a href="#__codelineno-0-303">303</a></span>
+<span class="normal"><a href="#__codelineno-0-304">304</a></span>
+<span class="normal"><a href="#__codelineno-0-305">305</a></span>
+<span class="normal"><a href="#__codelineno-0-306">306</a></span>
+<span class="normal"><a href="#__codelineno-0-307">307</a></span>
+<span class="normal"><a href="#__codelineno-0-308">308</a></span>
+<span class="normal"><a href="#__codelineno-0-309">309</a></span>
+<span class="normal"><a href="#__codelineno-0-310">310</a></span>
+<span class="normal"><a href="#__codelineno-0-311">311</a></span>
+<span class="normal"><a href="#__codelineno-0-312">312</a></span>
+<span class="normal"><a href="#__codelineno-0-313">313</a></span>
+<span class="normal"><a href="#__codelineno-0-314">314</a></span>
+<span class="normal"><a href="#__codelineno-0-315">315</a></span>
+<span class="normal"><a href="#__codelineno-0-316">316</a></span>
+<span class="normal"><a href="#__codelineno-0-317">317</a></span>
+<span class="normal"><a href="#__codelineno-0-318">318</a></span>
+<span class="normal"><a href="#__codelineno-0-319">319</a></span>
+<span class="normal"><a href="#__codelineno-0-320">320</a></span>
+<span class="normal"><a href="#__codelineno-0-321">321</a></span>
+<span class="normal"><a href="#__codelineno-0-322">322</a></span>
+<span class="normal"><a href="#__codelineno-0-323">323</a></span>
+<span class="normal"><a href="#__codelineno-0-324">324</a></span>
+<span class="normal"><a href="#__codelineno-0-325">325</a></span>
+<span class="normal"><a href="#__codelineno-0-326">326</a></span>
+<span class="normal"><a href="#__codelineno-0-327">327</a></span>
+<span class="normal"><a href="#__codelineno-0-328">328</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-158" name="__codelineno-0-158"></a><span class="nd">@dataclass</span>
 <a id="__codelineno-0-159" name="__codelineno-0-159"></a><span class="k">class</span><span class="w"> </span><span class="nc">InputArc</span><span class="p">:</span>
 <a id="__codelineno-0-160" name="__codelineno-0-160"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;Describe how a transition consumes tokens from one input place.</span>
 <a id="__codelineno-0-161" name="__codelineno-0-161"></a>
@@ -1723,114 +1838,146 @@ with a slow or diverging <code>__lt__</code> can hold the lock past any timeout.
 <a id="__codelineno-0-186" name="__codelineno-0-186"></a><span class="sd">             descending order, negate the key. The key must return values totally ordered</span>
 <a id="__codelineno-0-187" name="__codelineno-0-187"></a><span class="sd">             *with each other*; if it raises, or the ordering is undefined, the arc yields</span>
 <a id="__codelineno-0-188" name="__codelineno-0-188"></a><span class="sd">             no tokens and the transition is not enabled. `None` (default) means FIFO.</span>
-<a id="__codelineno-0-189" name="__codelineno-0-189"></a><span class="sd">        filter: Per-token eligibility predicate — a pure `Callable[[Token], bool]`. A token</span>
-<a id="__codelineno-0-190" name="__codelineno-0-190"></a><span class="sd">                is a candidate for this arc only when the predicate returns `True`; the</span>
-<a id="__codelineno-0-191" name="__codelineno-0-191"></a><span class="sd">                rest stay in the place. `None` (default) means every available token is</span>
-<a id="__codelineno-0-192" name="__codelineno-0-192"></a><span class="sd">                eligible. If annotated, the return type is checked to be `bool` at</span>
-<a id="__codelineno-0-193" name="__codelineno-0-193"></a><span class="sd">                construction (a non-`bool` annotation raises `TypeError`); unannotated</span>
-<a id="__codelineno-0-194" name="__codelineno-0-194"></a><span class="sd">                callables (including every lambda) are accepted unchecked. A filter that</span>
-<a id="__codelineno-0-195" name="__codelineno-0-195"></a><span class="sd">                raises makes the arc unsatisfiable rather than firing on a partial pool.</span>
-<a id="__codelineno-0-196" name="__codelineno-0-196"></a>
-<a id="__codelineno-0-197" name="__codelineno-0-197"></a><span class="sd">    Warning:</span>
-<a id="__codelineno-0-198" name="__codelineno-0-198"></a><span class="sd">        **`consume_all=True` ignores both `key` and `filter`.** A draining arc takes every</span>
-<a id="__codelineno-0-199" name="__codelineno-0-199"></a><span class="sd">        available token, in FIFO order, whatever the selection callables say — a token the</span>
-<a id="__codelineno-0-200" name="__codelineno-0-200"></a><span class="sd">        `filter` rejects *is still consumed*. This preserves the pre-`key`/`filter`</span>
-<a id="__codelineno-0-201" name="__codelineno-0-201"></a><span class="sd">        behavior of the arc inscription it replaced, but it is a genuine footgun: `filter`</span>
-<a id="__codelineno-0-202" name="__codelineno-0-202"></a><span class="sd">        reads as a declaration of eligibility, and under `consume_all` it is not one. Do</span>
-<a id="__codelineno-0-203" name="__codelineno-0-203"></a><span class="sd">        not combine them expecting &quot;drain everything eligible&quot;; that pattern is not</span>
-<a id="__codelineno-0-204" name="__codelineno-0-204"></a><span class="sd">        supported today. To drain only eligible tokens, use a large `count` rather than</span>
-<a id="__codelineno-0-205" name="__codelineno-0-205"></a><span class="sd">        `consume_all`.</span>
-<a id="__codelineno-0-206" name="__codelineno-0-206"></a>
-<a id="__codelineno-0-207" name="__codelineno-0-207"></a><span class="sd">        Because that combination is always a mistake rather than a style choice,</span>
-<a id="__codelineno-0-208" name="__codelineno-0-208"></a><span class="sd">        constructing (or reassigning into) such an arc emits a `UserWarning` naming the</span>
-<a id="__codelineno-0-209" name="__codelineno-0-209"></a><span class="sd">        ignored parameters. Silence it with</span>
-<a id="__codelineno-0-210" name="__codelineno-0-210"></a><span class="sd">        `warnings.filterwarnings(&quot;ignore&quot;, message=&quot;consume_all=True ignores&quot;)` if you</span>
-<a id="__codelineno-0-211" name="__codelineno-0-211"></a><span class="sd">        genuinely mean &quot;drain everything, selection notwithstanding&quot;.</span>
-<a id="__codelineno-0-212" name="__codelineno-0-212"></a>
-<a id="__codelineno-0-213" name="__codelineno-0-213"></a><span class="sd">    Note:</span>
-<a id="__codelineno-0-214" name="__codelineno-0-214"></a><span class="sd">        Both callables are purity-verified at assignment, and each carries its own</span>
-<a id="__codelineno-0-215" name="__codelineno-0-215"></a><span class="sd">        inline-safe flag: a **certified** callable (see [`cpnx.certification`]) runs</span>
-<a id="__codelineno-0-216" name="__codelineno-0-216"></a><span class="sd">        inline under the engine lock, an uncertified one on the timeout-bounded</span>
-<a id="__codelineno-0-217" name="__codelineno-0-217"></a><span class="sd">        expression pool.</span>
-<a id="__codelineno-0-218" name="__codelineno-0-218"></a>
-<a id="__codelineno-0-219" name="__codelineno-0-219"></a><span class="sd">        Uncertified `key`/`filter` are allowed, but on a **deep place they are the one</span>
-<a id="__codelineno-0-220" name="__codelineno-0-220"></a><span class="sd">        thing worth certifying.** Both are evaluated *per token* over the whole available</span>
-<a id="__codelineno-0-221" name="__codelineno-0-221"></a><span class="sd">        pool, so an uncertified one costs a thread round-trip per token per enabling</span>
-<a id="__codelineno-0-222" name="__codelineno-0-222"></a><span class="sd">        check — where a guard costs one per *candidate binding*, bounded by</span>
-<a id="__codelineno-0-223" name="__codelineno-0-223"></a><span class="sd">        `binding_search_limit`. Nothing bounds the per-token count: worst-case lock-hold is</span>
-<a id="__codelineno-0-224" name="__codelineno-0-224"></a><span class="sd">        `len(place) * expr_timeout_secs` for that arc. A certified callable skips the</span>
-<a id="__codelineno-0-225" name="__codelineno-0-225"></a><span class="sd">        executor entirely and the concern disappears.</span>
-<a id="__codelineno-0-226" name="__codelineno-0-226"></a>
-<a id="__codelineno-0-227" name="__codelineno-0-227"></a><span class="sd">        Separately, `expr_timeout_secs` bounds a `key`&#39;s *extraction*, not the</span>
-<a id="__codelineno-0-228" name="__codelineno-0-228"></a><span class="sd">        **comparisons** between the values it returns — the sort runs inline under the</span>
-<a id="__codelineno-0-229" name="__codelineno-0-229"></a><span class="sd">        engine lock. Return plain comparables (numbers, strings, tuples thereof); a value</span>
-<a id="__codelineno-0-230" name="__codelineno-0-230"></a><span class="sd">        with a slow or diverging `__lt__` can hold the lock past any timeout.</span>
-<a id="__codelineno-0-231" name="__codelineno-0-231"></a>
-<a id="__codelineno-0-232" name="__codelineno-0-232"></a><span class="sd">    Example:</span>
-<a id="__codelineno-0-233" name="__codelineno-0-233"></a><span class="sd">        ```python</span>
-<a id="__codelineno-0-234" name="__codelineno-0-234"></a><span class="sd">        InputArc(&quot;inbox&quot;, count=2, key=lambda t: t.payload[&quot;priority&quot;], filter=lambda t: not t.payload[&quot;held&quot;])</span>
-<a id="__codelineno-0-235" name="__codelineno-0-235"></a><span class="sd">        ```</span>
-<a id="__codelineno-0-236" name="__codelineno-0-236"></a><span class="sd">    &quot;&quot;&quot;</span>
-<a id="__codelineno-0-237" name="__codelineno-0-237"></a>
-<a id="__codelineno-0-238" name="__codelineno-0-238"></a>    <span class="n">place</span><span class="p">:</span> <span class="nb">str</span>
-<a id="__codelineno-0-239" name="__codelineno-0-239"></a>    <span class="n">count</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
-<a id="__codelineno-0-240" name="__codelineno-0-240"></a>    <span class="n">consume_all</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
-<a id="__codelineno-0-241" name="__codelineno-0-241"></a>    <span class="n">settle_secs</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span>
-<a id="__codelineno-0-242" name="__codelineno-0-242"></a>    <span class="n">key</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">Token</span><span class="p">],</span> <span class="nb">object</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<a id="__codelineno-0-243" name="__codelineno-0-243"></a>    <span class="nb">filter</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">Token</span><span class="p">],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-0-189" name="__codelineno-0-189"></a><span class="sd">             **Make it closed-world (certified) or a deep place drains in O(N²)** — see the</span>
+<a id="__codelineno-0-190" name="__codelineno-0-190"></a><span class="sd">             performance warning below.</span>
+<a id="__codelineno-0-191" name="__codelineno-0-191"></a><span class="sd">        filter: Per-token eligibility predicate — a pure `Callable[[Token], bool]`. A token</span>
+<a id="__codelineno-0-192" name="__codelineno-0-192"></a><span class="sd">                is a candidate for this arc only when the predicate returns `True`; the</span>
+<a id="__codelineno-0-193" name="__codelineno-0-193"></a><span class="sd">                rest stay in the place. `None` (default) means every available token is</span>
+<a id="__codelineno-0-194" name="__codelineno-0-194"></a><span class="sd">                eligible. If annotated, the return type is checked to be `bool` at</span>
+<a id="__codelineno-0-195" name="__codelineno-0-195"></a><span class="sd">                construction (a non-`bool` annotation raises `TypeError`); unannotated</span>
+<a id="__codelineno-0-196" name="__codelineno-0-196"></a><span class="sd">                callables (including every lambda) are accepted unchecked. A filter that</span>
+<a id="__codelineno-0-197" name="__codelineno-0-197"></a><span class="sd">                raises makes the arc unsatisfiable rather than firing on a partial pool.</span>
+<a id="__codelineno-0-198" name="__codelineno-0-198"></a><span class="sd">                **Same performance warning as `key`** — an uncertified filter is quadratic</span>
+<a id="__codelineno-0-199" name="__codelineno-0-199"></a><span class="sd">                on a deep place, and (unlike `key`) a certified `key` cannot rescue it.</span>
+<a id="__codelineno-0-200" name="__codelineno-0-200"></a>
+<a id="__codelineno-0-201" name="__codelineno-0-201"></a><span class="sd">    Warning:</span>
+<a id="__codelineno-0-202" name="__codelineno-0-202"></a><span class="sd">        **`consume_all=True` ignores both `key` and `filter`.** A draining arc takes every</span>
+<a id="__codelineno-0-203" name="__codelineno-0-203"></a><span class="sd">        available token, in FIFO order, whatever the selection callables say — a token the</span>
+<a id="__codelineno-0-204" name="__codelineno-0-204"></a><span class="sd">        `filter` rejects *is still consumed*. This preserves the pre-`key`/`filter`</span>
+<a id="__codelineno-0-205" name="__codelineno-0-205"></a><span class="sd">        behavior of the arc inscription it replaced, but it is a genuine footgun: `filter`</span>
+<a id="__codelineno-0-206" name="__codelineno-0-206"></a><span class="sd">        reads as a declaration of eligibility, and under `consume_all` it is not one. Do</span>
+<a id="__codelineno-0-207" name="__codelineno-0-207"></a><span class="sd">        not combine them expecting &quot;drain everything eligible&quot;; that pattern is not</span>
+<a id="__codelineno-0-208" name="__codelineno-0-208"></a><span class="sd">        supported today. To drain only eligible tokens, use a large `count` rather than</span>
+<a id="__codelineno-0-209" name="__codelineno-0-209"></a><span class="sd">        `consume_all`.</span>
+<a id="__codelineno-0-210" name="__codelineno-0-210"></a>
+<a id="__codelineno-0-211" name="__codelineno-0-211"></a><span class="sd">        Because that combination is always a mistake rather than a style choice,</span>
+<a id="__codelineno-0-212" name="__codelineno-0-212"></a><span class="sd">        constructing (or reassigning into) such an arc emits a `UserWarning` naming the</span>
+<a id="__codelineno-0-213" name="__codelineno-0-213"></a><span class="sd">        ignored parameters. Silence it with</span>
+<a id="__codelineno-0-214" name="__codelineno-0-214"></a><span class="sd">        `warnings.filterwarnings(&quot;ignore&quot;, message=&quot;consume_all=True ignores&quot;)` if you</span>
+<a id="__codelineno-0-215" name="__codelineno-0-215"></a><span class="sd">        genuinely mean &quot;drain everything, selection notwithstanding&quot;.</span>
+<a id="__codelineno-0-216" name="__codelineno-0-216"></a>
+<a id="__codelineno-0-217" name="__codelineno-0-217"></a><span class="sd">    Warning:</span>
+<a id="__codelineno-0-218" name="__codelineno-0-218"></a><span class="sd">        **On a deep place, make your `key`/`filter` closed-world (certified) — or pay a</span>
+<a id="__codelineno-0-219" name="__codelineno-0-219"></a><span class="sd">        quadratic drain.** A *certified* selection callable is served from a persistent</span>
+<a id="__codelineno-0-220" name="__codelineno-0-220"></a><span class="sd">        `(key, seq)` index maintained on the place, so the drain stays roughly linear in</span>
+<a id="__codelineno-0-221" name="__codelineno-0-221"></a><span class="sd">        place depth. An *uncertified* one cannot be indexed — keying happens on the</span>
+<a id="__codelineno-0-222" name="__codelineno-0-222"></a><span class="sd">        `deposit()` path, which cannot host an unbounded callable — so every enabling</span>
+<a id="__codelineno-0-223" name="__codelineno-0-223"></a><span class="sd">        check re-reads and re-sorts the whole available pool **and** dispatches the</span>
+<a id="__codelineno-0-224" name="__codelineno-0-224"></a><span class="sd">        callable through the timeout-bounded executor once per token. Both costs are</span>
+<a id="__codelineno-0-225" name="__codelineno-0-225"></a><span class="sd">        per-token-per-firing, so draining a deep place is **O(N²)**: worst-case lock-hold</span>
+<a id="__codelineno-0-226" name="__codelineno-0-226"></a><span class="sd">        for the arc is `len(place) * expr_timeout_secs`, and `benchmarks/bench_station_costs.py`</span>
+<a id="__codelineno-0-227" name="__codelineno-0-227"></a><span class="sd">        measures an uncertified `key` at over **100×** a certified key computing the</span>
+<a id="__codelineno-0-228" name="__codelineno-0-228"></a><span class="sd">        *identical* order at depth 2000 — a gap that widens with depth. A `filter` is</span>
+<a id="__codelineno-0-229" name="__codelineno-0-229"></a><span class="sd">        worse to get wrong than a `key`: a single uncertified `filter` disqualifies the</span>
+<a id="__codelineno-0-230" name="__codelineno-0-230"></a><span class="sd">        whole arc from indexing *even when the `key` is certified*, because applying an</span>
+<a id="__codelineno-0-231" name="__codelineno-0-231"></a><span class="sd">        uncertified predicate after a capped index read could silently under-select.</span>
+<a id="__codelineno-0-232" name="__codelineno-0-232"></a>
+<a id="__codelineno-0-233" name="__codelineno-0-233"></a><span class="sd">        **To certify, close over immutable values — never read mutable state at call</span>
+<a id="__codelineno-0-234" name="__codelineno-0-234"></a><span class="sd">        time.** A callable certifies (see [`cpnx.certification`]) only when it draws on a</span>
+<a id="__codelineno-0-235" name="__codelineno-0-235"></a><span class="sd">        fixed vocabulary and closes over nothing mutable. In practice: read configuration</span>
+<a id="__codelineno-0-236" name="__codelineno-0-236"></a><span class="sd">        at construction and capture the *value*. A callable that reads a module global, an</span>
+<a id="__codelineno-0-237" name="__codelineno-0-237"></a><span class="sd">        instance attribute, or any `list`/`dict`/`set` on each call does **not** certify —</span>
+<a id="__codelineno-0-238" name="__codelineno-0-238"></a><span class="sd">        that is exactly the pattern that lands on the O(N²) path. Captured values must be</span>
+<a id="__codelineno-0-239" name="__codelineno-0-239"></a><span class="sd">        immutable leaves (numbers, strings, `bytes`, `bool`, `None`) or `tuple`/`frozenset`</span>
+<a id="__codelineno-0-240" name="__codelineno-0-240"></a><span class="sd">        thereof — a `frozenset` certifies, a `set` does not::</span>
+<a id="__codelineno-0-241" name="__codelineno-0-241"></a>
+<a id="__codelineno-0-242" name="__codelineno-0-242"></a><span class="sd">            cutoff = config[&quot;vip_cutoff&quot;]                        # an int, read once at construction</span>
+<a id="__codelineno-0-243" name="__codelineno-0-243"></a><span class="sd">            key = lambda t: (t.payload[&quot;spend&quot;] &lt; cutoff, t.created_at)   # closes over an int -&gt; certifies</span>
 <a id="__codelineno-0-244" name="__codelineno-0-244"></a>
-<a id="__codelineno-0-245" name="__codelineno-0-245"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-<a id="__codelineno-0-246" name="__codelineno-0-246"></a>        <span class="c1"># Marks construction complete, so `__setattr__` can tell a field assignment made by</span>
-<a id="__codelineno-0-247" name="__codelineno-0-247"></a>        <span class="c1"># the generated ``__init__`` (all of which this hook already covers, once) from a</span>
-<a id="__codelineno-0-248" name="__codelineno-0-248"></a>        <span class="c1"># later reassignment by the caller (which must warn on its own).</span>
-<a id="__codelineno-0-249" name="__codelineno-0-249"></a>        <span class="bp">self</span><span class="o">.</span><span class="n">_constructed</span> <span class="o">=</span> <span class="kc">True</span>
-<a id="__codelineno-0-250" name="__codelineno-0-250"></a>        <span class="bp">self</span><span class="o">.</span><span class="n">_warn_if_drain_ignores_selection</span><span class="p">(</span><span class="n">stacklevel</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
-<a id="__codelineno-0-251" name="__codelineno-0-251"></a>
-<a id="__codelineno-0-252" name="__codelineno-0-252"></a>    <span class="k">def</span><span class="w"> </span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
-<a id="__codelineno-0-253" name="__codelineno-0-253"></a>        <span class="c1"># Keep each selection callable&#39;s inline-safe flag in sync, including</span>
-<a id="__codelineno-0-254" name="__codelineno-0-254"></a>        <span class="c1"># post-construction reassignment. Reject/verify before mutating so a bad</span>
-<a id="__codelineno-0-255" name="__codelineno-0-255"></a>        <span class="c1"># value leaves the arc in its previous valid state.</span>
-<a id="__codelineno-0-256" name="__codelineno-0-256"></a>        <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;key&quot;</span><span class="p">,</span> <span class="s2">&quot;filter&quot;</span><span class="p">):</span>
-<a id="__codelineno-0-257" name="__codelineno-0-257"></a>            <span class="n">_reject_string_expression</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;InputArc.</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
-<a id="__codelineno-0-258" name="__codelineno-0-258"></a>            <span class="k">if</span> <span class="nb">callable</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
-<a id="__codelineno-0-259" name="__codelineno-0-259"></a>                <span class="n">verify_callable_purity</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
-<a id="__codelineno-0-260" name="__codelineno-0-260"></a>                <span class="k">if</span> <span class="n">name</span> <span class="o">==</span> <span class="s2">&quot;filter&quot;</span><span class="p">:</span>
-<a id="__codelineno-0-261" name="__codelineno-0-261"></a>                    <span class="n">_reject_non_bool_return</span><span class="p">(</span><span class="s2">&quot;InputArc.filter&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
-<a id="__codelineno-0-262" name="__codelineno-0-262"></a>            <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;_</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">_inline_safe&quot;</span><span class="p">,</span> <span class="n">_inline_safe_for</span><span class="p">(</span><span class="n">value</span><span class="p">))</span>
-<a id="__codelineno-0-263" name="__codelineno-0-263"></a>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
-<a id="__codelineno-0-264" name="__codelineno-0-264"></a>        <span class="c1"># Re-check the drain/selection conflict after the value lands, so the warning</span>
-<a id="__codelineno-0-265" name="__codelineno-0-265"></a>        <span class="c1"># reflects the arc as it now is. Skipped during ``__init__`` — `__post_init__`</span>
-<a id="__codelineno-0-266" name="__codelineno-0-266"></a>        <span class="c1"># reports the finished arc once, rather than once per conflicting field.</span>
-<a id="__codelineno-0-267" name="__codelineno-0-267"></a>        <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;consume_all&quot;</span><span class="p">,</span> <span class="s2">&quot;key&quot;</span><span class="p">,</span> <span class="s2">&quot;filter&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;_constructed&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">):</span>
-<a id="__codelineno-0-268" name="__codelineno-0-268"></a>            <span class="bp">self</span><span class="o">.</span><span class="n">_warn_if_drain_ignores_selection</span><span class="p">(</span><span class="n">stacklevel</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+<a id="__codelineno-0-245" name="__codelineno-0-245"></a><span class="sd">        If the ordering *genuinely* depends on state that changes at run time — a live</span>
+<a id="__codelineno-0-246" name="__codelineno-0-246"></a><span class="sd">        priority a human retunes mid-run — it cannot certify by construction, and the</span>
+<a id="__codelineno-0-247" name="__codelineno-0-247"></a><span class="sd">        quadratic cost is **intrinsic, not a bug**: an index needs a key it can compute</span>
+<a id="__codelineno-0-248" name="__codelineno-0-248"></a><span class="sd">        once, at deposit, and a value that changes afterward would sort already-deposited</span>
+<a id="__codelineno-0-249" name="__codelineno-0-249"></a><span class="sd">        tokens wrong. There is no engine fix for that case. Restructure so the key is</span>
+<a id="__codelineno-0-250" name="__codelineno-0-250"></a><span class="sd">        closed-world (snapshot the state into an immutable at construction and rebuild the</span>
+<a id="__codelineno-0-251" name="__codelineno-0-251"></a><span class="sd">        arc when it changes), or accept the O(N²) on a shallow place only.</span>
+<a id="__codelineno-0-252" name="__codelineno-0-252"></a>
+<a id="__codelineno-0-253" name="__codelineno-0-253"></a><span class="sd">    Note:</span>
+<a id="__codelineno-0-254" name="__codelineno-0-254"></a><span class="sd">        Both callables are purity-verified at assignment, and each carries its own</span>
+<a id="__codelineno-0-255" name="__codelineno-0-255"></a><span class="sd">        inline-safe flag: a **certified** callable runs inline under the engine lock, an</span>
+<a id="__codelineno-0-256" name="__codelineno-0-256"></a><span class="sd">        uncertified one on the timeout-bounded expression pool (the source of the cost in</span>
+<a id="__codelineno-0-257" name="__codelineno-0-257"></a><span class="sd">        the warning above).</span>
+<a id="__codelineno-0-258" name="__codelineno-0-258"></a>
+<a id="__codelineno-0-259" name="__codelineno-0-259"></a><span class="sd">        Separately, `expr_timeout_secs` bounds a `key`&#39;s *extraction*, not the</span>
+<a id="__codelineno-0-260" name="__codelineno-0-260"></a><span class="sd">        **comparisons** between the values it returns — the sort runs inline under the</span>
+<a id="__codelineno-0-261" name="__codelineno-0-261"></a><span class="sd">        engine lock. Return plain comparables (numbers, strings, tuples thereof); a value</span>
+<a id="__codelineno-0-262" name="__codelineno-0-262"></a><span class="sd">        with a slow or diverging `__lt__` can hold the lock past any timeout.</span>
+<a id="__codelineno-0-263" name="__codelineno-0-263"></a>
+<a id="__codelineno-0-264" name="__codelineno-0-264"></a><span class="sd">    Example:</span>
+<a id="__codelineno-0-265" name="__codelineno-0-265"></a><span class="sd">        ```python</span>
+<a id="__codelineno-0-266" name="__codelineno-0-266"></a><span class="sd">        InputArc(&quot;inbox&quot;, count=2, key=lambda t: t.payload[&quot;priority&quot;], filter=lambda t: not t.payload[&quot;held&quot;])</span>
+<a id="__codelineno-0-267" name="__codelineno-0-267"></a><span class="sd">        ```</span>
+<a id="__codelineno-0-268" name="__codelineno-0-268"></a><span class="sd">    &quot;&quot;&quot;</span>
 <a id="__codelineno-0-269" name="__codelineno-0-269"></a>
-<a id="__codelineno-0-270" name="__codelineno-0-270"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">_warn_if_drain_ignores_selection</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">stacklevel</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<a id="__codelineno-0-271" name="__codelineno-0-271"></a><span class="w">        </span><span class="sd">&quot;&quot;&quot;Warn when this arc sets `key`/`filter` that `consume_all` will silently ignore.</span>
-<a id="__codelineno-0-272" name="__codelineno-0-272"></a>
-<a id="__codelineno-0-273" name="__codelineno-0-273"></a><span class="sd">        The combination is never meaningful — a draining arc consumes the whole available</span>
-<a id="__codelineno-0-274" name="__codelineno-0-274"></a><span class="sd">        pool in FIFO order regardless — so it is far more likely to be a misreading of</span>
-<a id="__codelineno-0-275" name="__codelineno-0-275"></a><span class="sd">        `filter` as &quot;drain everything eligible&quot; than a deliberate choice. Engine behavior</span>
-<a id="__codelineno-0-276" name="__codelineno-0-276"></a><span class="sd">        is unaffected; this only makes the documented bypass audible at the call site.</span>
-<a id="__codelineno-0-277" name="__codelineno-0-277"></a>
-<a id="__codelineno-0-278" name="__codelineno-0-278"></a><span class="sd">        `stacklevel` is passed in because the two callers sit at different depths: the</span>
-<a id="__codelineno-0-279" name="__codelineno-0-279"></a><span class="sd">        `__post_init__` path is reached through the generated `__init__`, the</span>
-<a id="__codelineno-0-280" name="__codelineno-0-280"></a><span class="sd">        `__setattr__` path directly from user code. Both aim the warning at the caller&#39;s</span>
-<a id="__codelineno-0-281" name="__codelineno-0-281"></a><span class="sd">        own line.</span>
-<a id="__codelineno-0-282" name="__codelineno-0-282"></a><span class="sd">        &quot;&quot;&quot;</span>
-<a id="__codelineno-0-283" name="__codelineno-0-283"></a>        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">consume_all</span><span class="p">:</span>
-<a id="__codelineno-0-284" name="__codelineno-0-284"></a>            <span class="k">return</span>
-<a id="__codelineno-0-285" name="__codelineno-0-285"></a>        <span class="n">ignored</span> <span class="o">=</span> <span class="p">[</span><span class="n">name</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;key&quot;</span><span class="p">,</span> <span class="s2">&quot;filter&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">]</span>
-<a id="__codelineno-0-286" name="__codelineno-0-286"></a>        <span class="k">if</span> <span class="ow">not</span> <span class="n">ignored</span><span class="p">:</span>
-<a id="__codelineno-0-287" name="__codelineno-0-287"></a>            <span class="k">return</span>
-<a id="__codelineno-0-288" name="__codelineno-0-288"></a>        <span class="n">named</span> <span class="o">=</span> <span class="s2">&quot; and &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;`</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">`&quot;</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">ignored</span><span class="p">)</span>
-<a id="__codelineno-0-289" name="__codelineno-0-289"></a>        <span class="n">warnings</span><span class="o">.</span><span class="n">warn</span><span class="p">(</span>
-<a id="__codelineno-0-290" name="__codelineno-0-290"></a>            <span class="sa">f</span><span class="s2">&quot;InputArc(place=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">place</span><span class="si">!r}</span><span class="s2">): consume_all=True ignores </span><span class="si">{</span><span class="n">named</span><span class="si">}</span><span class="s2"> — a draining &quot;</span>
-<a id="__codelineno-0-291" name="__codelineno-0-291"></a>            <span class="s2">&quot;arc consumes every available token in FIFO order, including tokens the filter &quot;</span>
-<a id="__codelineno-0-292" name="__codelineno-0-292"></a>            <span class="s2">&quot;rejects. To drain only eligible tokens, use a large `count` instead of &quot;</span>
-<a id="__codelineno-0-293" name="__codelineno-0-293"></a>            <span class="s2">&quot;`consume_all`; to drain unconditionally, drop the ignored parameter(s).&quot;</span><span class="p">,</span>
-<a id="__codelineno-0-294" name="__codelineno-0-294"></a>            <span class="ne">UserWarning</span><span class="p">,</span>
-<a id="__codelineno-0-295" name="__codelineno-0-295"></a>            <span class="n">stacklevel</span><span class="o">=</span><span class="n">stacklevel</span><span class="p">,</span>
-<a id="__codelineno-0-296" name="__codelineno-0-296"></a>        <span class="p">)</span>
+<a id="__codelineno-0-270" name="__codelineno-0-270"></a>    <span class="n">place</span><span class="p">:</span> <span class="nb">str</span>
+<a id="__codelineno-0-271" name="__codelineno-0-271"></a>    <span class="n">count</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+<a id="__codelineno-0-272" name="__codelineno-0-272"></a>    <span class="n">consume_all</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+<a id="__codelineno-0-273" name="__codelineno-0-273"></a>    <span class="n">settle_secs</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">0.0</span>
+<a id="__codelineno-0-274" name="__codelineno-0-274"></a>    <span class="n">key</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">Token</span><span class="p">],</span> <span class="nb">object</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-0-275" name="__codelineno-0-275"></a>    <span class="nb">filter</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">Token</span><span class="p">],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">kw_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-0-276" name="__codelineno-0-276"></a>
+<a id="__codelineno-0-277" name="__codelineno-0-277"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<a id="__codelineno-0-278" name="__codelineno-0-278"></a>        <span class="c1"># Marks construction complete, so `__setattr__` can tell a field assignment made by</span>
+<a id="__codelineno-0-279" name="__codelineno-0-279"></a>        <span class="c1"># the generated ``__init__`` (all of which this hook already covers, once) from a</span>
+<a id="__codelineno-0-280" name="__codelineno-0-280"></a>        <span class="c1"># later reassignment by the caller (which must warn on its own).</span>
+<a id="__codelineno-0-281" name="__codelineno-0-281"></a>        <span class="bp">self</span><span class="o">.</span><span class="n">_constructed</span> <span class="o">=</span> <span class="kc">True</span>
+<a id="__codelineno-0-282" name="__codelineno-0-282"></a>        <span class="bp">self</span><span class="o">.</span><span class="n">_warn_if_drain_ignores_selection</span><span class="p">(</span><span class="n">stacklevel</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+<a id="__codelineno-0-283" name="__codelineno-0-283"></a>
+<a id="__codelineno-0-284" name="__codelineno-0-284"></a>    <span class="k">def</span><span class="w"> </span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
+<a id="__codelineno-0-285" name="__codelineno-0-285"></a>        <span class="c1"># Keep each selection callable&#39;s inline-safe flag in sync, including</span>
+<a id="__codelineno-0-286" name="__codelineno-0-286"></a>        <span class="c1"># post-construction reassignment. Reject/verify before mutating so a bad</span>
+<a id="__codelineno-0-287" name="__codelineno-0-287"></a>        <span class="c1"># value leaves the arc in its previous valid state.</span>
+<a id="__codelineno-0-288" name="__codelineno-0-288"></a>        <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;key&quot;</span><span class="p">,</span> <span class="s2">&quot;filter&quot;</span><span class="p">):</span>
+<a id="__codelineno-0-289" name="__codelineno-0-289"></a>            <span class="n">_reject_string_expression</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;InputArc.</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+<a id="__codelineno-0-290" name="__codelineno-0-290"></a>            <span class="k">if</span> <span class="nb">callable</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
+<a id="__codelineno-0-291" name="__codelineno-0-291"></a>                <span class="n">verify_callable_purity</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+<a id="__codelineno-0-292" name="__codelineno-0-292"></a>                <span class="k">if</span> <span class="n">name</span> <span class="o">==</span> <span class="s2">&quot;filter&quot;</span><span class="p">:</span>
+<a id="__codelineno-0-293" name="__codelineno-0-293"></a>                    <span class="n">_reject_non_bool_return</span><span class="p">(</span><span class="s2">&quot;InputArc.filter&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+<a id="__codelineno-0-294" name="__codelineno-0-294"></a>            <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;_</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">_inline_safe&quot;</span><span class="p">,</span> <span class="n">_inline_safe_for</span><span class="p">(</span><span class="n">value</span><span class="p">))</span>
+<a id="__codelineno-0-295" name="__codelineno-0-295"></a>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+<a id="__codelineno-0-296" name="__codelineno-0-296"></a>        <span class="c1"># Re-check the drain/selection conflict after the value lands, so the warning</span>
+<a id="__codelineno-0-297" name="__codelineno-0-297"></a>        <span class="c1"># reflects the arc as it now is. Skipped during ``__init__`` — `__post_init__`</span>
+<a id="__codelineno-0-298" name="__codelineno-0-298"></a>        <span class="c1"># reports the finished arc once, rather than once per conflicting field.</span>
+<a id="__codelineno-0-299" name="__codelineno-0-299"></a>        <span class="k">if</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;consume_all&quot;</span><span class="p">,</span> <span class="s2">&quot;key&quot;</span><span class="p">,</span> <span class="s2">&quot;filter&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;_constructed&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">):</span>
+<a id="__codelineno-0-300" name="__codelineno-0-300"></a>            <span class="bp">self</span><span class="o">.</span><span class="n">_warn_if_drain_ignores_selection</span><span class="p">(</span><span class="n">stacklevel</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+<a id="__codelineno-0-301" name="__codelineno-0-301"></a>
+<a id="__codelineno-0-302" name="__codelineno-0-302"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">_warn_if_drain_ignores_selection</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">stacklevel</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<a id="__codelineno-0-303" name="__codelineno-0-303"></a><span class="w">        </span><span class="sd">&quot;&quot;&quot;Warn when this arc sets `key`/`filter` that `consume_all` will silently ignore.</span>
+<a id="__codelineno-0-304" name="__codelineno-0-304"></a>
+<a id="__codelineno-0-305" name="__codelineno-0-305"></a><span class="sd">        The combination is never meaningful — a draining arc consumes the whole available</span>
+<a id="__codelineno-0-306" name="__codelineno-0-306"></a><span class="sd">        pool in FIFO order regardless — so it is far more likely to be a misreading of</span>
+<a id="__codelineno-0-307" name="__codelineno-0-307"></a><span class="sd">        `filter` as &quot;drain everything eligible&quot; than a deliberate choice. Engine behavior</span>
+<a id="__codelineno-0-308" name="__codelineno-0-308"></a><span class="sd">        is unaffected; this only makes the documented bypass audible at the call site.</span>
+<a id="__codelineno-0-309" name="__codelineno-0-309"></a>
+<a id="__codelineno-0-310" name="__codelineno-0-310"></a><span class="sd">        `stacklevel` is passed in because the two callers sit at different depths: the</span>
+<a id="__codelineno-0-311" name="__codelineno-0-311"></a><span class="sd">        `__post_init__` path is reached through the generated `__init__`, the</span>
+<a id="__codelineno-0-312" name="__codelineno-0-312"></a><span class="sd">        `__setattr__` path directly from user code. Both aim the warning at the caller&#39;s</span>
+<a id="__codelineno-0-313" name="__codelineno-0-313"></a><span class="sd">        own line.</span>
+<a id="__codelineno-0-314" name="__codelineno-0-314"></a><span class="sd">        &quot;&quot;&quot;</span>
+<a id="__codelineno-0-315" name="__codelineno-0-315"></a>        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">consume_all</span><span class="p">:</span>
+<a id="__codelineno-0-316" name="__codelineno-0-316"></a>            <span class="k">return</span>
+<a id="__codelineno-0-317" name="__codelineno-0-317"></a>        <span class="n">ignored</span> <span class="o">=</span> <span class="p">[</span><span class="n">name</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;key&quot;</span><span class="p">,</span> <span class="s2">&quot;filter&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">]</span>
+<a id="__codelineno-0-318" name="__codelineno-0-318"></a>        <span class="k">if</span> <span class="ow">not</span> <span class="n">ignored</span><span class="p">:</span>
+<a id="__codelineno-0-319" name="__codelineno-0-319"></a>            <span class="k">return</span>
+<a id="__codelineno-0-320" name="__codelineno-0-320"></a>        <span class="n">named</span> <span class="o">=</span> <span class="s2">&quot; and &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;`</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">`&quot;</span> <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">ignored</span><span class="p">)</span>
+<a id="__codelineno-0-321" name="__codelineno-0-321"></a>        <span class="n">warnings</span><span class="o">.</span><span class="n">warn</span><span class="p">(</span>
+<a id="__codelineno-0-322" name="__codelineno-0-322"></a>            <span class="sa">f</span><span class="s2">&quot;InputArc(place=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">place</span><span class="si">!r}</span><span class="s2">): consume_all=True ignores </span><span class="si">{</span><span class="n">named</span><span class="si">}</span><span class="s2"> — a draining &quot;</span>
+<a id="__codelineno-0-323" name="__codelineno-0-323"></a>            <span class="s2">&quot;arc consumes every available token in FIFO order, including tokens the filter &quot;</span>
+<a id="__codelineno-0-324" name="__codelineno-0-324"></a>            <span class="s2">&quot;rejects. To drain only eligible tokens, use a large `count` instead of &quot;</span>
+<a id="__codelineno-0-325" name="__codelineno-0-325"></a>            <span class="s2">&quot;`consume_all`; to drain unconditionally, drop the ignored parameter(s).&quot;</span><span class="p">,</span>
+<a id="__codelineno-0-326" name="__codelineno-0-326"></a>            <span class="ne">UserWarning</span><span class="p">,</span>
+<a id="__codelineno-0-327" name="__codelineno-0-327"></a>            <span class="n">stacklevel</span><span class="o">=</span><span class="n">stacklevel</span><span class="p">,</span>
+<a id="__codelineno-0-328" name="__codelineno-0-328"></a>        <span class="p">)</span>
 </code></pre></div></td></tr></table></div>
               </details>
 
@@ -1955,39 +2102,7 @@ token selection (see <a class="autorefs autorefs-internal" title="            cp
 
               <details class="mkdocstrings-source">
                 <summary>Source code in <code>src/cpnx/transitions.py</code></summary>
-                <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-299">299</a></span>
-<span class="normal"><a href="#__codelineno-0-300">300</a></span>
-<span class="normal"><a href="#__codelineno-0-301">301</a></span>
-<span class="normal"><a href="#__codelineno-0-302">302</a></span>
-<span class="normal"><a href="#__codelineno-0-303">303</a></span>
-<span class="normal"><a href="#__codelineno-0-304">304</a></span>
-<span class="normal"><a href="#__codelineno-0-305">305</a></span>
-<span class="normal"><a href="#__codelineno-0-306">306</a></span>
-<span class="normal"><a href="#__codelineno-0-307">307</a></span>
-<span class="normal"><a href="#__codelineno-0-308">308</a></span>
-<span class="normal"><a href="#__codelineno-0-309">309</a></span>
-<span class="normal"><a href="#__codelineno-0-310">310</a></span>
-<span class="normal"><a href="#__codelineno-0-311">311</a></span>
-<span class="normal"><a href="#__codelineno-0-312">312</a></span>
-<span class="normal"><a href="#__codelineno-0-313">313</a></span>
-<span class="normal"><a href="#__codelineno-0-314">314</a></span>
-<span class="normal"><a href="#__codelineno-0-315">315</a></span>
-<span class="normal"><a href="#__codelineno-0-316">316</a></span>
-<span class="normal"><a href="#__codelineno-0-317">317</a></span>
-<span class="normal"><a href="#__codelineno-0-318">318</a></span>
-<span class="normal"><a href="#__codelineno-0-319">319</a></span>
-<span class="normal"><a href="#__codelineno-0-320">320</a></span>
-<span class="normal"><a href="#__codelineno-0-321">321</a></span>
-<span class="normal"><a href="#__codelineno-0-322">322</a></span>
-<span class="normal"><a href="#__codelineno-0-323">323</a></span>
-<span class="normal"><a href="#__codelineno-0-324">324</a></span>
-<span class="normal"><a href="#__codelineno-0-325">325</a></span>
-<span class="normal"><a href="#__codelineno-0-326">326</a></span>
-<span class="normal"><a href="#__codelineno-0-327">327</a></span>
-<span class="normal"><a href="#__codelineno-0-328">328</a></span>
-<span class="normal"><a href="#__codelineno-0-329">329</a></span>
-<span class="normal"><a href="#__codelineno-0-330">330</a></span>
-<span class="normal"><a href="#__codelineno-0-331">331</a></span>
+                <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-331">331</a></span>
 <span class="normal"><a href="#__codelineno-0-332">332</a></span>
 <span class="normal"><a href="#__codelineno-0-333">333</a></span>
 <span class="normal"><a href="#__codelineno-0-334">334</a></span>
@@ -2017,69 +2132,101 @@ token selection (see <a class="autorefs autorefs-internal" title="            cp
 <span class="normal"><a href="#__codelineno-0-358">358</a></span>
 <span class="normal"><a href="#__codelineno-0-359">359</a></span>
 <span class="normal"><a href="#__codelineno-0-360">360</a></span>
-<span class="normal"><a href="#__codelineno-0-361">361</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-299" name="__codelineno-0-299"></a><span class="nd">@dataclass</span>
-<a id="__codelineno-0-300" name="__codelineno-0-300"></a><span class="k">class</span><span class="w"> </span><span class="nc">OutputArc</span><span class="p">:</span>
-<a id="__codelineno-0-301" name="__codelineno-0-301"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;Describe how a transition deposits tokens into one output place.</span>
-<a id="__codelineno-0-302" name="__codelineno-0-302"></a>
-<a id="__codelineno-0-303" name="__codelineno-0-303"></a><span class="sd">    In CPN formalism an output arc carries an *arc expression* — a function evaluated</span>
-<a id="__codelineno-0-304" name="__codelineno-0-304"></a><span class="sd">    against the transition&#39;s output tokens that determines whether tokens flow along this</span>
-<a id="__codelineno-0-305" name="__codelineno-0-305"></a><span class="sd">    arc. On the output side that inscription is, in practice, always a boolean *activation*</span>
-<a id="__codelineno-0-306" name="__codelineno-0-306"></a><span class="sd">    predicate, so cpnx names it `condition` — a different mechanism from the input side&#39;s</span>
-<a id="__codelineno-0-307" name="__codelineno-0-307"></a><span class="sd">    token selection (see [`InputArc`][cpnx.InputArc] and</span>
-<a id="__codelineno-0-308" name="__codelineno-0-308"></a><span class="sd">    `docs/adr/0004-arc-selection-key-filter.md`).</span>
-<a id="__codelineno-0-309" name="__codelineno-0-309"></a>
-<a id="__codelineno-0-310" name="__codelineno-0-310"></a><span class="sd">    Attributes:</span>
-<a id="__codelineno-0-311" name="__codelineno-0-311"></a><span class="sd">        place: Name of the target place.</span>
-<a id="__codelineno-0-312" name="__codelineno-0-312"></a><span class="sd">        count: Number of tokens to deposit. Defaults to 1.</span>
-<a id="__codelineno-0-313" name="__codelineno-0-313"></a><span class="sd">        condition: Arc activation predicate. Receives the list of non-resource</span>
-<a id="__codelineno-0-314" name="__codelineno-0-314"></a><span class="sd">                   output tokens returned by the action; the arc is *skipped*</span>
-<a id="__codelineno-0-315" name="__codelineno-0-315"></a><span class="sd">                   (no tokens deposited) when it returns `False`. `None`</span>
-<a id="__codelineno-0-316" name="__codelineno-0-316"></a><span class="sd">                   (default) means the arc always fires. A pure `Callable`;</span>
-<a id="__codelineno-0-317" name="__codelineno-0-317"></a><span class="sd">                   certified callables run inline (see [`cpnx.certification`]).</span>
-<a id="__codelineno-0-318" name="__codelineno-0-318"></a><span class="sd">                   A boolean predicate: if annotated, its return type is checked to</span>
-<a id="__codelineno-0-319" name="__codelineno-0-319"></a><span class="sd">                   be `bool` at construction (a non-`bool` annotation raises</span>
-<a id="__codelineno-0-320" name="__codelineno-0-320"></a><span class="sd">                   `TypeError`); unannotated callables are accepted unchecked.</span>
-<a id="__codelineno-0-321" name="__codelineno-0-321"></a><span class="sd">    &quot;&quot;&quot;</span>
-<a id="__codelineno-0-322" name="__codelineno-0-322"></a>
-<a id="__codelineno-0-323" name="__codelineno-0-323"></a>    <span class="n">place</span><span class="p">:</span> <span class="nb">str</span>
-<a id="__codelineno-0-324" name="__codelineno-0-324"></a>    <span class="n">count</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
-<a id="__codelineno-0-325" name="__codelineno-0-325"></a>    <span class="n">condition</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">]],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
-<a id="__codelineno-0-326" name="__codelineno-0-326"></a>
-<a id="__codelineno-0-327" name="__codelineno-0-327"></a>    <span class="k">def</span><span class="w"> </span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
-<a id="__codelineno-0-328" name="__codelineno-0-328"></a>        <span class="c1"># Keep the inline-safe flag in sync with ``condition``, including</span>
-<a id="__codelineno-0-329" name="__codelineno-0-329"></a>        <span class="c1"># post-construction reassignment. Reject/verify before mutating so a bad</span>
-<a id="__codelineno-0-330" name="__codelineno-0-330"></a>        <span class="c1"># value leaves the arc in its previous valid state.</span>
-<a id="__codelineno-0-331" name="__codelineno-0-331"></a>        <span class="k">if</span> <span class="n">name</span> <span class="o">==</span> <span class="s2">&quot;condition&quot;</span><span class="p">:</span>
-<a id="__codelineno-0-332" name="__codelineno-0-332"></a>            <span class="n">_reject_string_expression</span><span class="p">(</span><span class="s2">&quot;OutputArc.condition&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
-<a id="__codelineno-0-333" name="__codelineno-0-333"></a>            <span class="k">if</span> <span class="nb">callable</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
-<a id="__codelineno-0-334" name="__codelineno-0-334"></a>                <span class="n">verify_callable_purity</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
-<a id="__codelineno-0-335" name="__codelineno-0-335"></a>                <span class="n">_reject_non_bool_return</span><span class="p">(</span><span class="s2">&quot;OutputArc.condition&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
-<a id="__codelineno-0-336" name="__codelineno-0-336"></a>            <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="s2">&quot;_inline_safe&quot;</span><span class="p">,</span> <span class="n">_inline_safe_for</span><span class="p">(</span><span class="n">value</span><span class="p">))</span>
-<a id="__codelineno-0-337" name="__codelineno-0-337"></a>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
-<a id="__codelineno-0-338" name="__codelineno-0-338"></a>
-<a id="__codelineno-0-339" name="__codelineno-0-339"></a>    <span class="nd">@classmethod</span>
-<a id="__codelineno-0-340" name="__codelineno-0-340"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">on_color</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">color</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">place</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">count</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;OutputArc&quot;</span><span class="p">:</span>
-<a id="__codelineno-0-341" name="__codelineno-0-341"></a><span class="w">        </span><span class="sd">&quot;&quot;&quot;Build an [`OutputArc`][cpnx.OutputArc] that only fires for a matching first token color.</span>
-<a id="__codelineno-0-342" name="__codelineno-0-342"></a>
-<a id="__codelineno-0-343" name="__codelineno-0-343"></a><span class="sd">        The returned arc&#39;s `condition` is a callable that checks whether the action&#39;s</span>
-<a id="__codelineno-0-344" name="__codelineno-0-344"></a><span class="sd">        output tokens are non-empty and the first token&#39;s color equals `color`. It closes</span>
-<a id="__codelineno-0-345" name="__codelineno-0-345"></a><span class="sd">        over `color` (an immutable string), so it certifies for inline evaluation.</span>
-<a id="__codelineno-0-346" name="__codelineno-0-346"></a>
-<a id="__codelineno-0-347" name="__codelineno-0-347"></a><span class="sd">        Args:</span>
-<a id="__codelineno-0-348" name="__codelineno-0-348"></a><span class="sd">            color: The `Token` color to match against the first output token.</span>
-<a id="__codelineno-0-349" name="__codelineno-0-349"></a><span class="sd">            place: Name of the target place.</span>
-<a id="__codelineno-0-350" name="__codelineno-0-350"></a><span class="sd">            count: Number of tokens to deposit when the arc fires. Defaults to 1.</span>
-<a id="__codelineno-0-351" name="__codelineno-0-351"></a>
-<a id="__codelineno-0-352" name="__codelineno-0-352"></a><span class="sd">        Returns:</span>
-<a id="__codelineno-0-353" name="__codelineno-0-353"></a><span class="sd">            A new `OutputArc` bound to `place` whose condition evaluates to `True` only</span>
-<a id="__codelineno-0-354" name="__codelineno-0-354"></a><span class="sd">            when the first token in the action&#39;s output has color `color`.</span>
-<a id="__codelineno-0-355" name="__codelineno-0-355"></a>
-<a id="__codelineno-0-356" name="__codelineno-0-356"></a><span class="sd">        Example:</span>
-<a id="__codelineno-0-357" name="__codelineno-0-357"></a><span class="sd">            ```python</span>
-<a id="__codelineno-0-358" name="__codelineno-0-358"></a><span class="sd">            OutputArc.on_color(&quot;success&quot;, place=&quot;done&quot;, count=1)</span>
-<a id="__codelineno-0-359" name="__codelineno-0-359"></a><span class="sd">            ```</span>
-<a id="__codelineno-0-360" name="__codelineno-0-360"></a><span class="sd">        &quot;&quot;&quot;</span>
-<a id="__codelineno-0-361" name="__codelineno-0-361"></a>        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">place</span><span class="o">=</span><span class="n">place</span><span class="p">,</span> <span class="n">count</span><span class="o">=</span><span class="n">count</span><span class="p">,</span> <span class="n">condition</span><span class="o">=</span><span class="k">lambda</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">bool</span><span class="p">(</span><span class="n">tokens</span> <span class="ow">and</span> <span class="n">tokens</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">color</span> <span class="o">==</span> <span class="n">color</span><span class="p">))</span>
+<span class="normal"><a href="#__codelineno-0-361">361</a></span>
+<span class="normal"><a href="#__codelineno-0-362">362</a></span>
+<span class="normal"><a href="#__codelineno-0-363">363</a></span>
+<span class="normal"><a href="#__codelineno-0-364">364</a></span>
+<span class="normal"><a href="#__codelineno-0-365">365</a></span>
+<span class="normal"><a href="#__codelineno-0-366">366</a></span>
+<span class="normal"><a href="#__codelineno-0-367">367</a></span>
+<span class="normal"><a href="#__codelineno-0-368">368</a></span>
+<span class="normal"><a href="#__codelineno-0-369">369</a></span>
+<span class="normal"><a href="#__codelineno-0-370">370</a></span>
+<span class="normal"><a href="#__codelineno-0-371">371</a></span>
+<span class="normal"><a href="#__codelineno-0-372">372</a></span>
+<span class="normal"><a href="#__codelineno-0-373">373</a></span>
+<span class="normal"><a href="#__codelineno-0-374">374</a></span>
+<span class="normal"><a href="#__codelineno-0-375">375</a></span>
+<span class="normal"><a href="#__codelineno-0-376">376</a></span>
+<span class="normal"><a href="#__codelineno-0-377">377</a></span>
+<span class="normal"><a href="#__codelineno-0-378">378</a></span>
+<span class="normal"><a href="#__codelineno-0-379">379</a></span>
+<span class="normal"><a href="#__codelineno-0-380">380</a></span>
+<span class="normal"><a href="#__codelineno-0-381">381</a></span>
+<span class="normal"><a href="#__codelineno-0-382">382</a></span>
+<span class="normal"><a href="#__codelineno-0-383">383</a></span>
+<span class="normal"><a href="#__codelineno-0-384">384</a></span>
+<span class="normal"><a href="#__codelineno-0-385">385</a></span>
+<span class="normal"><a href="#__codelineno-0-386">386</a></span>
+<span class="normal"><a href="#__codelineno-0-387">387</a></span>
+<span class="normal"><a href="#__codelineno-0-388">388</a></span>
+<span class="normal"><a href="#__codelineno-0-389">389</a></span>
+<span class="normal"><a href="#__codelineno-0-390">390</a></span>
+<span class="normal"><a href="#__codelineno-0-391">391</a></span>
+<span class="normal"><a href="#__codelineno-0-392">392</a></span>
+<span class="normal"><a href="#__codelineno-0-393">393</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-331" name="__codelineno-0-331"></a><span class="nd">@dataclass</span>
+<a id="__codelineno-0-332" name="__codelineno-0-332"></a><span class="k">class</span><span class="w"> </span><span class="nc">OutputArc</span><span class="p">:</span>
+<a id="__codelineno-0-333" name="__codelineno-0-333"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;Describe how a transition deposits tokens into one output place.</span>
+<a id="__codelineno-0-334" name="__codelineno-0-334"></a>
+<a id="__codelineno-0-335" name="__codelineno-0-335"></a><span class="sd">    In CPN formalism an output arc carries an *arc expression* — a function evaluated</span>
+<a id="__codelineno-0-336" name="__codelineno-0-336"></a><span class="sd">    against the transition&#39;s output tokens that determines whether tokens flow along this</span>
+<a id="__codelineno-0-337" name="__codelineno-0-337"></a><span class="sd">    arc. On the output side that inscription is, in practice, always a boolean *activation*</span>
+<a id="__codelineno-0-338" name="__codelineno-0-338"></a><span class="sd">    predicate, so cpnx names it `condition` — a different mechanism from the input side&#39;s</span>
+<a id="__codelineno-0-339" name="__codelineno-0-339"></a><span class="sd">    token selection (see [`InputArc`][cpnx.InputArc] and</span>
+<a id="__codelineno-0-340" name="__codelineno-0-340"></a><span class="sd">    `docs/adr/0004-arc-selection-key-filter.md`).</span>
+<a id="__codelineno-0-341" name="__codelineno-0-341"></a>
+<a id="__codelineno-0-342" name="__codelineno-0-342"></a><span class="sd">    Attributes:</span>
+<a id="__codelineno-0-343" name="__codelineno-0-343"></a><span class="sd">        place: Name of the target place.</span>
+<a id="__codelineno-0-344" name="__codelineno-0-344"></a><span class="sd">        count: Number of tokens to deposit. Defaults to 1.</span>
+<a id="__codelineno-0-345" name="__codelineno-0-345"></a><span class="sd">        condition: Arc activation predicate. Receives the list of non-resource</span>
+<a id="__codelineno-0-346" name="__codelineno-0-346"></a><span class="sd">                   output tokens returned by the action; the arc is *skipped*</span>
+<a id="__codelineno-0-347" name="__codelineno-0-347"></a><span class="sd">                   (no tokens deposited) when it returns `False`. `None`</span>
+<a id="__codelineno-0-348" name="__codelineno-0-348"></a><span class="sd">                   (default) means the arc always fires. A pure `Callable`;</span>
+<a id="__codelineno-0-349" name="__codelineno-0-349"></a><span class="sd">                   certified callables run inline (see [`cpnx.certification`]).</span>
+<a id="__codelineno-0-350" name="__codelineno-0-350"></a><span class="sd">                   A boolean predicate: if annotated, its return type is checked to</span>
+<a id="__codelineno-0-351" name="__codelineno-0-351"></a><span class="sd">                   be `bool` at construction (a non-`bool` annotation raises</span>
+<a id="__codelineno-0-352" name="__codelineno-0-352"></a><span class="sd">                   `TypeError`); unannotated callables are accepted unchecked.</span>
+<a id="__codelineno-0-353" name="__codelineno-0-353"></a><span class="sd">    &quot;&quot;&quot;</span>
+<a id="__codelineno-0-354" name="__codelineno-0-354"></a>
+<a id="__codelineno-0-355" name="__codelineno-0-355"></a>    <span class="n">place</span><span class="p">:</span> <span class="nb">str</span>
+<a id="__codelineno-0-356" name="__codelineno-0-356"></a>    <span class="n">count</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span>
+<a id="__codelineno-0-357" name="__codelineno-0-357"></a>    <span class="n">condition</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">list</span><span class="p">[</span><span class="n">Token</span><span class="p">]],</span> <span class="nb">bool</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<a id="__codelineno-0-358" name="__codelineno-0-358"></a>
+<a id="__codelineno-0-359" name="__codelineno-0-359"></a>    <span class="k">def</span><span class="w"> </span><span class="fm">__setattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">):</span>
+<a id="__codelineno-0-360" name="__codelineno-0-360"></a>        <span class="c1"># Keep the inline-safe flag in sync with ``condition``, including</span>
+<a id="__codelineno-0-361" name="__codelineno-0-361"></a>        <span class="c1"># post-construction reassignment. Reject/verify before mutating so a bad</span>
+<a id="__codelineno-0-362" name="__codelineno-0-362"></a>        <span class="c1"># value leaves the arc in its previous valid state.</span>
+<a id="__codelineno-0-363" name="__codelineno-0-363"></a>        <span class="k">if</span> <span class="n">name</span> <span class="o">==</span> <span class="s2">&quot;condition&quot;</span><span class="p">:</span>
+<a id="__codelineno-0-364" name="__codelineno-0-364"></a>            <span class="n">_reject_string_expression</span><span class="p">(</span><span class="s2">&quot;OutputArc.condition&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+<a id="__codelineno-0-365" name="__codelineno-0-365"></a>            <span class="k">if</span> <span class="nb">callable</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
+<a id="__codelineno-0-366" name="__codelineno-0-366"></a>                <span class="n">verify_callable_purity</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+<a id="__codelineno-0-367" name="__codelineno-0-367"></a>                <span class="n">_reject_non_bool_return</span><span class="p">(</span><span class="s2">&quot;OutputArc.condition&quot;</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+<a id="__codelineno-0-368" name="__codelineno-0-368"></a>            <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="s2">&quot;_inline_safe&quot;</span><span class="p">,</span> <span class="n">_inline_safe_for</span><span class="p">(</span><span class="n">value</span><span class="p">))</span>
+<a id="__codelineno-0-369" name="__codelineno-0-369"></a>        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__setattr__</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span>
+<a id="__codelineno-0-370" name="__codelineno-0-370"></a>
+<a id="__codelineno-0-371" name="__codelineno-0-371"></a>    <span class="nd">@classmethod</span>
+<a id="__codelineno-0-372" name="__codelineno-0-372"></a>    <span class="k">def</span><span class="w"> </span><span class="nf">on_color</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">color</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">place</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">count</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;OutputArc&quot;</span><span class="p">:</span>
+<a id="__codelineno-0-373" name="__codelineno-0-373"></a><span class="w">        </span><span class="sd">&quot;&quot;&quot;Build an [`OutputArc`][cpnx.OutputArc] that only fires for a matching first token color.</span>
+<a id="__codelineno-0-374" name="__codelineno-0-374"></a>
+<a id="__codelineno-0-375" name="__codelineno-0-375"></a><span class="sd">        The returned arc&#39;s `condition` is a callable that checks whether the action&#39;s</span>
+<a id="__codelineno-0-376" name="__codelineno-0-376"></a><span class="sd">        output tokens are non-empty and the first token&#39;s color equals `color`. It closes</span>
+<a id="__codelineno-0-377" name="__codelineno-0-377"></a><span class="sd">        over `color` (an immutable string), so it certifies for inline evaluation.</span>
+<a id="__codelineno-0-378" name="__codelineno-0-378"></a>
+<a id="__codelineno-0-379" name="__codelineno-0-379"></a><span class="sd">        Args:</span>
+<a id="__codelineno-0-380" name="__codelineno-0-380"></a><span class="sd">            color: The `Token` color to match against the first output token.</span>
+<a id="__codelineno-0-381" name="__codelineno-0-381"></a><span class="sd">            place: Name of the target place.</span>
+<a id="__codelineno-0-382" name="__codelineno-0-382"></a><span class="sd">            count: Number of tokens to deposit when the arc fires. Defaults to 1.</span>
+<a id="__codelineno-0-383" name="__codelineno-0-383"></a>
+<a id="__codelineno-0-384" name="__codelineno-0-384"></a><span class="sd">        Returns:</span>
+<a id="__codelineno-0-385" name="__codelineno-0-385"></a><span class="sd">            A new `OutputArc` bound to `place` whose condition evaluates to `True` only</span>
+<a id="__codelineno-0-386" name="__codelineno-0-386"></a><span class="sd">            when the first token in the action&#39;s output has color `color`.</span>
+<a id="__codelineno-0-387" name="__codelineno-0-387"></a>
+<a id="__codelineno-0-388" name="__codelineno-0-388"></a><span class="sd">        Example:</span>
+<a id="__codelineno-0-389" name="__codelineno-0-389"></a><span class="sd">            ```python</span>
+<a id="__codelineno-0-390" name="__codelineno-0-390"></a><span class="sd">            OutputArc.on_color(&quot;success&quot;, place=&quot;done&quot;, count=1)</span>
+<a id="__codelineno-0-391" name="__codelineno-0-391"></a><span class="sd">            ```</span>
+<a id="__codelineno-0-392" name="__codelineno-0-392"></a><span class="sd">        &quot;&quot;&quot;</span>
+<a id="__codelineno-0-393" name="__codelineno-0-393"></a>        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">place</span><span class="o">=</span><span class="n">place</span><span class="p">,</span> <span class="n">count</span><span class="o">=</span><span class="n">count</span><span class="p">,</span> <span class="n">condition</span><span class="o">=</span><span class="k">lambda</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">bool</span><span class="p">(</span><span class="n">tokens</span> <span class="ow">and</span> <span class="n">tokens</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">color</span> <span class="o">==</span> <span class="n">color</span><span class="p">))</span>
 </code></pre></div></td></tr></table></div>
               </details>
 
@@ -2240,51 +2387,51 @@ over <code>color</code> (an immutable string), so it certifies for inline evalua
 
             <details class="mkdocstrings-source">
               <summary>Source code in <code>src/cpnx/transitions.py</code></summary>
-              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-339">339</a></span>
-<span class="normal"><a href="#__codelineno-0-340">340</a></span>
-<span class="normal"><a href="#__codelineno-0-341">341</a></span>
-<span class="normal"><a href="#__codelineno-0-342">342</a></span>
-<span class="normal"><a href="#__codelineno-0-343">343</a></span>
-<span class="normal"><a href="#__codelineno-0-344">344</a></span>
-<span class="normal"><a href="#__codelineno-0-345">345</a></span>
-<span class="normal"><a href="#__codelineno-0-346">346</a></span>
-<span class="normal"><a href="#__codelineno-0-347">347</a></span>
-<span class="normal"><a href="#__codelineno-0-348">348</a></span>
-<span class="normal"><a href="#__codelineno-0-349">349</a></span>
-<span class="normal"><a href="#__codelineno-0-350">350</a></span>
-<span class="normal"><a href="#__codelineno-0-351">351</a></span>
-<span class="normal"><a href="#__codelineno-0-352">352</a></span>
-<span class="normal"><a href="#__codelineno-0-353">353</a></span>
-<span class="normal"><a href="#__codelineno-0-354">354</a></span>
-<span class="normal"><a href="#__codelineno-0-355">355</a></span>
-<span class="normal"><a href="#__codelineno-0-356">356</a></span>
-<span class="normal"><a href="#__codelineno-0-357">357</a></span>
-<span class="normal"><a href="#__codelineno-0-358">358</a></span>
-<span class="normal"><a href="#__codelineno-0-359">359</a></span>
-<span class="normal"><a href="#__codelineno-0-360">360</a></span>
-<span class="normal"><a href="#__codelineno-0-361">361</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-339" name="__codelineno-0-339"></a><span class="nd">@classmethod</span>
-<a id="__codelineno-0-340" name="__codelineno-0-340"></a><span class="k">def</span><span class="w"> </span><span class="nf">on_color</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">color</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">place</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">count</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;OutputArc&quot;</span><span class="p">:</span>
-<a id="__codelineno-0-341" name="__codelineno-0-341"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;Build an [`OutputArc`][cpnx.OutputArc] that only fires for a matching first token color.</span>
-<a id="__codelineno-0-342" name="__codelineno-0-342"></a>
-<a id="__codelineno-0-343" name="__codelineno-0-343"></a><span class="sd">    The returned arc&#39;s `condition` is a callable that checks whether the action&#39;s</span>
-<a id="__codelineno-0-344" name="__codelineno-0-344"></a><span class="sd">    output tokens are non-empty and the first token&#39;s color equals `color`. It closes</span>
-<a id="__codelineno-0-345" name="__codelineno-0-345"></a><span class="sd">    over `color` (an immutable string), so it certifies for inline evaluation.</span>
-<a id="__codelineno-0-346" name="__codelineno-0-346"></a>
-<a id="__codelineno-0-347" name="__codelineno-0-347"></a><span class="sd">    Args:</span>
-<a id="__codelineno-0-348" name="__codelineno-0-348"></a><span class="sd">        color: The `Token` color to match against the first output token.</span>
-<a id="__codelineno-0-349" name="__codelineno-0-349"></a><span class="sd">        place: Name of the target place.</span>
-<a id="__codelineno-0-350" name="__codelineno-0-350"></a><span class="sd">        count: Number of tokens to deposit when the arc fires. Defaults to 1.</span>
-<a id="__codelineno-0-351" name="__codelineno-0-351"></a>
-<a id="__codelineno-0-352" name="__codelineno-0-352"></a><span class="sd">    Returns:</span>
-<a id="__codelineno-0-353" name="__codelineno-0-353"></a><span class="sd">        A new `OutputArc` bound to `place` whose condition evaluates to `True` only</span>
-<a id="__codelineno-0-354" name="__codelineno-0-354"></a><span class="sd">        when the first token in the action&#39;s output has color `color`.</span>
-<a id="__codelineno-0-355" name="__codelineno-0-355"></a>
-<a id="__codelineno-0-356" name="__codelineno-0-356"></a><span class="sd">    Example:</span>
-<a id="__codelineno-0-357" name="__codelineno-0-357"></a><span class="sd">        ```python</span>
-<a id="__codelineno-0-358" name="__codelineno-0-358"></a><span class="sd">        OutputArc.on_color(&quot;success&quot;, place=&quot;done&quot;, count=1)</span>
-<a id="__codelineno-0-359" name="__codelineno-0-359"></a><span class="sd">        ```</span>
-<a id="__codelineno-0-360" name="__codelineno-0-360"></a><span class="sd">    &quot;&quot;&quot;</span>
-<a id="__codelineno-0-361" name="__codelineno-0-361"></a>    <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">place</span><span class="o">=</span><span class="n">place</span><span class="p">,</span> <span class="n">count</span><span class="o">=</span><span class="n">count</span><span class="p">,</span> <span class="n">condition</span><span class="o">=</span><span class="k">lambda</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">bool</span><span class="p">(</span><span class="n">tokens</span> <span class="ow">and</span> <span class="n">tokens</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">color</span> <span class="o">==</span> <span class="n">color</span><span class="p">))</span>
+              <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-371">371</a></span>
+<span class="normal"><a href="#__codelineno-0-372">372</a></span>
+<span class="normal"><a href="#__codelineno-0-373">373</a></span>
+<span class="normal"><a href="#__codelineno-0-374">374</a></span>
+<span class="normal"><a href="#__codelineno-0-375">375</a></span>
+<span class="normal"><a href="#__codelineno-0-376">376</a></span>
+<span class="normal"><a href="#__codelineno-0-377">377</a></span>
+<span class="normal"><a href="#__codelineno-0-378">378</a></span>
+<span class="normal"><a href="#__codelineno-0-379">379</a></span>
+<span class="normal"><a href="#__codelineno-0-380">380</a></span>
+<span class="normal"><a href="#__codelineno-0-381">381</a></span>
+<span class="normal"><a href="#__codelineno-0-382">382</a></span>
+<span class="normal"><a href="#__codelineno-0-383">383</a></span>
+<span class="normal"><a href="#__codelineno-0-384">384</a></span>
+<span class="normal"><a href="#__codelineno-0-385">385</a></span>
+<span class="normal"><a href="#__codelineno-0-386">386</a></span>
+<span class="normal"><a href="#__codelineno-0-387">387</a></span>
+<span class="normal"><a href="#__codelineno-0-388">388</a></span>
+<span class="normal"><a href="#__codelineno-0-389">389</a></span>
+<span class="normal"><a href="#__codelineno-0-390">390</a></span>
+<span class="normal"><a href="#__codelineno-0-391">391</a></span>
+<span class="normal"><a href="#__codelineno-0-392">392</a></span>
+<span class="normal"><a href="#__codelineno-0-393">393</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-371" name="__codelineno-0-371"></a><span class="nd">@classmethod</span>
+<a id="__codelineno-0-372" name="__codelineno-0-372"></a><span class="k">def</span><span class="w"> </span><span class="nf">on_color</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">color</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">place</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">count</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;OutputArc&quot;</span><span class="p">:</span>
+<a id="__codelineno-0-373" name="__codelineno-0-373"></a><span class="w">    </span><span class="sd">&quot;&quot;&quot;Build an [`OutputArc`][cpnx.OutputArc] that only fires for a matching first token color.</span>
+<a id="__codelineno-0-374" name="__codelineno-0-374"></a>
+<a id="__codelineno-0-375" name="__codelineno-0-375"></a><span class="sd">    The returned arc&#39;s `condition` is a callable that checks whether the action&#39;s</span>
+<a id="__codelineno-0-376" name="__codelineno-0-376"></a><span class="sd">    output tokens are non-empty and the first token&#39;s color equals `color`. It closes</span>
+<a id="__codelineno-0-377" name="__codelineno-0-377"></a><span class="sd">    over `color` (an immutable string), so it certifies for inline evaluation.</span>
+<a id="__codelineno-0-378" name="__codelineno-0-378"></a>
+<a id="__codelineno-0-379" name="__codelineno-0-379"></a><span class="sd">    Args:</span>
+<a id="__codelineno-0-380" name="__codelineno-0-380"></a><span class="sd">        color: The `Token` color to match against the first output token.</span>
+<a id="__codelineno-0-381" name="__codelineno-0-381"></a><span class="sd">        place: Name of the target place.</span>
+<a id="__codelineno-0-382" name="__codelineno-0-382"></a><span class="sd">        count: Number of tokens to deposit when the arc fires. Defaults to 1.</span>
+<a id="__codelineno-0-383" name="__codelineno-0-383"></a>
+<a id="__codelineno-0-384" name="__codelineno-0-384"></a><span class="sd">    Returns:</span>
+<a id="__codelineno-0-385" name="__codelineno-0-385"></a><span class="sd">        A new `OutputArc` bound to `place` whose condition evaluates to `True` only</span>
+<a id="__codelineno-0-386" name="__codelineno-0-386"></a><span class="sd">        when the first token in the action&#39;s output has color `color`.</span>
+<a id="__codelineno-0-387" name="__codelineno-0-387"></a>
+<a id="__codelineno-0-388" name="__codelineno-0-388"></a><span class="sd">    Example:</span>
+<a id="__codelineno-0-389" name="__codelineno-0-389"></a><span class="sd">        ```python</span>
+<a id="__codelineno-0-390" name="__codelineno-0-390"></a><span class="sd">        OutputArc.on_color(&quot;success&quot;, place=&quot;done&quot;, count=1)</span>
+<a id="__codelineno-0-391" name="__codelineno-0-391"></a><span class="sd">        ```</span>
+<a id="__codelineno-0-392" name="__codelineno-0-392"></a><span class="sd">    &quot;&quot;&quot;</span>
+<a id="__codelineno-0-393" name="__codelineno-0-393"></a>    <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">place</span><span class="o">=</span><span class="n">place</span><span class="p">,</span> <span class="n">count</span><span class="o">=</span><span class="n">count</span><span class="p">,</span> <span class="n">condition</span><span class="o">=</span><span class="k">lambda</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">bool</span><span class="p">(</span><span class="n">tokens</span> <span class="ow">and</span> <span class="n">tokens</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">color</span> <span class="o">==</span> <span class="n">color</span><span class="p">))</span>
 </code></pre></div></td></tr></table></div>
             </details>
     </div>

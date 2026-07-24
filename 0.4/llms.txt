@@ -8,6 +8,10 @@ cpnx is a Coloured Petri Net (CPN) executor for concurrent Python pipelines — 
 
 - [Home](https://philgresh.github.io/cpnx/latest/index.md)
 
+## Worked example
+
+- [The Concurrency Cafe](https://philgresh.github.io/cpnx/latest/cafe/index.md)
+
 ## API reference
 
 - [Core](https://philgresh.github.io/cpnx/latest/reference/core/index.md)
