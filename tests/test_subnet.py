@@ -101,21 +101,43 @@ def _paced_subnet_net(pacing: float) -> PetriNet:
     )
 
 
-def test_subnet_with_internal_cooldown_drains_under_logical_driver():
-    """A subnet with real internal friction must still fully drain under the logical driver. Its
-    cooldown is waited out on the wall clock (a subnet is not on the parent's logical clock), so a
-    tiny pacing keeps the test fast — the point is correctness, not that the wait is skipped."""
-    net = _paced_subnet_net(pacing=0.01)
-    n = 5
+def test_subnet_cooldown_is_free_under_logical_driver():
+    """A subnet with real internal friction drains under the logical driver, AND its cooldown is
+    jumped for free — the parent's logical-clock discipline is inherited by the subnet (on the
+    subnet's own clock). A large pacing would take real seconds if it were waited out; here the
+    whole drive must finish far inside that, proving the cooldown was skipped, not slept."""
+    pacing = 5.0  # would be 5 s * n if waited on the wall clock — must NOT be
+    n = 4
+    net = _paced_subnet_net(pacing=pacing)
     with net:
         for i in range(n):
             net.deposit("P_Source", Token(payload={"i": i}))
+        start = time.perf_counter()
         net.drive_to_quiescence()
+        elapsed = time.perf_counter() - start
         assert net.places["P_Sink"].stats()["absorbed"] == n
+        assert elapsed < 1.0, f"subnet cooldown was waited in real time ({elapsed:.1f}s), not jumped"
 
 
-def test_subnet_clock_stays_isolated_across_many_firings():
-    """The parent's logical clock must never leak into the subnet, however many times it fires."""
+def test_subnet_cooldown_is_waited_on_the_wall_clock_in_production():
+    """The counterpart: under the wall-clock driver (`run`, production), a subnet's cooldown IS
+    waited out in real time — correct production semantics."""
+    pacing = 0.05
+    n = 3
+    net = _paced_subnet_net(pacing=pacing)
+    with net:
+        for i in range(n):
+            net.deposit("P_Source", Token(payload={"i": i}))
+        start = time.perf_counter()
+        net.run(deadline=time.monotonic() + 30.0)
+        elapsed = time.perf_counter() - start
+        assert net.places["P_Sink"].stats()["absorbed"] == n
+        assert elapsed >= (n - 1) * pacing, "a real cooldown was skipped under the wall-clock driver"
+
+
+def test_subnet_clock_value_stays_decoupled_across_many_firings():
+    """The parent's logical *time value* must never leak into the subnet, however many firings —
+    even though the subnet keeps its own (independent) logical clock under the logical driver."""
     net = bench_subnet._wrapped_net(2)
     net.advance_time(5000.0)  # parent far out on the logical clock
     with net:
@@ -123,5 +145,5 @@ def test_subnet_clock_stays_isolated_across_many_firings():
             net.deposit("P_Source", Token(payload={"i": i}))
         net.drive_to_quiescence()
         subnet = net.transitions["T_Sub"].subnet
-        assert subnet._model_time is None, "parent's logical clock leaked into the subnet"
+        assert subnet._model_time != 5000.0, "parent's logical time value leaked into the subnet"
         assert net.places["P_Sink"].stats()["absorbed"] == 10

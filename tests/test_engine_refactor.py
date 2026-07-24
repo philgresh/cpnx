@@ -584,12 +584,13 @@ def test_deposit_into_subnet():
     assert subnet.places["p1"].tokens[0].id != src_token.id
 
 
-def test_subnet_clock_is_isolated_from_parent():
-    """A subnet runs on its own wall clock — the parent's logical clock never crosses the port
-    boundary. (This replaces an earlier `test_sync_subnet_time`, which asserted the opposite:
-    that the parent pushed its logical time onto the subnet. That coupling stranded tokens under
-    `drive_to_quiescence` because a subnet fires once per binding and the repeated push moved the
-    subnet clock backward-or-equal, which `advance_time` rejects. See `tests/test_subnet.py`.)"""
+def test_subnet_clock_value_is_decoupled_from_parent():
+    """The parent's logical *time value* never crosses the port boundary. (This replaces an
+    earlier `test_sync_subnet_time`, which asserted the opposite — that the parent pushed its
+    logical time onto the subnet. That coupling stranded tokens under `drive_to_quiescence`,
+    because a subnet fires once per binding and the repeated push moved the subnet clock
+    backward-or-equal, which `advance_time` rejects. The subnet may hold its *own* clock; it must
+    never be the parent's value. See `tests/test_subnet.py`.)"""
     import time
 
     from cpnx.transitions import InputArc, SubstitutionTransition
@@ -611,12 +612,11 @@ def test_subnet_clock_is_isolated_from_parent():
             )
         ],
     )
-    # Parent on the logical clock; firing the subnet must not couple or advance the subnet's clock.
-    net.advance_time(1000.0)
+    net.advance_time(1000.0)  # parent far out on the logical clock
     with net:
         net.deposit("socket_in", Token())
         net.run(deadline=time.monotonic() + 2.0)
-    assert subnet._model_time is None, "subnet clock was coupled to the parent's logical clock"
+    assert subnet._model_time != 1000.0, "parent's logical time value leaked into the subnet"
     assert len(net.places["socket_out"].tokens) == 1
 
 

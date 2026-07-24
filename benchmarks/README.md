@@ -521,43 +521,44 @@ CPython 3.14.3, min-of-three, 1000 tokens):
 | 10 | 349.6 | 454.8 | 105.2 |
 | 30 | 1817.0 | 2241.6 | 424.6 |
 
-Two facts:
+Two facts (production, wall-clock `run()`):
 
 - **A fixed ~50-56 µs per firing** (read at K=1, where the shared per-step cost is smallest) —
-  the deposit-into-ports, spin-up-`run()`, retrieve, sync-clock machinery. That is the flat
-  tax for wrapping, paid once per firing regardless of workload depth.
-- **On top of that, a subnet re-runs its own run/quiescence loop per internal step**, which is
+  the deposit-into-ports, drive-the-subnet, retrieve machinery. That is the flat tax for
+  wrapping, paid once per firing regardless of workload depth.
+- **On top of that, a subnet re-runs its own drive/quiescence loop per internal step**, which is
   heavier than an inlined step — so the overhead *grows* with K (56→425 µs). A subnet does not
   make a large internal workflow cheaper; it multiplies its per-step cost. (The flat baseline
   is itself super-linear in K — per-step enablement scan grows with transition count — and both
   sides pay that; the *delta* is the subnet-specific part.)
 
-**The wall-clock leak — the one that bites.** A subnet is clock-isolated: its internal `run()`
-waits out its own cooldowns on the **real** clock, and the parent's logical-clock driver cannot
-reach across the boundary. The same 0.05 s cooldown, 8 tokens, both under `drive_to_quiescence`:
+**Driver-mode inheritance: a subnet's cooldowns are free to simulate.** A subnet inherits the
+parent's clock *regime*. Under the logical driver (`drive_to_quiescence`) it is driven logically
+too, so its internal cooldowns are jumped for free — exactly like the parent's; under the wall
+driver (`run()`, production) they are waited out in real time. The same 0.05 s cooldown, 8 tokens:
 
-| cooldown location | wall time |
-| --- | ---: |
-| in the parent | 0.6 ms (logical driver skips it) |
-| inside a subnet | 394.5 ms (isolated, waited in full) |
+| cooldown location | driver | wall time |
+| --- | --- | ---: |
+| in the parent | logical | 0.6 ms (jumped) |
+| inside a subnet | logical | 1.0 ms (jumped — inherited) |
+| inside a subnet | wall | 388 ms (waited — production) |
 
-That is **~660×**, landing on the `n × pacing` real-time floor. The trick that makes the
-cafe's 8-second grinder cooldown cost nothing in a benchmark does not extend into a subnet —
-any subnet with real internal friction burns real wall time per firing, and it cannot be
-driven away. This is intentional (see below), not a driver limitation.
+Logical driving is **~380× faster to simulate** the friction subnet, while the wall driver
+still waits the real cooldown when you actually run the net. Tradeoff: for a *friction-free*
+subnet the logical driver's clock machinery is ~20% heavier per firing than `run()`'s — a
+simulation-only cost, negligible against the friction win, and production (the table above) is
+unchanged.
 
-**Fixed along the way: `drive_to_quiescence` used to strand tokens in a subnet.** Driving a
-wrapped net on the logical clock left tokens stuck in the subnet's input port (measured: 14 of
-20), returned `is_quiescent() == True`, and reported a fast, wrong result — a silent
-correctness failure. The cause was clock *coupling*: the parent pushed its logical time onto the
-subnet via `advance_time`, but a subnet fires once per binding, so the second firing at the same
-instant moved the subnet clock backward-or-equal, which `advance_time` rejects; the resulting
-error rolled the firing back and stranded the already-deposited copy. It had never surfaced
-because `pastry_case` is not in the throughput sweep, so no logical-clock run had ever met a
-subnet. The fix isolates the subnet's clock entirely (a subnet is an atomic wall-clock
-sub-process; the parent's clock is parent context and does not cross the port boundary) —
-`src/cpnx/engine.py`, regression tests in `tests/test_subnet.py`. The wall-clock leak above is
-the intended residual of that isolation, not a bug.
+**How this was reached — a fixed silent bug.** `drive_to_quiescence` used to *strand* tokens in
+a subnet: driving a wrapped net on the logical clock left tokens stuck in the subnet's input port
+(measured: 14 of 20), returned `is_quiescent() == True`, and reported a fast, wrong result. The
+cause was clock *value* coupling — the parent pushed its logical time onto the subnet via
+`advance_time`, but a subnet fires once per binding, so the second firing at the same instant
+moved the subnet clock backward-or-equal, which `advance_time` rejects; the error rolled the
+firing back and stranded the already-deposited copy. It had never surfaced because `pastry_case`
+is not in the throughput sweep, so no logical-clock run had ever met a subnet. The fix isolates
+the subnet's clock *value* (the parent's time never crosses the boundary) while inheriting its
+*regime* (logical vs. wall) — `src/cpnx/engine.py`, regression tests in `tests/test_subnet.py`.
 
 [#18]: https://github.com/philgresh/cpnx/issues/18
 [#25]: https://github.com/philgresh/cpnx/issues/25

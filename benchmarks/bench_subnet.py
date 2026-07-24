@@ -11,30 +11,33 @@ in `engine.py`:
 
 1. **Overhead of the abstraction.** Wrap a chain of K instant pass-through transitions in a
    subnet vs. inlining the identical K transitions in the parent. Same logical work; the
-   wall-time delta per firing is the cost of the subnet machinery (deposit into ports, spin
-   up `subnet.run()`, retrieve from ports, sync the clock) that inlining does not pay.
+   wall-time delta per firing is the cost of the subnet machinery (deposit into ports, drive
+   the subnet to quiescence, retrieve from ports) that inlining does not pay.
 
 2. **Does that overhead scale with subnet size?** Sweep K. A fixed per-firing cost (spin-up /
    teardown only) stays flat in K; a per-internal-transition cost grows with it.
 
-3. **The wall-clock leak.** A subnet's internal `run()` waits out *its own* cooldowns on the
-   **real** clock. The parent's logical-clock driver (`drive_to_quiescence`) — the trick that
-   makes the cafe's grinder cooldown cost nothing — cannot reach across the boundary, *by
-   design*: a subnet is clock-isolated (see below). This section drives the same cooldown under
-   the logical driver in both places and shows it costing nothing in the parent and its full
-   real time in a subnet.
+3. **Driver-mode inheritance — a subnet's cooldowns are free under simulation.** A subnet
+   inherits the parent's clock *regime*: under `drive_to_quiescence` (logical) the subnet is
+   driven logically too, so its internal cooldowns/settles are jumped for free, exactly as the
+   parent's are; under `run()` (wall, production) they are waited out in real time. This section
+   runs the same cooldown both ways and shows it free in simulation and real in production.
 
-Driver note — clock isolation
------------------------------
-A subnet runs on its own wall clock, fully isolated from the parent's clock. This was not
-always so: `drive_to_quiescence` used to *strand* tokens inside a subnet (14 of 20 stuck in
-the input port) and report success anyway, because the parent's logical time was pushed onto
-the subnet and the second firing at the same instant moved its clock backward-or-equal, which
-`advance_time` rejects. That silent bug is fixed (`src/cpnx/engine.py`, regression tests in
-`tests/test_subnet.py`); the isolation it established is what makes section 3's leak an
-intentional, documented property rather than a driver limitation.
+Driver note — clock isolation + regime inheritance
+--------------------------------------------------
+A subnet's clock *value* is isolated (the parent's logical time is never pushed onto it), while
+its clock *regime* (logical vs. wall) is inherited from how the parent is being driven.
 
-Sections 1-2 use zero-friction subnets, so their wall time is engine CPU regardless of driver.
+This was not always so. `drive_to_quiescence` used to *strand* tokens inside a subnet (14 of 20
+stuck in the input port) and report success anyway, because the parent's logical time value was
+pushed onto the subnet and the second firing at the same instant moved its clock
+backward-or-equal, which `advance_time` rejects — a silent wrong result. The fix isolates the
+value and inherits the regime (`src/cpnx/engine.py`, regression tests in `tests/test_subnet.py`).
+
+Tradeoff, measured below: for a *friction-free* subnet the logical driver's tighter clock
+machinery is ~20% heavier per firing than `run()`'s — a simulation-only cost, and negligible
+against the win for any subnet with real internal friction (waited in full → jumped for free).
+Sections 1-2 report the production (wall-clock `run()`) overhead.
 
     python benchmarks/bench_subnet.py
 """
@@ -190,17 +193,15 @@ def _paced_parent_logical(n_tokens: int, pacing: float) -> float:
     return wall
 
 
-def _paced_subnet_logical(n_tokens: int, pacing: float) -> float:
-    """The identical cooldown INSIDE a subnet, driven on the SAME logical driver as the parent
-    case. The subnet still pays the cooldown in full: it is clock-isolated, so `subnet.run()`
-    waits it out on the real clock even though the parent is on the logical clock."""
+def _paced_subnet_net(pacing: float) -> PetriNet:
+    """A parent wrapping a subnet whose single internal step needs a paced (cooling) permit."""
     subnet = PetriNet(
         places=[Place("P_In"), PacedResourcePlace("P_Slot", capacity=1, pacing_secs=pacing), Place("P_Out")],
         transitions=[Transition("T_Step", [InputArc("P_In"), InputArc("P_Slot")], [OutputArc("P_Out")], _identity)],
         max_workers=1,
         seed=NET_SEED,
     )
-    net = PetriNet(
+    return PetriNet(
         places=[Place("P_Source"), SinkPlace("P_Sink")],
         transitions=[
             SubstitutionTransition(
@@ -216,6 +217,11 @@ def _paced_subnet_logical(n_tokens: int, pacing: float) -> float:
         max_workers=1,
         seed=NET_SEED,
     )
+
+
+def _paced_subnet_logical(n_tokens: int, pacing: float) -> float:
+    """Subnet cooldown under the LOGICAL driver — inherited regime jumps it for free."""
+    net = _paced_subnet_net(pacing)
     with net:
         for i in range(n_tokens):
             net.deposit("P_Source", Token(payload={"i": i}))
@@ -226,25 +232,33 @@ def _paced_subnet_logical(n_tokens: int, pacing: float) -> float:
     return wall
 
 
-def run_wallclock_leak(n_tokens: int = 8, pacing: float = 0.05) -> None:
-    print(f"\n=== The wall-clock leak: {n_tokens} tokens through a {pacing}s cooldown ===")
-    print("The same cooldown, once in the parent and once inside a subnet, both under the LOGICAL")
-    print("driver. The driver jumps over the parent's own friction (free); it cannot reach into a")
-    print("subnet, which is clock-isolated, so run() waits the identical cooldown out in real time.\n")
-    parent = _paced_parent_logical(n_tokens, pacing)
-    subnet = _paced_subnet_logical(n_tokens, pacing)
+def _paced_subnet_wall(n_tokens: int, pacing: float) -> float:
+    """The identical subnet cooldown under the WALL driver (`run()`, production) — waited in full."""
+    return _drain(_paced_subnet_net(pacing), n_tokens)
+
+
+def run_driver_mode(n_tokens: int = 8, pacing: float = 0.05) -> None:
+    print(f"\n=== Driver-mode inheritance: {n_tokens} tokens through a {pacing}s cooldown ===")
+    print("A subnet inherits the parent's clock regime. Under the logical driver (simulation) a")
+    print("subnet's cooldown is jumped for free, exactly like the parent's; under the wall driver")
+    print("(production) it is correctly waited out in real time.\n")
+    parent_logical = _paced_parent_logical(n_tokens, pacing)
+    subnet_logical = _paced_subnet_logical(n_tokens, pacing)
+    subnet_wall = _paced_subnet_wall(n_tokens, pacing)
     floor = n_tokens * pacing
-    print(f"  cooldown in parent  (logical driver skips it):  {parent * 1e3:8.1f} ms")
-    print(f"  cooldown in subnet  (isolated, waited in full): {subnet * 1e3:8.1f} ms")
-    print(f"  real-time floor  (n x pacing):                  {floor * 1e3:8.1f} ms")
-    print(f"\n  the subnet paid ~{subnet / max(parent, 1e-9):.0f}x the parent, landing on the real-time floor:")
-    print("  the logical-clock benchmark trick does NOT extend across a subnet boundary.")
+    print(f"  parent cooldown, logical driver:  {parent_logical * 1e3:8.1f} ms  (jumped)")
+    print(f"  subnet cooldown, logical driver:  {subnet_logical * 1e3:8.1f} ms  (jumped — inherited)")
+    print(f"  subnet cooldown, wall driver:     {subnet_wall * 1e3:8.1f} ms  (waited — production)")
+    print(f"  real-time floor  (n x pacing):    {floor * 1e3:8.1f} ms")
+    speedup = subnet_wall / max(subnet_logical, 1e-9)
+    print(f"\n  logical driving is ~{speedup:.0f}x faster to SIMULATE the friction subnet, while the wall")
+    print("  driver still waits the real cooldown when you actually run the net.")
 
 
 def main() -> None:
     print(f"☕ SubstitutionTransition benchmark — seed={NET_SEED}, max_workers=1")
     run_overhead_table()
-    run_wallclock_leak()
+    run_driver_mode()
 
 
 if __name__ == "__main__":
