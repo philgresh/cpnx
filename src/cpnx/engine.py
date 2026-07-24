@@ -2202,12 +2202,6 @@ class PetriNet:
             for port_name in socket_to_ports[socket_name]:
                 subnet.deposit(port_name, token.evolve())
 
-    def _sync_subnet_time(self, subnet: "PetriNet") -> None:
-        with self._lock:
-            current_model_time = self._model_time
-        if current_model_time is not None:
-            subnet.advance_time(current_model_time)
-
     def _retrieve_subnet_outputs(
         self, subnet: "PetriNet", port_socket_map: dict[str, str], parent_outputs: list[str]
     ) -> list[Token]:
@@ -2233,9 +2227,31 @@ class PetriNet:
         socket_to_ports = self._map_sockets_to_ports(transition.port_socket_map)
         self._verify_port_socket_boundaries(token_sources, socket_to_ports)
         self._deposit_into_subnet(subnet, token_sources, socket_to_ports)
-        self._sync_subnet_time(subnet)
 
-        subnet.run(deadline=time.monotonic() + transition.subnet_deadline_secs)
+        # Fire the subnet in the parent's clock *regime*, but on the subnet's OWN clock. The
+        # subnet's clock is isolated — the parent's logical time is never pushed onto it (doing so
+        # was unsound: a subnet fires once per binding, so a second firing at the same parent
+        # instant moved the subnet clock backward-or-equal, which `advance_time` rejects; that
+        # ValueError surfaced as a firing failure, rolled the transition back, and stranded the
+        # deposited token inside the subnet while `is_quiescent()` still reported True). What the
+        # subnet *does* inherit is whether time is logical or real:
+        #
+        #   - parent on the logical clock (`drive_to_quiescence`): drive the subnet logically too,
+        #     so its internal cooldowns/settles are jumped for free and the firing is deterministic
+        #     and cheap (the tight `drive_to_quiescence` loop, not `run()`'s wall-clock wait). The
+        #     subnet anchors and advances its own logical clock, unrelated to the parent's value.
+        #   - parent on the wall clock (`run()`, production): run the subnet on the wall clock, so
+        #     real cooldowns are genuinely waited out — the correct production semantics.
+        #
+        # `subnet_deadline_secs` bounds only the wall-clock path; a logically-driven subnet is
+        # bounded by `drive_to_quiescence`'s own `max_ticks`/`max_spins`. See `tests/test_subnet.py`
+        # and `benchmarks/bench_subnet.py`.
+        with self._lock:
+            parent_on_logical_clock = self._model_time is not None
+        if parent_on_logical_clock:
+            subnet.drive_to_quiescence()
+        else:
+            subnet.run(deadline=time.monotonic() + transition.subnet_deadline_secs)
 
         parent_outputs = [arc.place for arc in transition.outputs]
         return self._retrieve_subnet_outputs(subnet, transition.port_socket_map, parent_outputs)

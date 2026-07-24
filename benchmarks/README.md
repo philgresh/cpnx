@@ -26,7 +26,53 @@ Two tiers:
 | `bench_enablement.py` | micro | Cost of one `_is_transition_enabled` check (and `_resolve_binding` across binding policies), for a **string** guard and a **callable** guard computing the identical predicate — the per-transition, per-`step()` hot path, and the dispatch gap between the two flavours. |
 | `bench_cafe_throughput.py` | macro | End-to-end throughput (`us/order`, `us/step`) of the cafe net processing N orders, swept over `N` and the binding regime. Reveals how per-step engine cost scales with marking depth. Single-worker by construction. |
 | `bench_cafe_concurrency.py` | macro | Wall-clock **makespan** against `max_workers`, swept over queue depth and guard regime. The only script here that says anything about parallelism. |
+| `bench_station_costs.py` | macro | µs/order against queue depth for each opt-in station's selection shape (certified vs. uncertified `key`, filter-only, timed×key), plus the arc-ordering and `binding_search_limit` search-budget sweeps. Answers the "Unmeasured combinations" audit below. |
+| `bench_subnet.py` | macro | Per-firing `SubstitutionTransition` overhead (wrapped vs. inlined, swept over subnet size) and the wall-clock-friction leak — a subnet's cooldowns are paid in real time even under the logical driver. |
 | `profile_cafe.py` | dev tool | `cProfile` a large cafe run and rank engine functions by cumulative / own time. Not a committed benchmark — a pointer to what to optimise. |
+
+## The fixture: `cafe/`
+
+The ☕ Concurrency Cafe topology lives in the `cafe/` package, split so that every place,
+transition, guard, key, filter, and action is an individually documented symbol — each one
+carrying both its *cafe role* and the *net feature* it exists to exercise. It renders as a
+page on the docs site; start at `cafe/__init__.py` for the tour.
+
+| Module | Holds |
+| --- | --- |
+| `cafe.places` / `cafe.transitions` | The core topology, one factory per entity |
+| `cafe.inscriptions` | Guards and binding keys — pure, run under the engine lock |
+| `cafe.actions` | Transition actions — side effects allowed, run off the lock |
+| `cafe.stations` | Opt-in stations, one self-contained module each |
+| `cafe.net` | `build_cafe`, which only chooses among the above |
+
+`concurrency_cafe.py` remains as the runnable demo and a back-compatible
+`from concurrency_cafe import build_cafe` shim.
+
+### Opt-in stations
+
+Every station is default-off and structure-preserving when off, so `build_cafe()` with no
+flags is exactly the base topology and the numbers below stay comparable. Each exists
+because there is an engine cost path the base net never touches:
+
+| Flag | Station | Exercises |
+| --- | --- | --- |
+| `cold_brew` | 🧊 Cold-brew tower | A deep **timed** place |
+| `cold_brew_key` | ↳ with a keyed arc | The timed×key residual ([#25]) |
+| `batch_triage` | 📋 Rush-hour triage | A certified `InputArc.key` at depth |
+| `decaf` | ☕ Decaf-only barista | `filter` **without** `key` — never indexed |
+| `knock_box` | 🥁 Knock box | `consume_all` re-scanned behind a false guard |
+| `specials_board` | 🧾 Specials board | An **uncertified** `key` (A/B vs `batch_triage`) |
+| `eighty_six` | 🚫 86 board | Certified `key` + **uncertified** `filter` |
+| `cupping` | 🥄 Cupping table | `count > 1` and the candidate space |
+| `pastry_case` | 🥐 Pastry case | The only `SubstitutionTransition` |
+
+Two knobs on `build_cafe` are not stations but are newly sweepable:
+`binding_search_limit` (previously fixed at the engine default) and
+`resource_arcs_first`, which reorders `T_Weigh_And_Grind`'s input arcs into the order
+`BindingPolicy`'s documentation recommends.
+
+**None of these are measured yet.** They are fixtures — the experiments they enable are
+listed in "Unmeasured combinations" below.
 
 Supporting module: `_driver.py` — two drivers, `drive_to_quiescence` (logical
 clock, deliberately serialized, measures engine CPU) and `drive_saturating`
@@ -381,6 +427,141 @@ with the fast path both present and reverted, which is a much stronger check tha
 the ad-hoc fingerprint used at the time. It is kept because it is nine lines and
 directionally faster on the guard-free path. But treat ~1% guard-free / ~0%
 guarded as the honest figure, not 3.3%.
+
+## API-combination audit: what each selection shape costs
+
+An audit of which API-element combinations affect performance, and which the corpus
+covered, turned up the gaps below. Fixtures exist for every one (see "Opt-in stations"),
+and `bench_station_costs.py` now measures the selection-shape and search-budget ones. The
+routing decision that drives nearly all of it is `engine._materialize_pool`, which picks
+between three costs per enabling check:
+
+| Route | Condition | Cost |
+| --- | --- | --- |
+| 1 — bounded FIFO peek | `key is None and filter is None and not consume_all and count == 1` | O(limit) |
+| 2 — key index | certified `key`, `filter` absent or certified, not `consume_all`, no cooling tokens | O(cap log cap) |
+| 3 — full peek + per-firing sort | **everything else** | O(N) peek + O(N) dispatches + O(N log N) sort |
+
+Route 3 runs **per `step()`, per transition** — including steps where the guard then
+rejects — so on a deep place it is the O(N²) drain the key-index work removed.
+
+### Results
+
+µs/order draining one deep single-arc place, min-of-two, one machine
+(Apple M4 Pro / CPython 3.14.3). Read the **growth** column (last÷first over an 8× depth
+increase — ~1× is linear) and the **ratio to the certified-key control**, not the absolute
+µs. Run-to-run spread was 2.5–5.4% on this pass, so treat anything under ~10% as unresolved.
+
+| regime | arc shape | route | 250 | 2000 | growth | ×control@2000 |
+| --- | --- | :-: | ---: | ---: | ---: | ---: |
+| `batch_triage` | certified `key` | 2 | 75.6 | 82.0 | **1.1×** | 1× (control) |
+| `decaf` | certified `filter`, no `key` | 3 | 94.1 | 178.7 | 1.9× | **2.1×** |
+| `cold_brew` | no selection, timed | 1 | 149.9 | 409.2 | 2.7× | 4.4× |
+| `cold_brew_key` | certified `key`, timed | 3 | 180.7 | 597.6 | 3.3× | 7.4× |
+| `specials_board` | **uncertified** `key` | 3 | 1411.7 | 11039.4 | **7.8×** | **134.8×** |
+| `eighty_six` | certified `key` + uncertified `filter` | 3 | 1439.3 | 11036.4 | 7.7× | 133.9× |
+
+The headline: **an uncertified selection callable is the dominant resource-suck in the
+API, by two orders of magnitude.** Certifying the `batch_triage` key keeps the drain flat
+(1.1× over 8× depth); an *identical ordering* read off a mutable dict (`specials_board`)
+grows 7.8× and lands **135× slower** at depth 2000 — and rising, since it is genuinely
+O(N²) in N with a ~10 µs thread-hop constant per token. `eighty_six` confirms the
+asymmetry it was built to show: one uncertified `filter` disqualifies the arc from indexing
+*even though the key certifies*, landing right on top of the uncertified-key curve.
+
+The three route-3 cases that stay cheap (`decaf`, both `cold_brew` arms) do so only because
+their callables are certified/absent: route 3 costs an O(N) scan but no thread hop, so they
+grow ~2–3× rather than ~8×. `cold_brew_key` (the timed×key residual, [#25]) is the most
+expensive *certified* regime — the timed marking blocks the index, so a fully-certified key
+still pays the per-firing sort — but at 7.4× it is a rounding error next to the uncertified
+cliff.
+
+### Search budget
+
+Both search-budget hypotheses **confirmed**, on the pipeline (`T_Weigh_And_Grind`'s
+three-arc product). "Deep-mobile rank" places one mobile-pickup ticket at the bottom of the
+line and reports where `binding_priority_key` actually gets it ground — 0 means the
+preference reached the bottom, ≈N means the budget ran out and it fell to FIFO.
+
+- **Arc ordering ([#18]).** Listing the permit arcs *before* the deep data arc
+  (`resource_arcs_first=True`) holds the deep-mobile rank at **0 through 800 orders**, while
+  the cafe's historical data-first order lets it slip to 45 at 400 and 325 at 800 — the
+  `limit / (scales × grinders)` cutoff the transition's own comment predicts. The one-line
+  reorder dissolves the symptom, at a ~10% µs/order cost from the wider effective search.
+  **This is the cheapest available fix for #18** and the reorder is semantics-preserving.
+- **`binding_search_limit`.** A clean cost-vs-reach trade: at 800 orders, `limit=100` runs
+  at 610 µs/order but strands the mobile ticket at rank 535; `limit=10000` reaches it
+  (rank 0) at 2879 µs/order — 4.7× the cost for full-depth preference. The default 1000
+  sits in between (rank 325), i.e. already past the cutoff for this depth.
+
+### Still unmeasured (fixtures exist, numbers do not)
+
+- **`consume_all`** (`knock_box`) — forces route 3, and pools are gathered *before* the
+  guard, so a rarely-firing drain is re-scanned in full every step. Not on the
+  `bench_station_costs.py` sweep because its cost depends on lull frequency, not depth.
+- **`count > 1` at depth** (`cupping`) — the token pool stays bounded but `C(pool, count)`
+  candidate combinations do not; the search-limit prefix can disable a transition while a
+  valid binding sits deeper. Needs a candidate-space sweep, not a depth sweep.
+- **Concurrency against uncertified selection.** A guard holds the lock per *candidate
+  binding*; an uncertified `key`/`filter` holds it per *token*, unbounded — a far worse
+  contention shape than any `bench_cafe_concurrency.py` regime currently exercises.
+  `specials_board`/`eighty_six` are the regimes to run through it.
+
+## `SubstitutionTransition` cost (`bench_subnet.py`)
+
+A subnet fires like any pooled action, but its "action" is *drive a whole nested net to
+quiescence*. `bench_subnet.py` measures what that abstraction costs, wrapping a chain of K
+instant transitions in a subnet vs. inlining the identical K transitions (Apple M4 Pro /
+CPython 3.14.3, min-of-three, 1000 tokens):
+
+| subnet depth K | flat µs/tok | wrapped µs/tok | overhead µs/firing |
+| ---: | ---: | ---: | ---: |
+| 1 | 22.0 | 78.0 | **56.0** |
+| 3 | 78.3 | 152.9 | 74.5 |
+| 10 | 349.6 | 454.8 | 105.2 |
+| 30 | 1817.0 | 2241.6 | 424.6 |
+
+Two facts (production, wall-clock `run()`):
+
+- **A fixed ~50-56 µs per firing** (read at K=1, where the shared per-step cost is smallest) —
+  the deposit-into-ports, drive-the-subnet, retrieve machinery. That is the flat tax for
+  wrapping, paid once per firing regardless of workload depth.
+- **On top of that, a subnet re-runs its own drive/quiescence loop per internal step**, which is
+  heavier than an inlined step — so the overhead *grows* with K (56→425 µs). A subnet does not
+  make a large internal workflow cheaper; it multiplies its per-step cost. (The flat baseline
+  is itself super-linear in K — per-step enablement scan grows with transition count — and both
+  sides pay that; the *delta* is the subnet-specific part.)
+
+**Driver-mode inheritance: a subnet's cooldowns are free to simulate.** A subnet inherits the
+parent's clock *regime*. Under the logical driver (`drive_to_quiescence`) it is driven logically
+too, so its internal cooldowns are jumped for free — exactly like the parent's; under the wall
+driver (`run()`, production) they are waited out in real time. The same 0.05 s cooldown, 8 tokens:
+
+| cooldown location | driver | wall time |
+| --- | --- | ---: |
+| in the parent | logical | 0.6 ms (jumped) |
+| inside a subnet | logical | 1.0 ms (jumped — inherited) |
+| inside a subnet | wall | 388 ms (waited — production) |
+
+Logical driving is **~380× faster to simulate** the friction subnet, while the wall driver
+still waits the real cooldown when you actually run the net. Tradeoff: for a *friction-free*
+subnet the logical driver's clock machinery is ~20% heavier per firing than `run()`'s — a
+simulation-only cost, negligible against the friction win, and production (the table above) is
+unchanged.
+
+**How this was reached — a fixed silent bug.** `drive_to_quiescence` used to *strand* tokens in
+a subnet: driving a wrapped net on the logical clock left tokens stuck in the subnet's input port
+(measured: 14 of 20), returned `is_quiescent() == True`, and reported a fast, wrong result. The
+cause was clock *value* coupling — the parent pushed its logical time onto the subnet via
+`advance_time`, but a subnet fires once per binding, so the second firing at the same instant
+moved the subnet clock backward-or-equal, which `advance_time` rejects; the error rolled the
+firing back and stranded the already-deposited copy. It had never surfaced because `pastry_case`
+is not in the throughput sweep, so no logical-clock run had ever met a subnet. The fix isolates
+the subnet's clock *value* (the parent's time never crosses the boundary) while inheriting its
+*regime* (logical vs. wall) — `src/cpnx/engine.py`, regression tests in `tests/test_subnet.py`.
+
+[#18]: https://github.com/philgresh/cpnx/issues/18
+[#25]: https://github.com/philgresh/cpnx/issues/25
 
 ## Scope
 
