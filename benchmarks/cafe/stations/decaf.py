@@ -79,7 +79,7 @@ def places() -> list[Place]:
         pool *within* the place rather than the place being pre-sorted, which is exactly
         what forces route 3's full-marking peek in `engine._materialize_pool`.
     """
-    return [Place("P_Decaf_Line")]
+    return [Place("P_Decaf_Line", schema=dict)]
 
 
 def transitions(*, work_secs: float = 0.0) -> list[Transition]:

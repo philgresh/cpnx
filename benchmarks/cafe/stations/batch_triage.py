@@ -79,8 +79,8 @@ def serve_batch_triage(tokens: list[Token]) -> list[Token]:
 
 
 def places() -> list[Place]:
-    """The backlog — an unbounded FIFO [`Place`][cpnx.Place], same shape as `P_Ticket_Line`."""
-    return [Place("P_Batch_Triage_Queue")]
+    """The backlog — an unbounded FIFO [`Place`][cpnx.Place] with `schema=dict`, same shape as `P_Ticket_Line`."""
+    return [Place("P_Batch_Triage_Queue", schema=dict)]
 
 
 def transitions(*, work_secs: float = 0.0) -> list[Transition]:

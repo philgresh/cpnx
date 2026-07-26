@@ -29,15 +29,15 @@ def p_ticket_line() -> Place:
         outside deposits.
 
     Demonstrates:
-        The plain unbounded FIFO [`Place`][cpnx.Place] — no colour set, no bound, no initial
-        marking. It is the net's **deep** place: the throughput benchmark stocks it
-        with up to 20 000 tickets, which is what makes it the place where marking
-        depth actually shows up in engine cost. It is drained by
-        `T_Weigh_And_Grind` under [`BindingPolicy.PRIORITY`][cpnx.BindingPolicy], so it is also the one
-        place whose depth feeds a full candidate enumeration rather than a head-only
-        read.
+        The plain unbounded FIFO [`Place`][cpnx.Place] — `schema=dict` enforces mapping token
+        payloads, but it has no colour set, no bound, and no initial marking. It is the
+        net's **deep** place: the throughput benchmark stocks it with up to 20 000
+        tickets, which is what makes it the place where marking depth actually shows
+        up in engine cost. It is drained by `T_Weigh_And_Grind` under
+        [`BindingPolicy.PRIORITY`][cpnx.BindingPolicy], so it is also the one place whose depth feeds a
+        full candidate enumeration rather than a head-only read.
     """
-    return Place("P_Ticket_Line")
+    return Place("P_Ticket_Line", schema=dict)
 
 
 def p_digital_scales(capacity: int = 3) -> ResourcePlace:
@@ -60,7 +60,7 @@ def p_digital_scales(capacity: int = 3) -> ResourcePlace:
     Args:
         capacity: How many scales are on the bench. Defaults to 3.
     """
-    return ResourcePlace("P_Digital_Scales", capacity=capacity)
+    return ResourcePlace("P_Digital_Scales", capacity=capacity, schema=dict)
 
 
 def p_burr_grinder(grinders: int = 2, pacing_secs: float = 8.0) -> PacedResourcePlace:
@@ -87,7 +87,7 @@ def p_burr_grinder(grinders: int = 2, pacing_secs: float = 8.0) -> PacedResource
         grinders: Number of grinders, i.e. the permit capacity. Defaults to 2.
         pacing_secs: Cooldown applied to each returned permit. Defaults to 8.0.
     """
-    return PacedResourcePlace("P_Burr_Grinder", capacity=grinders, pacing_secs=pacing_secs)
+    return PacedResourcePlace("P_Burr_Grinder", capacity=grinders, pacing_secs=pacing_secs, schema=dict)
 
 
 def p_ground_coffee() -> Place:
@@ -99,14 +99,15 @@ def p_ground_coffee() -> Place:
         back to* when `T_Pull_Shot` fails and the engine retries it.
 
     Demonstrates:
-        A colour-restricted [`Place`][cpnx.Place] — `color_set={"ground_coffee"}` makes the place
-        reject any token of the wrong colour, which turns a mis-wired output arc into
-        an immediate error instead of a silently weird marking. Because it is the
-        retry target, it is also the shallow queue that the channeling regime's extra
-        `step()`s fire against (which is why retries make µs/*step* look cheaper
-        while making the run strictly more expensive).
+        A colour-restricted and schema-validated [`Place`][cpnx.Place] — `color_set={"ground_coffee"}`
+        and `schema=dict` make the place reject any token of the wrong colour or
+        payload type, which turns a mis-wired output arc into an immediate error
+        instead of a silently weird marking. Because it is the retry target, it is
+        also the shallow queue that the channeling regime's extra `step()`s fire
+        against (which is why retries make µs/*step* look cheaper while making the
+        run strictly more expensive).
     """
-    return Place("P_Ground_Coffee", color_set={"ground_coffee"})
+    return Place("P_Ground_Coffee", color_set={"ground_coffee"}, schema=dict)
 
 
 def p_milk_queue() -> Place:
@@ -118,12 +119,13 @@ def p_milk_queue() -> Place:
         the grounds branch becomes a shot.
 
     Demonstrates:
-        A second colour-restricted [`Place`][cpnx.Place] (`{"milk_ticket"}`), and — jointly with
-        [`p_ground_coffee`][cafe.places.p_ground_coffee] — the net's **fork**: one transition writing two output
-        arcs into two different places, so the two downstream stations become
-        independently enabled and can genuinely run concurrently.
+        A second colour-restricted and schema-validated [`Place`][cpnx.Place] (`{"milk_ticket"}`,
+        `schema=dict`), and — jointly with [`p_ground_coffee`][cafe.places.p_ground_coffee] — the net's
+        **fork**: one transition writing two output arcs into two different places,
+        so the two downstream stations become independently enabled and can genuinely
+        run concurrently.
     """
-    return Place("P_Milk_Queue", color_set={"milk_ticket"})
+    return Place("P_Milk_Queue", color_set={"milk_ticket"}, schema=dict)
 
 
 def p_espresso_machine(capacity: int = 2) -> ResourcePlace:
@@ -143,7 +145,7 @@ def p_espresso_machine(capacity: int = 2) -> ResourcePlace:
     Args:
         capacity: Number of group heads. Defaults to 2.
     """
-    return ResourcePlace("P_Espresso_Machine", capacity=capacity)
+    return ResourcePlace("P_Espresso_Machine", capacity=capacity, schema=dict)
 
 
 def p_steam_wand(capacity: int = 2) -> ResourcePlace:
@@ -160,7 +162,7 @@ def p_steam_wand(capacity: int = 2) -> ResourcePlace:
     Args:
         capacity: Number of wands. Defaults to 2.
     """
-    return ResourcePlace("P_Steam_Wand", capacity=capacity)
+    return ResourcePlace("P_Steam_Wand", capacity=capacity, schema=dict)
 
 
 def p_order_tray(threshold: int = 2, bound: int | None = 6) -> ThresholdPlace:
@@ -190,7 +192,7 @@ def p_order_tray(threshold: int = 2, bound: int | None = 6) -> ThresholdPlace:
         threshold: Tokens that must accumulate before any retrieval is allowed.
         bound: Optional k-bound (cups the counter fits). `None` removes the bound.
     """
-    tray = ThresholdPlace("P_Order_Tray", threshold=threshold)
+    tray = ThresholdPlace("P_Order_Tray", threshold=threshold, schema=dict)
     # ThresholdPlace's constructor doesn't expose `bound` (threshold and k-bound are
     # orthogonal CPN concepts), but `bound` is a plain, settable attribute inherited
     # from Place.
@@ -212,7 +214,7 @@ def p_served() -> SinkPlace:
         deep throughput sweeps measuring the *drain*, rather than measuring memory
         growth at the far end of the pipeline.
     """
-    return SinkPlace("P_Served")
+    return SinkPlace("P_Served", schema=dict)
 
 
 def p_trash_can(keep_last: int = 10) -> SinkPlace:
@@ -232,4 +234,4 @@ def p_trash_can(keep_last: int = 10) -> SinkPlace:
     Args:
         keep_last: Size of the retained rolling window. Defaults to 10.
     """
-    return SinkPlace("P_Trash_Can", keep_last=keep_last)
+    return SinkPlace("P_Trash_Can", keep_last=keep_last, schema=dict)

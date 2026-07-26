@@ -18,7 +18,8 @@ import itertools
 import threading
 import time
 from collections import OrderedDict, deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
+from typing import Any
 
 from cpnx.tokens import AVAILABLE_NOW, Token
 
@@ -348,6 +349,7 @@ class Place:
         bound: int | None = None,
         color_set: set[str] | None = None,
         initial_marking: list[Token] | None = None,
+        schema: type | Callable[[Any], bool] | None = None,
     ) -> None:
         """Create a new Place.
 
@@ -362,18 +364,57 @@ class Place:
                        typing at deposit time.
             initial_marking: Tokens to deposit at construction (CPN *I* function).
                              Deposited before any external code runs.
+            schema: Optional schema or type constraint for token payloads. Can be a
+                    type (checked via ``isinstance``) or a callable predicate
+                    returning a bool. ``None`` (default) accepts any payload.
         """
         self.name = name
         self.bound = bound
         self.color_set = color_set
+        self.schema = schema
         self._store = _TokenStore()
         self._lock = threading.Lock()
         self.last_deposit_time: float = 0.0
         self.last_deposit_time_model: float = 0.0
 
         for token in initial_marking or []:
+            if self.color_set is not None and token.color not in self.color_set:
+                raise TypeError(
+                    f"Place '{self.name}' has color_set {self.color_set!r} — "
+                    f"cannot deposit token with color {token.color!r}."
+                )
+            if not self.validate_schema(token.payload):
+                raise TypeError(
+                    f"Color Set / Schema Violation in Place '{self.name}': "
+                    f"payload {token.payload!r} does not match schema {self.schema!r}."
+                )
             self._store.append(token)
             self.last_deposit_time = time.monotonic()
+
+    def validate_schema(self, payload: Any) -> bool:
+        """Validate whether *payload* conforms to this place's schema.
+
+        Args:
+            payload: The token payload to check against `schema`.
+
+        Returns:
+            ``True`` if `schema` is ``None``, or if *payload* is an instance of `schema`
+            (when `schema` is a type), or if ``schema(payload)`` evaluates to truthy
+            (when `schema` is a callable). ``False`` otherwise, including when a callable
+            schema raises an exception.
+        """
+        if self.schema is None:
+            return True
+        if isinstance(self.schema, type):
+            if self.schema is dict and isinstance(payload, Mapping):
+                return True
+            return isinstance(payload, self.schema)
+        if callable(self.schema):
+            try:
+                return bool(self.schema(payload))
+            except Exception:
+                return False
+        return False
 
     def deposit(self, token: Token, model_time: float | None = None) -> None:
         """Append *token* to the tail of the FIFO queue, enforcing the place's colour set.
@@ -387,13 +428,19 @@ class Place:
                         Does not affect wall-clock availability checks.
 
         Raises:
-            TypeError: If `color_set` is set and *token*'s colour is not in it.
+            TypeError: If `color_set` is set and *token*'s colour is not in it,
+                       or if `schema` is set and *token*'s payload fails validation.
         """
         with self._lock:
             if self.color_set is not None and token.color not in self.color_set:
                 raise TypeError(
                     f"Place '{self.name}' has color_set {self.color_set!r} — "
                     f"cannot deposit token with color {token.color!r}."
+                )
+            if not self.validate_schema(token.payload):
+                raise TypeError(
+                    f"Color Set / Schema Violation in Place '{self.name}': "
+                    f"payload {token.payload!r} does not match schema {self.schema!r}."
                 )
             self._store.append(token)
             self.last_deposit_time = time.monotonic()
@@ -602,19 +649,22 @@ class Place:
             return len(self._store) + count <= self.bound
 
     def can_accept(self, token: Token) -> bool:
-        """Return ``True`` if *token*'s colour is compatible with this place's colour set.
+        """Return ``True`` if *token* is compatible with this place's colour set and schema.
 
         This is a non-mutating pre-flight check that does not modify the place's tokens
         and does not consider capacity — use `can_deposit` for bound checks.
 
         Args:
-            token: The token to check for colour compatibility.
+            token: The token to check for colour compatibility and schema validation.
 
         Returns:
-            ``True`` if `color_set` is ``None`` or contains *token*'s colour, ``False`` otherwise.
+            ``True`` if `color_set` is ``None`` or contains *token*'s colour and
+            `validate_schema` returns ``True``, ``False`` otherwise.
         """
         with self._lock:
             if self.color_set is not None and token.color not in self.color_set:
+                return False
+            if not self.validate_schema(token.payload):
                 return False
             return True
 
@@ -656,19 +706,26 @@ class ResourcePlace(Place):
         ```
     """
 
-    def __init__(self, name: str, capacity: int) -> None:
+    def __init__(
+        self,
+        name: str,
+        capacity: int,
+        schema: type | Callable[[Any], bool] | None = None,
+    ) -> None:
         """Create a ResourcePlace pre-filled with *capacity* resource tokens.
 
         Args:
             name: Unique identifier for this place within a [`PetriNet`][cpnx.PetriNet].
             capacity: Number of resource permits in the pool. ``0`` is valid
                       (creates an empty, permanently-blocking place).
+            schema: Optional schema or type constraint for token payloads.
         """
         self.capacity = capacity
         super().__init__(
             name,
             color_set={"resource"},
             initial_marking=[Token(color="resource") for _ in range(capacity)],
+            schema=schema,
         )
 
 
@@ -690,7 +747,13 @@ class PacedResourcePlace(ResourcePlace):
         ```
     """
 
-    def __init__(self, name: str, capacity: int, pacing_secs: float) -> None:
+    def __init__(
+        self,
+        name: str,
+        capacity: int,
+        pacing_secs: float,
+        schema: type | Callable[[Any], bool] | None = None,
+    ) -> None:
         """Create a PacedResourcePlace.
 
         Args:
@@ -698,9 +761,10 @@ class PacedResourcePlace(ResourcePlace):
             capacity: Number of resource permits in the pool.
             pacing_secs: Seconds a token must wait after being returned before
                          it becomes available again.
+            schema: Optional schema or type constraint for token payloads.
         """
         self.pacing_secs = pacing_secs
-        super().__init__(name, capacity)
+        super().__init__(name, capacity, schema=schema)
 
     def deposit(self, token: Token, model_time: float | None = None) -> None:
         """Return a resource token to the pool, replacing its `available_at` to start a cooldown timer.
@@ -715,8 +779,16 @@ class PacedResourcePlace(ResourcePlace):
             model_time: Optional logical clock timestamp used instead of wall-clock time
                         as the cooldown's start reference, and recorded in
                         `last_deposit_time_model`.
+
+        Raises:
+            TypeError: If `schema` is set and *token*'s payload fails validation.
         """
         with self._lock:
+            if not self.validate_schema(token.payload):
+                raise TypeError(
+                    f"Color Set / Schema Violation in Place '{self.name}': "
+                    f"payload {token.payload!r} does not match schema {self.schema!r}."
+                )
             ref_time = model_time if model_time is not None else time.monotonic()
             # Create a new token with updated availability timestamp (stateless place cooldown)
             timed_token = token.evolve(available_at=ref_time + self.pacing_secs, id=token.id)
@@ -815,15 +887,21 @@ class ThresholdPlace(Place):
         ```
     """
 
-    def __init__(self, name: str, threshold: int) -> None:
+    def __init__(
+        self,
+        name: str,
+        threshold: int,
+        schema: type | Callable[[Any], bool] | None = None,
+    ) -> None:
         """Create a ThresholdPlace.
 
         Args:
             name: Unique identifier for this place within a [`PetriNet`][cpnx.PetriNet].
             threshold: Minimum queue depth required before any retrieval is
                        permitted. Must be >= 1.
+            schema: Optional schema or type constraint for token payloads.
         """
-        super().__init__(name)
+        super().__init__(name, schema=schema)
         self.threshold = threshold
 
     def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
@@ -932,7 +1010,14 @@ class SinkPlace(Place):
         causing the token to be lost rather than successfully dead-lettered.
     """
 
-    def __init__(self, name: str, *, keep_last: int = 0, color_set: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        keep_last: int = 0,
+        color_set: set[str] | None = None,
+        schema: type | Callable[[Any], bool] | None = None,
+    ) -> None:
         """Create a new SinkPlace.
 
         Args:
@@ -941,8 +1026,9 @@ class SinkPlace(Place):
                        Default is 0 (retain nothing beyond the aggregate counters).
             color_set: Set of accepted token colours. ``None`` (default) accepts any colour.
                        Do not use a restrictive color_set if used as an error_place.
+            schema: Optional schema or type constraint for token payloads.
         """
-        super().__init__(name, bound=None, color_set=color_set)
+        super().__init__(name, bound=None, color_set=color_set, schema=schema)
         self.keep_last = keep_last
         self._kept: deque[Token] = deque(maxlen=keep_last)
         self._absorbed = 0
@@ -963,13 +1049,19 @@ class SinkPlace(Place):
             model_time: Optional logical clock timestamp recorded in `last_deposit_time_model`.
 
         Raises:
-            TypeError: If `color_set` is set and *token*'s colour is not in it.
+            TypeError: If `color_set` is set and *token*'s colour is not in it,
+                       or if `schema` is set and *token*'s payload fails validation.
         """
         with self._lock:
             if self.color_set is not None and token.color not in self.color_set:
                 raise TypeError(
                     f"Place '{self.name}' has color_set {self.color_set!r} — "
                     f"cannot deposit token with color {token.color!r}."
+                )
+            if not self.validate_schema(token.payload):
+                raise TypeError(
+                    f"Color Set / Schema Violation in Place '{self.name}': "
+                    f"payload {token.payload!r} does not match schema {self.schema!r}."
                 )
             self._kept.append(token)
             now = time.monotonic()

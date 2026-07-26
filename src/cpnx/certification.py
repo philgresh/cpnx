@@ -238,9 +238,7 @@ class _Certifier:
             return self._check_name(node, func, bound, stack)
         return Verdict(True)
 
-    def _check_name(
-        self, node: ast.Name, func: Callable, bound: frozenset[str], stack: frozenset[Callable]
-    ) -> Verdict:
+    def _check_name(self, node: ast.Name, func: Callable, bound: frozenset[str], stack: frozenset[Callable]) -> Verdict:
         """A free/global name read must resolve to an immutable value or a certifying helper.
 
         Locally bound names pass unconditionally. Unresolved names pass too: they

@@ -14,11 +14,11 @@ from dataclasses import dataclass
 from typing import Callable, Iterator, TypeAlias
 
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace
-from cpnx.tokens import Token
+from cpnx.tokens import ERROR_COLOR, Token
 from cpnx.transitions import BindingPolicy, InputArc, OutputArc, SubstitutionTransition, Transition
 from cpnx.visualization import snapshot, to_dot
 
-_DepositFn: TypeAlias = Callable[[str, Token], None]
+_DepositFn: TypeAlias = Callable[[str, Token], bool | None]
 """Callable that deposits a token into a named place. Must be invoked under the engine lock."""
 
 _Binding: TypeAlias = list[tuple[InputArc, list[Token]]]
@@ -76,8 +76,8 @@ def _enact_planned_deposits(
     """
     deposited: list[tuple[str, Token]] = []
     for place_name, token in planned_deposits:
-        deposit(place_name, token)
-        deposited.append((place_name, token))
+        if deposit(place_name, token) is not False:
+            deposited.append((place_name, token))
 
     for arc, is_res_place in active_outputs:
         for _ in range(arc.count):
@@ -1054,6 +1054,62 @@ class PetriNet:
             )
         self.places[place_name].deposit(token, model_time=self._get_model_time_under_lock())
 
+    def _handle_schema_violation(
+        self,
+        place_name: str,
+        token: Token,
+        error_msg: str,
+        *,
+        is_internal: bool = False,
+        transition_name: str | None = None,
+        dead_lettered_tokens: list[Token] | None = None,
+    ) -> None:
+        if not is_internal:
+            raise TypeError(error_msg)
+
+        error_token = token.evolve(
+            color=ERROR_COLOR,
+            payload_updates={
+                "error": error_msg,
+                "error_type": "Color Set / Schema Violation",
+                "target_place": place_name,
+                "transition": transition_name or "",
+            },
+        )
+        if self.error_place and self.error_place in self.places:
+            self.places[self.error_place].deposit(error_token, model_time=self._get_model_time_under_lock())
+        if dead_lettered_tokens is not None:
+            dead_lettered_tokens.append(error_token)
+
+    def _deposit_output_under_lock(
+        self,
+        place_name: str,
+        token: Token,
+        transition_name: str,
+        dl_tokens: list[Token],
+    ) -> bool:
+        if place_name not in self.places:
+            raise KeyError(
+                f"Place '{place_name}' is not registered. Call add_place() before referencing it in a Transition arc."
+            )
+        place = self.places[place_name]
+        if not place.validate_schema(token.payload):
+            error_msg = (
+                f"Color Set / Schema Violation: Token schema violation in Place '{place_name}': "
+                f"payload {token.payload!r} does not match schema {place.schema!r}."
+            )
+            self._handle_schema_violation(
+                place_name,
+                token,
+                error_msg,
+                is_internal=True,
+                transition_name=transition_name,
+                dead_lettered_tokens=dl_tokens,
+            )
+            return False
+        self._deposit_under_lock(place_name, token)
+        return True
+
     def _is_transition_enabled(self, transition: Transition) -> bool:
         """Return `True` if all preconditions for firing `transition` are satisfied right now.
 
@@ -1812,9 +1868,7 @@ class PetriNet:
         and the advance runs per tick, so draining is O(N^2).
         """
         boundaries = (
-            place.earliest_available_boundary(now)
-            for place in self.places.values()
-            if not isinstance(place, SinkPlace)
+            place.earliest_available_boundary(now) for place in self.places.values() if not isinstance(place, SinkPlace)
         )
         return min((b for b in boundaries if b is not None), default=None)
 
@@ -1856,9 +1910,7 @@ class PetriNet:
         """
         now = self.model_time
         candidates = [
-            b
-            for b in (self._earliest_cooldown_boundary(now), self._earliest_settle_boundary(now))
-            if b is not None
+            b for b in (self._earliest_cooldown_boundary(now), self._earliest_settle_boundary(now)) if b is not None
         ]
         return min(candidates, default=None)
 
@@ -1965,12 +2017,15 @@ class PetriNet:
         if plan_error is not None:
             return False, plan_error, [], [], []
 
+        dl_data: list[Token] = []
         deposited = _enact_planned_deposits(
             planned_deposits,
             active_outputs,
             res_deque,
             out_deque,
-            deposit=self._deposit_under_lock,
+            deposit=lambda place_name, token: self._deposit_output_under_lock(
+                place_name, token, transition.name, dl_data
+            ),
         )
         deposited.extend(
             _return_leftover_resources(
@@ -1979,7 +2034,7 @@ class PetriNet:
                 deposit=self._deposit_under_lock,
             )
         )
-        return True, None, [], [], deposited
+        return True, None, [], dl_data, deposited
 
     def _execute_transition_action(
         self,
@@ -2080,7 +2135,7 @@ class PetriNet:
             place = self.places.get(place_name)
             if place is None:
                 return KeyError(f"Place '{place_name}' is not registered.")
-            if not place.can_accept(token):
+            if place.color_set is not None and token.color not in place.color_set:
                 return TypeError(f"Place '{place_name}' cannot accept token with color '{token.color}'.")
         return None
 
@@ -2170,6 +2225,11 @@ class PetriNet:
     ) -> None:
         if success:
             self._dispatch_transition_fired(transition.name, duration)
+            if dead_lettered_data_tokens:
+                self._dispatch_dead_letters(transition.name, dead_lettered_data_tokens)
+                for dl_token in dead_lettered_data_tokens:
+                    err_msg = dl_token.payload.get("error", "Color Set / Schema Violation")
+                    self._dispatch_transition_error(transition.name, TypeError(err_msg), [dl_token])
         else:
             self._dispatch_transition_error(transition.name, error, data_tokens)
             self._dispatch_dead_letters(transition.name, dead_lettered_data_tokens)

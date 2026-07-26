@@ -141,7 +141,7 @@ def places() -> list[Place]:
     Returns:
         A single-element list containing `P_Sample_Queue`.
     """
-    return [Place("P_Sample_Queue")]
+    return [Place("P_Sample_Queue", schema=dict)]
 
 
 def transitions(*, work_secs: float = 0.0, count: int = 4) -> list[Transition]:

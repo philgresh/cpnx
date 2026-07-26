@@ -154,11 +154,11 @@ def build_kitchen_subnet(*, oven_capacity: int = 1, oven_pacing_secs: float = 0.
         An unstarted [`PetriNet`][cpnx.PetriNet] with port places `P_Pastry_In` and `P_Pastry_Out`
         already populated, ready to be wrapped by a [`SubstitutionTransition`][cpnx.SubstitutionTransition].
     """
-    p_pastry_in = Place(P_PASTRY_IN)
-    p_unwrapped = Place("P_Unwrapped")
-    p_oven = PacedResourcePlace("P_Oven", capacity=oven_capacity, pacing_secs=oven_pacing_secs)
-    p_warmed = Place("P_Warmed")
-    p_pastry_out = Place(P_PASTRY_OUT)
+    p_pastry_in = Place(P_PASTRY_IN, schema=dict)
+    p_unwrapped = Place("P_Unwrapped", schema=dict)
+    p_oven = PacedResourcePlace("P_Oven", capacity=oven_capacity, pacing_secs=oven_pacing_secs, schema=dict)
+    p_warmed = Place("P_Warmed", schema=dict)
+    p_pastry_out = Place(P_PASTRY_OUT, schema=dict)
 
     t_unwrap = Transition(
         name="T_Unwrap",
@@ -198,7 +198,7 @@ def places() -> list[Place]:
         `T_Pastry_Case` wraps. This place is only ever the socket named by that
         transition's `port_socket_map`.
     """
-    return [Place("P_Food_Order")]
+    return [Place("P_Food_Order", schema=dict)]
 
 
 def transitions(

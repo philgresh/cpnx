@@ -113,7 +113,7 @@ def places() -> list[Place]:
         lull, which is what makes it a controllable experimental knob rather than a fixed
         property of the fixture.
     """
-    return [Place("P_Knock_Box")]
+    return [Place("P_Knock_Box", schema=dict)]
 
 
 def transitions(*, work_secs: float = 0.0, min_pucks: int = 25) -> list[Transition]:

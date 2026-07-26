@@ -75,8 +75,8 @@ def pull_cold_brew(tokens: list[Token]) -> list[Token]:
 
 
 def places() -> list[Place]:
-    """The tower itself — one colour-restricted [`Place`][cpnx.Place] holding steeping batches."""
-    return [Place("P_Cold_Brew_Steeping", color_set={"cold_brew"})]
+    """The tower itself — one colour-restricted and schema-validated [`Place`][cpnx.Place] holding steeping batches."""
+    return [Place("P_Cold_Brew_Steeping", color_set={"cold_brew"}, schema=dict)]
 
 
 def transitions(*, work_secs: float = 0.0, key: bool = False) -> list[Transition]:

@@ -91,7 +91,7 @@ def places() -> list[Place]:
         Holds tickets waiting on whatever syrup they need, regardless of whether that
         syrup is currently 86'd — the filter, not the place, is what withholds them.
     """
-    return [Place("P_Eighty_Six_Queue")]
+    return [Place("P_Eighty_Six_Queue", schema=dict)]
 
 
 def transitions(*, work_secs: float = 0.0) -> list[Transition]:

@@ -77,9 +77,7 @@ def _reject_non_bool_return(field: str, value) -> None:
         return
     if bool in typing.get_args(return_type):  # bool | None, Optional[bool], Union[bool, ...]
         return
-    if typing.get_origin(return_type) is Literal and all(
-        isinstance(arg, bool) for arg in typing.get_args(return_type)
-    ):
+    if typing.get_origin(return_type) is Literal and all(isinstance(arg, bool) for arg in typing.get_args(return_type)):
         return  # Literal[True] / Literal[False] / Literal[True, False]
     raise TypeError(
         f"{field} must return bool (CPN guard contract Type[G(t)] = Bool); its annotated "

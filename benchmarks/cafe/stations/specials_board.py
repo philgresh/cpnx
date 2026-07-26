@@ -129,7 +129,7 @@ def places() -> list[Place]:
 
     Args:
     """
-    return [Place("P_Specials_Queue")]
+    return [Place("P_Specials_Queue", schema=dict)]
 
 
 def transitions(*, work_secs: float = 0.0) -> list[Transition]:
