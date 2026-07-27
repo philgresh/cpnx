@@ -52,7 +52,7 @@ Warning:
     the function body.
 """
 
-from cafe.support import with_work
+from cafe.support import has_payload, with_work
 from cpnx import InputArc, OutputArc, PacedResourcePlace, PetriNet, Place, SubstitutionTransition, Token, Transition
 
 #: Port place names inside the kitchen subnet — see
@@ -154,11 +154,11 @@ def build_kitchen_subnet(*, oven_capacity: int = 1, oven_pacing_secs: float = 0.
         An unstarted [`PetriNet`][cpnx.PetriNet] with port places `P_Pastry_In` and `P_Pastry_Out`
         already populated, ready to be wrapped by a [`SubstitutionTransition`][cpnx.SubstitutionTransition].
     """
-    p_pastry_in = Place(P_PASTRY_IN)
-    p_unwrapped = Place("P_Unwrapped")
+    p_pastry_in = Place(P_PASTRY_IN, schema=has_payload)
+    p_unwrapped = Place("P_Unwrapped", schema=has_payload)
     p_oven = PacedResourcePlace("P_Oven", capacity=oven_capacity, pacing_secs=oven_pacing_secs)
-    p_warmed = Place("P_Warmed")
-    p_pastry_out = Place(P_PASTRY_OUT)
+    p_warmed = Place("P_Warmed", schema=has_payload)
+    p_pastry_out = Place(P_PASTRY_OUT, schema=has_payload)
 
     t_unwrap = Transition(
         name="T_Unwrap",
@@ -198,7 +198,7 @@ def places() -> list[Place]:
         `T_Pastry_Case` wraps. This place is only ever the socket named by that
         transition's `port_socket_map`.
     """
-    return [Place("P_Food_Order")]
+    return [Place("P_Food_Order", schema=has_payload)]
 
 
 def transitions(

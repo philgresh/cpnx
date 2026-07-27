@@ -81,10 +81,9 @@ def test_whitelisted_method_calls_on_payload():
     # needs no transitive certification.
     def fn(toks):
         return (
-            toks[0].payload.get("val") is not None
-            and toks[0].id.startswith("lead-")
-            and bool(toks[0].payload.items())
+            toks[0].payload.get("val") is not None and toks[0].id.startswith("lead-") and bool(toks[0].payload.items())
         )
+
     _assert_certified(fn)
 
 

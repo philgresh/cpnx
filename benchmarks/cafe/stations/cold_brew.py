@@ -23,7 +23,7 @@ Demonstrates:
     ([#25](https://github.com/philgresh/cpnx/issues/25)) — see `cold_brew_key`.
 """
 
-from cafe.support import with_work
+from cafe.support import has_payload, with_work
 from cpnx import InputArc, OutputArc, Place, Token, Transition
 
 
@@ -75,8 +75,8 @@ def pull_cold_brew(tokens: list[Token]) -> list[Token]:
 
 
 def places() -> list[Place]:
-    """The tower itself — one colour-restricted [`Place`][cpnx.Place] holding steeping batches."""
-    return [Place("P_Cold_Brew_Steeping", color_set={"cold_brew"})]
+    """The tower itself — one colour-restricted and schema-validated [`Place`][cpnx.Place] holding steeping batches."""
+    return [Place("P_Cold_Brew_Steeping", color_set={"cold_brew"}, schema=has_payload)]
 
 
 def transitions(*, work_secs: float = 0.0, key: bool = False) -> list[Transition]:

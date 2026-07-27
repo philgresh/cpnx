@@ -14,11 +14,11 @@ from dataclasses import dataclass
 from typing import Callable, Iterator, TypeAlias
 
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace
-from cpnx.tokens import Token
+from cpnx.tokens import ERROR_COLOR, Token
 from cpnx.transitions import BindingPolicy, InputArc, OutputArc, SubstitutionTransition, Transition
 from cpnx.visualization import snapshot, to_dot
 
-_DepositFn: TypeAlias = Callable[[str, Token], None]
+_DepositFn: TypeAlias = Callable[[str, Token], bool | None]
 """Callable that deposits a token into a named place. Must be invoked under the engine lock."""
 
 _Binding: TypeAlias = list[tuple[InputArc, list[Token]]]
@@ -76,8 +76,8 @@ def _enact_planned_deposits(
     """
     deposited: list[tuple[str, Token]] = []
     for place_name, token in planned_deposits:
-        deposit(place_name, token)
-        deposited.append((place_name, token))
+        if deposit(place_name, token) is not False:
+            deposited.append((place_name, token))
 
     for arc, is_res_place in active_outputs:
         for _ in range(arc.count):
@@ -183,7 +183,7 @@ class PetriNet:
     from multiple threads concurrently; transition *actions* themselves run outside that lock.
 
     Resource tokens (`Token.is_resource`) are always returned to their source place once a
-    firing completes, whether it succeeds or fails. For data tokens, the net supports three
+    firing completes, whether it succeeds or fails. For data tokens, the net supports four
     error-handling dispositions:
 
     - **A. Colour-routed error (primary/canonical)** — the action catches its own
@@ -196,6 +196,13 @@ class PetriNet:
       it is dead-lettered to `error_place`.
     - **C. Immediate dead-letter** — setting `max_retries=0` on a transition routes any
       action failure immediately to `error_place`.
+    - **D. Output schema violation** — when an output token fails the target place's
+      [`schema`][cpnx.Place] (see `Place.validate_schema`), that one token is dead-lettered
+      to `error_place` immediately (no retry — the violation is deterministic, so retrying
+      cannot help), while the firing still **succeeds** and its other outputs are deposited
+      normally. The dead-lettered token is re-coloured `ERROR_COLOR` with the violation
+      detail in its payload, and both `on_token_dead_lettered` and `on_error` fire for it.
+      Resource permits are exempt from schema validation, so this never strands a permit.
 
     Note that `error_place` can be configured as a [`SinkPlace`][cpnx.SinkPlace]
     (e.g. `SinkPlace("failed", keep_last=10)`) to keep only the last N failures for
@@ -223,22 +230,29 @@ class PetriNet:
             called when a data token is dead-lettered to `error_place` (retries exhausted, or
             `max_retries=0`). Fires outside the engine lock.
         on_error: Optional callback `(transition_name: str, exc: Exception, token: Token | None)
-            -> None`. Fires outside the engine lock, for three kinds of event:
+            -> None`. Fires outside the engine lock, for four kinds of event:
 
             - a transition's **action raises** — `token` is the data token routed to the error
               place or rolled back, or `None` if the transition consumed no data tokens;
             - an [`InputArc`][cpnx.InputArc] **`key`/`filter` raises**, making that arc
               unsatisfiable so the transition cannot fire (`token` is `None`);
             - `binding_priority_key` raises for **every** candidate binding under
-              `BindingPolicy.PRIORITY`, so selection fell back to insertion order.
+              `BindingPolicy.PRIORITY`, so selection fell back to insertion order;
+            - an **output token violates its target place's `schema`** (disposition D above).
+              This is the one case that fires on an *otherwise-successful* firing: the offending
+              token is dead-lettered while the transition still succeeds. `token` is the
+              error-coloured dead-lettered token, and `exc` is a `TypeError` (matching the
+              `TypeError` a direct `deposit()` raises on a schema violation) — **not** the
+              `RuntimeError`-with-`__cause__` used by the fault reports below; there is no
+              original exception to chain, since the schema simply rejected the payload.
 
             The **`key`/`filter`** report is *edge-triggered*: selection re-runs on every
             enabling check, so a persistent fault reports once when it starts rather than once
             per `step()`, and reports again only when a fault appears that involves none of
             the tokens the last one did. The **`binding_priority_key`** report is not — it is
             de-duplicated only within a single pass, so a persistent one fires about once per
-            `step()` that resolves that transition. Both wrap the original exception in a
-            descriptive `RuntimeError` and chain it as `__cause__`.
+            `step()` that resolves that transition. Both of those wrap the original exception in
+            a descriptive `RuntimeError` and chain it as `__cause__`.
 
     Example:
         ```python
@@ -1054,6 +1068,71 @@ class PetriNet:
             )
         self.places[place_name].deposit(token, model_time=self._get_model_time_under_lock())
 
+    def _handle_schema_violation(
+        self,
+        place_name: str,
+        token: Token,
+        error_msg: str,
+        *,
+        transition_name: str,
+        dead_lettered_tokens: list[Token],
+        error_deposits: list[tuple[str, Token]],
+    ) -> None:
+        """Dead-letter a schema-violating transition output to the error place.
+
+        Builds an error-coloured token carrying the violation detail, deposits it into
+        `error_place`, and records it in `dead_lettered_tokens` (drives the dead-letter and
+        `on_error` callbacks) and — when actually deposited — in `error_deposits`, so
+        `on_token_deposited` fires for it. The error-place deposit happens off the committer's
+        planned-deposit path and would otherwise be invisible to that callback.
+        """
+        error_token = token.evolve(
+            color=ERROR_COLOR,
+            payload_updates={
+                "error": error_msg,
+                "error_type": "Color Set / Schema Violation",
+                "target_place": place_name,
+                "transition": transition_name,
+            },
+        )
+        if self.error_place and self.error_place in self.places:
+            self.places[self.error_place].deposit(error_token, model_time=self._get_model_time_under_lock())
+            error_deposits.append((self.error_place, error_token))
+        dead_lettered_tokens.append(error_token)
+
+    def _deposit_output_under_lock(
+        self,
+        place_name: str,
+        token: Token,
+        transition_name: str,
+        dl_tokens: list[Token],
+        error_deposits: list[tuple[str, Token]],
+    ) -> bool:
+        if place_name not in self.places:
+            raise KeyError(
+                f"Place '{place_name}' is not registered. Call add_place() before referencing it in a Transition arc."
+            )
+        place = self.places[place_name]
+        # Resource permits carry no payload, so a payload schema never applies to them — see
+        # Place._enforce_schema. `_schema_failure_reason` returns the diagnostic (incl. a raising
+        # predicate's own exception) so the dead-letter carries it instead of a bare rejection.
+        reason = None if token.is_resource else place._schema_failure_reason(token.payload)
+        if reason is not None:
+            error_msg = f"Color Set / Schema Violation: Token schema violation in Place '{place_name}': {reason}"
+            self._handle_schema_violation(
+                place_name,
+                token,
+                error_msg,
+                transition_name=transition_name,
+                dead_lettered_tokens=dl_tokens,
+                error_deposits=error_deposits,
+            )
+            return False
+        # Re-validates schema via place.deposit(); redundant with the check above but cheap and
+        # deterministic (belt-and-suspenders — a bypass would only add API surface).
+        self._deposit_under_lock(place_name, token)
+        return True
+
     def _is_transition_enabled(self, transition: Transition) -> bool:
         """Return `True` if all preconditions for firing `transition` are satisfied right now.
 
@@ -1812,9 +1891,7 @@ class PetriNet:
         and the advance runs per tick, so draining is O(N^2).
         """
         boundaries = (
-            place.earliest_available_boundary(now)
-            for place in self.places.values()
-            if not isinstance(place, SinkPlace)
+            place.earliest_available_boundary(now) for place in self.places.values() if not isinstance(place, SinkPlace)
         )
         return min((b for b in boundaries if b is not None), default=None)
 
@@ -1856,9 +1933,7 @@ class PetriNet:
         """
         now = self.model_time
         candidates = [
-            b
-            for b in (self._earliest_cooldown_boundary(now), self._earliest_settle_boundary(now))
-            if b is not None
+            b for b in (self._earliest_cooldown_boundary(now), self._earliest_settle_boundary(now)) if b is not None
         ]
         return min(candidates, default=None)
 
@@ -1965,13 +2040,20 @@ class PetriNet:
         if plan_error is not None:
             return False, plan_error, [], [], []
 
+        dl_data: list[Token] = []
+        error_deposits: list[tuple[str, Token]] = []
         deposited = _enact_planned_deposits(
             planned_deposits,
             active_outputs,
             res_deque,
             out_deque,
-            deposit=self._deposit_under_lock,
+            deposit=lambda place_name, token: self._deposit_output_under_lock(
+                place_name, token, transition.name, dl_data, error_deposits
+            ),
         )
+        # Schema-dead-lettered outputs land in the error place off the planned-deposit path;
+        # fold them into `deposited` so `on_token_deposited` fires for them too.
+        deposited.extend(error_deposits)
         deposited.extend(
             _return_leftover_resources(
                 res_deque,
@@ -1979,7 +2061,7 @@ class PetriNet:
                 deposit=self._deposit_under_lock,
             )
         )
-        return True, None, [], [], deposited
+        return True, None, [], dl_data, deposited
 
     def _execute_transition_action(
         self,
@@ -2080,7 +2162,7 @@ class PetriNet:
             place = self.places.get(place_name)
             if place is None:
                 return KeyError(f"Place '{place_name}' is not registered.")
-            if not place.can_accept(token):
+            if place.color_set is not None and token.color not in place.color_set:
                 return TypeError(f"Place '{place_name}' cannot accept token with color '{token.color}'.")
         return None
 
@@ -2170,6 +2252,11 @@ class PetriNet:
     ) -> None:
         if success:
             self._dispatch_transition_fired(transition.name, duration)
+            if dead_lettered_data_tokens:
+                self._dispatch_dead_letters(transition.name, dead_lettered_data_tokens)
+                for dl_token in dead_lettered_data_tokens:
+                    err_msg = dl_token.payload.get("error", "Color Set / Schema Violation")
+                    self._dispatch_transition_error(transition.name, TypeError(err_msg), [dl_token])
         else:
             self._dispatch_transition_error(transition.name, error, data_tokens)
             self._dispatch_dead_letters(transition.name, dead_lettered_data_tokens)

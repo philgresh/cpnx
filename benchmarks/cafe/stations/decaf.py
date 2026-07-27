@@ -34,7 +34,7 @@ Demonstrates:
     decaf rates of 0.5, 0.1, and 0.01 against a fixed depth to see it directly.
 """
 
-from cafe.support import with_work
+from cafe.support import has_payload, with_work
 from cpnx import InputArc, OutputArc, Place, Token, Transition
 
 
@@ -79,7 +79,7 @@ def places() -> list[Place]:
         pool *within* the place rather than the place being pre-sorted, which is exactly
         what forces route 3's full-marking peek in `engine._materialize_pool`.
     """
-    return [Place("P_Decaf_Line")]
+    return [Place("P_Decaf_Line", schema=has_payload)]
 
 
 def transitions(*, work_secs: float = 0.0) -> list[Transition]:

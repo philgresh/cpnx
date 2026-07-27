@@ -8,7 +8,7 @@ that gives an otherwise-instant action some GIL-releasing physical duration.
 """
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from cpnx import Token
 
@@ -18,6 +18,29 @@ DOSE_TARGET_G = 18.0
 
 #: Type of a transition action: consumes the bound input tokens, returns output tokens.
 Action = Callable[[list[Token]], list[Token]]
+
+
+def is_order(payload: Mapping) -> bool:
+    """Place `schema` predicate for order-ticket queues: a real ticket carries its dose weight.
+
+    Every order is seeded with ``weight_g`` and each pipeline step derives new tokens via
+    [`Token.evolve`][cpnx.Token.evolve] (which preserves payload), so grounds and milk tickets
+    keep it too. A bare or mis-wired token reaching one of these places would be missing it and
+    get dead-lettered — which is the point: unlike the old ``schema=dict`` (always true, since
+    every payload is a mapping), this actually rejects something.
+    """
+    return "weight_g" in payload
+
+
+def has_payload(payload: Mapping) -> bool:
+    """Place `schema` predicate for mixed/terminal queues: every cafe *data* token has a payload.
+
+    Used where a place legitimately holds heterogeneous tokens — freshly-assembled drinks
+    (``{"components": ...}``), cold-brew batches (``{"batch": ...}``), station-specific tickets —
+    so no single key can be required, but a payload-*less* data token still signals a wiring bug.
+    Resource permits are exempt from schema validation, so their empty payload never trips this.
+    """
+    return len(payload) > 0
 
 
 def dose_band(dose_tolerance_g: float | None) -> tuple[float | None, float | None]:

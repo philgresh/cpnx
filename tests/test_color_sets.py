@@ -5,8 +5,8 @@ import time
 import pytest
 
 from cpnx.engine import PetriNet
-from cpnx.places import Place, ResourcePlace
-from cpnx.tokens import Token
+from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace, ThresholdPlace
+from cpnx.tokens import ERROR_COLOR, Token
 from cpnx.transitions import InputArc, OutputArc, Transition
 
 
@@ -137,3 +137,180 @@ class TestIsDead:
         net._running_count = 5  # simulate in-flight work
         assert net.is_dead()
         net._running_count = 0
+
+
+class TestSchemaEnforcement:
+    def test_schema_type_matching(self):
+        class OrderPayload(dict):
+            pass
+
+        p = Place("p", schema=dict)
+        p.deposit(Token(payload={"id": 1}))
+        assert len(p.tokens) == 1
+
+        p_strict = Place("p_strict", schema=OrderPayload)
+        with pytest.raises(TypeError, match="schema"):
+            p_strict.deposit(Token(payload={"id": 2}))
+
+    def test_schema_callable(self):
+        p = Place("p", schema=lambda x: "id" in x)
+        p.deposit(Token(payload={"id": 1, "name": "foo"}))
+        assert len(p.tokens) == 1
+        with pytest.raises(TypeError, match="schema"):
+            p.deposit(Token(payload={"name": "missing id"}))
+
+    def test_schema_callable_raises_exception_rejected(self):
+        p = Place("p", schema=lambda x: x["val"] > 0)
+        with pytest.raises(TypeError, match="schema"):
+            p.deposit(Token(payload={}))
+        assert len(p.tokens) == 0
+
+    def test_schema_initial_marking_validated(self):
+        with pytest.raises(TypeError, match="schema"):
+            Place("p", schema=lambda x: "valid" in x, initial_marking=[Token(payload={"wrong": 1})])
+
+        p_valid = Place(
+            "p",
+            schema=lambda x: "valid" in x,
+            initial_marking=[Token(payload={"valid": 1}), Token(payload={"valid": 2})],
+        )
+        assert len(p_valid.tokens) == 2
+
+    def test_schema_subclasses(self):
+        rp = ResourcePlace("rp", capacity=2, schema=dict)
+        rp.deposit(Token(color="resource", payload={}))
+
+        prp = PacedResourcePlace("prp", 1, 0.1, schema=dict)
+        prp.deposit(Token(color="resource", payload={}))
+
+        tp = ThresholdPlace("tp", threshold=1, schema=lambda x: "val" in x)
+        tp.deposit(Token(payload={"val": 10}))
+        with pytest.raises(TypeError, match="schema"):
+            tp.deposit(Token(payload={"other": 10}))
+
+        sp = SinkPlace("sp", keep_last=5, schema=lambda x: "val" in x)
+        sp.deposit(Token(payload={"val": 3.14}))
+        with pytest.raises(TypeError, match="schema"):
+            sp.deposit(Token(payload={"other": 3.14}))
+
+    def test_schema_exempts_resource_permits(self):
+        # W2: a content schema on a resource pool must NOT reject the auto-generated permits
+        # (they carry no payload), so construction with capacity > 0 succeeds and returning a
+        # permit is fine — while a non-resource data token is still validated.
+        rp = ResourcePlace("rp", capacity=3, schema=lambda p: "meta" in p)
+        assert len(rp.tokens) == 3  # permits constructed despite the content schema
+        rp.deposit(Token(color="resource", payload={}))  # returning a permit: exempt
+        assert len(rp.tokens) == 4
+
+        prp = PacedResourcePlace("prp", capacity=2, pacing_secs=0.1, schema=lambda p: "meta" in p)
+        assert len(prp.tokens) == 2
+        prp.deposit(Token(color="resource", payload={}))  # exempt
+
+    def test_schema_permit_survives_transition_round_trip(self):
+        # W2: a permit consumed and returned through an output arc lands back in the pool,
+        # not the error place, even when the pool carries a content schema.
+        net = PetriNet(error_place="errors")
+        net.add_place(ResourcePlace("pool", capacity=1, schema=lambda p: "meta" in p))
+        net.add_place(Place("input"))
+        net.add_place(Place("done"))
+        net.add_place(Place("errors"))
+        net.add_transition(
+            Transition(
+                name="use_permit",
+                inputs=[InputArc("input"), InputArc("pool")],
+                outputs=[OutputArc("done"), OutputArc("pool")],
+                action=lambda tokens: tokens,
+            )
+        )
+        net.deposit("input", Token(payload={"meta": "x"}))
+        net.run(deadline=time.monotonic() + 1.0)
+        assert len(net.places["pool"].tokens) == 1  # permit returned, not stranded
+        assert len(net.places["errors"].tokens) == 0
+
+    def test_schema_predicate_exception_surfaced(self):
+        # M5: a predicate that raises still rejects, but the raised exception is surfaced in
+        # the error message rather than silently swallowed.
+        p = Place("p", schema=lambda x: x["val"] > 0)
+        with pytest.raises(TypeError, match="predicate raised"):
+            p.deposit(Token(payload={}))
+
+    def test_schema_transition_valid_deposit(self):
+        net = PetriNet()
+        net.add_place(Place("input"))
+        net.add_place(Place("output_valid", schema=lambda x: "code" in x))
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[InputArc("input")],
+                outputs=[OutputArc("output_valid")],
+                action=lambda tokens: [Token(payload={"code": 200})],
+            )
+        )
+        net.deposit("input", Token())
+        assert net.step() is True
+        net.run(deadline=time.monotonic() + 1.0)
+        assert len(net.places["output_valid"].tokens) == 1
+        assert net.places["output_valid"].tokens[0].payload == {"code": 200}
+
+    def test_schema_transition_dead_lettering(self):
+        net = PetriNet(error_place="errors")
+        net.add_place(Place("input"))
+        net.add_place(Place("output_strict", schema=lambda x: "required_key" in x))
+        net.add_place(Place("output_ok"))
+        net.add_place(Place("errors"))
+
+        errors_seen = []
+        dead_letters_seen = []
+        deposits_seen = []
+
+        def on_error(t_name, exc, token):
+            errors_seen.append((t_name, str(exc), token))
+
+        def on_dead_letter(t_name, token):
+            dead_letters_seen.append((t_name, token))
+
+        def on_deposit(place_name, token):
+            deposits_seen.append((place_name, token))
+
+        net.on_error = on_error
+        net.on_token_dead_lettered = on_dead_letter
+        net.on_token_deposited = on_deposit
+
+        net.add_transition(
+            Transition(
+                name="produce",
+                inputs=[InputArc("input")],
+                outputs=[OutputArc("output_strict"), OutputArc("output_ok")],
+                action=lambda tokens: [
+                    Token(payload={"wrong_key": 1}),  # violates schema
+                    Token(payload={"ok": True}),  # succeeds in output_ok
+                ],
+            )
+        )
+
+        net.deposit("input", Token())
+        assert net.step() is True
+        net.run(deadline=time.monotonic() + 1.0)
+
+        assert len(net.places["output_ok"].tokens) == 1
+        assert len(net.places["output_strict"].tokens) == 0
+        assert len(net.places["errors"].tokens) == 1
+
+        err_tok = net.places["errors"].tokens[0]
+        assert err_tok.color == ERROR_COLOR
+        assert err_tok.payload["error_type"] == "Color Set / Schema Violation"
+        assert err_tok.payload["target_place"] == "output_strict"
+        assert err_tok.payload["transition"] == "produce"
+        assert "does not match schema" in err_tok.payload["error"]
+
+        assert len(errors_seen) == 1
+        assert len(dead_letters_seen) == 1
+        assert dead_letters_seen[0][0] == "produce"
+        assert dead_letters_seen[0][1].id == err_tok.id
+
+        # M3: on_token_deposited must fire for the error-place deposit too (it lands off the
+        # planned-deposit path), alongside the successful output_ok deposit.
+        deposited_places = [p for p, _ in deposits_seen]
+        assert "errors" in deposited_places
+        assert "output_ok" in deposited_places
+        assert any(p == "errors" and t.id == err_tok.id for p, t in deposits_seen)
