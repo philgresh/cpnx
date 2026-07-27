@@ -42,7 +42,7 @@ Demonstrates:
     cannot.
 """
 
-from cafe.support import DOSE_TARGET_G, with_work
+from cafe.support import DOSE_TARGET_G, has_payload, with_work
 from cpnx import InputArc, OutputArc, Place, Token, Transition
 
 #: The whiteboard. A shift lead's live priorities, keyed by the same two groupings
@@ -129,7 +129,7 @@ def places() -> list[Place]:
 
     Args:
     """
-    return [Place("P_Specials_Queue", schema=dict)]
+    return [Place("P_Specials_Queue", schema=has_payload)]
 
 
 def transitions(*, work_secs: float = 0.0) -> list[Transition]:

@@ -366,7 +366,15 @@ class Place:
                              Deposited before any external code runs.
             schema: Optional schema or type constraint for token payloads. Can be a
                     type (checked via ``isinstance``) or a callable predicate
-                    returning a bool. ``None`` (default) accepts any payload.
+                    returning a bool. ``None`` (default) accepts any payload. Resource
+                    permit tokens (``color="resource"``) are exempt, since permits carry
+                    no payload — a payload schema never applies to them.
+
+        Note:
+            Token payloads are always coerced to an immutable [`FrozenDict`][cpnx.FrozenDict]
+            (a ``Mapping``, not a ``dict`` subclass), so a type schema is only useful as
+            ``dict``/``Mapping`` (always satisfied) or an ``ABC`` that ``FrozenDict`` registers
+            under. To validate payload *contents*, pass a callable predicate.
         """
         self.name = name
         self.bound = bound
@@ -383,16 +391,46 @@ class Place:
                     f"Place '{self.name}' has color_set {self.color_set!r} — "
                     f"cannot deposit token with color {token.color!r}."
                 )
-            if not self.validate_schema(token.payload):
-                raise TypeError(
-                    f"Color Set / Schema Violation in Place '{self.name}': "
-                    f"payload {token.payload!r} does not match schema {self.schema!r}."
-                )
+            self._enforce_schema(token)
             self._store.append(token)
             self.last_deposit_time = time.monotonic()
 
+    def _schema_failure_reason(self, payload: Any) -> str | None:
+        """Return ``None`` if *payload* conforms to `schema`, else a human-readable reason.
+
+        The reason always contains the word "schema" (callers wrap it in a ``TypeError``) and,
+        when a callable schema *raises*, includes that exception via ``repr`` — so a buggy or
+        over-strict predicate is diagnosable rather than silently collapsed to a bare rejection.
+        A raising predicate still counts as a rejection (the payload could not be validated).
+
+        Args:
+            payload: The token payload to check against `schema`.
+
+        Returns:
+            ``None`` when valid; otherwise a reason string describing the violation.
+        """
+        if self.schema is None:
+            return None
+        if isinstance(self.schema, type):
+            if self.schema is dict and isinstance(payload, Mapping):
+                return None
+            if isinstance(payload, self.schema):
+                return None
+            return f"payload {payload!r} does not match schema {self.schema!r}."
+        if callable(self.schema):
+            try:
+                ok = bool(self.schema(payload))
+            except Exception as exc:
+                return f"payload {payload!r} does not match schema {self.schema!r} (predicate raised {exc!r})."
+            if ok:
+                return None
+            return f"payload {payload!r} does not match schema {self.schema!r}."
+        return f"payload {payload!r} does not match schema {self.schema!r} (schema is neither a type nor callable)."
+
     def validate_schema(self, payload: Any) -> bool:
         """Validate whether *payload* conforms to this place's schema.
+
+        Thin boolean wrapper over `_schema_failure_reason` (which carries the diagnostic detail).
 
         Args:
             payload: The token payload to check against `schema`.
@@ -403,18 +441,21 @@ class Place:
             (when `schema` is a callable). ``False`` otherwise, including when a callable
             schema raises an exception.
         """
-        if self.schema is None:
-            return True
-        if isinstance(self.schema, type):
-            if self.schema is dict and isinstance(payload, Mapping):
-                return True
-            return isinstance(payload, self.schema)
-        if callable(self.schema):
-            try:
-                return bool(self.schema(payload))
-            except Exception:
-                return False
-        return False
+        return self._schema_failure_reason(payload) is None
+
+    def _enforce_schema(self, token: Token) -> None:
+        """Raise ``TypeError`` if *token* violates this place's schema.
+
+        Resource permit tokens (``color="resource"``) are exempt: a permit carries no payload,
+        so `schema` — a *payload* constraint — never applies to it. Enforcing it would reject
+        every auto-generated permit (empty payload) and, on the transition return path, silently
+        route the permit to the error place instead of the pool. See `is_resource`.
+        """
+        if token.is_resource:
+            return
+        reason = self._schema_failure_reason(token.payload)
+        if reason is not None:
+            raise TypeError(f"Color Set / Schema Violation in Place '{self.name}': {reason}")
 
     def deposit(self, token: Token, model_time: float | None = None) -> None:
         """Append *token* to the tail of the FIFO queue, enforcing the place's colour set.
@@ -437,11 +478,7 @@ class Place:
                     f"Place '{self.name}' has color_set {self.color_set!r} — "
                     f"cannot deposit token with color {token.color!r}."
                 )
-            if not self.validate_schema(token.payload):
-                raise TypeError(
-                    f"Color Set / Schema Violation in Place '{self.name}': "
-                    f"payload {token.payload!r} does not match schema {self.schema!r}."
-                )
+            self._enforce_schema(token)
             self._store.append(token)
             self.last_deposit_time = time.monotonic()
             if model_time is not None:
@@ -659,12 +696,13 @@ class Place:
 
         Returns:
             ``True`` if `color_set` is ``None`` or contains *token*'s colour and
-            `validate_schema` returns ``True``, ``False`` otherwise.
+            `validate_schema` returns ``True``, ``False`` otherwise. Resource permit
+            tokens are exempt from the schema check (see `_enforce_schema`).
         """
         with self._lock:
             if self.color_set is not None and token.color not in self.color_set:
                 return False
-            if not self.validate_schema(token.payload):
+            if not token.is_resource and not self.validate_schema(token.payload):
                 return False
             return True
 
@@ -718,7 +756,8 @@ class ResourcePlace(Place):
             name: Unique identifier for this place within a [`PetriNet`][cpnx.PetriNet].
             capacity: Number of resource permits in the pool. ``0`` is valid
                       (creates an empty, permanently-blocking place).
-            schema: Optional schema or type constraint for token payloads.
+            schema: Optional schema or type constraint for token payloads. Resource
+                    permit tokens are exempt (they carry no payload). See [`Place`][cpnx.Place].
         """
         self.capacity = capacity
         super().__init__(
@@ -761,7 +800,8 @@ class PacedResourcePlace(ResourcePlace):
             capacity: Number of resource permits in the pool.
             pacing_secs: Seconds a token must wait after being returned before
                          it becomes available again.
-            schema: Optional schema or type constraint for token payloads.
+            schema: Optional schema or type constraint for token payloads. Resource
+                    permit tokens are exempt (they carry no payload). See [`Place`][cpnx.Place].
         """
         self.pacing_secs = pacing_secs
         super().__init__(name, capacity, schema=schema)
@@ -781,14 +821,11 @@ class PacedResourcePlace(ResourcePlace):
                         `last_deposit_time_model`.
 
         Raises:
-            TypeError: If `schema` is set and *token*'s payload fails validation.
+            TypeError: If `schema` is set and *token*'s payload fails validation. Resource
+                permit tokens (the usual case here) are exempt — see `_enforce_schema`.
         """
         with self._lock:
-            if not self.validate_schema(token.payload):
-                raise TypeError(
-                    f"Color Set / Schema Violation in Place '{self.name}': "
-                    f"payload {token.payload!r} does not match schema {self.schema!r}."
-                )
+            self._enforce_schema(token)
             ref_time = model_time if model_time is not None else time.monotonic()
             # Create a new token with updated availability timestamp (stateless place cooldown)
             timed_token = token.evolve(available_at=ref_time + self.pacing_secs, id=token.id)
@@ -899,7 +936,8 @@ class ThresholdPlace(Place):
             name: Unique identifier for this place within a [`PetriNet`][cpnx.PetriNet].
             threshold: Minimum queue depth required before any retrieval is
                        permitted. Must be >= 1.
-            schema: Optional schema or type constraint for token payloads.
+            schema: Optional schema or type constraint for token payloads. Resource
+                    permit tokens are exempt (they carry no payload). See [`Place`][cpnx.Place].
         """
         super().__init__(name, schema=schema)
         self.threshold = threshold
@@ -1026,7 +1064,8 @@ class SinkPlace(Place):
                        Default is 0 (retain nothing beyond the aggregate counters).
             color_set: Set of accepted token colours. ``None`` (default) accepts any colour.
                        Do not use a restrictive color_set if used as an error_place.
-            schema: Optional schema or type constraint for token payloads.
+            schema: Optional schema or type constraint for token payloads. Resource
+                    permit tokens are exempt (they carry no payload). See [`Place`][cpnx.Place].
         """
         super().__init__(name, bound=None, color_set=color_set, schema=schema)
         self.keep_last = keep_last
@@ -1058,11 +1097,7 @@ class SinkPlace(Place):
                     f"Place '{self.name}' has color_set {self.color_set!r} — "
                     f"cannot deposit token with color {token.color!r}."
                 )
-            if not self.validate_schema(token.payload):
-                raise TypeError(
-                    f"Color Set / Schema Violation in Place '{self.name}': "
-                    f"payload {token.payload!r} does not match schema {self.schema!r}."
-                )
+            self._enforce_schema(token)
             self._kept.append(token)
             now = time.monotonic()
             self.last_deposit_time = now

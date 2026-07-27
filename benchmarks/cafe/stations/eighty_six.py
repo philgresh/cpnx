@@ -38,7 +38,7 @@ Demonstrates:
 """
 
 from cafe.stations.batch_triage import batch_triage_key
-from cafe.support import with_work
+from cafe.support import has_payload, with_work
 from cpnx import InputArc, OutputArc, Place, Token, Transition
 
 #: The 86 board: syrup names currently sold out, keyed by nothing but their own presence.
@@ -91,7 +91,7 @@ def places() -> list[Place]:
         Holds tickets waiting on whatever syrup they need, regardless of whether that
         syrup is currently 86'd — the filter, not the place, is what withholds them.
     """
-    return [Place("P_Eighty_Six_Queue", schema=dict)]
+    return [Place("P_Eighty_Six_Queue", schema=has_payload)]
 
 
 def transitions(*, work_secs: float = 0.0) -> list[Transition]:

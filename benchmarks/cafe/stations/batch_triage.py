@@ -24,7 +24,7 @@ Demonstrates:
     [ADR 0004](https://github.com/philgresh/cpnx/blob/main/docs/adr/0004-arc-selection-key-filter.md).
 """
 
-from cafe.support import DOSE_TARGET_G, with_work
+from cafe.support import DOSE_TARGET_G, is_order, with_work
 from cpnx import InputArc, OutputArc, Place, Token, Transition
 
 
@@ -79,8 +79,8 @@ def serve_batch_triage(tokens: list[Token]) -> list[Token]:
 
 
 def places() -> list[Place]:
-    """The backlog — an unbounded FIFO [`Place`][cpnx.Place] with `schema=dict`, same shape as `P_Ticket_Line`."""
-    return [Place("P_Batch_Triage_Queue", schema=dict)]
+    """The backlog — an unbounded FIFO [`Place`][cpnx.Place] with `schema=is_order`, same shape as `P_Ticket_Line`."""
+    return [Place("P_Batch_Triage_Queue", schema=is_order)]
 
 
 def transitions(*, work_secs: float = 0.0) -> list[Transition]:

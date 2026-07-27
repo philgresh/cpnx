@@ -179,9 +179,6 @@ class TestSchemaEnforcement:
     def test_schema_subclasses(self):
         rp = ResourcePlace("rp", capacity=2, schema=dict)
         rp.deposit(Token(color="resource", payload={}))
-        with pytest.raises(TypeError, match="schema"):
-            rp_strict = ResourcePlace("rp_strict", capacity=0, schema=lambda x: "meta" in x)
-            rp_strict.deposit(Token(color="resource", payload={}))
 
         prp = PacedResourcePlace("prp", 1, 0.1, schema=dict)
         prp.deposit(Token(color="resource", payload={}))
@@ -195,6 +192,47 @@ class TestSchemaEnforcement:
         sp.deposit(Token(payload={"val": 3.14}))
         with pytest.raises(TypeError, match="schema"):
             sp.deposit(Token(payload={"other": 3.14}))
+
+    def test_schema_exempts_resource_permits(self):
+        # W2: a content schema on a resource pool must NOT reject the auto-generated permits
+        # (they carry no payload), so construction with capacity > 0 succeeds and returning a
+        # permit is fine — while a non-resource data token is still validated.
+        rp = ResourcePlace("rp", capacity=3, schema=lambda p: "meta" in p)
+        assert len(rp.tokens) == 3  # permits constructed despite the content schema
+        rp.deposit(Token(color="resource", payload={}))  # returning a permit: exempt
+        assert len(rp.tokens) == 4
+
+        prp = PacedResourcePlace("prp", capacity=2, pacing_secs=0.1, schema=lambda p: "meta" in p)
+        assert len(prp.tokens) == 2
+        prp.deposit(Token(color="resource", payload={}))  # exempt
+
+    def test_schema_permit_survives_transition_round_trip(self):
+        # W2: a permit consumed and returned through an output arc lands back in the pool,
+        # not the error place, even when the pool carries a content schema.
+        net = PetriNet(error_place="errors")
+        net.add_place(ResourcePlace("pool", capacity=1, schema=lambda p: "meta" in p))
+        net.add_place(Place("input"))
+        net.add_place(Place("done"))
+        net.add_place(Place("errors"))
+        net.add_transition(
+            Transition(
+                name="use_permit",
+                inputs=[InputArc("input"), InputArc("pool")],
+                outputs=[OutputArc("done"), OutputArc("pool")],
+                action=lambda tokens: tokens,
+            )
+        )
+        net.deposit("input", Token(payload={"meta": "x"}))
+        net.run(deadline=time.monotonic() + 1.0)
+        assert len(net.places["pool"].tokens) == 1  # permit returned, not stranded
+        assert len(net.places["errors"].tokens) == 0
+
+    def test_schema_predicate_exception_surfaced(self):
+        # M5: a predicate that raises still rejects, but the raised exception is surfaced in
+        # the error message rather than silently swallowed.
+        p = Place("p", schema=lambda x: x["val"] > 0)
+        with pytest.raises(TypeError, match="predicate raised"):
+            p.deposit(Token(payload={}))
 
     def test_schema_transition_valid_deposit(self):
         net = PetriNet()
@@ -223,6 +261,7 @@ class TestSchemaEnforcement:
 
         errors_seen = []
         dead_letters_seen = []
+        deposits_seen = []
 
         def on_error(t_name, exc, token):
             errors_seen.append((t_name, str(exc), token))
@@ -230,8 +269,12 @@ class TestSchemaEnforcement:
         def on_dead_letter(t_name, token):
             dead_letters_seen.append((t_name, token))
 
+        def on_deposit(place_name, token):
+            deposits_seen.append((place_name, token))
+
         net.on_error = on_error
         net.on_token_dead_lettered = on_dead_letter
+        net.on_token_deposited = on_deposit
 
         net.add_transition(
             Transition(
@@ -264,3 +307,10 @@ class TestSchemaEnforcement:
         assert len(dead_letters_seen) == 1
         assert dead_letters_seen[0][0] == "produce"
         assert dead_letters_seen[0][1].id == err_tok.id
+
+        # M3: on_token_deposited must fire for the error-place deposit too (it lands off the
+        # planned-deposit path), alongside the successful output_ok deposit.
+        deposited_places = [p for p, _ in deposits_seen]
+        assert "errors" in deposited_places
+        assert "output_ok" in deposited_places
+        assert any(p == "errors" and t.id == err_tok.id for p, t in deposits_seen)

@@ -9,6 +9,7 @@ Opt-in stations live in [`cafe.stations`][cafe.stations]; this module is only wh
 bare `build_cafe()`.
 """
 
+from cafe.support import has_payload, is_order
 from cpnx import (
     PacedResourcePlace,
     Place,
@@ -29,15 +30,16 @@ def p_ticket_line() -> Place:
         outside deposits.
 
     Demonstrates:
-        The plain unbounded FIFO [`Place`][cpnx.Place] — `schema=dict` enforces mapping token
-        payloads, but it has no colour set, no bound, and no initial marking. It is the
-        net's **deep** place: the throughput benchmark stocks it with up to 20 000
+        The plain unbounded FIFO [`Place`][cpnx.Place] — `schema=is_order` requires each ticket
+        to carry its dose `weight_g` (a real reject, unlike `schema=dict`, which every mapping
+        payload trivially satisfies), but it has no colour set, no bound, and no initial marking.
+        It is the net's **deep** place: the throughput benchmark stocks it with up to 20 000
         tickets, which is what makes it the place where marking depth actually shows
         up in engine cost. It is drained by `T_Weigh_And_Grind` under
         [`BindingPolicy.PRIORITY`][cpnx.BindingPolicy], so it is also the one place whose depth feeds a
         full candidate enumeration rather than a head-only read.
     """
-    return Place("P_Ticket_Line", schema=dict)
+    return Place("P_Ticket_Line", schema=is_order)
 
 
 def p_digital_scales(capacity: int = 3) -> ResourcePlace:
@@ -60,7 +62,7 @@ def p_digital_scales(capacity: int = 3) -> ResourcePlace:
     Args:
         capacity: How many scales are on the bench. Defaults to 3.
     """
-    return ResourcePlace("P_Digital_Scales", capacity=capacity, schema=dict)
+    return ResourcePlace("P_Digital_Scales", capacity=capacity)
 
 
 def p_burr_grinder(grinders: int = 2, pacing_secs: float = 8.0) -> PacedResourcePlace:
@@ -87,7 +89,7 @@ def p_burr_grinder(grinders: int = 2, pacing_secs: float = 8.0) -> PacedResource
         grinders: Number of grinders, i.e. the permit capacity. Defaults to 2.
         pacing_secs: Cooldown applied to each returned permit. Defaults to 8.0.
     """
-    return PacedResourcePlace("P_Burr_Grinder", capacity=grinders, pacing_secs=pacing_secs, schema=dict)
+    return PacedResourcePlace("P_Burr_Grinder", capacity=grinders, pacing_secs=pacing_secs)
 
 
 def p_ground_coffee() -> Place:
@@ -100,14 +102,15 @@ def p_ground_coffee() -> Place:
 
     Demonstrates:
         A colour-restricted and schema-validated [`Place`][cpnx.Place] — `color_set={"ground_coffee"}`
-        and `schema=dict` make the place reject any token of the wrong colour or
-        payload type, which turns a mis-wired output arc into an immediate error
-        instead of a silently weird marking. Because it is the retry target, it is
-        also the shallow queue that the channeling regime's extra `step()`s fire
+        and `schema=is_order` make the place reject any token of the wrong colour or any
+        payload missing its dose `weight_g` (grounds are derived from the order via
+        `Token.evolve`, so they carry it), which turns a mis-wired output arc into an
+        immediate error instead of a silently weird marking. Because it is the retry target,
+        it is also the shallow queue that the channeling regime's extra `step()`s fire
         against (which is why retries make µs/*step* look cheaper while making the
         run strictly more expensive).
     """
-    return Place("P_Ground_Coffee", color_set={"ground_coffee"}, schema=dict)
+    return Place("P_Ground_Coffee", color_set={"ground_coffee"}, schema=is_order)
 
 
 def p_milk_queue() -> Place:
@@ -120,12 +123,13 @@ def p_milk_queue() -> Place:
 
     Demonstrates:
         A second colour-restricted and schema-validated [`Place`][cpnx.Place] (`{"milk_ticket"}`,
-        `schema=dict`), and — jointly with [`p_ground_coffee`][cafe.places.p_ground_coffee] — the net's
+        `schema=is_order` — the milk ticket is `evolve`d from the order and keeps its
+        `weight_g`), and — jointly with [`p_ground_coffee`][cafe.places.p_ground_coffee] — the net's
         **fork**: one transition writing two output arcs into two different places,
         so the two downstream stations become independently enabled and can genuinely
         run concurrently.
     """
-    return Place("P_Milk_Queue", color_set={"milk_ticket"}, schema=dict)
+    return Place("P_Milk_Queue", color_set={"milk_ticket"}, schema=is_order)
 
 
 def p_espresso_machine(capacity: int = 2) -> ResourcePlace:
@@ -145,7 +149,7 @@ def p_espresso_machine(capacity: int = 2) -> ResourcePlace:
     Args:
         capacity: Number of group heads. Defaults to 2.
     """
-    return ResourcePlace("P_Espresso_Machine", capacity=capacity, schema=dict)
+    return ResourcePlace("P_Espresso_Machine", capacity=capacity)
 
 
 def p_steam_wand(capacity: int = 2) -> ResourcePlace:
@@ -162,7 +166,7 @@ def p_steam_wand(capacity: int = 2) -> ResourcePlace:
     Args:
         capacity: Number of wands. Defaults to 2.
     """
-    return ResourcePlace("P_Steam_Wand", capacity=capacity, schema=dict)
+    return ResourcePlace("P_Steam_Wand", capacity=capacity)
 
 
 def p_order_tray(threshold: int = 2, bound: int | None = 6) -> ThresholdPlace:
@@ -192,7 +196,9 @@ def p_order_tray(threshold: int = 2, bound: int | None = 6) -> ThresholdPlace:
         threshold: Tokens that must accumulate before any retrieval is allowed.
         bound: Optional k-bound (cups the counter fits). `None` removes the bound.
     """
-    tray = ThresholdPlace("P_Order_Tray", threshold=threshold, schema=dict)
+    # `schema=has_payload`: the tray holds espresso and steamed-milk tokens (heterogeneous
+    # colours), so it can't require one key — but a payload-less token here is a wiring bug.
+    tray = ThresholdPlace("P_Order_Tray", threshold=threshold, schema=has_payload)
     # ThresholdPlace's constructor doesn't expose `bound` (threshold and k-bound are
     # orthogonal CPN concepts), but `bound` is a plain, settable attribute inherited
     # from Place.
@@ -213,8 +219,13 @@ def p_served() -> SinkPlace:
         does not accumulate 20 000 live tokens in the marking. That is what keeps the
         deep throughput sweeps measuring the *drain*, rather than measuring memory
         growth at the far end of the pipeline.
+
+        `schema=has_payload`: served drinks are heterogeneous — a freshly-assembled
+        `{"components": ...}` token from `T_Serve_Drink`, or a drive-through station's
+        `evolve`d ticket — so a single required key would be wrong, but a payload-less
+        token still signals a wiring bug.
     """
-    return SinkPlace("P_Served", schema=dict)
+    return SinkPlace("P_Served", schema=has_payload)
 
 
 def p_trash_can(keep_last: int = 10) -> SinkPlace:
@@ -231,7 +242,12 @@ def p_trash_can(keep_last: int = 10) -> SinkPlace:
         dead-letters a transition's data tokens here automatically once
         `max_retries` is exhausted, without any arc being drawn to it.
 
+        Deliberately carries **no** `schema`: as the `error_place` it must accept whatever
+        gets dead-lettered — including the error-coloured tokens the engine mints for *schema*
+        violations elsewhere — so constraining it would risk rejecting a dead-letter inside the
+        locked commit and stranding it. See [`SinkPlace`][cpnx.SinkPlace]'s error-place warning.
+
     Args:
         keep_last: Size of the retained rolling window. Defaults to 10.
     """
-    return SinkPlace("P_Trash_Can", keep_last=keep_last, schema=dict)
+    return SinkPlace("P_Trash_Can", keep_last=keep_last)

@@ -46,7 +46,7 @@ Demonstrates:
     valid same-origin flight existing deeper in the bench than the search looked.
 """
 
-from cafe.support import with_work
+from cafe.support import has_payload, with_work
 from cpnx import BindingPolicy, InputArc, OutputArc, Place, Token, Transition
 
 
@@ -141,7 +141,7 @@ def places() -> list[Place]:
     Returns:
         A single-element list containing `P_Sample_Queue`.
     """
-    return [Place("P_Sample_Queue", schema=dict)]
+    return [Place("P_Sample_Queue", schema=has_payload)]
 
 
 def transitions(*, work_secs: float = 0.0, count: int = 4) -> list[Transition]:
