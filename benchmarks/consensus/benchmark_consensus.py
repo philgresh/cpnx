@@ -410,6 +410,7 @@ def run_quiescence(*, seed: int = 20260726) -> dict:
 
 
 def main() -> None:
+    """CLI entry point: parse args, then run Phase 1 (throughput) and Phase 2 (quiescence)."""
     parser = argparse.ArgumentParser(description="cpnx BFT (80% UNL) consensus benchmark")
     parser.add_argument("--n-tx", type=int, default=1000, help="Phase 1 transaction count (default: 1000)")
     parser.add_argument(

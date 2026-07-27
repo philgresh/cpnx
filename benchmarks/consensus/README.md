@@ -83,8 +83,10 @@ on transition priority, which `build_consensus_net`'s `eager_commit` flag contro
   just observed but *guaranteed by priority ordering*.
 - **Eager-commit priority** (`eager_commit=True`): `T_commit` outranks `T_validate`, so it
   fires the instant the 80-vote barrier is met rather than waiting for the remaining votes to
-  land. This keeps the shared `yes_votes` pool small under concurrent load, which matters
-  because `consume_all`'s scan cost grows with pool size — see Phase 1 below.
+  land. This keeps the shared `yes_votes` pool small under concurrent load — a `consume_all`
+  drain of a deep pool is what motivated the engine's **count-only enablement fast path**
+  ([ADR 0005](../../docs/adr/0005-consume-all-count-only-fast-path.md)), which makes the barrier
+  probe `O(1)` instead of an `O(N)` full-pool peek. See Phase 1 below.
 
 ## Two execution phases
 
