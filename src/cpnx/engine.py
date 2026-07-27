@@ -11,7 +11,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
-from typing import Callable, Iterator, TypeAlias
+from typing import Callable, Iterator, TypeAlias, cast
 
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace
 from cpnx.tokens import ERROR_COLOR, Token
@@ -21,8 +21,33 @@ from cpnx.visualization import snapshot, to_dot
 _DepositFn: TypeAlias = Callable[[str, Token], bool | None]
 """Callable that deposits a token into a named place. Must be invoked under the engine lock."""
 
-_Binding: TypeAlias = list[tuple[InputArc, list[Token]]]
-"""A resolved binding: each input arc paired with the exact tokens it will consume."""
+
+class _DrainAll:
+    """Sentinel standing in for a `consume_all` arc's tokens in a resolved binding.
+
+    A `consume_all` arc consumes the *whole* available pool, and does so only if its owning
+    transition is actually selected to fire. Materializing that pool during enablement probes
+    and losing resolutions is what makes draining a deep place O(N²) (see
+    `_try_count_only_binding`). For a **guard-free, head-only** transition — which inspects no
+    token before firing and draws no RNG — the binding can instead carry this marker: the arc
+    is known enabled from the O(1) count check, and the pool is materialized exactly once, at
+    consume time, via `Place.retrieve_all`.
+    """
+
+    __slots__ = ()
+
+
+#: Marks a `consume_all` arc for whole-pool draining at consume time (see `_DrainAll`).
+_DRAIN = _DrainAll()
+
+#: Returned by `_try_count_only_binding` when a transition does not qualify for the fast path,
+#: so callers fall through to the ordinary (materializing) resolution. Distinct from `None`,
+#: which means "qualified, but not currently enabled".
+_NO_FAST_PATH = object()
+
+_Binding: TypeAlias = list[tuple[InputArc, "list[Token] | _DrainAll"]]
+"""A resolved binding: each input arc paired with the exact tokens it will consume, or the
+[`_DRAIN`][] sentinel for a `consume_all` arc resolved lazily (drained at consume time)."""
 
 
 @dataclass(frozen=True)
@@ -34,8 +59,17 @@ class DriveResult:
 
 
 def _flatten_binding(binding: _Binding) -> list[Token]:
-    """Flatten a resolved binding into a single guard-candidate token list, in arc order."""
-    return [t for _, tokens in binding for t in tokens]
+    """Flatten a resolved binding into a single guard-candidate token list, in arc order.
+
+    Only ever called on eagerly-materialized bindings (the guarded / search paths). A binding
+    carrying a `_DRAIN` marker comes exclusively from a guard-free, key-free transition that is
+    never flattened, so the assertion documents that invariant rather than guarding a real case.
+    """
+    flat: list[Token] = []
+    for _, tokens in binding:
+        assert not isinstance(tokens, _DrainAll), "a drain binding must never be flattened"
+        flat.extend(tokens)
+    return flat
 
 
 _first = operator.itemgetter(0)
@@ -676,7 +710,13 @@ class PetriNet:
         try:
             for arc, tokens in binding:
                 place = self.places[arc.place]
-                got = place.retrieve_specific(tokens, model_time=m_time)
+                if isinstance(tokens, _DrainAll):
+                    # Lazily-resolved `consume_all` arc: materialize and remove the whole
+                    # available pool now, under the same lock that selected the binding, so it
+                    # is consistent with the `can_retrieve` check that enabled it.
+                    got = place.retrieve_all(model_time=m_time)
+                else:
+                    got = place.retrieve_specific(tokens, model_time=m_time)
                 consumed_tokens.extend(got)
                 for t in got:
                     token_sources.append((arc.place, t))
@@ -1288,6 +1328,87 @@ class PetriNet:
             return True
         return policy is BindingPolicy.FIRST and transition.guard is None
 
+    def _try_count_only_binding(
+        self, transition: Transition, m_time: float | None, ignore_timing: bool
+    ) -> "_Binding | None | object":
+        """Resolve a `consume_all` transition by count alone, without materializing the pool.
+
+        Returns:
+            - `_NO_FAST_PATH` if the transition does not qualify (the caller must fall through
+              to the ordinary, materializing resolution);
+            - a `_Binding` (with `_DRAIN` markers for the `consume_all` arcs) if it qualifies
+              and is currently enabled;
+            - `None` if it qualifies but is not currently enabled.
+
+        **Why this is safe.** The only things that read an arc's tokens between resolution and
+        firing are a transition `guard` and a `binding_priority_key` (see `_head_binding` /
+        `_min_key_pick`). A transition with neither, resolved head-only, inspects no token
+        before it fires and draws **no RNG** while resolving — so deferring a `consume_all`
+        arc's whole-pool read to consume time is behaviour-identical, and in particular cannot
+        perturb the seeded RNG stream that `test_seeded_determinism` pins. Non-`consume_all`
+        arcs are still resolved eagerly here, but their reads are bounded (FIFO head / key
+        index), never the O(N) full-pool peek that this path exists to avoid.
+
+        The fast path is gated on the presence of a `consume_all` arc precisely because that is
+        the only arc shape whose ordinary resolution is unbounded; a transition without one
+        gains nothing and is left on the existing path to keep the change's blast radius small.
+        """
+        if not self._qualifies_for_count_only(transition):
+            return _NO_FAST_PATH
+
+        binding: _Binding = []
+        for arc in transition.inputs:
+            resolved = self._count_only_arc_binding(arc, transition.name, m_time, ignore_timing)
+            if resolved is None:
+                return None
+            binding.append(resolved)
+        return binding
+
+    def _qualifies_for_count_only(self, transition: Transition) -> bool:
+        """Whether `transition` may take the count-only `consume_all` fast path.
+
+        Excludes anything that would read tokens before firing (a `guard` or a
+        `binding_priority_key`) or that enumerates rather than taking the head
+        (`RANDOM`/`PRIORITY`), and requires at least one `consume_all` arc — the only arc
+        shape whose ordinary resolution is unbounded. See `_try_count_only_binding` for why
+        this exact set keeps the deferral behaviour- and RNG-identical.
+        """
+        return (
+            transition.guard is None
+            and transition.binding_priority_key is None
+            and self._is_head_only(transition, self._effective_policy(transition))
+            and any(arc.consume_all for arc in transition.inputs)
+        )
+
+    def _count_only_arc_binding(
+        self, arc: InputArc, transition_name: str, m_time: float | None, ignore_timing: bool
+    ) -> "tuple[InputArc, list[Token] | _DrainAll] | None":
+        """Resolve one arc for the count-only path, or `None` if it cannot be satisfied.
+
+        A `consume_all` arc is settled by count alone: enablement is a pure count question
+        (`can_retrieve(count)` short-circuits at O(1) for a place with no cooling tokens) and
+        the pool is drained in one pass at consume time, so it is paired with the `_DRAIN`
+        marker and never materialized on a probe or a losing step. A non-draining arc
+        alongside it is resolved the ordinary (bounded FIFO head / key-index) way.
+        """
+        place = self.places.get(arc.place)
+        if not arc.consume_all:
+            available = self._arc_available(arc, place, m_time, ignore_timing, arc.count)
+            if available is None:
+                return None
+            tokens = self._resolve_input_tokens(arc, available, transition_name=transition_name)
+            if tokens is None:
+                return None
+            return (arc, tokens)
+        if place is None:
+            return None
+        t_limit = float("inf") if ignore_timing else m_time
+        if not place.can_retrieve(arc.count, model_time=t_limit):
+            return None
+        if not ignore_timing and not self._is_settle_time_met(place, arc):
+            return None
+        return (arc, _DRAIN)
+
     def _resolve_binding(
         self, transition: Transition, m_time: float | None, *, ignore_timing: bool = False
     ) -> _Binding | None:
@@ -1319,6 +1440,9 @@ class PetriNet:
             The resolved binding (each arc paired with the tokens it will consume), or `None`
             if no guard-satisfying binding exists within the search limit.
         """
+        fast = self._try_count_only_binding(transition, m_time, ignore_timing)
+        if fast is not _NO_FAST_PATH:
+            return cast("_Binding | None", fast)
         pools = self._gather_arc_pools(transition, m_time, ignore_timing)
         if pools is None:
             return None
@@ -1336,6 +1460,9 @@ class PetriNet:
         which must not perturb the seeded RNG — otherwise a timing-dependent number of probe
         calls would make `RANDOM` runs non-reproducible.
         """
+        fast = self._try_count_only_binding(transition, m_time, ignore_timing)
+        if fast is not _NO_FAST_PATH:
+            return fast is not None
         pools = self._gather_arc_pools(transition, m_time, ignore_timing)
         if pools is None:
             return False

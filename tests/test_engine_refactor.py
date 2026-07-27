@@ -937,8 +937,14 @@ def test_get_deposit_counts():
 
 
 def test_resolve_binding_consume_all():
-    """consume_all arcs bind ALL available tokens, not just arc.count."""
-    from cpnx.engine import _flatten_binding
+    """consume_all arcs consume ALL available tokens, not just arc.count.
+
+    A guard-free, head-only consume_all arc resolves *lazily*: the binding carries the
+    `_DRAIN` marker instead of the materialized pool, so enablement probes and losing steps
+    never do the O(N) full-pool peek (see `_try_count_only_binding`). The whole-pool semantics
+    is preserved — and exercised — at consume time, which is what this asserts.
+    """
+    from cpnx.engine import _DRAIN
     from cpnx.transitions import InputArc
 
     net = PetriNet()
@@ -954,4 +960,9 @@ def test_resolve_binding_consume_all():
     binding = net._resolve_binding(trans, None)
 
     assert binding is not None
-    assert len(_flatten_binding(binding)) == 3  # all three, not just arc.count (default 1)
+    # Lazily resolved: the arc is marked for draining rather than eagerly materialized.
+    assert binding == [(arc, _DRAIN)]
+    # ...but consuming it still takes all three, not just arc.count (default 1).
+    consumed, _sources = net._consume_binding(binding, None)
+    assert len(consumed) == 3
+    assert len(p) == 0
