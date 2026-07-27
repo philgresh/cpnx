@@ -2,7 +2,8 @@
 
 Ports the Ripple-style 80%-UNL consensus of Asare, Nana & Quist-Aphetsi,
 *"Modeling and Simulation of a Blockchain Consensus for IoT Node Data Validation"*
-(IJACSA 13.12, 2022), onto ``cpnx``'s real ``ThreadPoolExecutor`` engine to show that
+(IJACSA 13.12, 2022 — https://thesai.org/Publications/ViewPaper?Volume=13&Issue=12&Code=IJACSA&SerialNo=4),
+onto ``cpnx``'s real ``ThreadPoolExecutor`` engine to show that
 one small net expresses three things academic, single-threaded CPN tools cannot do
 concurrently:
 

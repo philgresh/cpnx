@@ -24,7 +24,7 @@ the engine mechanics it exercises, and how to run it.
 ## The academic model
 
 The benchmark ports the consensus model from Asare, Nana & Quist-Aphetsi,
-*"Modeling and Simulation of a Blockchain Consensus for IoT Node Data Validation"*
+[*"Modeling and Simulation of a Blockchain Consensus for IoT Node Data Validation"*](https://thesai.org/Publications/ViewPaper?Volume=13&Issue=12&Code=IJACSA&SerialNo=4)
 (IJACSA Vol. 13, No. 12, 2022), which itself models Ripple's consensus protocol. Ripple is a
 **permissioned** consensus that operates in rounds using each server's **Unique Node List
 (UNL)** — a fixed set of validators the server trusts not to collude. A transaction is
