@@ -513,6 +513,13 @@ class PetriNet:
         #: alternate (`step()` excludes cooling tokens, `is_quiescent()` includes them) — the
         #: latter otherwise cleared and re-armed the latch on every poll.
         self._selection_faulted: dict[tuple[str, str], frozenset[str]] = {}
+        #: ``id(InputArc)`` for arcs whose place key-index disabled itself on a *reported*
+        #: selection fault. The engine re-arms the index (`Place.rearm_key_index`) the next
+        #: time selection succeeds for the arc and discards it here, so the fast path recovers
+        #: once the offending token is gone rather than staying disabled for the life of the
+        #: net (issue #34). Empty for a net whose keys never raise, so the healthy path pays
+        #: only a set-membership test.
+        self._key_index_disabled_arcs: set[int] = set()
 
         self.add_place(Place(error_place))
         for p in places or []:
@@ -1286,6 +1293,7 @@ class PetriNet:
         if self._key_index_arcs.get(id(arc)) is not arc.key:
             place.register_key_index(id(arc), arc.key)
             self._key_index_arcs[id(arc)] = arc.key
+            self._key_index_disabled_arcs.discard(id(arc))
         return True
 
     def _gather_arc_pools(
@@ -1696,7 +1704,23 @@ class PetriNet:
             # which is an ordinary "not enabled", not an error, and stays silent.
             self._signal_selection_failure(fault_id, exc, pool, arc)
             return None
+        if id(arc) in self._key_index_disabled_arcs:
+            self._maybe_rearm_key_index(arc)
         return available
+
+    def _maybe_rearm_key_index(self, arc: InputArc) -> None:
+        """Re-arm a disabled key-index once selection succeeds again for *arc* (issue #34).
+
+        Called on the success path of `_order_available` for an arc recorded in
+        `_key_index_disabled_arcs`. A successful selection means the surviving pool keys
+        cleanly, so the place can usually rebuild its index from the ready set; on success we
+        stop tracking the arc. A rate-limited or still-failing rebuild returns ``False`` and is
+        retried on the next success. Takes the place lock under the engine lock — the same
+        ordering `_signal_selection_failure` already uses for `Place.key_index_disabled`.
+        """
+        place = self.places.get(arc.place)
+        if place is not None and place.rearm_key_index(id(arc)):
+            self._key_index_disabled_arcs.discard(id(arc))
 
     def _sort_by_key(self, arc: InputArc, available: list[Token]) -> list[Token]:
         """Order *available* ascending by `arc.key`, dispatching as certification allows.
@@ -1860,6 +1884,8 @@ class PetriNet:
         # direct unit-test calls to `_resolve_input_tokens` need not have registered it.
         place = self.places.get(arc.place)
         index_lost = place is not None and place.key_index_disabled(id(arc))
+        if index_lost:
+            self._key_index_disabled_arcs.add(id(arc))
         self._pending_selection_failures[fault_id] = (exc, index_lost)
 
     def _flush_selection_failures(self) -> None:
@@ -1886,9 +1912,10 @@ class PetriNet:
             return
         for (name, place), (first_exc, index_disabled) in pending.items():
             caveat = (
-                "This also permanently disabled that arc's place key-index for the life of the "
-                "net, so selection stays correct but reverts to the per-firing sort even after "
-                "the fault clears (see issue #34). "
+                "This also disabled that arc's place key-index, so selection stays correct but "
+                "temporarily reverts to the slower per-firing sort; the index re-arms "
+                "automatically once selection succeeds again after the fault clears (see issue "
+                "#34). "
                 if index_disabled
                 else ""
             )
