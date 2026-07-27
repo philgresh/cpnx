@@ -1353,40 +1353,61 @@ class PetriNet:
         the only arc shape whose ordinary resolution is unbounded; a transition without one
         gains nothing and is left on the existing path to keep the change's blast radius small.
         """
-        policy = self._effective_policy(transition)
-        if (
-            transition.guard is not None
-            or transition.binding_priority_key is not None
-            or not self._is_head_only(transition, policy)
-            or not any(arc.consume_all for arc in transition.inputs)
-        ):
+        if not self._qualifies_for_count_only(transition):
             return _NO_FAST_PATH
 
         binding: _Binding = []
         for arc in transition.inputs:
-            place = self.places.get(arc.place)
-            if arc.consume_all:
-                # Enablement is a pure count question — `can_retrieve(count)` short-circuits at
-                # O(1) for a place with no cooling tokens — and the pool is drained in one pass
-                # at consume time, so it is never materialized on a probe or a losing step.
-                if place is None:
-                    return None
-                t_limit = float("inf") if ignore_timing else m_time
-                if not place.can_retrieve(arc.count, model_time=t_limit):
-                    return None
-                if not ignore_timing and not self._is_settle_time_met(place, arc):
-                    return None
-                binding.append((arc, _DRAIN))
-            else:
-                # A non-draining arc alongside the drain: resolve it the ordinary (bounded) way.
-                available = self._arc_available(arc, place, m_time, ignore_timing, arc.count)
-                if available is None:
-                    return None
-                tokens = self._resolve_input_tokens(arc, available, transition_name=transition.name)
-                if tokens is None:
-                    return None
-                binding.append((arc, tokens))
+            resolved = self._count_only_arc_binding(arc, transition.name, m_time, ignore_timing)
+            if resolved is None:
+                return None
+            binding.append(resolved)
         return binding
+
+    def _qualifies_for_count_only(self, transition: Transition) -> bool:
+        """Whether `transition` may take the count-only `consume_all` fast path.
+
+        Excludes anything that would read tokens before firing (a `guard` or a
+        `binding_priority_key`) or that enumerates rather than taking the head
+        (`RANDOM`/`PRIORITY`), and requires at least one `consume_all` arc — the only arc
+        shape whose ordinary resolution is unbounded. See `_try_count_only_binding` for why
+        this exact set keeps the deferral behaviour- and RNG-identical.
+        """
+        return (
+            transition.guard is None
+            and transition.binding_priority_key is None
+            and self._is_head_only(transition, self._effective_policy(transition))
+            and any(arc.consume_all for arc in transition.inputs)
+        )
+
+    def _count_only_arc_binding(
+        self, arc: InputArc, transition_name: str, m_time: float | None, ignore_timing: bool
+    ) -> "tuple[InputArc, list[Token] | _DrainAll] | None":
+        """Resolve one arc for the count-only path, or `None` if it cannot be satisfied.
+
+        A `consume_all` arc is settled by count alone: enablement is a pure count question
+        (`can_retrieve(count)` short-circuits at O(1) for a place with no cooling tokens) and
+        the pool is drained in one pass at consume time, so it is paired with the `_DRAIN`
+        marker and never materialized on a probe or a losing step. A non-draining arc
+        alongside it is resolved the ordinary (bounded FIFO head / key-index) way.
+        """
+        place = self.places.get(arc.place)
+        if not arc.consume_all:
+            available = self._arc_available(arc, place, m_time, ignore_timing, arc.count)
+            if available is None:
+                return None
+            tokens = self._resolve_input_tokens(arc, available, transition_name=transition_name)
+            if tokens is None:
+                return None
+            return (arc, tokens)
+        if place is None:
+            return None
+        t_limit = float("inf") if ignore_timing else m_time
+        if not place.can_retrieve(arc.count, model_time=t_limit):
+            return None
+        if not ignore_timing and not self._is_settle_time_met(place, arc):
+            return None
+        return (arc, _DRAIN)
 
     def _resolve_binding(
         self, transition: Transition, m_time: float | None, *, ignore_timing: bool = False
