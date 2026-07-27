@@ -7,6 +7,7 @@ installing the package.
 ```bash
 python benchmarks/bench_enablement.py
 python benchmarks/bench_consume_all_drain.py
+python benchmarks/bench_transition_scan.py
 python benchmarks/bench_cafe_throughput.py
 python benchmarks/bench_cafe_concurrency.py
 ```
@@ -26,6 +27,7 @@ Two tiers:
 | --- | --- | --- |
 | `bench_enablement.py` | micro | Cost of one `_is_transition_enabled` check (and `_resolve_binding` across binding policies), for a **string** guard and a **callable** guard computing the identical predicate — the per-transition, per-`step()` hot path, and the dispatch gap between the two flavours. |
 | `bench_consume_all_drain.py` | micro | Per-probe cost of `_is_transition_enabled` for a `consume_all` transition over a place of growing depth `N`, contrasting the **count-only fast path** (guard-free) against the **eager full-pool peek** (an always-true guard forces the pre-fix path). Fast holds `O(1)`, eager climbs `O(N)` — the per-probe half of the `O(N)`-vs-`O(N²)` accumulate-then-drain gap. |
+| `bench_transition_scan.py` | micro + macro | Per-step cost as the **transition count** `T` grows (the axis nothing else here sweeps). `_select_transition_to_fire` re-resolves *every* transition each step, so one scan is `O(T)` and a `K`-firing run is `O(K·T)`. Sweeps `T` for a single scan probe (climbs `O(T)`) and an end-to-end drive of `T` independent one-shot transitions (`K = T`, so wall time is `O(T²)`). Quantifies the ceiling an incremental-enablement (per-place dirty-set) scheduler would remove. |
 | `bench_cafe_throughput.py` | macro | End-to-end throughput (`us/order`, `us/step`) of the cafe net processing N orders, swept over `N` and the binding regime. Reveals how per-step engine cost scales with marking depth. Single-worker by construction. |
 | `bench_cafe_concurrency.py` | macro | Wall-clock **makespan** against `max_workers`, swept over queue depth and guard regime. The only script here that says anything about parallelism. |
 | `bench_station_costs.py` | macro | µs/order against queue depth for each opt-in station's selection shape (certified vs. uncertified `key`, filter-only, timed×key), plus the arc-ordering and `binding_search_limit` search-budget sweeps. Answers the "Unmeasured combinations" audit below. |
