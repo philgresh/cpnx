@@ -258,6 +258,98 @@ class TestKeyIndexMaintenance:
         assert [t.payload["p"] for t in place.peek_by_key(id(arc), 3)] == [2, 1, 0]
 
 
+class TestKeyIndexRearm:
+    """A keying failure disables the index only *until it recovers* (issue #34).
+
+    Before #34 a certified `key` that raised even once permanently reverted its arc to the
+    per-firing sort for the life of the net — correct, but silently slow. The index now
+    re-arms once selection succeeds again, rebuilt at most once per
+    `_KEY_INDEX_REARM_MIN_DEPOSITS` deposits so a flapping key cannot thrash the heap. The
+    observable is `peek_by_key` serving (non-`None`) / `key_index_disabled` flipping back to
+    `False` — the *index* is working again, not merely that results are right.
+    """
+
+    def test_rearm_reenables_a_disabled_index(self, monkeypatch):
+        """Once the un-keyable token is gone, `rearm` repopulates from the ready set."""
+        monkeypatch.setattr(places_module, "_KEY_INDEX_REARM_MIN_DEPOSITS", 0)
+        place = Place("p")
+        place.register_key_index(1, priority_key)
+        poison = Token(payload={})  # priority_key subscripts "p" -> KeyError, disabling the index
+        place.deposit(poison)
+        assert place.peek_by_key(1, 3) is None
+        assert place.key_index_disabled(1) is True
+
+        place.retrieve_specific([poison])
+        for p in (3, 1, 2):
+            place.deposit(Token(payload={"p": p}))
+
+        assert place.rearm_key_index(1) is True
+        assert place.key_index_disabled(1) is False
+        served = place.peek_by_key(1, 3)
+        assert served is not None, "the index must be serving again"
+        assert [t.payload["p"] for t in served] == [1, 2, 3]
+
+    def test_rearm_is_rate_limited(self, monkeypatch):
+        """A rebuild is refused until enough deposits have elapsed since the last build."""
+        monkeypatch.setattr(places_module, "_KEY_INDEX_REARM_MIN_DEPOSITS", 5)
+        place = Place("p")
+        place.register_key_index(1, priority_key)
+        poison = Token(payload={})
+        place.deposit(poison)  # deposit clock -> 1, index disabled
+        place.retrieve_specific([poison])
+
+        assert place.rearm_key_index(1) is False, "too few deposits since the last build"
+        assert place.key_index_disabled(1) is True
+
+        for p in range(6):  # advance the deposit clock past the threshold
+            place.deposit(Token(payload={"p": p}))
+        assert place.rearm_key_index(1) is True
+        assert place.key_index_disabled(1) is False
+
+    def test_rearm_re_disables_when_the_poison_is_still_present(self, monkeypatch):
+        """If the un-keyable token is still in the ready set, the back-fill re-disables."""
+        monkeypatch.setattr(places_module, "_KEY_INDEX_REARM_MIN_DEPOSITS", 0)
+        place = Place("p")
+        place.register_key_index(1, priority_key)
+        place.deposit(Token(payload={}))  # still here — nothing removed
+        place.deposit(Token(payload={"p": 1}))
+
+        assert place.rearm_key_index(1) is False
+        assert place.key_index_disabled(1) is True
+
+    def test_engine_rearms_index_after_fault_clears(self, monkeypatch):
+        """End to end: a reported fault disables the index; a later success re-arms it."""
+        monkeypatch.setattr(places_module, "_KEY_INDEX_REARM_MIN_DEPOSITS", 0)
+        net = PetriNet(max_workers=1)
+        net.add_place(Place("in"))
+        net.add_place(Place("out"))
+        errors: list[Exception] = []
+        net.on_error = lambda name, exc, tok: errors.append(exc)
+        arc = InputArc("in", key=priority_key)
+        net.add_transition(Transition("t", inputs=[arc], outputs=[OutputArc("out")], action=lambda toks: toks))
+        place = net.places["in"]
+        poison = Token(payload={})  # priority_key raises KeyError
+        net.deposit("in", poison)
+        net.deposit("in", Token(payload={"p": 1}))
+
+        net.step()  # registers the index (disabling it) and reports the fault
+        assert place.key_index_disabled(id(arc)) is True
+        assert place.peek_by_key(id(arc), 2) is None
+        assert errors, "the selection fault must be reported"
+        assert "issue #34" in str(errors[0])
+
+        place.retrieve_specific([poison])
+        net.run(deadline=time.monotonic() + 1)  # a successful selection re-arms the index
+
+        assert place.key_index_disabled(id(arc)) is False, "the index must have re-armed"
+        # the recovered index tracks new deposits and serves them in ascending key order
+        for p in (3, 1, 2):
+            net.deposit("in", Token(payload={"p": p}))
+        served = place.peek_by_key(id(arc), 3)
+        assert served is not None
+        assert [t.payload["p"] for t in served] == [1, 2, 3]
+
+
 class TestTokenArgCertification:
     """`certify` is arity-agnostic, so per-token keys/filters certify without a whitelist change."""
 

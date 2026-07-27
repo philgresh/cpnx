@@ -23,6 +23,11 @@ from typing import Any
 
 from cpnx.tokens import AVAILABLE_NOW, Token
 
+#: Rebuild a disabled key-index at most once per this many deposits, so a key that raises
+#: intermittently (a "flapping" key) cannot trigger a full O(ready) heap rebuild on every
+#: recovery. The re-arm path reads this live, so tests may monkeypatch it.
+_KEY_INDEX_REARM_MIN_DEPOSITS = 64
+
 
 class _KeyIndex:
     """A persistent ``(key, seq)`` min-heap over one [`_TokenStore`][]'s ready tokens.
@@ -39,19 +44,22 @@ class _KeyIndex:
     optimisation rather than a semantic change.
 
     **Self-disabling.** Any failure to key or order a token (`key_fn` raises; two keys are
-    mutually incomparable, which surfaces from the heap comparison) permanently disables
-    the index. The engine then falls back to the per-firing filter+sort, which reproduces
-    the documented behaviour for those cases — including making the arc unsatisfiable. A
-    broken key must not turn a `deposit()` into an exception, and must not be able to
-    corrupt the ordering of a partially-built heap, so the heap is dropped outright.
+    mutually incomparable, which surfaces from the heap comparison) disables the index
+    until it is re-armed (`rearm`). The engine then falls back to the per-firing
+    filter+sort, which reproduces the documented behaviour for those cases — including
+    making the arc unsatisfiable — until the engine re-arms the index once selection
+    succeeds again for the arc (see issue #34). A broken key must not turn a `deposit()`
+    into an exception, and must not be able to corrupt the ordering of a partially-built
+    heap, so the heap is dropped outright.
     """
 
-    __slots__ = ("key_fn", "_heap", "disabled")
+    __slots__ = ("key_fn", "_heap", "disabled", "_last_build")
 
     def __init__(self, key_fn: Callable[[Token], object]) -> None:
         self.key_fn = key_fn
         self._heap: list[tuple[object, int]] = []
         self.disabled = False
+        self._last_build: int = 0
 
     def add(self, seq: int, token: Token) -> bool:
         """Index *token* under *seq*. Returns ``False`` (and disables) if it cannot be keyed."""
@@ -65,9 +73,33 @@ class _KeyIndex:
         return True
 
     def disable(self) -> None:
-        """Permanently stop serving this index and release its heap."""
+        """Stop serving this index and release its heap. Can be undone by `rearm`."""
         self.disabled = True
         self._heap = []
+
+    def rearm(self, ready: "OrderedDict[int, Token]", deposit_clock: int) -> bool:
+        """Re-enable a disabled index and repopulate it from *ready*; return whether it is
+        now serving.
+
+        A no-op returning ``True`` when the index is already enabled. Rebuilding walks the
+        whole ready set (re-keying every token), so it is rate-limited to at most once per
+        ``_KEY_INDEX_REARM_MIN_DEPOSITS`` deposits (``deposit_clock`` is the store's monotonic
+        deposit counter): a key that raises intermittently cannot rebuild the heap on every
+        recovery. When the limit has not yet elapsed this returns ``False`` and a later
+        success retries. A back-fill that hits a token it still cannot key re-disables the
+        index and returns ``False``.
+        """
+        if not self.disabled:
+            return True
+        if deposit_clock - self._last_build < _KEY_INDEX_REARM_MIN_DEPOSITS:
+            return False
+        self._last_build = deposit_clock
+        self.disabled = False
+        self._heap = []
+        for seq, token in ready.items():
+            if not self.add(seq, token):
+                return False  # still un-keyable — add() re-disabled the index
+        return True
 
     def peek_ordered(
         self,
@@ -151,6 +183,18 @@ class _TokenStore:
         for seq, token in self._ready.items():
             if not index.add(seq, token):
                 break  # keying failed — the index disabled itself; leave it to fall back
+
+    def rearm_key_index(self, index_id: int) -> bool:
+        """Re-enable *index_id*'s disabled index, repopulating from the current ready set.
+
+        Returns whether it is serving afterwards. ``False`` if there is no such index, the
+        per-deposit rebuild limit has not elapsed, or the ready set still holds an un-keyable
+        token. The deposit clock is `_next_seq`, which advances on every `append`.
+        """
+        index = self._key_indexes.get(index_id)
+        if index is None:
+            return False
+        return index.rearm(self._ready, self._next_seq)
 
     def key_index(self, index_id: int) -> "_KeyIndex | None":
         """Return the registered index for *index_id*, or ``None`` if there is none."""
@@ -599,7 +643,9 @@ class Place:
         indexed, because keying happens on the deposit path where an unbounded callable
         cannot be allowed to run. *index_id* identifies the registering arc; re-registering
         the same id with a different function rebuilds the index, so reassigning `arc.key`
-        after construction stays correct.
+        after construction stays correct. A disabled index can also be re-armed in place,
+        without changing the function, via [`rearm_key_index`][cpnx.Place.rearm_key_index]
+        (issue #34).
 
         Registration back-fills from the tokens already present, so it is safe on a
         non-empty place. This is a pure optimisation: every read through
@@ -609,15 +655,28 @@ class Place:
         with self._lock:
             self._store.register_key_index(index_id, key_fn)
 
+    def rearm_key_index(self, index_id: int) -> bool:
+        """Re-enable a disabled key-index for *index_id* and repopulate it from the ready set.
+
+        Returns whether the index is serving afterwards. Called by the engine when selection
+        succeeds again for an arc whose index disabled itself (issue #34): a keying failure is
+        no longer permanent — once the offending token is gone the fast path is restored,
+        rebuilt at most once per `_KEY_INDEX_REARM_MIN_DEPOSITS` deposits to bound the cost of a
+        flapping key.
+        """
+        with self._lock:
+            return self._store.rearm_key_index(index_id)
+
     def key_index_disabled(self, index_id: int) -> bool:
-        """Whether *index_id*'s index exists and has permanently disabled itself.
+        """Whether *index_id*'s index exists and has disabled itself.
 
         Distinct from "cannot answer right now" (see
         [`peek_by_key`][cpnx.Place.peek_by_key], which also declines while the place holds
-        cooling tokens): this is specifically the irreversible state a keying failure leaves
-        behind. The engine reads it when reporting a selection fault, so the report mentions
-        the lost index only when one was actually lost — a raising `filter` never touches the
-        index, and an uncertified key never has one.
+        cooling tokens): this is specifically the state a keying failure leaves behind, which
+        is reversible via [`rearm_key_index`][cpnx.Place.rearm_key_index] (issue #34). The
+        engine reads it when reporting a selection fault, so the report mentions the lost
+        index only when one was actually lost — a raising `filter` never touches the index,
+        and an uncertified key never has one.
         """
         with self._lock:
             index = self._store.key_index(index_id)
