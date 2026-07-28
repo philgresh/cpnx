@@ -1,6 +1,6 @@
 # ADR 0006 — Incremental Enablement (Per-Place Dirty Set Scheduling)
 
-- **Status:** Proposed (Draft)
+- **Status:** Accepted — implemented in [#44](https://github.com/philgresh/cpnx/pull/44)
 - **Date:** 2026-07-27
 - **Deciders:** cpnx maintainers
 - **Related:** `docs/adr/0005-consume-all-count-only-fast-path.md` (the depth-side companion to
@@ -128,7 +128,12 @@ re-enablement hazards. Each is handled explicitly above rather than assumed away
   dirties it, reaching the transitions whose output arc targets it). An *out-of-band* drain —
   `net.places[name].retrieve(...)` straight on the `Place`, bypassing the engine — emits no
   dirty flag, so `_capacity_blocked` re-checks every currently back-pressured transition each
-  reconcile to catch it.
+  reconcile to catch it. This safety net covers draining an *output* place to release
+  back-pressure, the only supported out-of-band pattern. Draining an *input* place out-of-band is
+  **not** supported on the fast path: a cached selection binding names specific token ids, so if
+  those tokens are pulled from under it the subsequent `retrieve_specific` raises rather than
+  silently re-resolving as the full scan would. Mutate live input markings through the engine
+  (`deposit`/firing), not by reaching into `Place` directly.
 - **(b) Time-gated re-arm.** A place or arc that re-enables purely from clock advance emits no
   mutation event for a dirty set to observe. The eligibility gate excludes such nets from the
   fast path outright (condition 1); the one clock-driven case close enough to the marking to be

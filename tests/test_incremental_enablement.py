@@ -256,8 +256,10 @@ class TestRetryReactivation:
 
         # Not immediately enabled — the token was rolled back with a future available_at.
         assert net.step() is False
-        assert not net.is_dead() or True  # is_dead() may be True right now (see below)
-        # The token IS potentially enabled (cooling), so is_quiescent() must be False.
+        # No binding is *selection*-enabled while the token cools, so is_dead() reads True...
+        assert net.is_dead() is True
+        # ...yet the cooling token is still *potentially* enabled, so is_quiescent() is False.
+        # This split (dead-now vs quiescent-ever) is exactly what the reactivation heap tracks.
         assert net.is_quiescent() is False
         # The reactivation heap has an entry for the pending retry.
         assert len(net._reactivation) > 0
@@ -405,6 +407,44 @@ class TestFallbackParity:
         net.run(deadline=time.monotonic() + 3.0)
         assert len(net.places["output"].tokens) == 4
         assert len(net.places["input"].tokens) == 0
+
+    def test_reassigning_net_binding_policy_updates_eligibility(self):
+        """A policy-unset transition's *effective* policy tracks the net default, so mutating
+        `net.binding_policy` must re-gate the incremental fast path — otherwise a net turned
+        RANDOM after construction would keep the scheduler on, perturbing the seeded stream."""
+        net = PetriNet(
+            seed=42,
+            max_workers=1,
+            places=[Place("input"), Place("output")],
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda tokens: tokens,
+                    # No per-transition policy: effective policy == the net default (LEGACY now).
+                )
+            ],
+        )
+        assert net._incremental_eligible is True
+        assert net._has_search_policy_transition is False
+
+        # Flip the net default to a search policy: the unset transition becomes effectively
+        # RANDOM, so the fast path must disengage.
+        net.binding_policy = BindingPolicy.RANDOM
+        assert net._has_search_policy_transition is True
+        assert net._incremental_eligible is False
+        assert net._scheduler_ready is False  # caches invalidated for the next reconcile
+
+        # And back again — the flag is recomputed, not latched, so eligibility is restored.
+        net.binding_policy = BindingPolicy.LEGACY
+        assert net._has_search_policy_transition is False
+        assert net._incremental_eligible is True
+
+        # Sanity: the net still runs correctly through the churn.
+        net.deposit("input", Token(payload={"i": 0}))
+        net.run(deadline=time.monotonic() + 2.0)
+        assert len(net.places["output"].tokens) == 1
 
 
 class TestIsQuiescentIsDeadOnIncrementalPath:

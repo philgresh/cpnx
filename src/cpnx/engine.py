@@ -437,7 +437,10 @@ class PetriNet:
         self.timeout_secs = timeout_secs
         self.expr_timeout_secs = expr_timeout_secs
         self.retry_delay = retry_delay
-        self.binding_policy = binding_policy
+        #: Backing field for the `binding_policy` property. Set directly here (the property
+        #: setter recomputes `_has_search_policy_transition`, which needs `self.transitions`
+        #: to already exist — it does not yet at this point in construction).
+        self._binding_policy = binding_policy
         if binding_search_limit < 1:
             raise ValueError(f"binding_search_limit must be >= 1, got {binding_search_limit}.")
         self.binding_search_limit = binding_search_limit
@@ -535,10 +538,14 @@ class PetriNet:
         # (see `_incremental_eligible`): `PacedResourcePlace` cooldowns and `settle_secs` windows
         # re-enable as *time* advances with no marking mutation, which a per-place dirty set
         # cannot observe. It is monotonic (only ever flips False→True).
-        #: Set once any registered transition resolves under an effective
+        #: True when any registered transition resolves under an effective
         #: `BindingPolicy.RANDOM`/`PRIORITY`. Those draw the seeded RNG *during binding
         #: resolution, per enabled transition, per step*; the incremental scheduler resolves
-        #: a different count of them, which would shift the seeded stream. Monotonic True.
+        #: a different count of them, which would shift the seeded stream. Latched True by
+        #: `add_transition`, and *recomputed* over the whole transition set by the
+        #: `binding_policy` setter — reassigning the net-level default can flip a transition's
+        #: *effective* policy into (or out of) a search policy, so the flag cannot be treated
+        #: as monotonic once the default is mutable.
         self._has_search_policy_transition = False
         #: Whether the routing tables + dirty seed have been built for the current transition
         #: set. Reset by `add_transition`; rebuilt lazily by `_ensure_scheduler_ready`.
@@ -587,6 +594,33 @@ class PetriNet:
             self.add_place(p)
         for t in transitions or []:
             self.add_transition(t)
+
+    @property
+    def binding_policy(self) -> BindingPolicy:
+        """Net-level default binding policy for transitions that do not set their own.
+
+        Reassignable after construction. Because a transition's *effective* policy is this
+        default when the transition leaves `binding_policy` unset, changing it can move a
+        transition into or out of a `RANDOM`/`PRIORITY` search policy — which gates the
+        incremental scheduler (see [`_incremental_eligible`][cpnx.PetriNet._incremental_eligible]).
+        The setter therefore recomputes `_has_search_policy_transition` over the current
+        transition set and invalidates the scheduler, so the seeded-determinism guarantee holds
+        even if the default is mutated mid-life.
+        """
+        return self._binding_policy
+
+    @binding_policy.setter
+    def binding_policy(self, value: BindingPolicy) -> None:
+        with self._lock:
+            self._binding_policy = value
+            # A new default can flip any policy-unset transition's *effective* policy in either
+            # direction, so recompute the flag from scratch rather than latching it monotonically.
+            self._has_search_policy_transition = any(
+                self._effective_policy(t) in (BindingPolicy.RANDOM, BindingPolicy.PRIORITY)
+                for t in self.transitions.values()
+            )
+            # Enabled-set caches were built under the old policy; force a rebuild before reuse.
+            self._scheduler_ready = False
 
     def _call_expr(self, fn, *args, timeout: float | None = None):
         t = timeout if timeout is not None else self.timeout_secs
