@@ -10,6 +10,7 @@ python benchmarks/bench_consume_all_drain.py
 python benchmarks/bench_transition_scan.py
 python benchmarks/bench_cafe_throughput.py
 python benchmarks/bench_cafe_concurrency.py
+python benchmarks/consensus/benchmark_consensus.py
 ```
 
 Two tiers:
@@ -33,6 +34,7 @@ Two tiers:
 | `bench_station_costs.py` | macro | µs/order against queue depth for each opt-in station's selection shape (certified vs. uncertified `key`, filter-only, timed×key), plus the arc-ordering and `binding_search_limit` search-budget sweeps. Answers the "Unmeasured combinations" audit below. |
 | `bench_subnet.py` | macro | Per-firing `SubstitutionTransition` overhead (wrapped vs. inlined, swept over subnet size) and the wall-clock-friction leak — a subnet's cooldowns are paid in real time even under the logical driver. |
 | `profile_cafe.py` | dev tool | `cProfile` a large cafe run and rank engine functions by cumulative / own time. Not a committed benchmark — a pointer to what to optimise. |
+| `consensus/benchmark_consensus.py` | macro | End-to-end **BFT (80% UNL) consensus** workload (a Ripple-style port): 1 tx fans out to 100 validators, an 80-vote `ThresholdPlace` barrier gates the commit, and a `consume_all` sweep clears stragglers — all as net structure. Phase 1 reports concurrent throughput (best-of-3 over a worker sweep) and hammers the `consume_all` fast path ([ADR 0005](../docs/adr/0005-consume-all-count-only-fast-path.md)); Phase 2 proves an exact deterministic fixed point. Self-documenting under [`consensus/README.md`](consensus/README.md). |
 
 ## The fixture: `cafe/`
 
