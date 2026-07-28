@@ -215,6 +215,7 @@ touch of it cost `O(fan-in)`. That is inherent — those transitions' enablement
   even if the per-transition cost were lower; the maintained enabled set avoids the loop over
   all `T` transitions entirely, not just the expensive part of visiting each one.
 - **Order-statistics tree for `O(log N)` selection even when all `N` transitions are
-  simultaneously enabled.** Deferred as a follow-up. It addresses the residual cost noted in
+  simultaneously enabled.** Deferred as a follow-up, tracked in
+  [#45](https://github.com/philgresh/cpnx/issues/45). It addresses the residual cost noted in
   Consequences, but is not needed to eliminate the dominant cost this ADR targets — resolving
   transitions that are disabled and irrelevant to the last firing.
