@@ -106,8 +106,20 @@ class BindingPolicy(enum.Enum):
         LEGACY: Test only the first `count` tokens of each input place (FIFO, or the
             leading tokens of the [`InputArc.key`][cpnx.InputArc] ordering) and
             evaluate the guard once against that single candidate set. This is the
-            historical behavior and the default — reproducible, but subject to
-            head-of-line blocking. Choose this to preserve pre-0.3.1 semantics exactly.
+            historical behavior and the current default — reproducible, but subject
+            to head-of-line blocking. Choose this to preserve pre-0.3.1 semantics
+            exactly.
+
+            **Deprecated.** `LEGACY` exists only to keep nets written before 0.3.1
+            byte-for-byte unaffected during the migration window described in
+            `docs/adr/0001-combinatorial-binding-search.md`. `FIRST` is a strict
+            superset of `LEGACY` — identical head selection whenever the head
+            already satisfies the guard, plus the head-of-line fix when it doesn't
+            — so there is no remaining reason to choose `LEGACY` over it. **`LEGACY`
+            will be removed in v0.6.0**; migrate by passing
+            `binding_policy=BindingPolicy.FIRST` explicitly wherever `LEGACY` is
+            relied on today, including the `PetriNet`/`Transition` default (see the
+            Phase 3 note in `docs/adr/0001-combinatorial-binding-search.md`).
         FIRST: Search input-token combinations in a stable insertion order and select
             the **first** combination whose guard is satisfied. Complete (finds a valid
             binding if one exists anywhere in the place, fixing head-of-line blocking)
@@ -446,10 +458,12 @@ class Transition:
         binding_policy: How the engine resolves which input tokens bind this transition
                when checking enablement — see [`BindingPolicy`][cpnx.BindingPolicy].
                `None` (default) inherits the net-wide default set on
-               [`PetriNet`][cpnx.PetriNet] (itself `BindingPolicy.LEGACY` by default), so
-               an unset transition behaves exactly as before. Set
-               `BindingPolicy.FIRST` to enable deterministic-complete binding search
-               (fixing head-of-line blocking) for this transition only.
+               [`PetriNet`][cpnx.PetriNet] (itself `BindingPolicy.LEGACY` by default, though
+               `LEGACY` is **deprecated and will be removed in v0.6.0** — see
+               [`BindingPolicy`][cpnx.BindingPolicy]), so an unset transition behaves
+               exactly as before. Set `BindingPolicy.FIRST` to enable
+               deterministic-complete binding search (fixing head-of-line blocking) for
+               this transition only.
         binding_priority_key: Sort key used only under `BindingPolicy.PRIORITY`. A pure
                `Callable[[list[Token]], object]` (must be callable or `None` — string
                expressions are not supported and raise `TypeError` at assignment) mapping a
