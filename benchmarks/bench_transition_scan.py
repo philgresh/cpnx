@@ -1,27 +1,27 @@
 """Benchmark: per-step transition-scan cost as the *transition count* grows.
 
-Every ``step()`` re-derives enablement from scratch. `_select_transition_to_fire` calls
-`_enabled_transition_bindings`, which loops over **every** transition in the net and resolves
-a fresh binding for each -- then fires exactly one. So a single step is ``O(T)`` in the
-transition count `T`, and a run that fires `K` times pays ``O(K * T)`` binding resolutions,
-even though any one firing changes only the places it touched and therefore can only flip the
-enablement of the transitions reading *those* places.
+Before ADR 0006, every ``step()`` re-derived enablement from scratch: `_select_transition_to_fire`
+looped over **every** transition in the net and resolved a fresh binding for each, then fired
+exactly one. A single step was ``O(T)`` in the transition count `T`, and a `K`-firing run paid
+``O(K * T)`` binding resolutions -- even though any one firing changes only the places it
+touched, and so can only flip the enablement of the transitions reading *those* places.
 
-Most of cpnx's benchmarks sweep marking *depth* (how many tokens a place holds). This one
-sweeps the orthogonal axis -- how many *transitions* the net has -- which is exactly the cost
-an incremental-enablement scheduler (a per-place dirty set) would remove, and which nothing
-here currently measures.
+ADR 0006 replaced that scan with an incremental (per-place dirty-set) scheduler: a step
+re-evaluates only the ``K`` transitions routed from the places the last firing mutated, so
+selection is ``O(K)`` (``O(1)`` for the shapes below) instead of ``O(T)``. This benchmark
+sweeps the axis that exposes the difference -- how many *transitions* the net has, which no
+other benchmark here sweeps -- and now serves as the regression guard for that collapse.
 
 Two views of the same cost:
 
 - **scan (micro).** A net of `T` independent transitions with exactly **one** enabled. Time a
-  single `_select_transition_to_fire` probe (it resolves all `T`, fires nothing). Per-probe
-  time should climb linearly with `T`: the ``O(T)`` scan, dominated by the ``T - 1``
-  transitions that cannot fire and would be skipped entirely under dirty-set scheduling.
+  single `_select_transition_to_fire` probe. Pre-0006 this resolved all `T` and climbed
+  ``O(T)``, dominated by the ``T - 1`` transitions that cannot fire; under the dirty-set
+  scheduler those are never re-resolved, so per-probe time stays ~flat as `T` grows.
 - **drive (macro).** A net of `T` independent transitions, each fed exactly one token, driven
-  to quiescence. That is ``K = T`` firings, each preceded by an ``O(T)`` scan, so total engine
-  CPU is ``O(T^2)``. Reported as wall time and microseconds-per-step; per-step should rise
-  linearly with `T` (=> quadratic overall).
+  to quiescence -- ``K = T`` firings. Pre-0006 each was preceded by an ``O(T)`` scan, so total
+  engine CPU was ``O(T^2)`` and per-step cost rose linearly; each firing now dirties only its
+  own private place, so per-step cost stays ~flat (=> total drive ``O(T)``).
 
 Report the *shape* (flat vs linear per step) and the growth factor, not raw microseconds --
 absolute figures are hardware- and interpreter-specific. Native stdlib only.
@@ -130,9 +130,9 @@ def main() -> None:
         prev_per_step = per_step_us
 
     print()
-    print("   Expected: 'scan us' and 'us/step' both ~double per doubling of T (O(T) per step).")
-    print("   Since the drive does K = T steps, total drive wall time is O(T^2) -- the ceiling")
-    print("   an incremental-enablement (per-place dirty-set) scheduler would collapse to O(T).")
+    print("   Before ADR 0006 both 'scan us' and 'us/step' ~doubled per doubling of T (the O(T)")
+    print("   scan; total drive wall time O(T^2)). The incremental (per-place dirty-set) scheduler")
+    print("   collapsed that to O(K): both columns should now stay ~flat as T doubles (growth ~1.0).")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """Concurrent Petri net executor."""
 
 import concurrent.futures
+import heapq
 import itertools
 import math
 import operator
@@ -436,7 +437,10 @@ class PetriNet:
         self.timeout_secs = timeout_secs
         self.expr_timeout_secs = expr_timeout_secs
         self.retry_delay = retry_delay
-        self.binding_policy = binding_policy
+        #: Backing field for the `binding_policy` property. Set directly here (the property
+        #: setter recomputes `_has_search_policy_transition`, which needs `self.transitions`
+        #: to already exist — it does not yet at this point in construction).
+        self._binding_policy = binding_policy
         if binding_search_limit < 1:
             raise ValueError(f"binding_search_limit must be >= 1, got {binding_search_limit}.")
         self.binding_search_limit = binding_search_limit
@@ -529,11 +533,94 @@ class PetriNet:
         #: only a set-membership test.
         self._key_index_disabled_arcs: set[int] = set()
 
+        # --- Incremental enablement scheduler (ADR 0006) ---
+        # `self._has_timed_features` (declared above) also gates the incremental fast path off
+        # (see `_incremental_eligible`): `PacedResourcePlace` cooldowns and `settle_secs` windows
+        # re-enable as *time* advances with no marking mutation, which a per-place dirty set
+        # cannot observe. It is monotonic (only ever flips False→True).
+        #: True when any registered transition resolves under an effective
+        #: `BindingPolicy.RANDOM`/`PRIORITY`. Those draw the seeded RNG *during binding
+        #: resolution, per enabled transition, per step*; the incremental scheduler resolves
+        #: a different count of them, which would shift the seeded stream. Latched True by
+        #: `add_transition`, and *recomputed* over the whole transition set by the
+        #: `binding_policy` setter — reassigning the net-level default can flip a transition's
+        #: *effective* policy into (or out of) a search policy, so the flag cannot be treated
+        #: as monotonic once the default is mutable.
+        self._has_search_policy_transition = False
+        #: Whether the routing tables + dirty seed have been built for the current transition
+        #: set. Reset by `add_transition`; rebuilt lazily by `_ensure_scheduler_ready`.
+        self._scheduler_ready = False
+        #: Place name -> transitions with an `InputArc` on it (adding tokens may enable them).
+        self._input_routing: dict[str, list[Transition]] = {}
+        #: Place name -> transitions with an *unconditional* `OutputArc` on it. Removing tokens
+        #: from such a place can release back-pressure (`_check_output_capacity`) and re-enable
+        #: the producer; conditional arcs never block, so they are excluded.
+        self._output_routing: dict[str, list[Transition]] = {}
+        #: Places whose token pool changed since the last reconcile (the "dirty set").
+        self._dirty_places: set[str] = set()
+        #: Transitions re-evaluated on *every* reconcile because their enablement can change
+        #: with no input-place mutation (input-less sources, guard/key/filter that may read
+        #: external mutable state). See `_is_volatile`. Rebuilt by the scheduler seed.
+        self._volatile_transitions: set[str] = set()
+        #: Transitions with a satisfiable binding held back *only* by output back-pressure.
+        #: Re-checked every reconcile so they unblock the moment their output place drops below
+        #: bound — including an out-of-band `place.retrieve()` the dirty set never sees.
+        self._capacity_blocked: set[str] = set()
+        #: Selection-enabled transitions (output capacity OK *and* a timing-aware binding
+        #: resolved) -> that resolved binding, maintained incrementally. Reused by `is_dead`.
+        self._enabled_bindings: dict[str, _Binding] = {}
+        #: Transitions with a binding *ignoring* timing and capacity — the quiescence
+        #: predicate (`_is_transition_potentially_enabled`). Lets `is_quiescent` answer in O(1).
+        self._potentially_enabled: set[str] = set()
+        #: `priority` value -> list of selection-enabled transition names at that priority.
+        #: Selection picks the minimum non-empty bucket, so `step` is O(1). Maintained by
+        #: swap-remove (`_bucket_add`/`_bucket_remove`), so bucket order is not registration
+        #: order — safe because eligible (LEGACY/FIRST) nets draw RNG only for the tie-break,
+        #: whose stream advance depends on candidate *count*, not order.
+        self._priority_buckets: dict[int, list[str]] = {}
+        #: Transition name -> its index within its priority bucket (for O(1) swap-remove).
+        self._bucket_index: dict[str, int] = {}
+        #: Transition name -> registration order. Reconcile re-evaluates the affected set in this
+        #: order so bucket membership (and hence the seeded `_rng.choice` tie-break) is
+        #: deterministic across processes — a plain `set` iteration is hash-seed-randomized.
+        self._transition_order: dict[str, int] = {}
+        #: Min-heap of `(available_at, place_name)` for future-dated (retry-delayed) tokens.
+        #: Drained at reconcile: a popped boundary <= now re-dirties its place, so a rolled-back
+        #: token re-enables its transition once `retry_delay` elapses without a full-net rescan.
+        self._reactivation: list[tuple[float, str]] = []
+
         self.add_place(Place(error_place))
         for p in places or []:
             self.add_place(p)
         for t in transitions or []:
             self.add_transition(t)
+
+    @property
+    def binding_policy(self) -> BindingPolicy:
+        """Net-level default binding policy for transitions that do not set their own.
+
+        Reassignable after construction. Because a transition's *effective* policy is this
+        default when the transition leaves `binding_policy` unset, changing it can move a
+        transition into or out of a `RANDOM`/`PRIORITY` search policy — which gates the
+        incremental scheduler (see `_incremental_eligible`). The setter therefore recomputes
+        `_has_search_policy_transition` over the current transition set and invalidates the
+        scheduler, so the seeded-determinism guarantee holds even if the default is mutated
+        mid-life.
+        """
+        return self._binding_policy
+
+    @binding_policy.setter
+    def binding_policy(self, value: BindingPolicy) -> None:
+        with self._lock:
+            self._binding_policy = value
+            # A new default can flip any policy-unset transition's *effective* policy in either
+            # direction, so recompute the flag from scratch rather than latching it monotonically.
+            self._has_search_policy_transition = any(
+                self._effective_policy(t) in (BindingPolicy.RANDOM, BindingPolicy.PRIORITY)
+                for t in self.transitions.values()
+            )
+            # Enabled-set caches were built under the old policy; force a rebuild before reuse.
+            self._scheduler_ready = False
 
     def _call_expr(self, fn, *args, timeout: float | None = None):
         t = timeout if timeout is not None else self.timeout_secs
@@ -642,6 +729,11 @@ class PetriNet:
             self.transitions[transition.name] = transition
             if any(arc.settle_secs > 0.0 for arc in transition.inputs):
                 self._has_timed_features = True
+            if self._effective_policy(transition) in (BindingPolicy.RANDOM, BindingPolicy.PRIORITY):
+                self._has_search_policy_transition = True
+            # The transition set changed: the routing tables and dirty seed must be rebuilt
+            # before the incremental scheduler is next consulted.
+            self._scheduler_ready = False
 
     def deposit(self, place_name: str, token: Token) -> None:
         """Deposit `token` into `place_name`, auto-creating a bare place if it does not exist.
@@ -664,6 +756,7 @@ class PetriNet:
             if place_name not in self.places:
                 self.places[place_name] = Place(place_name)
             self.places[place_name].deposit(token, model_time=self._get_model_time_under_lock())
+            self._mark_dirty(place_name, token)
         self._work_available.set()
         if self.on_token_deposited:
             try:
@@ -699,8 +792,198 @@ class PetriNet:
         return result
 
     def _select_transition_to_fire(self) -> tuple[Transition, _Binding] | None:
+        if self._incremental_eligible:
+            return self._select_incremental()
         candidates = self._filter_highest_priority(self._enabled_transition_bindings())
         return self._rng.choice(candidates) if candidates else None
+
+    # ------------------------------------------------------------------
+    # Incremental enablement scheduler (ADR 0006)
+    # ------------------------------------------------------------------
+
+    @property
+    def _incremental_eligible(self) -> bool:
+        """Whether the incremental (dirty-set) scheduler may drive selection/quiescence.
+
+        Off for nets with clock-driven re-enablement (`_has_timed_features`) or any
+        `RANDOM`/`PRIORITY` transition (`_has_search_policy_transition`); those fall back to
+        the full-net scan, which is behaviour- and RNG-stream-identical. Both inputs are
+        monotonic, so this only ever flips True→False over a net's life.
+        """
+        return not self._has_timed_features and not self._has_search_policy_transition
+
+    def _mark_dirty(self, place_name: str, token: Token | None = None) -> None:
+        """Flag a place whose token pool changed, for incremental re-evaluation.
+
+        No-op unless the incremental scheduler is eligible. A future-dated `token` (a
+        retry-delayed rollback) also schedules a reactivation at its `available_at`, so the
+        place re-dirties once the delay elapses — the one time-gate the fast path handles
+        rather than falling back on. Caller must hold `self._lock`.
+        """
+        if not self._incremental_eligible:
+            return
+        self._dirty_places.add(place_name)
+        if token is not None and token.available_at > self._get_model_time_under_lock():
+            heapq.heappush(self._reactivation, (token.available_at, place_name))
+
+    def _build_routing(self) -> None:
+        """Build the static place→transition reverse-routing tables from the current net."""
+        inp: dict[str, list[Transition]] = {}
+        out: dict[str, list[Transition]] = {}
+        for t in self.transitions.values():
+            for arc in t.inputs:
+                inp.setdefault(arc.place, []).append(t)
+            for arc in t.outputs:
+                if arc.condition is None:
+                    out.setdefault(arc.place, []).append(t)
+        self._input_routing = inp
+        self._output_routing = out
+
+    def _is_volatile(self, transition: Transition) -> bool:
+        """Whether `transition`'s enablement can change with **no input-place mutation**.
+
+        The dirty set only re-checks a transition when one of its input places changes. These
+        shapes escape that and so must be re-evaluated on every reconcile regardless:
+
+        - **input-less** transitions (sources) read no place, so no dirty flag ever routes to
+          them, yet they are (potentially) always enabled;
+        - a transition with a **`guard`**, or an input arc with a **`key`/`filter`**. Even a
+          *certified* callable is not necessarily token-pure: certification's documented
+          late-binding rule (see `cpnx.certification`) admits reads of a rebindable global/free
+          variable (e.g. `guard=lambda toks: gate_open` with a `bool` `gate_open` that is later
+          reassigned — `test_guard_with_resource_check`). The pre-0006 engine re-evaluated every
+          guard on every scan, so such rebinding worked; caching would silently break it. Rather
+          than probe exactly which callables are token-only, re-evaluate any of them each pass —
+          this costs the same as the old scan for guarded transitions and is never wrong. The
+          incremental win still applies fully to guard/selection-free transitions (the common
+          fan-out shape, and the `bench_transition_scan` workload).
+        """
+        if not transition.inputs:
+            return True
+        if transition.guard is not None:
+            return True
+        return any(arc.key is not None or arc.filter is not None for arc in transition.inputs)
+
+    def _ensure_scheduler_ready(self) -> None:
+        """Rebuild routing + reseed the dirty set after a transition-set change. Under lock.
+
+        Seeds every non-empty place dirty (so all currently-markable transitions get an initial
+        evaluation) and primes the reactivation heap from any place already holding a cooling
+        token, then clears the maintained enabled sets so the next reconcile rebuilds them.
+        """
+        if self._scheduler_ready:
+            return
+        self._build_routing()
+        self._transition_order = {name: i for i, name in enumerate(self.transitions)}
+        self._volatile_transitions = {t.name for t in self.transitions.values() if self._is_volatile(t)}
+        self._capacity_blocked = set()
+        self._enabled_bindings = {}
+        self._potentially_enabled = set()
+        self._priority_buckets = {}
+        self._bucket_index = {}
+        self._reactivation = []
+        now = self._get_model_time_under_lock()
+        self._dirty_places = set()
+        for name, place in self.places.items():
+            if len(place) == 0:
+                continue
+            self._dirty_places.add(name)
+            if not isinstance(place, SinkPlace):
+                boundary = place.earliest_available_boundary(now)
+                if boundary is not None:
+                    heapq.heappush(self._reactivation, (boundary, name))
+        self._scheduler_ready = True
+
+    def _reconcile_dirty(self) -> None:
+        """Bring the maintained enabled sets up to date with the dirty set. Under lock.
+
+        Drains any reactivation boundaries that have elapsed (re-dirtying their places), then
+        re-evaluates the transitions routed from the dirty places plus the always-volatile set
+        — the O(K) core that replaces the O(T) scan.
+        """
+        self._ensure_scheduler_ready()
+        now = self._get_model_time_under_lock()
+        while self._reactivation and self._reactivation[0][0] <= now:
+            _, place = heapq.heappop(self._reactivation)
+            self._dirty_places.add(place)
+        affected: set[str] = self._volatile_transitions | self._capacity_blocked
+        for place_name in self._dirty_places:
+            affected.update(t.name for t in self._input_routing.get(place_name, ()))
+            affected.update(t.name for t in self._output_routing.get(place_name, ()))
+        self._dirty_places.clear()
+        # Re-evaluate in registration order so bucket membership — and thus the seeded
+        # tie-break `_rng.choice` indexes into it — is reproducible across processes.
+        for name in sorted(affected, key=self._transition_order.__getitem__):
+            self._reevaluate_transition(self.transitions[name], now)
+
+    def _reevaluate_transition(self, transition: Transition, m_time: float) -> None:
+        """Recompute one transition's membership in the enabled + potentially-enabled sets.
+
+        Resolves the timing-aware binding **once** (never drawing the seeded RNG on the eligible
+        LEGACY/FIRST path, so a variable per-reconcile count cannot perturb the tie-break
+        stream, and re-evaluating no more than needed — see `_arc_key_evaluated_once` regression).
+        A satisfiable timing-aware binding is a fortiori potentially-enabled; the timing-ignoring
+        probe is needed only to catch a transition currently blocked *solely* by a cooling
+        (retry-delayed) token, so it runs only while such tokens are outstanding.
+        """
+        name = transition.name
+        binding = self._resolve_binding(transition, m_time)
+        if binding is not None and self._check_output_capacity(transition):
+            self._enabled_bindings[name] = binding
+            self._bucket_add(name, transition.priority)
+            self._capacity_blocked.discard(name)
+        else:
+            self._enabled_bindings.pop(name, None)
+            self._bucket_remove(name)
+            # Held back *only* by output back-pressure? Track it so it is re-checked every
+            # reconcile and unblocks as soon as its output drains (even out-of-band).
+            if binding is not None:
+                self._capacity_blocked.add(name)
+            else:
+                self._capacity_blocked.discard(name)
+
+        if binding is not None:
+            potentially = True
+        elif self._reactivation:  # cooling tokens outstanding — a timing-ignoring probe may differ
+            potentially = self._binding_exists(transition, float("inf"), ignore_timing=True)
+        else:
+            potentially = False
+        if potentially:
+            self._potentially_enabled.add(name)
+        else:
+            self._potentially_enabled.discard(name)
+
+    def _bucket_add(self, name: str, priority: int) -> None:
+        """Add `name` to its priority bucket (idempotent; priority is static per transition)."""
+        if name in self._bucket_index:
+            return
+        bucket = self._priority_buckets.setdefault(priority, [])
+        self._bucket_index[name] = len(bucket)
+        bucket.append(name)
+
+    def _bucket_remove(self, name: str) -> None:
+        """Remove `name` from its priority bucket in O(1) via swap-remove."""
+        idx = self._bucket_index.pop(name, None)
+        if idx is None:
+            return
+        bucket = self._priority_buckets[self.transitions[name].priority]
+        last = bucket.pop()
+        if idx < len(bucket):
+            bucket[idx] = last
+            self._bucket_index[last] = idx
+
+    def _select_incremental(self) -> tuple[Transition, _Binding] | None:
+        """Select the highest-priority enabled transition from the maintained enabled set.
+
+        Reconciles pending dirties (O(K)), then picks the minimum non-empty priority bucket and
+        random-tie-breaks within it — O(1) in the transition count, versus the O(T) full scan.
+        """
+        self._reconcile_dirty()
+        if not self._enabled_bindings:
+            return None
+        min_priority = min(p for p, bucket in self._priority_buckets.items() if bucket)
+        name = self._rng.choice(self._priority_buckets[min_priority])
+        return self.transitions[name], self._enabled_bindings[name]
 
     def _consume_binding(self, binding: _Binding, m_time: float | None) -> tuple[list[Token], list[tuple[str, Token]]]:
         """Remove the exact tokens named by `binding` from their source places.
@@ -732,6 +1015,10 @@ class PetriNet:
                     got = place.retrieve_all(model_time=m_time)
                 else:
                     got = place.retrieve_specific(tokens, model_time=m_time)
+                if got:
+                    # Removing tokens can release output back-pressure on this place, so flag
+                    # it dirty for the output-side dependents too (see `_output_routing`).
+                    self._mark_dirty(arc.place)
                 consumed_tokens.extend(got)
                 for t in got:
                     token_sources.append((arc.place, t))
@@ -993,6 +1280,9 @@ class PetriNet:
         with self._lock:
             if self._running_count > 0:
                 result = False
+            elif self._incremental_eligible:
+                self._reconcile_dirty()
+                result = not self._potentially_enabled
             else:
                 result = not any(self._is_transition_potentially_enabled(t) for t in self.transitions.values())
         self._flush_search_exhaustions()
@@ -1030,7 +1320,11 @@ class PetriNet:
             `True` if every transition's enabling condition currently fails.
         """
         with self._lock:
-            result = not any(self._is_transition_enabled(t) for t in self.transitions.values())
+            if self._incremental_eligible:
+                self._reconcile_dirty()
+                result = not self._enabled_bindings
+            else:
+                result = not any(self._is_transition_enabled(t) for t in self.transitions.values())
         self._flush_search_exhaustions()
         self._flush_priority_key_failures()
         self._flush_selection_failures()
@@ -1122,6 +1416,7 @@ class PetriNet:
                 f"Place '{place_name}' is not registered. Call add_place() before referencing it in a Transition arc."
             )
         self.places[place_name].deposit(token, model_time=self._get_model_time_under_lock())
+        self._mark_dirty(place_name, token)
 
     def _handle_schema_violation(
         self,
@@ -1152,6 +1447,7 @@ class PetriNet:
         )
         if self.error_place and self.error_place in self.places:
             self.places[self.error_place].deposit(error_token, model_time=self._get_model_time_under_lock())
+            self._mark_dirty(self.error_place, error_token)
             error_deposits.append((self.error_place, error_token))
         dead_lettered_tokens.append(error_token)
 
