@@ -602,10 +602,10 @@ class PetriNet:
         Reassignable after construction. Because a transition's *effective* policy is this
         default when the transition leaves `binding_policy` unset, changing it can move a
         transition into or out of a `RANDOM`/`PRIORITY` search policy — which gates the
-        incremental scheduler (see [`_incremental_eligible`][cpnx.PetriNet._incremental_eligible]).
-        The setter therefore recomputes `_has_search_policy_transition` over the current
-        transition set and invalidates the scheduler, so the seeded-determinism guarantee holds
-        even if the default is mutated mid-life.
+        incremental scheduler (see `_incremental_eligible`). The setter therefore recomputes
+        `_has_search_policy_transition` over the current transition set and invalidates the
+        scheduler, so the seeded-determinism guarantee holds even if the default is mutated
+        mid-life.
         """
         return self._binding_policy
 
