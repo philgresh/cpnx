@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-27
+
 ### Added
 
 - **Incremental enablement scheduler — the per-step transition scan is now `O(K)`, not `O(T)`.** Before this change every `step()`, `is_quiescent()`, and `is_dead()` looped over **every** registered transition (`_enabled_transition_bindings` / `_is_transition_potentially_enabled` / `_is_transition_enabled` over `self.transitions.values()`), resolving a fresh binding for each and then firing one — so a single step was `O(T)` in the transition count `T`, a `K`-firing run `O(K·T)`, all under the single global engine lock (the lock-hold time that starves the `ThreadPoolExecutor` on a wide fan-out net). The engine now maintains an incremental scheduler: a static reverse-routing table (`_input_routing`: place → transitions with an `InputArc` on it; `_output_routing`: place → transitions with an *unconditional* `OutputArc` on it) plus a per-place dirty set (`_dirty_places`), so a step re-evaluates only the `K` transitions routed from the places the last firing actually mutated. Selection is `O(1)` — a `_rng.choice` over the minimum non-empty priority bucket — and `is_quiescent()`/`is_dead()` are `O(1)` for untimed nets (`not _potentially_enabled` / `not _enabled_bindings`), which lifts `run()`'s per-iteration ceiling, not just `step()`'s. Measured by [`benchmarks/bench_transition_scan.py`](benchmarks/bench_transition_scan.py): the `scan us` probe (1-of-`T` enabled) flattens from a linear climb to a constant ~0.6 µs, and the drive's `us/step` from linear to a constant ~33 µs (total drive `O(T²)` → `O(T)`), both growth factors ~1.0 across `T` doubling 50→1600.
