@@ -384,6 +384,14 @@ class PetriNet:
                          Defaults to `BindingPolicy.LEGACY` (historical head-of-queue
                          behavior), so existing nets are unaffected. A transition may
                          override this via its own `binding_policy`.
+
+                         **`BindingPolicy.LEGACY` is deprecated and will be removed in
+                         v0.6.0**, including as this parameter's default. `FIRST` is a
+                         strict superset of `LEGACY`'s behavior (same head selection,
+                         plus the head-of-line fix) and costs nothing extra on
+                         guard-free transitions, so migrate by passing
+                         `binding_policy=BindingPolicy.FIRST` explicitly. See
+                         `docs/adr/0001-combinatorial-binding-search.md`.
             binding_search_limit: Maximum number of input-token combinations tried per
                          enablement check when a transition uses `BindingPolicy.FIRST`
                          (default: 1000). Bounds both the work and the memory of a search
