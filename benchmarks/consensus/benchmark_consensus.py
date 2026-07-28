@@ -110,8 +110,10 @@ def first_k_yes(k: int) -> Decider:
 
     Unlike :func:`rate_yes` (probabilistic — a 30% rate yields ~30, not exactly 30), this
     produces an exact YES/NO split, so a test can assert precise final counts. It is stateful
-    (a call counter), so use it only under the single-threaded ``drive_to_quiescence`` driver,
-    where firing order is deterministic.
+    (an *unlocked* call counter), so use it only under the single-threaded ``drive_to_quiescence``
+    driver, where firing order is deterministic. It must **not** be used under ``net.run()`` /
+    concurrent workers: the ``counter["n"]`` read-increment would race, so the YES/NO split would
+    be neither exact nor reproducible. Use :func:`rate_yes` (a pure per-call RNG draw) there.
     """
     counter = {"n": 0}
 
@@ -284,12 +286,20 @@ def _deposit_transactions(net: PetriNet, n_tx: int) -> None:
 
 def _time_one_throughput_run(
     n_tx: int, workers: int, p_yes: float, work_secs: float, seed: int
-) -> tuple[float, Counter]:
-    """One Phase-1 run at a given worker count; return ``(wall_secs, firing_counts)``.
+) -> tuple[float, Counter, bool]:
+    """One Phase-1 run at a given worker count; return ``(wall_secs, firing_counts, truncated)``.
 
-    A fresh net and a freshly-seeded RNG each call, so the validation stream is identical
-    across worker counts and repeat trials — only the concurrency (and scheduler noise)
-    varies, keeping the throughput comparison apples-to-apples.
+    A fresh net and a freshly-seeded RNG each call, so the *aggregate* YES-rate is stable across
+    worker counts and repeat trials. But the exact per-token validation stream is **not**
+    reproducible here: under ``net.run()`` the ``rate_yes`` closure is called by multiple pool
+    threads that draw from the one shared ``random.Random`` in OS-scheduled order (GIL-safe — no
+    corruption — but nondeterministic). Only Phase 2's single-threaded driver (``max_workers=1``)
+    gives a reproducible stream; ``PetriNet.run``'s own docstring notes the same ("above 1,
+    identical seeds are not guaranteed to reproduce"). That is fine for a throughput comparison,
+    which reads as a shape, not a per-token result.
+
+    ``truncated`` is ``True`` if the run hit ``_DEADLINE_SECS`` before draining (i.e. the net was
+    not quiescent when ``run`` returned), so a partial run is never reported as valid throughput.
     """
     net = build_consensus_net(
         rate_yes(p_yes, random.Random(seed)),
@@ -304,7 +314,9 @@ def _time_one_throughput_run(
         start = time.perf_counter()
         net.run(deadline=time.monotonic() + _DEADLINE_SECS)
         wall = time.perf_counter() - start
-    return wall, counts
+        # `run` exits silently at the deadline; a non-quiescent net means the numbers are partial.
+        truncated = not net.is_quiescent()
+    return wall, counts, truncated
 
 
 def run_throughput(
@@ -344,21 +356,26 @@ def run_throughput(
 
     baseline_wall: float | None = None
     for workers in worker_counts:
-        # Best-of-`trials`: keep the fastest run's wall and its firing counts together.
-        wall, counts = min(
+        # Best-of-`trials`: keep the fastest run's wall, its firing counts, and its truncated flag.
+        wall, counts, truncated = min(
             (_time_one_throughput_run(n_tx, workers, p_yes, work_secs, seed) for _ in range(trials)),
-            key=lambda wc: wc[0],
+            key=lambda wct: wct[0],
         )
         validations = counts["T_validate"]
         commits = counts["T_commit"]
-        # Tokens moved ~= one output token per firing plus the fan-out amplification.
+        # Output-side token production ~= broadcast fan-out (1->N_NODES) + one T_validate output
+        # per validation + one T_commit output per commit. A deliberate throughput proxy, not an
+        # exact token-movement ledger (it counts produced tokens, not the consumed side).
         tokens_moved = validations + commits + counts["T_broadcast"] * N_NODES
         if baseline_wall is None:
             baseline_wall = wall
         speedup = baseline_wall / wall
+        # A truncated run hit the deadline mid-drain, so its throughput is partial — flag it loudly
+        # rather than letting the number read as a valid measurement.
+        marker = "  ⚠ deadline hit — throughput truncated" if truncated else ""
         print(
             f"{workers:>8} {wall:>10.3f} {validations / wall:>15,.0f} "
-            f"{commits / wall:>12,.1f} {tokens_moved / wall:>13,.0f} {speedup:>8.2f}x"
+            f"{commits / wall:>12,.1f} {tokens_moved / wall:>13,.0f} {speedup:>8.2f}x{marker}"
         )
 
     print("\n(Throughput rises with workers as the pool overlaps validation latency, then saturates")
