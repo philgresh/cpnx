@@ -189,6 +189,19 @@ class InputArc:
                      `key` and `filter`** — see the warning below.
         settle_secs: Wait for no new arrivals for this many seconds before
                      consuming. Defaults to `0.0` (no wait).
+        test: Make this a **non-consuming test/read arc**. Defaults to `False`. A test arc
+              gates the transition's enablement on token *presence* — the transition is
+              enabled only while the place holds at least `count` available tokens — but
+              firing **consumes nothing** from the place and deposits nothing back. Because
+              a test arc binds no specific token, many transitions can test the same place
+              **concurrently** without serialising on it, and its tokens never participate
+              in rollback/retry. A test arc is a pure presence gate: its tokens are **not**
+              passed to the transition `guard` (the guard sees only consuming arcs), and
+              `key`/`filter` are ignored (there is nothing to order or select — only to
+              count). This is the mechanism a [`CircuitBreakerPlace`][cpnx.CircuitBreakerPlace]
+              health gate uses to disable dependent transitions while a shared dependency is
+              down. **Cannot be combined with `consume_all=True`** (a draining arc consumes,
+              which contradicts a test arc) — that combination raises `TypeError`.
         key: Per-token sort key — a pure `Callable[[Token], object]` mapping one token to a
              comparable value. Eligible tokens are consumed in **ascending** key order
              (min-first, mirroring [`Transition.binding_priority_key`][cpnx.Transition]),
@@ -281,6 +294,7 @@ class InputArc:
     count: int = 1
     consume_all: bool = False
     settle_secs: float = 0.0
+    test: bool = False
     key: Callable[[Token], object] | None = field(default=None, compare=False, kw_only=True)
     filter: Callable[[Token], bool] | None = field(default=None, compare=False, kw_only=True)
 
@@ -289,6 +303,7 @@ class InputArc:
         # the generated ``__init__`` (all of which this hook already covers, once) from a
         # later reassignment by the caller (which must warn on its own).
         self._constructed = True
+        self._reject_test_drain_conflict()
         self._warn_if_drain_ignores_selection(stacklevel=4)
 
     def __setattr__(self, name, value):
@@ -308,6 +323,25 @@ class InputArc:
         # reports the finished arc once, rather than once per conflicting field.
         if name in ("consume_all", "key", "filter") and getattr(self, "_constructed", False):
             self._warn_if_drain_ignores_selection(stacklevel=3)
+        # A test arc that also drains is a contradiction — re-validate on any post-construction
+        # reassignment of either flag (construction is covered once by `__post_init__`).
+        if name in ("consume_all", "test") and getattr(self, "_constructed", False):
+            self._reject_test_drain_conflict()
+
+    def _reject_test_drain_conflict(self) -> None:
+        """Raise if this arc is both a test arc and a draining arc.
+
+        A test arc consumes nothing; `consume_all` drains everything. The combination is
+        never meaningful, so it is a hard error (unlike the `consume_all`/`key`/`filter`
+        overlap, which is only a warning because a draining arc still has a well-defined,
+        if surprising, behaviour). See `test` and `consume_all` in the class docstring.
+        """
+        if self.test and self.consume_all:
+            raise TypeError(
+                f"InputArc(place={self.place!r}): test=True cannot be combined with "
+                "consume_all=True — a test arc consumes nothing, a draining arc consumes "
+                "everything. Use one or the other."
+            )
 
     def _warn_if_drain_ignores_selection(self, *, stacklevel: int) -> None:
         """Warn when this arc sets `key`/`filter` that `consume_all` will silently ignore.
@@ -464,6 +498,18 @@ class Transition:
                exactly as before. Set `BindingPolicy.FIRST` to enable
                deterministic-complete binding search (fixing head-of-line blocking) for
                this transition only.
+        breaker: Optional name of a [`CircuitBreakerPlace`][cpnx.CircuitBreakerPlace] this
+               transition's action failures feed. `None` (default) means the transition is
+               not bound to a breaker. When set, each time this transition's action fails the
+               engine passes the exception to the breaker's `trip_predicate`; after
+               `failure_threshold` consecutive *classified* failures the breaker trips (opens),
+               removing its health token so every transition with a test arc on that place
+               stops firing. A successful firing resets the breaker's consecutive-failure
+               count. **Multiple transitions may name the same breaker** — the dependency is
+               shared, which is the whole point. Binding a transition to a breaker does **not**
+               by itself gate it; add an `InputArc(<breaker place>, test=True)` to gate. The
+               named place must exist and be a `CircuitBreakerPlace` (validated when the
+               transition is added to the net).
         binding_priority_key: Sort key used only under `BindingPolicy.PRIORITY`. A pure
                `Callable[[list[Token]], object]` (must be callable or `None` — string
                expressions are not supported and raise `TypeError` at assignment) mapping a
@@ -497,6 +543,7 @@ class Transition:
     max_retries: int | None = 5
     binding_policy: BindingPolicy | None = None
     binding_priority_key: Callable[[list[Token]], object] | None = None
+    breaker: str | None = None
 
     def __setattr__(self, name, value):
         # Keep the inline-safe flag in sync with ``guard``, including post-construction

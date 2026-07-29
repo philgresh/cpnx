@@ -23,7 +23,7 @@ def snapshot(net: "PetriNet") -> dict[str, Any]:
         `"absorbed"`; and `"running_count"`, the number of transitions currently
         mid-firing.
     """
-    from cpnx.places import SinkPlace
+    from cpnx.places import CircuitBreakerPlace, SinkPlace
 
     with net._lock:
         places_snapshot: dict[str, Any] = {}
@@ -38,7 +38,15 @@ def snapshot(net: "PetriNet") -> dict[str, Any]:
                         "color": t.color,
                     }
                 )
-            if isinstance(place, SinkPlace):
+            if isinstance(place, CircuitBreakerPlace):
+                places_snapshot[name] = {
+                    "tokens": tokens_list,
+                    "state": place.state,
+                    "consecutive_failures": place.consecutive_failures,
+                    "probe_at": place.probe_at,
+                    "probing": place.probing,
+                }
+            elif isinstance(place, SinkPlace):
                 places_snapshot[name] = {
                     "tokens": tokens_list,
                     "absorbed": place.stats()["absorbed"],
@@ -67,40 +75,48 @@ def to_dot(net: "PetriNet") -> str:
         A string containing the full `digraph PetriNet { ... }` DOT source,
         suitable for rendering with Graphviz (e.g. `dot -Tpng`).
     """
-    from cpnx.places import SinkPlace
-
     with net._lock:
         lines = ["digraph PetriNet {", "  rankdir=LR;"]
 
-        # Nodes: Places
         for name, place in net.places.items():
-            if isinstance(place, SinkPlace):
-                token_count = place.stats()["absorbed"]
-            else:
-                token_count = len(place)
-            label = f"{name}\\n({token_count})"
-            lines.append(f'  "{name}" [shape=circle, label="{label}"];')
+            lines.append(_place_node(name, place))
 
-        # Nodes: Transitions
         for name in net.transitions.keys():
             lines.append(f'  "{name}" [shape=box, label="{name}"];')
 
-        # Edges
         for name, trans in net.transitions.items():
-            # Inputs: Place -> Transition
             for arc in trans.inputs:
-                label_parts = [f"count={arc.count}"]
-                if arc.consume_all:
-                    label_parts.append("consume_all")
-                if arc.settle_secs > 0.0:
-                    label_parts.append(f"settle={arc.settle_secs}s")
-                label = ", ".join(label_parts)
-                lines.append(f'  "{arc.place}" -> "{name}" [label="{label}"];')
-
-            # Outputs: Transition -> Place
+                lines.append(_input_edge(name, arc))
             for out_arc in trans.outputs:
-                label = f"count={out_arc.count}"
-                lines.append(f'  "{name}" -> "{out_arc.place}" [label="{label}"];')
+                lines.append(f'  "{name}" -> "{out_arc.place}" [label="count={out_arc.count}"];')
 
         lines.append("}")
         return "\n".join(lines)
+
+
+def _place_node(name: str, place: "Any") -> str:
+    """Render one place as a DOT node line, styled by place type."""
+    from cpnx.places import CircuitBreakerPlace, SinkPlace
+
+    if isinstance(place, CircuitBreakerPlace):
+        # A breaker is drawn as a double circle labelled with its lifecycle state so an
+        # open (gated) dependency is visible at a glance.
+        return f'  "{name}" [shape=doublecircle, label="{name}\\n[{place.state}]"];'
+    token_count = place.stats()["absorbed"] if isinstance(place, SinkPlace) else len(place)
+    return f'  "{name}" [shape=circle, label="{name}\\n({token_count})"];'
+
+
+def _input_edge(transition_name: str, arc: "Any") -> str:
+    """Render one input arc as a DOT edge line; a test/read arc is dashed and hollow-headed."""
+    label_parts = [f"count={arc.count}"]
+    if arc.consume_all:
+        label_parts.append("consume_all")
+    if arc.test:
+        label_parts.append("test")
+    if arc.settle_secs > 0.0:
+        label_parts.append(f"settle={arc.settle_secs}s")
+    label = ", ".join(label_parts)
+    # A test/read arc consumes nothing — draw it dashed with a hollow arrowhead so it is
+    # visually distinct from a consuming arc.
+    style = " style=dashed arrowhead=onormal" if arc.test else ""
+    return f'  "{arc.place}" -> "{transition_name}" [label="{label}"{style}];'

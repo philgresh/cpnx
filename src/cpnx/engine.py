@@ -14,7 +14,7 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from typing import Callable, Iterator, TypeAlias, cast
 
-from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace
+from cpnx.places import CircuitBreakerPlace, PacedResourcePlace, Place, ResourcePlace, SinkPlace
 from cpnx.tokens import ERROR_COLOR, Token
 from cpnx.transitions import BindingPolicy, InputArc, OutputArc, SubstitutionTransition, Transition
 from cpnx.visualization import snapshot, to_dot
@@ -447,6 +447,8 @@ class PetriNet:
         self._rng = random.Random(seed)
         self._has_timed_features = False
         self._model_time: float | None = None
+        #: Circuit-breaker places, serviced each run-loop pass for cooldown-driven recovery.
+        self._breakers: list[CircuitBreakerPlace] = []
         self.places: dict[str, Place] = {}
         self.transitions: dict[str, Transition] = {}
         self._lock = threading.Lock()
@@ -698,6 +700,12 @@ class PetriNet:
             self.places[place.name] = place
             if isinstance(place, PacedResourcePlace):
                 self._has_timed_features = True
+            if isinstance(place, CircuitBreakerPlace):
+                # The breaker's cooldown re-arm is clock-driven with no marking mutation, so it
+                # is invisible to the dirty-set fast path (ADR 0006) — route the net to the
+                # full-scan scheduler, and track the breaker for run-loop probe servicing.
+                self._has_timed_features = True
+                self._breakers.append(place)
 
     def _validate_new_transition(self, transition: Transition) -> None:
         if transition.name in self.places:
@@ -1007,6 +1015,11 @@ class PetriNet:
         token_sources: list[tuple[str, Token]] = []
         try:
             for arc, tokens in binding:
+                if arc.test:
+                    # A test/read arc consumes nothing and deposits nothing — skip it entirely,
+                    # so many transitions can test the same place concurrently and its tokens
+                    # never enter the rollback/retry path.
+                    continue
                 place = self.places[arc.place]
                 if isinstance(tokens, _DrainAll):
                     # Lazily-resolved `consume_all` arc: materialize and remove the whole
@@ -1094,6 +1107,40 @@ class PetriNet:
                 )
             if arc.place not in self.places:
                 raise KeyError(f"Place '{arc.place}' referenced by transition '{transition_name}' is not registered.")
+        self._validate_breaker_wiring(transition_name, transition)
+
+    def _validate_breaker_wiring(self, transition_name: str, transition: Transition) -> None:
+        """Enforce that circuit-breaker places are read-only gates and `breaker` names one.
+
+        A [`CircuitBreakerPlace`][cpnx.CircuitBreakerPlace] owns a non-consuming health signal:
+        an input arc on it must be a test arc, no output arc may target it, and a transition's
+        `breaker` binding must name a registered breaker place.
+        """
+        for arc in transition.inputs:
+            if isinstance(self.places.get(arc.place), CircuitBreakerPlace) and not arc.test:
+                raise TypeError(
+                    f"Transition '{transition_name}' has a consuming input arc on CircuitBreakerPlace "
+                    f"'{arc.place}'. Gate on a breaker with InputArc('{arc.place}', test=True) — a "
+                    "breaker's health signal is read, never consumed."
+                )
+        for arc in transition.outputs:
+            if isinstance(self.places.get(arc.place), CircuitBreakerPlace):
+                raise TypeError(
+                    f"Transition '{transition_name}' has an output arc targeting CircuitBreakerPlace "
+                    f"'{arc.place}'. A breaker manages its own health signal and cannot be deposited into."
+                )
+        if transition.breaker is not None:
+            target = self.places.get(transition.breaker)
+            if target is None:
+                raise KeyError(
+                    f"Transition '{transition_name}' names breaker '{transition.breaker}', which is not "
+                    "a registered place."
+                )
+            if not isinstance(target, CircuitBreakerPlace):
+                raise TypeError(
+                    f"Transition '{transition_name}' names breaker '{transition.breaker}', which is a "
+                    f"{type(target).__name__}, not a CircuitBreakerPlace."
+                )
 
     def validate(self) -> None:
         """Check the net's structural topology and raise on the first problem found.
@@ -1135,6 +1182,53 @@ class PetriNet:
         if stop_event is not None and stop_event.is_set():
             return True
         return deadline is not None and time.monotonic() > deadline
+
+    def _service_breakers(self, *, sync: bool = False) -> None:
+        """Attempt recovery on any open breaker whose cooldown has elapsed.
+
+        Called once per pass of the `run`/`drive_to_quiescence` loops. For each breaker whose
+        cooldown has elapsed and that has no probe in flight:
+
+        - **no `probe`** — close optimistically; the next real firing of a gated transition is
+          the trial, and its first classified failure re-opens the breaker;
+        - **with a `probe`** — mark it in flight (so at most one probe ever runs) and evaluate
+          the health check *off the engine lock* (it may do I/O). `sync=True` runs it inline
+          (the deterministic, single-threaded `drive_to_quiescence` path); otherwise it is
+          dispatched to the action pool and its result applied when it completes.
+        """
+        if not self._breakers:
+            return
+        to_probe: list[CircuitBreakerPlace] = []
+        changed = False
+        with self._lock:
+            now = self._get_model_time_under_lock()
+            for breaker in self._breakers:
+                if not breaker.due_for_probe(now):
+                    continue
+                if breaker.probe is None:
+                    breaker.record_probe_result(True, now)  # optimistic half-open close
+                    changed = True
+                else:
+                    breaker.begin_probe()
+                    to_probe.append(breaker)
+        for breaker in to_probe:
+            if sync:
+                self._run_probe(breaker)
+            else:
+                self._action_executor.submit(self._run_probe, breaker)
+        if changed:
+            # An optimistic close re-armed the health signal — wake the run loop to re-check.
+            self._work_available.set()
+
+    def _run_probe(self, breaker: CircuitBreakerPlace) -> None:
+        """Evaluate a breaker's probe (off the engine lock) and apply the outcome."""
+        try:
+            ok = bool(breaker.probe()) if breaker.probe is not None else True
+        except Exception:
+            ok = False  # a raising probe is treated as "still down" — keep the breaker open.
+        with self._lock:
+            breaker.record_probe_result(ok, self._get_model_time_under_lock())
+        self._work_available.set()
 
     def run(
         self,
@@ -1196,6 +1290,7 @@ class PetriNet:
             if self._should_stop_run(deadline, stop_event):
                 break
             self._work_available.clear()
+            self._service_breakers()
             if not self.step():
                 self._wait_for_work(deadline, stop_event)
 
@@ -1242,6 +1337,9 @@ class PetriNet:
         steps = 0
         ticks = 0
         while ticks < max_ticks:
+            # Recover any breaker whose cooldown elapsed at (or before) the current logical
+            # instant, running its probe inline to keep the drive single-threaded/deterministic.
+            self._service_breakers(sync=True)
             # Fire everything enabled at the current logical instant. The await after each firing is
             # deliberate: `step` returns as soon as the action is submitted, so awaiting means at
             # most one action is ever in flight. This keeps the drive single-threaded (determinism)
@@ -1622,12 +1720,37 @@ class PetriNet:
         pools: list[tuple[InputArc, list[Token]]] = []
         head_only = self._is_head_only(transition, self._effective_policy(transition))
         for arc in transition.inputs:
+            if arc.test:
+                # A test/read arc gates on presence only — it binds and consumes no token, so
+                # it contributes an empty group to every candidate binding (see `_arc_options`
+                # and `_resolve_input_tokens`) and is skipped at consume time.
+                if not self._test_arc_satisfied(arc, self.places.get(arc.place), m_time, ignore_timing):
+                    return None
+                pools.append((arc, []))
+                continue
             cap = arc.count if head_only else self.binding_search_limit + arc.count
             available = self._arc_available(arc, self.places.get(arc.place), m_time, ignore_timing, cap)
             if available is None:
                 return None
             pools.append((arc, available))
         return pools
+
+    def _test_arc_satisfied(
+        self, arc: InputArc, place: Place | None, m_time: float | None, ignore_timing: bool
+    ) -> bool:
+        """Whether a non-consuming test arc's presence gate is met right now.
+
+        A test arc is enabled iff its place holds at least `arc.count` available tokens. It
+        ignores `settle_secs`, `key`, and `filter` (there is nothing to settle, order, or
+        select — only to count), and consumes nothing. `ignore_timing` uses the same `+inf`
+        sentinel as the rest of the engine, so a [`CircuitBreakerPlace`][cpnx.CircuitBreakerPlace]
+        reports an open breaker as *eventually* available (keeping `is_quiescent` honest) while
+        still gating real firings.
+        """
+        if place is None:
+            return False
+        t_limit = float("inf") if ignore_timing else m_time
+        return place.can_retrieve(arc.count, model_time=t_limit)
 
     def _is_head_only(self, transition: Transition, policy: BindingPolicy) -> bool:
         """Whether `transition` resolves via the O(1) head binding rather than a search.
@@ -1704,14 +1827,27 @@ class PetriNet:
         alongside it is resolved the ordinary (bounded FIFO head / key-index) way.
         """
         place = self.places.get(arc.place)
-        if not arc.consume_all:
-            available = self._arc_available(arc, place, m_time, ignore_timing, arc.count)
-            if available is None:
-                return None
-            tokens = self._resolve_input_tokens(arc, available, transition_name=transition_name)
-            if tokens is None:
-                return None
-            return (arc, tokens)
+        if arc.test:
+            # Presence gate only — pairs to an empty consume set (see `_gather_arc_pools`).
+            return (arc, []) if self._test_arc_satisfied(arc, place, m_time, ignore_timing) else None
+        if arc.consume_all:
+            return self._drain_arc_binding(arc, place, m_time, ignore_timing)
+        available = self._arc_available(arc, place, m_time, ignore_timing, arc.count)
+        if available is None:
+            return None
+        tokens = self._resolve_input_tokens(arc, available, transition_name=transition_name)
+        if tokens is None:
+            return None
+        return (arc, tokens)
+
+    def _drain_arc_binding(
+        self, arc: InputArc, place: Place | None, m_time: float | None, ignore_timing: bool
+    ) -> "tuple[InputArc, _DrainAll] | None":
+        """Resolve a `consume_all` arc by count alone, deferring the whole-pool read to consume time.
+
+        Enablement is a pure count question, so the arc is paired with the `_DRAIN` marker and
+        never materialized on a probe or a losing step (see `_count_only_arc_binding`).
+        """
         if place is None:
             return None
         t_limit = float("inf") if ignore_timing else m_time
@@ -1928,6 +2064,11 @@ class PetriNet:
         the arc's head selection. An arc whose `key`/`filter` raises, or that has fewer than
         `count` eligible tokens, yields nothing (making the transition unbindable).
         """
+        if arc.test:
+            # A test/read arc contributes exactly one option that consumes nothing, so the
+            # Cartesian product gains a single empty group for it and the guard never sees it.
+            yield []
+            return
         if arc.consume_all:
             yield available
             return
@@ -2284,6 +2425,10 @@ class PetriNet:
         multiplicity rule applies either way, so a short selection disables the transition
         rather than firing with too few tokens.
         """
+        if arc.test:
+            # A test/read arc consumes nothing — it resolves to an empty group regardless of
+            # what is present (its presence gate was already checked in `_gather_arc_pools`).
+            return []
         if arc.consume_all:
             # A draining arc takes the whole available pool untouched — `key` and `filter`
             # are bypassed, exactly as the arc inscription they replaced was. Documented as
@@ -2467,6 +2612,14 @@ class PetriNet:
                 success, error, data_tokens, dl_data, deposited = self._commit_or_rollback_transition(
                     transition, success, consumed_tokens, output_tokens, token_sources, error
                 )
+                # Feed the firing outcome to a bound circuit breaker: a classified failure counts
+                # toward a trip; a success resets its consecutive-failure count. Tripping removes
+                # the breaker's health signal, so every test-arc-gated transition stops firing —
+                # picked up by the re-evaluation `_work_available.set()` triggers below.
+                if transition.breaker:
+                    breaker = self.places.get(transition.breaker)
+                    if isinstance(breaker, CircuitBreakerPlace):
+                        breaker.record_result(success, error, self._get_model_time_under_lock())
 
             # --- OUTSIDE THE LOCK ---
             self._invoke_transition_callbacks(transition, success, duration, error, data_tokens, dl_data, deposited)

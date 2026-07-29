@@ -15,6 +15,7 @@ shorthands for a place whose colour set is ``{"resource"}`` with a pre-filled in
 
 import heapq
 import itertools
+import math
 import threading
 import time
 from collections import OrderedDict, deque
@@ -1346,3 +1347,316 @@ class SinkPlace(Place):
             self._by_color = {}
             self._first_deposit_time = None
             return snapshot
+
+
+#: Breaker lifecycle states. ``half_open`` is not a distinct stored state — a probe in flight
+#: is tracked by a separate flag while the breaker remains ``open`` (gated off) until the probe
+#: resolves, so there is never a window in which dependent transitions fire un-probed.
+_CB_CLOSED = "closed"
+_CB_OPEN = "open"
+
+
+class CircuitBreakerPlace(Place):
+    """A health gate that disables dependent transitions while a shared dependency is down.
+
+    A `CircuitBreakerPlace` models the availability of one external dependency as **net
+    state** rather than an application global. It is referenced by dependent transitions
+    through a **non-consuming test arc** ([`InputArc(place, test=True)`][cpnx.InputArc]): while
+    the breaker is *closed* (healthy) the test passes and those transitions fire normally;
+    when it *opens* (unhealthy) the test fails, so every gated transition — the failing
+    downstream one **and** the expensive upstream ones that feed it — stops firing and its
+    input tokens simply queue in place. No busy-spin, no wasted upstream compute. Work resumes
+    automatically once the dependency recovers.
+
+    **CPN alignment:** the breaker holds a single binary *health* signal. A test arc reads that
+    signal without consuming it, so it is a place-encoded guard (`health present ⇒ enabled`),
+    the same "encode the guard on the place" shorthand as [`ThresholdPlace`][cpnx.ThresholdPlace]
+    — not a finite permit pool like [`ResourcePlace`][cpnx.ResourcePlace].
+
+    **Lifecycle.** Starts *closed*. A transition bound to this breaker via
+    [`Transition.breaker`][cpnx.Transition] reports each action failure through
+    [`record_result`][cpnx.CircuitBreakerPlace.record_result]; the breaker runs the
+    consumer-supplied `trip_predicate` to classify it, and after `failure_threshold`
+    **consecutive classified** failures it *opens* for `cooldown_secs`. Once the cooldown
+    elapses the engine attempts recovery:
+
+    - if a `probe` was supplied, the engine runs it **off the engine lock** (it may do I/O),
+      exactly one at a time; a truthy result *closes* the breaker, a falsy result or an
+      exception re-opens it for another `cooldown_secs`;
+    - if no `probe` was supplied, the breaker *closes optimistically* — the next real firing of
+      a gated transition acts as the trial, and the first classified failure re-opens it.
+
+    A gated transition **never fires while the breaker is open**, so at most one probe is ever
+    in flight (handoff single-probe guarantee). A successful firing of a bound transition
+    resets the consecutive-failure count.
+
+    **Engine integration.** A net containing a `CircuitBreakerPlace` runs on the full-scan
+    scheduler (the cooldown re-arm is clock-driven with no marking mutation, so the
+    dirty-set fast path is bypassed — see `docs/adr/0006-incremental-enablement.md`). An open
+    breaker with queued work is *not* quiescent — the engine keeps polling until the cooldown
+    boundary so recovery is automatic — but it *is* a dead marking for that instant (nothing
+    can fire right now), which matches [`is_dead`][cpnx.PetriNet.is_dead]'s snapshot semantics.
+
+    The breaker owns its health signal: it holds no ordinary tokens, cannot be deposited into,
+    and must be referenced only by test arcs (the engine rejects a consuming arc or an output
+    arc on a breaker place at validation time).
+
+    Example:
+        ```python
+        net.add_place(CircuitBreakerPlace(
+            "dependency_healthy",
+            trip_predicate=lambda exc: isinstance(exc, ConnectionError),
+            failure_threshold=3,
+            cooldown_secs=600.0,
+            probe=lambda: ping_dependency(),   # optional; cheap health check
+        ))
+        # gate every dependent transition (upstream and downstream):
+        #   inputs=[..., InputArc("dependency_healthy", test=True)]
+        # couple the failing transition's failures to the breaker:
+        #   Transition(..., breaker="dependency_healthy")
+        ```
+    """
+
+    def __init__(
+        self,
+        name: str,
+        trip_predicate: Callable[[BaseException], bool],
+        failure_threshold: int = 3,
+        cooldown_secs: float = 600.0,
+        probe: Callable[[], bool] | None = None,
+    ) -> None:
+        """Create a CircuitBreakerPlace.
+
+        Args:
+            name: Unique identifier for this place within a [`PetriNet`][cpnx.PetriNet].
+            trip_predicate: Classifier `Callable[[BaseException], bool]` deciding whether a
+                given failure counts toward tripping. Return `True` only for failures that
+                indicate a *sustained* outage (retrying immediately is pointless); return
+                `False` for transient/self-recovering errors, leaving them to the backend's
+                own retry/backoff. **Runs under the engine lock**, so it must be trivially
+                cheap and must not do I/O — it is a pure classifier, like a transition `guard`.
+                An exception raised by the predicate is treated as "does not trip" (a broken
+                classifier must never crash the engine).
+            failure_threshold: Number of *consecutive* classified failures that opens the
+                breaker. Must be >= 1. Defaults to 3.
+            cooldown_secs: Seconds the breaker stays open before the engine attempts recovery.
+                Defaults to 600.0.
+            probe: Optional cheap health check `Callable[[], bool]`. When supplied, the engine
+                runs it off the engine lock once the cooldown elapses (it may do I/O); a truthy
+                result closes the breaker, otherwise it re-opens. When `None` (default), the
+                breaker closes optimistically after the cooldown and lets the next real firing
+                be the trial.
+
+        Raises:
+            ValueError: If `failure_threshold < 1` or `cooldown_secs < 0`.
+            TypeError: If `trip_predicate` is not callable, or `probe` is neither callable
+                nor `None`.
+        """
+        if not callable(trip_predicate):
+            raise TypeError("trip_predicate must be callable.")
+        if probe is not None and not callable(probe):
+            raise TypeError("probe must be callable or None.")
+        if failure_threshold < 1:
+            raise ValueError(f"failure_threshold must be >= 1, got {failure_threshold}.")
+        if cooldown_secs < 0:
+            raise ValueError(f"cooldown_secs must be >= 0, got {cooldown_secs}.")
+        super().__init__(name)
+        self.trip_predicate = trip_predicate
+        self.failure_threshold = failure_threshold
+        self.cooldown_secs = cooldown_secs
+        self.probe = probe
+        self._state = _CB_CLOSED
+        self._consecutive_failures = 0
+        self._probe_at = 0.0
+        self._probing = False
+
+    # --- read-only introspection (for snapshot / to_dot / telemetry) ---
+
+    @property
+    def state(self) -> str:
+        """Current lifecycle state: ``"closed"`` (healthy) or ``"open"`` (gated off)."""
+        with self._lock:
+            return self._state
+
+    @property
+    def consecutive_failures(self) -> int:
+        """Consecutive classified failures recorded since the last success or trip."""
+        with self._lock:
+            return self._consecutive_failures
+
+    @property
+    def probe_at(self) -> float:
+        """Monotonic (or model-clock) deadline at which recovery is next attempted while open."""
+        with self._lock:
+            return self._probe_at
+
+    @property
+    def probing(self) -> bool:
+        """Whether a probe is currently in flight (at most one ever is)."""
+        with self._lock:
+            return self._probing
+
+    def is_open(self) -> bool:
+        """Whether the breaker is currently open (dependent transitions gated off)."""
+        with self._lock:
+            return self._state == _CB_OPEN
+
+    # --- state transitions (mutations are driven by the engine under its lock) ---
+
+    def _open_locked(self, now: float) -> None:
+        """Open the breaker until ``now + cooldown_secs``. Caller holds ``self._lock``."""
+        self._state = _CB_OPEN
+        self._probe_at = now + self.cooldown_secs
+        self._consecutive_failures = 0
+        self._probing = False
+
+    def record_result(self, success: bool, exc: BaseException | None, now: float) -> bool:
+        """Fold a bound transition's firing outcome into the breaker state; return whether it tripped.
+
+        Called by the engine under its lock immediately after a bound transition commits or
+        rolls back. A success resets the consecutive-failure count. A failure is classified by
+        `trip_predicate`; a classified failure while *closed* increments the count and opens
+        the breaker once it reaches `failure_threshold`. Failures recorded while already open
+        are ignored (the breaker is gated off; a bound transition should not be firing anyway).
+
+        Args:
+            success: Whether the transition's action succeeded.
+            exc: The failure exception when ``success`` is ``False``; otherwise ``None``.
+            now: The engine's current clock (model time), used as the open deadline reference.
+
+        Returns:
+            ``True`` iff this call transitioned the breaker from closed to open.
+        """
+        with self._lock:
+            if success:
+                self._consecutive_failures = 0
+                return False
+            if exc is None or self._state != _CB_CLOSED:
+                return False
+            try:
+                classified = bool(self.trip_predicate(exc))
+            except Exception:
+                # A broken classifier must never crash the engine — treat as non-tripping.
+                classified = False
+            if not classified:
+                return False
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self.failure_threshold:
+                self._open_locked(now)
+                return True
+            return False
+
+    def trip(self, now: float | None = None) -> bool:
+        """Force the breaker open from an out-of-band signal; return whether it changed state.
+
+        For the case where the consumer learns the dependency is down from something other
+        than a gated transition's failure. A no-op (returns ``False``) if already open.
+
+        Args:
+            now: Clock reference for the cooldown deadline. Defaults to ``time.monotonic()``;
+                pass the net's model time when driving a logical-clock net.
+        """
+        ref = time.monotonic() if now is None else now
+        with self._lock:
+            if self._state == _CB_OPEN:
+                return False
+            self._open_locked(ref)
+            return True
+
+    def close(self) -> None:
+        """Force the breaker closed (healthy) and reset failure tracking. Out-of-band control."""
+        with self._lock:
+            self._state = _CB_CLOSED
+            self._consecutive_failures = 0
+            self._probing = False
+
+    # --- probe servicing (driven by the engine's run loop) ---
+
+    def due_for_probe(self, now: float) -> bool:
+        """Whether the cooldown has elapsed and no probe is in flight. Engine-facing."""
+        with self._lock:
+            return self._state == _CB_OPEN and not self._probing and now >= self._probe_at
+
+    def begin_probe(self) -> None:
+        """Mark a probe as in flight so no second probe is dispatched. Engine-facing."""
+        with self._lock:
+            self._probing = True
+
+    def record_probe_result(self, ok: bool, now: float) -> None:
+        """Apply a probe outcome: close on success, re-open (re-cool) on failure. Engine-facing."""
+        with self._lock:
+            self._probing = False
+            if ok:
+                self._state = _CB_CLOSED
+                self._consecutive_failures = 0
+            else:
+                self._open_locked(now)
+
+    # --- Place overrides: the breaker owns a single binary health signal, no real tokens ---
+
+    def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
+        """Report health presence for a test arc: ``True`` while closed, gated while open.
+
+        A test arc calls this to decide enablement. While *closed* the health signal is
+        present (any ``count`` passes — the signal is binary, not a permit pool). While *open*
+        the signal is absent for real-time checks, so gated transitions cannot fire; the one
+        exception is the engine's timing-ignoring probe (`model_time == inf`, used by
+        [`is_quiescent`][cpnx.PetriNet.is_quiescent]), which reports the signal as *eventually*
+        available so an open breaker with queued work is not mistaken for a quiescent net.
+        """
+        if count <= 0:
+            return True
+        with self._lock:
+            if self._state == _CB_CLOSED:
+                return True
+            # Open: absent for a real firing; "eventually available" only under the engine's
+            # ignore-timing sentinel (t_limit == +inf), so recovery is not treated as quiescence.
+            return model_time == math.inf
+
+    def earliest_available_boundary(self, now: float) -> float | None:
+        """Report the cooldown deadline while open so the engine wakes to attempt recovery.
+
+        ``None`` while closed (nothing pending). While open, the recovery deadline — nudged to
+        strictly after ``now`` if it has already elapsed, so the run loop reliably picks it up
+        and services the probe on the next pass.
+        """
+        with self._lock:
+            if self._state == _CB_CLOSED:
+                return None
+            return self._probe_at if self._probe_at > now else math.nextafter(now, math.inf)
+
+    def deposit(self, token: Token, model_time: float | None = None) -> None:
+        """Reject deposits: a breaker owns its health signal and no output arc may target it."""
+        raise TypeError(
+            f"CircuitBreakerPlace '{self.name}' manages its own health signal — it cannot be "
+            "deposited into (no output arc may target a breaker place)."
+        )
+
+    def can_deposit(self, count: int = 1) -> bool:
+        """Always ``False``: nothing can be deposited into a breaker place."""
+        return False
+
+    def retrieve(self, count: int = 1, model_time: float | None = None) -> list[Token]:
+        """Reject consumption: a breaker place may be referenced only by non-consuming test arcs."""
+        raise ValueError(
+            f"CircuitBreakerPlace '{self.name}' holds a non-consuming health signal — "
+            "reference it with InputArc(test=True), never a consuming arc."
+        )
+
+    def retrieve_specific(self, tokens: list[Token], model_time: float | None = None) -> list[Token]:
+        """Reject consumption (see [`retrieve`][cpnx.CircuitBreakerPlace.retrieve])."""
+        return self.retrieve()
+
+    def retrieve_all(self, model_time: float | None = None) -> list[Token]:
+        """Reject consumption (see [`retrieve`][cpnx.CircuitBreakerPlace.retrieve])."""
+        return self.retrieve()
+
+    @property
+    def tokens(self) -> tuple[Token, ...]:
+        """A breaker holds no ordinary tokens — its state is exposed via `state` / snapshot."""
+        return ()
+
+    def __len__(self) -> int:
+        """1 while closed (health present), 0 while open — a cosmetic count for `to_dot`."""
+        with self._lock:
+            return 1 if self._state == _CB_CLOSED else 0
