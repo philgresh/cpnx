@@ -3,6 +3,7 @@
 import time
 
 from cpnx import (
+    CircuitBreakerPlace,
     InputArc,
     OutputArc,
     PacedResourcePlace,
@@ -22,6 +23,7 @@ class TestPublicImports:
         assert ResourcePlace
         assert PacedResourcePlace
         assert ThresholdPlace
+        assert CircuitBreakerPlace
         assert Token
         assert Transition
         assert InputArc

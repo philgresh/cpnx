@@ -1,9 +1,53 @@
 import json
 
 from cpnx.engine import PetriNet
-from cpnx.places import Place, ResourcePlace
+from cpnx.places import CircuitBreakerPlace, Place, ResourcePlace
 from cpnx.tokens import Token
 from cpnx.transitions import InputArc, OutputArc, Transition
+
+
+class TestCircuitBreakerVisualization:
+    def _net(self):
+        net = PetriNet()
+        net.add_place(
+            CircuitBreakerPlace("healthy", trip_predicate=lambda e: True, failure_threshold=1, cooldown_secs=5.0)
+        )
+        net.add_place(Place("work"))
+        net.add_place(Place("done"))
+        net.add_transition(
+            Transition(
+                "t",
+                inputs=[InputArc("work"), InputArc("healthy", test=True)],
+                outputs=[OutputArc("done")],
+                action=lambda toks: [toks[0]],
+                breaker="healthy",
+            )
+        )
+        return net
+
+    def test_snapshot_exposes_breaker_state(self):
+        net = self._net()
+        entry = net.snapshot()["places"]["healthy"]
+        assert entry["state"] == "closed"
+        assert entry["consecutive_failures"] == 0
+        assert "probe_at" in entry and "probing" in entry
+        net.places["healthy"].trip(now=1.0)
+        assert net.snapshot()["places"]["healthy"]["state"] == "open"
+
+    def test_snapshot_json_serializable_with_breaker(self):
+        net = self._net()
+        json.dumps(net.snapshot())  # must not raise
+
+    def test_dot_renders_breaker_node_and_test_arc(self):
+        net = self._net()
+        dot = net.to_dot()
+        assert "doublecircle" in dot
+        assert "[closed]" in dot
+        # the test arc is dashed and labelled "test"; the consuming arc is neither
+        test_edge = next(line for line in dot.splitlines() if '"healthy" -> "t"' in line)
+        assert "test" in test_edge and "dashed" in test_edge
+        work_edge = next(line for line in dot.splitlines() if '"work" -> "t"' in line)
+        assert "dashed" not in work_edge
 
 
 class TestSnapshot:
