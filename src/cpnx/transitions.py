@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Literal
 
 from cpnx.certification import is_inline_safe
+from cpnx.linting import lint_and_warn
 from cpnx.sandbox import verify_callable_purity
 from cpnx.tokens import Token
 
@@ -299,6 +300,9 @@ class InputArc:
             _reject_string_expression(f"InputArc.{name}", value)
             if callable(value):
                 verify_callable_purity(value)
+                # Best-effort advisory scan for side-effecting / non-deterministic
+                # trouble spots (see :mod:`cpnx.linting`); warns, or raises in strict mode.
+                lint_and_warn(value, f"InputArc.{name}", stacklevel=3)
                 if name == "filter":
                     _reject_non_bool_return("InputArc.filter", value)
             super().__setattr__(f"_{name}_inline_safe", _inline_safe_for(value))
@@ -374,6 +378,7 @@ class OutputArc:
             _reject_string_expression("OutputArc.condition", value)
             if callable(value):
                 verify_callable_purity(value)
+                lint_and_warn(value, "OutputArc.condition", stacklevel=3)
                 _reject_non_bool_return("OutputArc.condition", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         super().__setattr__(name, value)
@@ -507,6 +512,7 @@ class Transition:
             _reject_string_expression("guard", value)
             if callable(value):
                 verify_callable_purity(value)
+                lint_and_warn(value, "guard", stacklevel=3)
                 _reject_non_bool_return("guard", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         elif name == "binding_priority_key" and value is not None:
@@ -519,6 +525,7 @@ class Transition:
                     f"got {type(value).__name__}. String-expression keys are not supported."
                 )
             verify_callable_purity(value)
+            lint_and_warn(value, "binding_priority_key", stacklevel=3)
         super().__setattr__(name, value)
 
 

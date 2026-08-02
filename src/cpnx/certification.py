@@ -26,7 +26,9 @@ payload whose ``__eq__``/``__lt__``/``.get`` diverges would do so inline, under
 the lock, with no timeout.
 
 This is deliberately a **whitelist** (closed-world), not the effect-detecting
-blocklist in :func:`cpnx.sandbox.verify_callable_purity`. Side effects cannot be
+blocklist in :func:`cpnx.sandbox.verify_callable_purity`, nor the best-effort
+advisory scanner in :mod:`cpnx.linting` (which *warns* about network/database/
+clock/randomness trouble spots rather than deciding inline-safety). Side effects cannot be
 reliably prevented in Python (see the module docstring of ``sandbox``); the
 timeout the executor provides bounds *duration*, not *effects*. Certification
 therefore does not try to prove purity — it proves the callable is built solely

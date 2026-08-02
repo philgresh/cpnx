@@ -163,6 +163,11 @@ def _try_verify_via_getsource(func: Callable) -> None:
 def verify_callable_purity(func: Callable) -> None:
     """Verify that a callable is pure by inspecting its AST for disallowed patterns.
 
+    This is the **hard** blocklist gate — a small set of unambiguous escapes that
+    raise. For the softer, best-effort scan of side-effecting/non-deterministic
+    *trouble spots* (network, database, clock, randomness) that only warns, see
+    :mod:`cpnx.linting`; for the whitelist inline-safety proof, :mod:`cpnx.certification`.
+
     Raises :exc:`PermissionError` if the callable contains any of:
 
     - I/O calls: ``open``, ``print``, ``eval``, ``exec``, ``__import__``,
