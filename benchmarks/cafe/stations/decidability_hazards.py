@@ -36,12 +36,16 @@ Runnability
 -----------
 The network hazard talks to a **local mock** loyalty endpoint (:func:`loyalty_stub`)
 rather than a third-party service, so it is genuinely runnable — real sockets, real
-(tunable) latency — without hammering anyone's API or requiring the network. The other
-three run on the standard library alone. Detection does not depend on any of this: the
-linter flags the ``http.client`` / ``sqlite3`` / ``random`` / ``time`` reference
-statically, at construction, whether or not the transition ever fires.
+(tunable) latency — without hammering anyone's API or requiring the network. The mock is
+loopback-only on an OS-assigned port and torn down with its ``with`` block; it also
+requires HTTP Basic auth (a self-describing, non-secret :data:`LOYALTY_DEMO_TOKEN`) to
+model an authenticated upstream — not to secure a fixture that holds nothing. The other
+three hazards run on the standard library alone. Detection does not depend on any of
+this: the linter flags the ``http.client`` / ``sqlite3`` / ``random`` / ``time``
+reference statically, at construction, whether or not the transition ever fires.
 """
 
+import base64
 import contextlib
 import http.client
 import json
@@ -64,15 +68,36 @@ _LOYALTY_ADDR: tuple[str, int] | None = None
 #: Loyalty tier at or above which a customer is treated as VIP (skips the queue).
 VIP_TIER = 3
 
+#: An **obviously fake, non-secret** bearer token the mock endpoint expects. It exists to
+#: make the hazard realistic — real loyalty APIs are authenticated — not to protect a
+#: loopback fixture that holds nothing worth protecting. The point it illustrates is the
+#: *second* facet of the anti-pattern: authenticating a remote call from inside enabling
+#: logic drags a credential into the guard too, which is strictly worse. Never put a real
+#: token in source; this string is deliberately self-describing so a secret scanner can
+#: tell it apart from one.
+LOYALTY_DEMO_TOKEN = "demo-token-not-a-secret"  # noqa: S105 - intentional non-secret placeholder
+_EXPECTED_AUTH = "Basic " + base64.b64encode(f"cafe:{LOYALTY_DEMO_TOKEN}".encode()).decode()
+
 
 class _LoyaltyHandler(BaseHTTPRequestHandler):
-    """Return ``{"tier": N}`` after a small delay — a stand-in for a real loyalty API."""
+    """Return ``{"tier": N}`` after a small delay — a stand-in for a real loyalty API.
+
+    Requires HTTP Basic auth and answers ``401`` without it. On a loopback fixture this
+    protects nothing; it is here to model an *authenticated* upstream so the hazard reads
+    like the real mistake it warns against (see :data:`LOYALTY_DEMO_TOKEN`).
+    """
 
     #: Artificial latency (seconds) so the hazard exhibits real round-trip cost.
     delay = 0.02
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         time.sleep(self.delay)
+        if self.headers.get("Authorization") != _EXPECTED_AUTH:
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="loyalty"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         # Derive a stable tier from the card query so repeated lookups of the same card
         # agree — the *lookup* is still a network round-trip, which is the hazard.
         card = self.path.partition("card=")[2]
@@ -128,14 +153,26 @@ def loyalty_priority(tokens: list[Token]) -> int:
         **action** (after the binding is chosen), or a value stamped onto the token
         upstream — never the enabling decision. :mod:`cpnx.linting` flags the
         ``http.client`` reference as ``network``.
+
+        A second facet, since the endpoint is authenticated: the call must carry a
+        credential, so a bearer token now lives inside the selection callable too. Secret
+        handling migrating into enabling logic is strictly worse than the network read
+        alone — one more reason this belongs in the action, not the guard/key.
     """
     if _LOYALTY_ADDR is None:
         return 1  # no endpoint up: everyone is a walk-in
     host, port = _LOYALTY_ADDR
     conn = http.client.HTTPConnection(host, port, timeout=2.0)
     try:
-        conn.request("GET", f"/loyalty?card={tokens[0].payload.get('card', '')}")
-        tier = json.load(conn.getresponse()).get("tier", 0)
+        conn.request(
+            "GET",
+            f"/loyalty?card={tokens[0].payload.get('card', '')}",
+            headers={"Authorization": _EXPECTED_AUTH},  # credential dragged into selection logic
+        )
+        response = conn.getresponse()
+        if response.status != 200:
+            return 1  # auth failed / service unhappy → treat as a walk-in
+        tier = json.load(response).get("tier", 0)
     finally:
         conn.close()
     return 0 if tier >= VIP_TIER else 1  # min-first ordering → VIPs sort ahead

@@ -155,3 +155,34 @@ def test_loyalty_stub_serves_a_real_round_trip():
     assert vip in (0, 1) and walk_in == 1
     # And with no endpoint up, it degrades safely rather than raising.
     assert hazards.loyalty_priority([Token(payload={"card": "x"})]) == 1
+
+
+def test_loyalty_endpoint_requires_auth():
+    """The mock rejects an unauthenticated request (401) and accepts the demo token.
+
+    Verifies the authenticated-upstream modelling: without the ``Authorization`` header
+    the endpoint 401s; the client sends :data:`LOYALTY_DEMO_TOKEN` and gets a real answer.
+    """
+    import http.client
+
+    with hazards.loyalty_stub(delay=0.0) as (host, port):
+        # No credential → 401.
+        anon = http.client.HTTPConnection(host, port, timeout=2.0)
+        try:
+            anon.request("GET", "/loyalty?card=abc")
+            assert anon.getresponse().status == 401
+        finally:
+            anon.close()
+
+        # With the demo token → 200 and a JSON tier.
+        authed = http.client.HTTPConnection(host, port, timeout=2.0)
+        try:
+            authed.request("GET", "/loyalty?card=abc", headers={"Authorization": hazards._EXPECTED_AUTH})
+            resp = authed.getresponse()
+            assert resp.status == 200
+            assert "tier" in resp.read().decode()
+        finally:
+            authed.close()
+
+    # The demo token is a self-describing non-secret, not a real credential.
+    assert "not-a-secret" in hazards.LOYALTY_DEMO_TOKEN
