@@ -117,11 +117,10 @@ def _randomorg_demo() -> None:
             print("  quota low — skipping the draw to stay a good citizen.\n")
             return
 
-    count = 16
     t0 = time.perf_counter()
-    outcomes, note = hazards.fetch_randomorg_outcomes(count=count)
+    outcome, note = hazards.fetch_randomorg_outcome()
     dt = (time.perf_counter() - t0) * 1000
-    print(f"  one batched request for {count} integers in [0,3]  [{dt:.0f} ms real round-trip]")
+    print(f"  one loyalty lookup — one real round-trip  [{dt:.0f} ms]")
 
     if note == hazards.RATE_LIMITED:
         print(f"  → {note}")
@@ -133,10 +132,7 @@ def _randomorg_demo() -> None:
         print(f"  → {note} (nothing drawn; the external dependency is exactly this fragile)\n")
         return
 
-    print("  simulated loyalty outcomes drawn from true atmospheric entropy:")
-    for i, outcome in enumerate(outcomes):
-        print(f"    draw[{i:2}] -> {outcome}")
-    print()
+    print(f"  loyalty outcome, drawn from true atmospheric entropy: {outcome}\n")
 
 
 if __name__ == "__main__":

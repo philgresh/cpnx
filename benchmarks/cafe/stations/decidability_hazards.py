@@ -49,6 +49,7 @@ import base64
 import contextlib
 import http.client
 import json
+import os
 import random
 import sqlite3
 import threading
@@ -192,17 +193,26 @@ def loyalty_priority(tokens: list[Token]) -> int:
 # --- optional: true external entropy + real WAN latency from random.org --------------
 #
 # The local mock above is non-deterministic but its entropy and latency are local. This
-# section is the opt-in flourish: one well-behaved, batched call to random.org for *true*
-# atmospheric entropy over a *real* internet round-trip, used only by the one-shot demo
-# (gated on CPNX_DEMO_RANDOM_ORG). It is deliberately NOT wired into the net, tests, or
-# any drive-to-quiescence path — at "once per candidate binding" call rates it would
-# exhaust random.org's per-IP quota, trip its rate limiter, and make runs non-reproducible
-# and network-dependent. Batching N draws into a single request keeps us within quota.
+# section is the opt-in flourish: one well-behaved call to random.org for a single loyalty
+# outcome — *true* atmospheric entropy over a *real* internet round-trip — used only by the
+# one-shot demo (gated on CPNX_DEMO_RANDOM_ORG). One request, one decision, the way a real
+# per-lookup call actually works. It is deliberately NOT wired into the net, tests, or any
+# drive-to-quiescence path — at "once per candidate binding" call rates it would exhaust
+# random.org's quota, trip its rate limiter, and make runs non-reproducible.
 
-#: random.org host and an identifying User-Agent (their automated-client guidelines ask
-#: callers to identify themselves; we point at the repo rather than a personal address).
 RANDOMORG_HOST = "www.random.org"
-_RANDOMORG_USER_AGENT = "cpnx-demo (+https://github.com/philgresh/cpnx)"
+
+#: Default identifying User-Agent — the repo URL, not a personal address. random.org's
+#: automated-client guidelines ask callers to identify themselves; override it with
+#: ``CPNX_RANDOMORG_USER_AGENT`` so a fork or a heavy user can present its own identity
+#: instead of the canonical repo's. (random.org meters the free interface per *source IP*,
+#: so a different User-Agent shares the same IP quota — the override is about honest
+#: identification, not sidestepping a quota block.)
+_DEFAULT_RANDOMORG_USER_AGENT = "cpnx-demo (+https://github.com/philgresh/cpnx)"
+
+
+def _randomorg_user_agent() -> str:
+    return os.environ.get("CPNX_RANDOMORG_USER_AGENT", "").strip() or _DEFAULT_RANDOMORG_USER_AGENT
 
 #: Map a small random integer to a simulated loyalty-service outcome. The range is kept
 #: tiny (0..3, i.e. 2 bits/draw) on purpose: fewer bits drawn is fewer bits charged
@@ -231,7 +241,7 @@ def fetch_randomorg_quota(*, timeout: float = 5.0) -> int | None:
     """
     conn = http.client.HTTPSConnection(RANDOMORG_HOST, timeout=timeout)
     try:
-        conn.request("GET", "/quota/?format=plain", headers={"User-Agent": _RANDOMORG_USER_AGENT})
+        conn.request("GET", "/quota/?format=plain", headers={"User-Agent": _randomorg_user_agent()})
         resp = conn.getresponse()
         if resp.status != 200:
             return None
@@ -242,31 +252,32 @@ def fetch_randomorg_quota(*, timeout: float = 5.0) -> int | None:
         conn.close()
 
 
-def fetch_randomorg_outcomes(count: int = 16, *, timeout: float = 5.0) -> tuple[list[str], str]:
-    """One batched, well-behaved call to random.org → simulated outcomes + a status note.
+def fetch_randomorg_outcome(*, timeout: float = 5.0) -> tuple[str | None, str]:
+    """One well-behaved call to random.org for a single loyalty outcome + a status note.
 
-    Draws *count* integers in ``[0, 3]`` in a single request (one round-trip, charged
-    once) and maps each to :data:`_OUTCOME_BY_INT`. A ``429``/``503`` from random.org is
-    returned as the :data:`RATE_LIMITED` scenario rather than an error, so the caller can
-    treat "the entropy service throttled us" as a valid net outcome. Never raises.
+    Draws one integer in ``[0, 3]`` — one request, one decision, mirroring a real
+    per-lookup call — and maps it via :func:`map_outcome`. A ``429``/``503`` from
+    random.org is returned as the :data:`RATE_LIMITED` scenario rather than an error, so
+    the caller can treat "the entropy service throttled us" as a valid net outcome. Never
+    raises.
 
-    Returns ``(outcomes, note)`` where *note* is ``"ok"``, :data:`RATE_LIMITED`, or a
-    short diagnostic; *outcomes* is empty unless *note* is ``"ok"``.
+    Returns ``(outcome, note)`` where *note* is ``"ok"``, :data:`RATE_LIMITED`, or a short
+    diagnostic; *outcome* is ``None`` unless *note* is ``"ok"``.
     """
-    query = f"/integers/?num={count}&min=0&max=3&col=1&base=10&format=plain&rnd=new"
+    query = "/integers/?num=1&min=0&max=3&col=1&base=10&format=plain&rnd=new"
     conn = http.client.HTTPSConnection(RANDOMORG_HOST, timeout=timeout)
     try:
-        conn.request("GET", query, headers={"User-Agent": _RANDOMORG_USER_AGENT})
+        conn.request("GET", query, headers={"User-Agent": _randomorg_user_agent()})
         resp = conn.getresponse()
         if resp.status in (429, 503):
             resp.read()
-            return [], RATE_LIMITED
+            return None, RATE_LIMITED
         if resp.status != 200:
-            return [], f"random.org returned HTTP {resp.status}"
-        draws = [int(token) for token in resp.read().decode().split()]
-        return [map_outcome(value) for value in draws], "ok"
+            return None, f"random.org returned HTTP {resp.status}"
+        value = int(resp.read().decode().strip())
+        return map_outcome(value), "ok"
     except (OSError, ValueError) as exc:
-        return [], f"random.org unavailable ({type(exc).__name__})"
+        return None, f"random.org unavailable ({type(exc).__name__})"
     finally:
         conn.close()
 
