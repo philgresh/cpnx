@@ -1,0 +1,268 @@
+"""⚠️ Decidability hazards — a gallery of DELIBERATE anti-patterns.
+
+**Do not copy these inscriptions.** Every callable in this module is intentionally
+wrong: it smuggles network I/O, a database read, or a clock/randomness read into a
+transition's *enabling* logic (a guard, an arc `key`/`filter`, or a
+`binding_priority_key`). Each one looks like a reasonable feature a shift lead
+might ask for — "serve VIPs first", "don't grind if we're out of beans", "spot-check
+one in ten drinks", "prioritise by time of day" — and each one quietly forfeits the
+net's analysability, because enabling now depends on non-deterministic or external
+state rather than on token colour alone.
+
+Why this station exists
+-----------------------
+The base cafe is deterministic: its guards/keys/filters read only token payloads and
+close over immutable config, so behaviour is reproducible and the best-effort linter
+(:mod:`cpnx.linting`) is silent on it (see ``tests/test_cafe_lint.py``). This station
+is the negative control: enabling it makes the linter *speak*, once per hazard,
+naming exactly the trouble spot. It is the running, in-context counterpart to the
+unit fixtures in ``tests/test_linting.py``.
+
+Unlike the other opt-in stations — which add self-contained side rails — these hazards
+deliberately tap **existing deep places** (``P_Ticket_Line``, ``P_Ground_Coffee``,
+``P_Order_Tray``), so the anti-pattern sits *inside* the real processing flow rather
+than off to the side. They remain default-off, so a bare ``build_cafe()`` is unchanged.
+
+Grounding
+---------
+High-level Petri nets (ISO/IEC 15909-1:2019) enable transitions on data-dependent
+inscriptions over token colours — a decidable core. Reaching outside that core for a
+clock, a random draw, or a remote/DB read is the departure this module makes legible.
+Sound *static* detection of such effects is impossible in Python (Eghbali, Burk &
+Pradel, "DyLin: A Dynamic Linter for Python", FSE 2025), which is why the linter is
+best-effort and advisory; this station is what a real net looks like when it trips it.
+
+Runnability
+-----------
+The network hazard talks to a **local mock** loyalty endpoint (:func:`loyalty_stub`)
+rather than a third-party service, so it is genuinely runnable — real sockets, real
+(tunable) latency — without hammering anyone's API or requiring the network. The other
+three run on the standard library alone. Detection does not depend on any of this: the
+linter flags the ``http.client`` / ``sqlite3`` / ``random`` / ``time`` reference
+statically, at construction, whether or not the transition ever fires.
+"""
+
+import contextlib
+import http.client
+import json
+import random
+import sqlite3
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from cafe.support import with_work
+from cpnx import BindingPolicy, InputArc, OutputArc, Place, SinkPlace, Token, Transition
+
+# --- network hazard: a local mock "loyalty API" -------------------------------------
+
+#: Address of the mock loyalty endpoint, set by :func:`loyalty_stub` while it runs.
+#: ``None`` means "no server up" — the guard degrades to a safe default rather than
+#: raising, so the station stays importable and lintable with nothing listening.
+_LOYALTY_ADDR: tuple[str, int] | None = None
+
+#: Loyalty tier at or above which a customer is treated as VIP (skips the queue).
+VIP_TIER = 3
+
+
+class _LoyaltyHandler(BaseHTTPRequestHandler):
+    """Return ``{"tier": N}`` after a small delay — a stand-in for a real loyalty API."""
+
+    #: Artificial latency (seconds) so the hazard exhibits real round-trip cost.
+    delay = 0.02
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        time.sleep(self.delay)
+        # Derive a stable tier from the card query so repeated lookups of the same card
+        # agree — the *lookup* is still a network round-trip, which is the hazard.
+        card = self.path.partition("card=")[2]
+        tier = (sum(map(ord, card)) % 5) if card else 0
+        body = json.dumps({"tier": tier}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args) -> None:  # silence the default stderr access log
+        pass
+
+
+@contextlib.contextmanager
+def loyalty_stub(delay: float = 0.02):
+    """Run a local mock loyalty endpoint for the lifetime of the ``with`` block.
+
+    Binds ``127.0.0.1`` on an OS-assigned port, publishes the address in
+    :data:`_LOYALTY_ADDR` so :func:`loyalty_priority` can reach it, and tears the
+    server down on exit. Using a mock we control — rather than a third-party service —
+    keeps the runnable demo reproducible, offline-friendly, and free of any external
+    rate-limit or fair-use concern, while still exercising a real socket round-trip.
+    """
+    global _LOYALTY_ADDR
+    _LoyaltyHandler.delay = delay
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _LoyaltyHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    _LOYALTY_ADDR = server.server_address
+    try:
+        yield server.server_address
+    finally:
+        _LOYALTY_ADDR = None
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
+
+def loyalty_priority(tokens: list[Token]) -> int:
+    """⚠️ ``binding_priority_key`` HAZARD (network): rank a shot by a remote loyalty lookup.
+
+    Cafe role:
+        "VIPs skip the line." Before deciding whose grounds to pull next, phone the
+        loyalty service for the customer's tier and let VIPs sort ahead.
+
+    Why it's a hazard:
+        The binding *priority* — and therefore which token the transition consumes —
+        now depends on a network round-trip. Firing is non-deterministic (the service
+        can change its answer, time out, or fail), latency-bound, and impossible to
+        reason about statically. The right home for a loyalty lookup is the transition's
+        **action** (after the binding is chosen), or a value stamped onto the token
+        upstream — never the enabling decision. :mod:`cpnx.linting` flags the
+        ``http.client`` reference as ``network``.
+    """
+    if _LOYALTY_ADDR is None:
+        return 1  # no endpoint up: everyone is a walk-in
+    host, port = _LOYALTY_ADDR
+    conn = http.client.HTTPConnection(host, port, timeout=2.0)
+    try:
+        conn.request("GET", f"/loyalty?card={tokens[0].payload.get('card', '')}")
+        tier = json.load(conn.getresponse()).get("tier", 0)
+    finally:
+        conn.close()
+    return 0 if tier >= VIP_TIER else 1  # min-first ordering → VIPs sort ahead
+
+
+# --- database hazard: an inventory lookup -------------------------------------------
+
+#: Path to an inventory database, set by a demo/test that seeds one. ``None`` means the
+#: guard reads a throwaway in-memory database and defaults to "in stock".
+_INVENTORY_DB: str | None = None
+
+
+def stock_check_guard(tokens: list[Token]) -> bool:
+    """⚠️ ``guard`` HAZARD (database): gate grinding on a live inventory query.
+
+    Cafe role:
+        "Don't grind if we're out of that bean." Look the ticket's bean up in the
+        stock database and only enable the grind when quantity remains.
+
+    Why it's a hazard:
+        Whether the transition is enabled now depends on **external mutable state**.
+        Two identical markings can enable or not depending on what a separate system
+        wrote to the database, so reachability and liveness cannot be reasoned about
+        from the net. A stock level belongs on the token (stamped upstream) or checked
+        inside the action, not in the guard. :mod:`cpnx.linting` flags ``sqlite3`` as
+        ``database``.
+    """
+    conn = sqlite3.connect(_INVENTORY_DB or ":memory:")
+    try:
+        bean = tokens[0].payload.get("bean", "house")
+        row = conn.execute("SELECT qty FROM stock WHERE bean = ?", (bean,)).fetchone()
+    except sqlite3.OperationalError:
+        return True  # no stock table (nothing seeded) → assume in stock
+    finally:
+        conn.close()
+    return bool(row) and row[0] > 0
+
+
+# --- randomness hazard: a quality spot-check ----------------------------------------
+
+
+def qc_spot_check(token: Token) -> bool:
+    """⚠️ ``filter`` HAZARD (randomness): divert ~1 drink in 10 for a quality tasting.
+
+    Cafe role:
+        "Spot-check one in ten." A quietly reasonable-looking QC rule that pulls a
+        random sample of finished drinks off the tray for a taste test.
+
+    Why it's a hazard:
+        The most innocent-looking of the four, and the most corrosive: token
+        *eligibility* is decided by a coin flip, so which drinks a transition may
+        consume is different on every run and no invariant over the marking holds.
+        Sampling should be an action side effect on a token that *would* be served, not
+        an eligibility predicate. :mod:`cpnx.linting` flags ``random`` as
+        ``nondeterminism``.
+    """
+    return random.random() < 0.1
+
+
+# --- clock hazard: time-of-day priority ---------------------------------------------
+
+
+def happy_hour_key(token: Token) -> int:
+    """⚠️ ``key`` HAZARD (clock): order the serve queue by the wall clock.
+
+    Cafe role:
+        "During happy hour, prioritise the discounted orders." Sort the tray by a value
+        derived from the current time of day.
+
+    Why it's a hazard:
+        Consumption *order* now depends on when the check happens to run, so the same
+        marking drains in different orders across runs and the net never has a
+        reproducible fixed point. Time-of-day belongs on the token at intake, not read
+        live in the selection key. :mod:`cpnx.linting` flags ``time`` as
+        ``nondeterminism``.
+    """
+    # Happy hour (16:00–18:00) sorts discounted orders first; otherwise arrival order.
+    hour = time.localtime(time.time()).tm_hour
+    return 0 if 16 <= hour < 18 and token.payload.get("discount") else 1
+
+
+# --- station contract ----------------------------------------------------------------
+
+
+def places() -> list[Place]:
+    """The one extra place the hazards need: a terminal bench for QC-sampled drinks."""
+    return [SinkPlace("P_QC_Bench", keep_last=8)]
+
+
+def transitions(*, work_secs: float = 0.0) -> list[Transition]:
+    """Four hazard transitions, each tapping an existing deep place (all default-off).
+
+    - ``T_Loyalty_Pull`` — network: a loyalty-ranked pull off ``P_Ground_Coffee``.
+    - ``T_Stock_Check_Grind`` — database: an inventory-gated grind off ``P_Ticket_Line``.
+    - ``T_Quality_Hold`` — randomness: a random QC sample off ``P_Order_Tray``.
+    - ``T_Happy_Hour_Serve`` — clock: a time-of-day-ordered serve off ``P_Order_Tray``.
+    """
+
+    def _pass(tokens: list[Token]) -> list[Token]:
+        return list(tokens)
+
+    return [
+        Transition(
+            name="T_Loyalty_Pull",
+            inputs=[InputArc("P_Ground_Coffee", count=1)],
+            outputs=[OutputArc("P_Order_Tray", count=1)],
+            action=with_work(work_secs, _pass),
+            binding_policy=BindingPolicy.PRIORITY,
+            binding_priority_key=loyalty_priority,
+        ),
+        Transition(
+            name="T_Stock_Check_Grind",
+            inputs=[InputArc("P_Ticket_Line", count=1)],
+            outputs=[OutputArc("P_Ground_Coffee", count=1)],
+            action=with_work(work_secs, _pass),
+            guard=stock_check_guard,
+        ),
+        Transition(
+            name="T_Quality_Hold",
+            inputs=[InputArc("P_Order_Tray", count=1, filter=qc_spot_check)],
+            outputs=[OutputArc("P_QC_Bench", count=1)],
+            action=with_work(work_secs, _pass),
+        ),
+        Transition(
+            name="T_Happy_Hour_Serve",
+            inputs=[InputArc("P_Order_Tray", count=1, key=happy_hour_key)],
+            outputs=[OutputArc("P_Served", count=1)],
+            action=with_work(work_secs, _pass),
+        ),
+    ]

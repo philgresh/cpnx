@@ -96,6 +96,18 @@ comparable. Each exists because there is some engine cost path the base net neve
 
 ::: cafe.stations.pastry_case
 
+## ⚠️ Decidability hazards — deliberate anti-patterns
+
+Every station above is deterministic, so the base cafe is **lint-clean**: the best-effort
+side-effect linter ([`cpnx.linting`](reference/transitions.md#side-effect-linting)) finds
+nothing to warn about, and `tests/test_cafe_lint.py` locks that in. The station below is the
+negative control — a gallery of guards/keys/filters that each smuggle network, database,
+clock, or randomness reads into *enabling* logic. Enable it with `build_cafe(hazards=True)`
+to watch the linter flag every one; `benchmarks/lint_cafe.py` prints the before/after report.
+**Do not copy these inscriptions** — they exist to be detected.
+
+::: cafe.stations.decidability_hazards
+
 ## Shared helpers
 
 ::: cafe.support
