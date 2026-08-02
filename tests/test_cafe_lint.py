@@ -149,12 +149,31 @@ def test_loyalty_stub_serves_a_real_round_trip():
     Confirms the runnable path: with :func:`loyalty_stub` up, ``loyalty_priority`` makes
     an actual HTTP round-trip and returns a valid min-first priority (0 for VIP, 1 else).
     """
-    with hazards.loyalty_stub(delay=0.0):
-        vip = hazards.loyalty_priority([Token(payload={"card": "VIP-999999"})])
-        walk_in = hazards.loyalty_priority([Token(payload={"card": ""})])
-    assert vip in (0, 1) and walk_in == 1
+    with hazards.loyalty_stub(delay=0.0, seed=1):
+        first = hazards.loyalty_priority([Token(payload={"card": "VIP-999999"})])
+        second = hazards.loyalty_priority([Token(payload={"card": ""})])
+    assert first in (0, 1) and second in (0, 1)  # a min-first priority either way
     # And with no endpoint up, it degrades safely rather than raising.
     assert hazards.loyalty_priority([Token(payload={"card": "x"})]) == 1
+
+
+def test_seeded_mock_is_reproducible():
+    """Same seed + same request order → same priorities (reproducible non-determinism)."""
+
+    def run():
+        with hazards.loyalty_stub(delay=0.0, seed=7):
+            return [hazards.loyalty_priority([Token(payload={"card": c})]) for c in ("a", "b", "c", "d")]
+
+    assert run() == run()
+
+
+def test_map_outcome_is_a_pure_offline_mapping():
+    """The random.org integer→outcome mapping is pure and needs no network."""
+    assert "accepted" in hazards.map_outcome(0)
+    assert "rejected" in hazards.map_outcome(1)
+    assert "401" in hazards.map_outcome(2)
+    assert "5xx" in hazards.map_outcome(3)
+    assert "unknown" in hazards.map_outcome(99)
 
 
 def test_loyalty_endpoint_requires_auth():

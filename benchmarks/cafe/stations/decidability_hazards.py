@@ -85,10 +85,16 @@ class _LoyaltyHandler(BaseHTTPRequestHandler):
     Requires HTTP Basic auth and answers ``401`` without it. On a loopback fixture this
     protects nothing; it is here to model an *authenticated* upstream so the hazard reads
     like the real mistake it warns against (see :data:`LOYALTY_DEMO_TOKEN`).
+
+    The tier is a genuine random draw, so the lookup is really non-deterministic — the
+    whole point of the hazard. :func:`loyalty_stub` seeds :attr:`rng` when reproducibility
+    is wanted (tests, a repeatable demo) and leaves it on system entropy otherwise.
     """
 
     #: Artificial latency (seconds) so the hazard exhibits real round-trip cost.
     delay = 0.02
+    #: Source of tier draws; replaced per-stub by :func:`loyalty_stub`.
+    rng = random.Random()
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         time.sleep(self.delay)
@@ -98,10 +104,9 @@ class _LoyaltyHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        # Derive a stable tier from the card query so repeated lookups of the same card
-        # agree — the *lookup* is still a network round-trip, which is the hazard.
-        card = self.path.partition("card=")[2]
-        tier = (sum(map(ord, card)) % 5) if card else 0
+        # A real draw per lookup: the same card can come back a different tier, which is
+        # exactly why reading this in a selection callable is non-deterministic.
+        tier = type(self).rng.randint(0, 4)
         body = json.dumps({"tier": tier}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -114,7 +119,7 @@ class _LoyaltyHandler(BaseHTTPRequestHandler):
 
 
 @contextlib.contextmanager
-def loyalty_stub(delay: float = 0.02):
+def loyalty_stub(delay: float = 0.02, seed: int | None = None):
     """Run a local mock loyalty endpoint for the lifetime of the ``with`` block.
 
     Binds ``127.0.0.1`` on an OS-assigned port, publishes the address in
@@ -122,9 +127,15 @@ def loyalty_stub(delay: float = 0.02):
     server down on exit. Using a mock we control — rather than a third-party service —
     keeps the runnable demo reproducible, offline-friendly, and free of any external
     rate-limit or fair-use concern, while still exercising a real socket round-trip.
+
+    The endpoint returns a genuinely random tier. Pass *seed* to make that draw
+    reproducible (same seed + same request order → same tiers); leave it ``None`` for
+    system-entropy non-determinism. For *true* external entropy and real WAN latency, see
+    :func:`fetch_randomorg_outcomes` — an opt-in, one-shot path, not this local mock.
     """
     global _LOYALTY_ADDR
     _LoyaltyHandler.delay = delay
+    _LoyaltyHandler.rng = random.Random(seed)
     server = ThreadingHTTPServer(("127.0.0.1", 0), _LoyaltyHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -176,6 +187,88 @@ def loyalty_priority(tokens: list[Token]) -> int:
     finally:
         conn.close()
     return 0 if tier >= VIP_TIER else 1  # min-first ordering → VIPs sort ahead
+
+
+# --- optional: true external entropy + real WAN latency from random.org --------------
+#
+# The local mock above is non-deterministic but its entropy and latency are local. This
+# section is the opt-in flourish: one well-behaved, batched call to random.org for *true*
+# atmospheric entropy over a *real* internet round-trip, used only by the one-shot demo
+# (gated on CPNX_DEMO_RANDOM_ORG). It is deliberately NOT wired into the net, tests, or
+# any drive-to-quiescence path — at "once per candidate binding" call rates it would
+# exhaust random.org's per-IP quota, trip its rate limiter, and make runs non-reproducible
+# and network-dependent. Batching N draws into a single request keeps us within quota.
+
+#: random.org host and an identifying User-Agent (their automated-client guidelines ask
+#: callers to identify themselves; we point at the repo rather than a personal address).
+RANDOMORG_HOST = "www.random.org"
+_RANDOMORG_USER_AGENT = "cpnx-demo (+https://github.com/philgresh/cpnx)"
+
+#: Map a small random integer to a simulated loyalty-service outcome. The range is kept
+#: tiny (0..3, i.e. 2 bits/draw) on purpose: fewer bits drawn is fewer bits charged
+#: against random.org's daily per-IP quota.
+_OUTCOME_BY_INT = {
+    0: "accepted (2xx, loyalty applied)",
+    1: "rejected (2xx, no loyalty)",
+    2: "unauthorized (simulated 401)",
+    3: "server-error (simulated 5xx)",
+}
+#: random.org throttling us is itself a first-class scenario — a net that depends on an
+#: external service must model the service saying "not now".
+RATE_LIMITED = "rate-limited (random.org 429/503)"
+
+
+def map_outcome(value: int) -> str:
+    """Map a 0..3 draw to a simulated loyalty HTTP outcome (pure; offline-testable)."""
+    return _OUTCOME_BY_INT.get(value, f"unknown ({value})")
+
+
+def fetch_randomorg_quota(*, timeout: float = 5.0) -> int | None:
+    """Return remaining bits in today's per-IP quota, or ``None`` if unavailable.
+
+    random.org's guidelines ask automated clients to check quota before drawing; this is
+    that check. Never raises — a network problem yields ``None`` and the caller skips.
+    """
+    conn = http.client.HTTPSConnection(RANDOMORG_HOST, timeout=timeout)
+    try:
+        conn.request("GET", "/quota/?format=plain", headers={"User-Agent": _RANDOMORG_USER_AGENT})
+        resp = conn.getresponse()
+        if resp.status != 200:
+            return None
+        return int(resp.read().decode().strip())
+    except (OSError, ValueError):
+        return None
+    finally:
+        conn.close()
+
+
+def fetch_randomorg_outcomes(count: int = 16, *, timeout: float = 5.0) -> tuple[list[str], str]:
+    """One batched, well-behaved call to random.org → simulated outcomes + a status note.
+
+    Draws *count* integers in ``[0, 3]`` in a single request (one round-trip, charged
+    once) and maps each to :data:`_OUTCOME_BY_INT`. A ``429``/``503`` from random.org is
+    returned as the :data:`RATE_LIMITED` scenario rather than an error, so the caller can
+    treat "the entropy service throttled us" as a valid net outcome. Never raises.
+
+    Returns ``(outcomes, note)`` where *note* is ``"ok"``, :data:`RATE_LIMITED`, or a
+    short diagnostic; *outcomes* is empty unless *note* is ``"ok"``.
+    """
+    query = f"/integers/?num={count}&min=0&max=3&col=1&base=10&format=plain&rnd=new"
+    conn = http.client.HTTPSConnection(RANDOMORG_HOST, timeout=timeout)
+    try:
+        conn.request("GET", query, headers={"User-Agent": _RANDOMORG_USER_AGENT})
+        resp = conn.getresponse()
+        if resp.status in (429, 503):
+            resp.read()
+            return [], RATE_LIMITED
+        if resp.status != 200:
+            return [], f"random.org returned HTTP {resp.status}"
+        draws = [int(token) for token in resp.read().decode().split()]
+        return [map_outcome(value) for value in draws], "ok"
+    except (OSError, ValueError) as exc:
+        return [], f"random.org unavailable ({type(exc).__name__})"
+    finally:
+        conn.close()
 
 
 # --- database hazard: an inventory lookup -------------------------------------------

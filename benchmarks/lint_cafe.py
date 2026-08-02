@@ -14,6 +14,7 @@ Run it::
     python benchmarks/lint_cafe.py
 """
 
+import os
 import sys
 import time
 import warnings
@@ -101,9 +102,48 @@ def _loyalty_demo() -> None:
     print("  why the linter flags it: enabling now depends on a remote service.\n")
 
 
+def _randomorg_demo() -> None:
+    print("=" * 78)
+    print("PART D — true external entropy + real WAN latency from random.org (opt-in)")
+    print("=" * 78)
+    if os.environ.get("CPNX_DEMO_RANDOM_ORG", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        print("  skipped — set CPNX_DEMO_RANDOM_ORG=1 to make ONE well-behaved call to random.org.\n")
+        return
+
+    quota = hazards.fetch_randomorg_quota()
+    if quota is not None:
+        print(f"  quota check: {quota} bits remaining today")
+        if quota < 1000:
+            print("  quota low — skipping the draw to stay a good citizen.\n")
+            return
+
+    count = 16
+    t0 = time.perf_counter()
+    outcomes, note = hazards.fetch_randomorg_outcomes(count=count)
+    dt = (time.perf_counter() - t0) * 1000
+    print(f"  one batched request for {count} integers in [0,3]  [{dt:.0f} ms real round-trip]")
+
+    if note == hazards.RATE_LIMITED:
+        print(f"  → {note}")
+        print("    random.org throttled us — modeled as a valid net scenario (route a")
+        print("    'rate-limited' token) rather than an error. That a net's liveness can")
+        print("    hinge on someone else's quota is the whole cautionary point.\n")
+        return
+    if note != "ok":
+        print(f"  → {note} (nothing drawn; the external dependency is exactly this fragile)\n")
+        return
+
+    print("  simulated loyalty outcomes drawn from true atmospheric entropy:")
+    for i, outcome in enumerate(outcomes):
+        print(f"    draw[{i:2}] -> {outcome}")
+    print()
+
+
 if __name__ == "__main__":
     clean = _lint_report("PART A — full deterministic cafe (all legitimate stations on)", **_ALL_LEGIT)
     _lint_report("PART B — cafe with ⚠️ decidability hazards enabled", **_ALL_LEGIT, hazards=True)
     _loyalty_demo()
+    _randomorg_demo()
     print("Summary: base cafe is lint-clean" if clean == 0 else "Summary: base cafe HAS findings (!)",
-          "· hazards are flagged · network hazard runs against a local mock.")
+          "· hazards are flagged · network hazard runs against a local mock",
+          "(random.org draw is opt-in via CPNX_DEMO_RANDOM_ORG).")
