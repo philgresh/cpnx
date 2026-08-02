@@ -19,6 +19,7 @@ from cafe.stations import batch_triage as _batch_triage
 from cafe.stations import cold_brew as _cold_brew
 from cafe.stations import cupping as _cupping
 from cafe.stations import decaf as _decaf
+from cafe.stations import decidability_hazards as _hazards
 from cafe.stations import eighty_six as _eighty_six
 from cafe.stations import knock_box as _knock_box
 from cafe.stations import pastry_case as _pastry_case
@@ -52,6 +53,7 @@ def build_cafe(
     cupping: bool = False,
     cupping_count: int = 4,
     pastry_case: bool = False,
+    hazards: bool = False,
 ) -> PetriNet:
     """Wire up the Concurrency Cafe topology and return the (unstarted) [`PetriNet`][cpnx.PetriNet].
 
@@ -135,6 +137,11 @@ def build_cafe(
             [`SubstitutionTransition`][cpnx.SubstitutionTransition], driving a nested
             kitchen subnet to quiescence per firing. See
             [`cafe.stations.pastry_case`][cafe.stations.pastry_case].
+        hazards: Add the ⚠️ decidability hazards — a gallery of **deliberate
+            anti-patterns** that smuggle network/database/clock/randomness reads into
+            enabling logic, so the best-effort linter ([`cpnx.linting`][cpnx.lint_callable])
+            flags them. Off by default; enabling it is what makes a bare cafe stop
+            being lint-clean. See [`cafe.stations.decidability_hazards`][cafe.stations.decidability_hazards].
 
     Raises:
         ValueError: If `cold_brew_key` is set without `cold_brew`.
@@ -209,6 +216,10 @@ def build_cafe(
     if pastry_case:
         net_places += _pastry_case.places()
         net_transitions += _pastry_case.transitions(work_secs=work_secs)
+
+    if hazards:
+        net_places += _hazards.places()
+        net_transitions += _hazards.transitions(work_secs=work_secs)
 
     return PetriNet(
         max_workers=max_workers,
