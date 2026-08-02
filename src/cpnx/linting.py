@@ -50,11 +50,12 @@ raises :class:`SideEffectLintError` when strict mode is on (opt in via
 
 Known limitations (best-effort by construction)
 ------------------------------------------------
-* Only the callable's **own body** is scanned, not helpers it calls. A risky call
-  hidden one function deep is invisible here (certification *is* transitive; this
-  is not). Uncertified helpers already fall back to the sandboxed pool.
-* Detection is by **name resolution + a small distinctive-attribute table**, so
-  fully dynamic dispatch (``getattr(mod, "get")(...)``) is not seen.
+* Only the callable's **own body** is scanned, not helpers it calls *by name*. A
+  risky call hidden one named function deep is invisible here (certification *is*
+  transitive; this is not); an inline nested ``def``/``lambda`` *is* walked, since it
+  is part of the body. Uncertified helpers already fall back to the sandboxed pool.
+* Detection is by **package/member resolution + a small distinctive-attribute
+  table**, so fully dynamic dispatch (``getattr(mod, "get")(...)``) is not seen.
 * Like certification, this reflects binding state at inspection time; later
   rebinding of a referenced name is undefined behaviour.
 """
@@ -66,7 +67,8 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .certification import _UNRESOLVED, _get_ast_node, _resolve_name, _root_name
+from .certification import _UNRESOLVED, _resolve_name, _root_name
+from .sandbox import _find_target_node
 
 #: Category label for findings whose root symbol is a network client/transport.
 NETWORK = "network"
@@ -82,7 +84,15 @@ NONDETERMINISM = "nondeterminism"
 #: and aliasing (``import requests as r``) is transparent because we resolve the
 #: bound object, not the source text. Kept deliberately conservative — packages
 #: with a broad benign surface (e.g. ``os``, whose ``os.path`` is harmless) are
-#: intentionally absent and handled by the distinctive-attribute table instead.
+#: intentionally absent (handled by :data:`_NONDETERMINISTIC_MEMBERS` or the
+#: distinctive-attribute table instead). Only packages whose *entire* callable
+#: surface is the effect belong here — the network/database drivers, and ``random``
+#: (a seeded ``Random`` aside, its point is non-determinism). Mixed-surface packages
+#: with a large deterministic API (``datetime``, ``time``, ``uuid``, ``secrets``) are
+#: **not** here: blanket-flagging them false-positives on ``datetime.timedelta``,
+#: ``uuid.UUID("…")``, ``time.strftime(…)`` and the like — which, in strict mode,
+#: would break construction of a perfectly valid net. Those go through the
+#: member-specific table below.
 _TOP_PACKAGE_CATEGORY: dict[str, str] = {
     # Network I/O.
     "requests": NETWORK,
@@ -116,20 +126,48 @@ _TOP_PACKAGE_CATEGORY: dict[str, str] = {
     "cassandra": DATABASE,
     "pyodbc": DATABASE,
     "cx_Oracle": DATABASE,
-    # Clock / randomness (non-determinism).
+    # Randomness — whole-surface non-deterministic.
     "random": NONDETERMINISM,
-    "time": NONDETERMINISM,
-    "datetime": NONDETERMINISM,
-    "secrets": NONDETERMINISM,
-    "uuid": NONDETERMINISM,
 }
 
-#: Attribute names distinctive enough to flag by name alone, for the case where
-#: the receiver does not resolve to a risky module (``from datetime import
-#: datetime; datetime.now()`` — root ``datetime`` is a *class*, not the module).
-#: Deliberately excludes ambiguous names that collide with token-payload / dict
-#: methods (``.get``, ``.post``, ``.connect``, ``.execute``, ``.cursor``); those
-#: rely on module resolution, which does not misfire on a plain dict.
+#: Mixed-surface stdlib packages: top-level package -> the **specific** member names
+#: that are non-deterministic. Everything *not* listed (``datetime.timedelta``,
+#: ``datetime.date``, ``uuid.UUID``, ``time.strftime``, ``time.mktime``, …) is
+#: deterministic and must not be flagged. Matched only when the callee's root name
+#: resolves to the package, so ``token.time()`` on a user object is never mistaken for
+#: ``time.time()`` (the reason these are here rather than in the by-name table below).
+_NONDETERMINISTIC_MEMBERS: dict[str, frozenset[str]] = {
+    # Clock *readers* only. Converters like ``localtime(ts)``/``gmtime(ts)``/``strftime``/
+    # ``mktime`` are deterministic given their argument, so they are intentionally absent —
+    # a guard reading the clock does so through one of these zero-argument readers, and the
+    # cafe's ``time.localtime(time.time())`` is already flagged via the inner ``time.time``.
+    "time": frozenset(
+        {
+            "time",
+            "time_ns",
+            "monotonic",
+            "monotonic_ns",
+            "perf_counter",
+            "perf_counter_ns",
+            "process_time",
+            "process_time_ns",
+            "thread_time",
+            "thread_time_ns",
+        }
+    ),
+    "datetime": frozenset({"now", "utcnow", "today"}),
+    "uuid": frozenset({"uuid1", "uuid4"}),  # uuid3/uuid5 are deterministic hashes
+    "secrets": frozenset(
+        {"token_hex", "token_bytes", "token_urlsafe", "randbelow", "randbits", "choice"}
+    ),
+}
+
+#: Attribute names distinctive enough to flag by name alone, for the case where the
+#: receiver does not resolve to a risky package (``d = datetime.datetime; d.now()``
+#: with ``d`` a local). Deliberately excludes ambiguous names that collide with
+#: token-payload / dict methods (``.get``, ``.post``, ``.connect``, ``.execute``,
+#: ``.cursor``, ``.time``); those rely on package/member resolution, which does not
+#: misfire on a plain dict or user object.
 _DISTINCTIVE_ATTRS: dict[str, str] = {
     "now": NONDETERMINISM,
     "utcnow": NONDETERMINISM,
@@ -188,19 +226,19 @@ class LintFinding:
     message: str
 
 
-def _risk_category(obj: object) -> str | None:
-    """Classify a resolved object by the top-level package that defines it.
+def _top_package(obj: object) -> str | None:
+    """Top-level package that defines *obj*, or ``None`` if it can't be determined.
 
-    Uses a module's own ``__name__`` (``import requests`` -> module ``requests``)
-    or any other object's ``__module__`` (``datetime.datetime`` -> ``"datetime"``),
-    then maps the top-level package via :data:`_TOP_PACKAGE_CATEGORY`.
+    Uses a module's own ``__name__`` (``import requests`` -> ``requests``) or any other
+    object's ``__module__`` (``datetime.datetime`` -> ``datetime``), reduced to its first
+    dotted component.
     """
     if obj is _UNRESOLVED or obj is None:
         return None
     modname = obj.__name__ if inspect.ismodule(obj) else getattr(obj, "__module__", None)
     if not isinstance(modname, str) or not modname:
         return None
-    return _TOP_PACKAGE_CATEGORY.get(modname.split(".")[0])
+    return modname.split(".")[0]
 
 
 def _symbol_text(callee: ast.expr) -> str:
@@ -211,29 +249,38 @@ def _symbol_text(callee: ast.expr) -> str:
         return _root_name(callee) or "<call>"
 
 
+def _called_member(callee: ast.expr, root: str) -> str:
+    """The member name being invoked: ``datetime.datetime.now`` -> ``now``; ``time()`` -> ``time``."""
+    return callee.attr if isinstance(callee, ast.Attribute) else root
+
+
 def _classify_call(node: ast.Call, func: Callable) -> tuple[str, str] | None:
     """Return ``(category, symbol)`` if this call is a trouble spot, else ``None``.
 
-    Three strategies, cheapest-first, all best-effort:
+    Three strategies, all best-effort:
 
-    1. **Module resolution** — resolve the callee's root name against *func*'s
-       closure/globals and classify by the defining package. Catches
-       ``requests.get``, ``socket.socket``, ``sqlite3.connect``, ``random.random``,
-       ``time.time`` regardless of import alias.
-    2. **Distinctive attribute** — a ``.now``/``.urlopen``/``.urandom``-style name
-       that is risky even when its receiver is a class rather than a module
-       (``from datetime import datetime; datetime.now()``).
-    3. **Bare-name resolution** — a plain ``Name`` callee (``get()`` after
-       ``from requests import get``) resolved and classified like strategy 1.
+    1. **Package resolution** — resolve the callee's root name against *func*'s
+       closure/globals and identify its defining package. A whole-surface-effect
+       package (:data:`_TOP_PACKAGE_CATEGORY`) flags outright; a mixed-surface package
+       (:data:`_NONDETERMINISTIC_MEMBERS`) flags only its specific risky members, so
+       ``datetime.timedelta``/``uuid.UUID(…)``/``time.strftime(…)`` pass. Handles import
+       aliases and ``from datetime import datetime; datetime.now()`` alike.
+    2. **Distinctive attribute** — a ``.now``/``.urlopen``/``.urandom``-style name risky
+       even when the receiver can't be resolved to a package (a local alias).
     """
     callee = node.func
 
-    # Strategy 1 + 3: resolve the root name and classify by defining package.
+    # Strategy 1: resolve the root name and classify by defining package.
     root = _root_name(callee)
     if root is not None:
-        category = _risk_category(_resolve_name(func, root))
-        if category is not None:
-            return category, _symbol_text(callee)
+        package = _top_package(_resolve_name(func, root))
+        if package is not None:
+            blanket = _TOP_PACKAGE_CATEGORY.get(package)
+            if blanket is not None:
+                return blanket, _symbol_text(callee)
+            members = _NONDETERMINISTIC_MEMBERS.get(package)
+            if members is not None and _called_member(callee, root) in members:
+                return NONDETERMINISM, _symbol_text(callee)
 
     # Strategy 2: distinctive attribute name (receiver need not resolve).
     if isinstance(callee, ast.Attribute):
@@ -242,6 +289,39 @@ def _classify_call(node: ast.Call, func: Callable) -> tuple[str, str] | None:
             return category, _symbol_text(callee)
 
     return None
+
+
+#: Per-source-file parsed-module cache: ``path -> (mtime, tree)``. Constructing many
+#: transitions from one module re-lints each callable from ``__setattr__``; without this,
+#: every call re-reads and re-parses the whole defining file. The cache is linting-private
+#: and only ever *walked* (never mutated), so it cannot be corrupted by certification's
+#: in-place annotation stripping on its own separate parse. Invalidated on mtime change.
+_FILE_TREE_CACHE: dict[str, tuple[float, ast.AST]] = {}
+
+
+def _get_cached_ast_node(func: Callable) -> ast.AST | None:
+    """Recover *func*'s ``Lambda``/``FunctionDef`` node, caching the file parse by mtime.
+
+    Mirrors :func:`cpnx.certification._get_ast_node` but memoises the (expensive) whole-file
+    ``ast.parse`` per source file, so N callables in one module cost one parse, not N.
+    Returns ``None`` when the source cannot be located (compiled builtin, REPL lambda).
+    """
+    try:
+        _, start_line = inspect.getsourcelines(func)
+        source_file = inspect.getsourcefile(func)
+        if not source_file:
+            return None
+        mtime = os.path.getmtime(source_file)
+        cached = _FILE_TREE_CACHE.get(source_file)
+        if cached is None or cached[0] != mtime:
+            with open(source_file, encoding="utf-8") as handle:
+                tree = ast.parse(handle.read(), filename=source_file)
+            _FILE_TREE_CACHE[source_file] = (mtime, tree)
+        else:
+            tree = cached[1]
+    except (OSError, TypeError, SyntaxError):
+        return None
+    return _find_target_node(tree, start_line)
 
 
 def lint_callable(func: Callable) -> list[LintFinding]:
@@ -255,7 +335,7 @@ def lint_callable(func: Callable) -> list[LintFinding]:
     """
     if not callable(func):
         return []
-    node = _get_ast_node(func)
+    node = _get_cached_ast_node(func)
     if node is None:
         return []
 

@@ -12,10 +12,12 @@ suite needs no third-party network/DB drivers installed.
 
 import datetime as datetime_mod
 import random
+import secrets
 import socket
 import sqlite3
 import time
 import urllib.request
+import uuid
 import warnings
 from datetime import datetime as DatetimeClass
 
@@ -70,12 +72,43 @@ def guard_random(tokens):
     return random.random() > 0.5
 
 
+def guard_uuid_random(tokens):
+    return uuid.uuid4().int % 2 == 0
+
+
+def guard_secrets_random(tokens):
+    return secrets.randbelow(100) > 50
+
+
 def key_clean(tokens):
     return tokens[0].payload.get("priority", 0)
 
 
 def guard_clean(tokens):
     return tokens[0].payload.get("weight", 0) > 5 and len(tokens) > 0
+
+
+# Deterministic members of otherwise "risky" packages — MUST NOT be flagged. Each is the
+# kind of thing a legitimate guard does: compare a token timestamp against a fixed window,
+# parse a token's UUID, order by a fixed date (regression for the strict-mode false
+# positive — see tests/test_linting.py history and PR #49 review).
+
+
+def guard_timedelta(tokens):
+    return tokens[0].created_at < datetime_mod.timedelta(hours=1).total_seconds()
+
+
+def guard_fixed_uuid(tokens):
+    return uuid.UUID("12345678-1234-5678-1234-567812345678").version == 4
+
+
+def guard_fixed_date(tokens):
+    return datetime_mod.date(2020, 1, 1) < datetime_mod.date(2021, 1, 1)
+
+
+def guard_strftime_of_arg(tokens):
+    # localtime/strftime of a *token-supplied* timestamp is deterministic (no clock read).
+    return time.strftime("%Y", time.localtime(tokens[0].created_at)).startswith("20")
 
 
 # --- lint_callable: detection --------------------------------------------------------
@@ -91,6 +124,8 @@ def guard_clean(tokens):
         (guard_clock_datetime_module, NONDETERMINISM, "now"),
         (guard_clock_datetime_class, NONDETERMINISM, "now"),
         (guard_random, NONDETERMINISM, "random"),
+        (guard_uuid_random, NONDETERMINISM, "uuid4"),
+        (guard_secrets_random, NONDETERMINISM, "randbelow"),
     ],
 )
 def test_flags_trouble_spot(func, category, symbol_contains):
@@ -102,9 +137,34 @@ def test_flags_trouble_spot(func, category, symbol_contains):
     assert category in findings[0].message
 
 
-@pytest.mark.parametrize("func", [key_clean, guard_clean])
+@pytest.mark.parametrize(
+    "func",
+    [
+        key_clean,
+        guard_clean,
+        # Deterministic members of "risky" packages — the strict-mode false-positive fix.
+        guard_timedelta,
+        guard_fixed_uuid,
+        guard_fixed_date,
+        guard_strftime_of_arg,
+    ],
+)
 def test_clean_callable_has_no_findings(func):
     assert lint_callable(func) == []
+
+
+def test_deterministic_members_do_not_raise_in_strict_mode():
+    """A deterministic ``datetime``/``uuid`` member must not break construction under strict.
+
+    Regression for the review finding: blanket top-package classification used to flag
+    ``datetime.timedelta``/``uuid.UUID(...)`` and, with CPNX_LINT_STRICT, raise on valid nets.
+    """
+    set_strict(True)
+    try:
+        assert lint_and_warn(guard_timedelta, "guard") == []
+        assert lint_and_warn(guard_fixed_uuid, "key") == []
+    finally:
+        set_strict(False)
 
 
 def test_dict_get_is_not_a_false_positive():

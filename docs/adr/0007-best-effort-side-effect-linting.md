@@ -41,16 +41,23 @@ three categories:
 - **network** — `requests`, `httpx`, `urllib`, `http`, `socket`, `smtplib`, …
 - **database** — `sqlite3`, `psycopg2`/`psycopg`, `sqlalchemy`, `pymysql`,
   `asyncpg`, `pymongo`, `redis`, …
-- **nondeterminism** — `time`, `datetime`, `random`, `secrets`, `uuid`, and
-  distinctive clock/entropy attributes (`.now`, `.monotonic`, `.urandom`, …).
+- **nondeterminism** — `random` (whole-surface), plus the *specific*
+  non-deterministic members of the mixed-surface stdlib packages `time`
+  (`time`/`monotonic`/`perf_counter`/…), `datetime` (`now`/`utcnow`/`today`),
+  `uuid` (`uuid1`/`uuid4`), and `secrets` (`token_hex`/`randbelow`/…), and a small
+  by-name table of distinctive clock/entropy attributes (`.now`, `.monotonic`,
+  `.urandom`, …) for local-alias receivers.
 
 Detection is by **resolving the called symbol to the package that defines it**
 (so `import requests as r; r.get(...)` and `from requests import get; get(...)`
-resolve identically), backed by a small distinctive-attribute table for the
-class-receiver case (`from datetime import datetime; datetime.now()`). Ambiguous
-names that collide with token-payload/dict methods (`.get`, `.execute`,
-`.connect`) are **excluded** from the attribute table — they rely on module
-resolution, which does not misfire on a plain dict.
+resolve identically). Whole-surface-effect packages (the network/database drivers,
+`random`) flag outright; mixed-surface packages flag only their listed members, so
+deterministic API — `datetime.timedelta`, `uuid.UUID("…")`, `time.strftime(…)` — is
+**not** flagged (which matters especially under strict mode, where a false positive
+would break construction of a valid net). Ambiguous names that collide with
+token-payload/dict methods (`.get`, `.execute`, `.connect`, `.time`) are **excluded**
+from the by-name table — they rely on package/member resolution, which does not
+misfire on a plain dict or user object.
 
 ### 2. Severity: **warn by default**, strict opt-in
 
