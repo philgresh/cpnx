@@ -107,6 +107,10 @@ def to_dot(net: "PetriNet", *, highlight_impact_from: str | None = None) -> str:
     Returns:
         A string containing the full `digraph PetriNet { ... }` DOT source,
         suitable for rendering with Graphviz (e.g. `dot -Tpng`).
+
+    Raises:
+        KeyError: if `highlight_impact_from` names no transition in `net`. The trace
+            runs before any DOT is built, so nothing is emitted on failure.
     """
     from cpnx.places import ResourcePlace
 

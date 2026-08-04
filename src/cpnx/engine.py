@@ -1367,6 +1367,10 @@ class PetriNet:
         Returns:
             A DOT language string. Render with Graphviz or paste into
             https://dreampuf.github.io/GraphvizOnline/.
+
+        Raises:
+            KeyError: if `highlight_impact_from` names no transition in this net
+                (raised before any DOT is produced).
         """
         return to_dot(self, highlight_impact_from=highlight_impact_from)
 
@@ -1383,6 +1387,9 @@ class PetriNet:
 
         Returns:
             An [`ImpactMap`][cpnx.ImpactMap] of downstream places and transitions.
+
+        Raises:
+            KeyError: if `transition_name` is not a transition in this net.
         """
         return trace_impact(self, transition_name, colors=colors)
 

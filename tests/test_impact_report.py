@@ -147,3 +147,31 @@ def test_empty_net_report_is_empty():
     report = net.risk_report()
     assert report["findings"] == []
     assert report["impact_maps"] == {}
+
+
+def test_risk_report_skips_transition_removed_after_snapshot(monkeypatch):
+    """A transition vanishing between the lock-snapshot and its per-transition trace
+    is skipped, not fatal. `risk_report` snapshots the transition list under the lock,
+    releases it, then re-enters `trace_impact` (which re-acquires the lock and raises
+    `KeyError` on an unknown name) per transition — a TOCTOU window on a live net. The
+    guard catches that `KeyError` and continues rather than aborting the whole report.
+    """
+    import cpnx.analysis as analysis
+
+    net = _build_net()
+    real_trace = analysis.trace_impact
+
+    def flaky_trace(n, name, **kwargs):
+        if name == "dirty":
+            raise KeyError(name)  # simulate a concurrent removal after the snapshot
+        return real_trace(n, name, **kwargs)
+
+    monkeypatch.setattr(analysis, "trace_impact", flaky_trace)
+    report = net.risk_report()
+
+    # The report still completes: the stale transition is absent from impact_maps,
+    # its lint findings (gathered before the trace) survive, and other transitions
+    # are traced normally.
+    assert "dirty" not in report["impact_maps"]
+    assert any(f["transition"] == "dirty" for f in report["findings"])
+    assert "annotated" in report["impact_maps"]

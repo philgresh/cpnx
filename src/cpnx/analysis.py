@@ -166,6 +166,14 @@ def trace_impact(
     the place→consumers routing is rebuilt fresh each call, so transitions added
     after an earlier trace are picked up.
 
+    Note on precision: an **undeclared** seed (``impacts_colors is None`` and no
+    ``colors=`` override) traces *universally*, so its radius bleeds through every
+    shared [`ResourcePlace`][cpnx.ResourcePlace] into every transition that borrows the
+    same permit pool — a resource self-loop is a legitimate downstream hop. That is the
+    documented sound over-approximation, not a bug; narrow it by *declaring* the seed's
+    colours (any set excluding ``"resource"`` prunes the pools, since a resource pool's
+    ``color_set`` is ``{"resource"}``).
+
     Args:
         net: The [`PetriNet`][cpnx.PetriNet] to analyse.
         transition_name: The seed transition.
@@ -312,7 +320,14 @@ def risk_report(net: "PetriNet") -> dict:
 
         declared = getattr(t, "impacts_colors", None) is not None
         if t_findings or declared:
-            impact_maps[t.name] = trace_impact(net, t.name).to_dict()
+            try:
+                impact_maps[t.name] = trace_impact(net, t.name).to_dict()
+            except KeyError:
+                # The transition list was snapshotted under the lock, but each
+                # trace re-acquires it: a concurrent removal between snapshot and
+                # trace leaves a stale name. Skip it rather than aborting the whole
+                # report — a live-mutation edge, not a bug in a static net.
+                pass
         if t_findings:
             findings_out.append({"transition": t.name, "findings": t_findings})
 
