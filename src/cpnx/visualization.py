@@ -108,7 +108,7 @@ def to_dot(net: "PetriNet", *, highlight_impact_from: str | None = None) -> str:
         A string containing the full `digraph PetriNet { ... }` DOT source,
         suitable for rendering with Graphviz (e.g. `dot -Tpng`).
     """
-    from cpnx.places import ResourcePlace, SinkPlace
+    from cpnx.places import ResourcePlace
 
     # Compute the blast radius *before* taking the lock: trace_impact acquires the
     # same (non-reentrant) lock itself.
@@ -121,127 +121,190 @@ def to_dot(net: "PetriNet", *, highlight_impact_from: str | None = None) -> str:
     with net._lock:
         places = net.places
         transitions = net.transitions
-
-        # Places produced by at least one output arc — anything absent is arc-sourceless.
-        produced = {arc.place for t in transitions.values() for arc in t.outputs}
-
-        def _is_resource(place_name: str) -> bool:
-            return isinstance(places.get(place_name), ResourcePlace)
-
-        # Resource borrows with no matching resource output arc → engine returns them
-        # implicitly; we draw that as a dashed edge so the picture stays honest.
-        implicit_returns: list[tuple[str, str]] = []
-        for tname, trans in transitions.items():
-            res_in = {a.place for a in trans.inputs if _is_resource(a.place)}
-            res_out = {a.place for a in trans.outputs if _is_resource(a.place)}
-            implicit_returns.extend((tname, pool) for pool in sorted(res_in - res_out))
-
         error_place = net.error_place
+        # Places produced by at least one output arc — anything absent is arc-sourceless.
+        produced = _produced_places(transitions)
+
         lines = ["digraph PetriNet {", "  rankdir=LR;"]
 
-        # Nodes: Places
-        has_source = has_sink = has_error = False
+        # Nodes: Places (each contributes at most one legend "role").
+        roles: set[str] = set()
         for name, place in places.items():
-            is_resource = isinstance(place, ResourcePlace)
-            is_sink = isinstance(place, SinkPlace)
-            is_error = bool(error_place) and name == error_place
-            is_drain = is_sink or is_error  # terminal / dead-letter — tokens fall in and stay
-            count = place.stats()["absorbed"] if is_sink else len(place)
-            # De-emphasise counts (the focus is a token's *paths*): show one only when a
-            # place actually holds tokens — e.g. an initial resource marking.
-            label = name if count == 0 else f"{name}\\n({count})"
-            shape = "doublecircle" if is_resource else "circle"
-            attrs = [f"shape={shape}", f'label="{label}"']
-
-            fill: str | None = None
-            style: str | None = None
-            if impact is not None and name in impact.places:
-                fill, style = _IMPACT_FILL, "filled"  # blast-radius overlay wins (solid)
-            elif is_resource:
-                fill, style = _RESOURCE_FILL, "filled"
-            elif is_drain:  # inverted-cone "well": a radial gradient reads as an inset shadow
-                fill = _ERROR_GRADIENT if is_error else _SINK_GRADIENT
-                style = "radial"
-                has_error = has_error or is_error
-                has_sink = has_sink or not is_error
-            elif name not in produced:  # arc in-degree 0 → external source
-                style = "dashed"
-                has_source = True
-            if fill is not None:
-                attrs.append(f'fillcolor="{fill}"')
-            if style is not None:
-                attrs.append(f'style="{style}"')
-            lines.append(f'  "{name}" [{", ".join(attrs)}];')
+            line, role = _place_node_line(
+                name, place, impact=impact, produced=produced, error_place=error_place
+            )
+            lines.append(line)
+            if role is not None:
+                roles.add(role)
 
         # Nodes: Transitions
-        for name in transitions.keys():
-            attrs = f'shape=box, label="{name}"'
-            if impact is not None:
-                if name == impact.origin:
-                    attrs += f', style=filled, fillcolor="{_IMPACT_ORIGIN_FILL}", penwidth=2'
-                elif name in impact.transitions:
-                    attrs += f', style=filled, fillcolor="{_IMPACT_FILL}"'
-            lines.append(f'  "{name}" [{attrs}];')
+        for name in transitions:
+            lines.append(_transition_node_line(name, impact))
 
-        # Edges
+        # Edges: input/output arcs, in transition order.
         for name, trans in transitions.items():
-            # Inputs: Place -> Transition
-            for arc in trans.inputs:
-                label_parts = [f"count={arc.count}"]
-                if arc.consume_all:
-                    label_parts.append("consume_all")
-                if arc.settle_secs > 0.0:
-                    label_parts.append(f"settle={arc.settle_secs}s")
-                label = ", ".join(label_parts)
-                lines.append(f'  "{arc.place}" -> "{name}" [label="{label}"];')
+            lines.extend(_arc_edge_lines(name, trans))
 
-            # Outputs: Transition -> Place
-            for out_arc in trans.outputs:
-                label = f"count={out_arc.count}"
-                lines.append(f'  "{name}" -> "{out_arc.place}" [label="{label}"];')
+        # Off-arc token paths (dashed) so no place looks isolated and no path is hidden.
+        implicit = _implicit_return_lines(transitions, places)
+        lines.extend(implicit)
+        deadletter, deadletter_drawn = _dead_letter_lines(transitions, error_place, places)
+        lines.extend(deadletter)
 
-        # Implicit resource returns (drawn only when the model omits the self-loop).
-        for tname, pool in implicit_returns:
-            lines.append(f'  "{tname}" -> "{pool}" [label="return (implicit)", style=dashed];')
-
-        # Dead-letter paths: a transition with a finite `max_retries` routes a failed data
-        # token to the error place *off-arc* (engine dead-lettering), which is why the error
-        # place otherwise looks isolated. Draw it dashed and `constraint=false` so the token's
-        # valid failure path is visible without warping the main flow layout. Skip any
-        # transition that already has a real output arc to the error place.
-        deadletter_drawn = False
-        if error_place and error_place in places:
-            for tname, trans in transitions.items():
-                if trans.max_retries is None:  # infinite retry → never dead-letters
-                    continue
-                if any(a.place == error_place for a in trans.outputs):  # already a real arc
-                    continue
-                # Unlabelled, thin, pale: a quiet side channel. The legend names it once,
-                # so we don't repeat "dead-letter" on every one of these edges.
-                lines.append(
-                    f'  "{tname}" -> "{error_place}" [style=dashed, color="{_DEADLETTER_COLOR}", '
-                    f"penwidth=0.6, arrowsize=0.7, constraint=false];"
-                )
-                deadletter_drawn = True
-
-        # Legend — only the encodings actually present, so trivial nets stay clean.
-        legend = []
-        if any(isinstance(p, ResourcePlace) for p in places.values()):
-            legend.append("double circle = resource pool")
-        if has_source:
-            legend.append("dashed circle = external source")
-        if has_sink:
-            legend.append("well (radial fill) = sink / terminal")
-        if has_error:
-            legend.append("salmon well = error place (dead-letter target)")
-        if deadletter_drawn:
-            legend.append("dashed red = dead-letter path")
-        if implicit_returns:
-            legend.append("dashed edge = implicit permit return")
-        if impact is not None:
-            legend.append(f"pink = blast radius of {impact.origin}")
-        if legend:
-            lines.append(f'  label="{"  ·  ".join(legend)}"; labelloc="b"; fontsize=9; fontcolor="#666666";')
+        legend = _legend_line(
+            has_resource=any(isinstance(p, ResourcePlace) for p in places.values()),
+            roles=roles,
+            deadletter_drawn=deadletter_drawn,
+            has_implicit=bool(implicit),
+            impact=impact,
+        )
+        if legend is not None:
+            lines.append(legend)
 
         lines.append("}")
         return "\n".join(lines)
+
+
+def _produced_places(transitions: dict) -> set[str]:
+    """Names of places produced by at least one output arc (in-degree > 0)."""
+    return {arc.place for t in transitions.values() for arc in t.outputs}
+
+
+def _place_fill_style(
+    name: str, *, is_resource: bool, is_sink: bool, is_error: bool, impact: Any, produced: set[str]
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve a place's `(fillcolor, style, legend-role)` in priority order.
+
+    `role` is one of `None`, `"source"`, `"sink"`, `"error"` — the legend keys whose
+    presence depends on a place actually appearing. A blast-radius overlay wins over
+    every structural role; a resource pool over a drain; error over sink.
+    """
+    if impact is not None and name in impact.places:
+        return _IMPACT_FILL, "filled", None  # blast-radius overlay wins (solid)
+    if is_resource:
+        return _RESOURCE_FILL, "filled", None
+    if is_error:  # inverted-cone "well": a radial gradient reads as an inset shadow
+        return _ERROR_GRADIENT, "radial", "error"
+    if is_sink:
+        return _SINK_GRADIENT, "radial", "sink"
+    if name not in produced:  # arc in-degree 0 → external source
+        return None, "dashed", "source"
+    return None, None, None
+
+
+def _place_node_line(
+    name: str, place: Any, *, impact: Any, produced: set[str], error_place: str | None
+) -> tuple[str, str | None]:
+    """Render one place node as a DOT line; return `(line, legend-role-or-None)`."""
+    from cpnx.places import ResourcePlace, SinkPlace
+
+    is_resource = isinstance(place, ResourcePlace)
+    is_sink = isinstance(place, SinkPlace)
+    is_error = bool(error_place) and name == error_place
+    count = place.stats()["absorbed"] if is_sink else len(place)
+    # De-emphasise counts (the focus is a token's *paths*): show one only when a
+    # place actually holds tokens — e.g. an initial resource marking.
+    label = name if count == 0 else f"{name}\\n({count})"
+    shape = "doublecircle" if is_resource else "circle"
+    attrs = [f"shape={shape}", f'label="{label}"']
+
+    fill, style, role = _place_fill_style(
+        name, is_resource=is_resource, is_sink=is_sink, is_error=is_error,
+        impact=impact, produced=produced,
+    )
+    if fill is not None:
+        attrs.append(f'fillcolor="{fill}"')
+    if style is not None:
+        attrs.append(f'style="{style}"')
+    return f'  "{name}" [{", ".join(attrs)}];', role
+
+
+def _transition_node_line(name: str, impact: Any) -> str:
+    """Render one transition node, shaded if it is the blast-radius seed or a member."""
+    attrs = f'shape=box, label="{name}"'
+    if impact is not None:
+        if name == impact.origin:
+            attrs += f', style=filled, fillcolor="{_IMPACT_ORIGIN_FILL}", penwidth=2'
+        elif name in impact.transitions:
+            attrs += f', style=filled, fillcolor="{_IMPACT_FILL}"'
+    return f'  "{name}" [{attrs}];'
+
+
+def _arc_edge_lines(name: str, trans: Any) -> list[str]:
+    """Input (place→transition) then output (transition→place) edges for one transition."""
+    lines = []
+    for arc in trans.inputs:
+        label_parts = [f"count={arc.count}"]
+        if arc.consume_all:
+            label_parts.append("consume_all")
+        if arc.settle_secs > 0.0:
+            label_parts.append(f"settle={arc.settle_secs}s")
+        lines.append(f'  "{arc.place}" -> "{name}" [label="{", ".join(label_parts)}"];')
+    for out_arc in trans.outputs:
+        lines.append(f'  "{name}" -> "{out_arc.place}" [label="count={out_arc.count}"];')
+    return lines
+
+
+def _implicit_return_lines(transitions: dict, places: dict) -> list[str]:
+    """Dashed `return (implicit)` edges — a resource borrow with no matching output arc,
+    so the engine returns the permit implicitly (drawn only when the self-loop is omitted)."""
+    from cpnx.places import ResourcePlace
+
+    pools = {n for n, p in places.items() if isinstance(p, ResourcePlace)}
+    lines = []
+    for tname, trans in transitions.items():
+        res_in = {a.place for a in trans.inputs if a.place in pools}
+        res_out = {a.place for a in trans.outputs if a.place in pools}
+        for pool in sorted(res_in - res_out):
+            lines.append(f'  "{tname}" -> "{pool}" [label="return (implicit)", style=dashed];')
+    return lines
+
+
+def _dead_letter_lines(
+    transitions: dict, error_place: str | None, places: dict
+) -> tuple[list[str], bool]:
+    """Dashed, `constraint=false` dead-letter side channels from finite-`max_retries`
+    transitions to the error place (engine failure routing), so it does not look isolated.
+
+    Returns `(lines, drawn)`; `drawn` gates the legend entry. Skips any transition that
+    already has a real output arc to the error place.
+    """
+    if not (error_place and error_place in places):
+        return [], False
+    lines = []
+    for tname, trans in transitions.items():
+        if trans.max_retries is None:  # infinite retry → never dead-letters
+            continue
+        if any(a.place == error_place for a in trans.outputs):  # already a real arc
+            continue
+        # Unlabelled, thin, pale: a quiet side channel. The legend names it once,
+        # so we don't repeat "dead-letter" on every one of these edges.
+        lines.append(
+            f'  "{tname}" -> "{error_place}" [style=dashed, color="{_DEADLETTER_COLOR}", '
+            f"penwidth=0.6, arrowsize=0.7, constraint=false];"
+        )
+    return lines, bool(lines)
+
+
+def _legend_line(
+    *, has_resource: bool, roles: set[str], deadletter_drawn: bool, has_implicit: bool, impact: Any
+) -> str | None:
+    """Assemble the bottom legend from only the encodings actually present (or `None`)."""
+    legend = []
+    if has_resource:
+        legend.append("double circle = resource pool")
+    if "source" in roles:
+        legend.append("dashed circle = external source")
+    if "sink" in roles:
+        legend.append("well (radial fill) = sink / terminal")
+    if "error" in roles:
+        legend.append("salmon well = error place (dead-letter target)")
+    if deadletter_drawn:
+        legend.append("dashed red = dead-letter path")
+    if has_implicit:
+        legend.append("dashed edge = implicit permit return")
+    if impact is not None:
+        legend.append(f"pink = blast radius of {impact.origin}")
+    if not legend:
+        return None
+    return f'  label="{"  ·  ".join(legend)}"; labelloc="b"; fontsize=9; fontcolor="#666666";'
