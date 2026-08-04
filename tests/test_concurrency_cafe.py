@@ -72,14 +72,17 @@ class TestConcurrencyCafeRuns:
     def test_orders_make_forward_progress(self):
         with build_cafe() as net:
             for payload in ORDERS:
-                net.deposit("P_Ticket_Line", Token(payload=payload))
+                # Orders enter through the single front door; T_Take_Order writes tickets.
+                net.deposit("P_New_Order", Token(payload=payload))
 
             net.run(deadline=time.monotonic() + 3.0)
 
-            # The grinder is available at t=0, so at least one ticket must leave the line —
-            # a net that can't fire at all is a real regression. (We don't assert an exact
-            # served count: the grinder's pacing cooldown and the ~15% channeling failure
-            # make the precise number nondeterministic within a short deadline.)
+            # Every order must clear the front door (T_Take_Order), and at least one must
+            # then be ground — a net that can't fire at all is a real regression. (We don't
+            # assert an exact served count: the grinder's pacing cooldown and the ~15%
+            # channeling failure make the precise number nondeterministic within a short
+            # deadline.)
+            assert len(net.marking["P_New_Order"]) == 0, "orders never left the front door"
             remaining = len(net.marking["P_Ticket_Line"])
             assert remaining < len(ORDERS), "no order left the ticket line — cafe never fired"
 

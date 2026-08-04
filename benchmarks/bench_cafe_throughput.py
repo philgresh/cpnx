@@ -107,7 +107,7 @@ def _run_once(n_orders: int, dose_tolerance_g: float | None, channel_rate: float
         dose_tolerance_g=dose_tolerance_g,
     ) as net:
         for payload in _order_payloads(n_orders):
-            net.deposit("P_Ticket_Line", Token(payload=payload))
+            net.deposit("P_New_Order", Token(payload=payload))  # single front door → T_Take_Order
 
         result = drive_to_quiescence(net)
 

@@ -41,8 +41,10 @@ Token colours in play
 - `None` (order tickets) — an uncoloured data token carrying the customer's order as
   its `payload`: `ratio`, `weight_g`, `dairy_free`, `mobile_pickup`.
 - `"resource"` — permit tokens pre-filled into [`ResourcePlace`][cpnx.ResourcePlace] and
-  [`PacedResourcePlace`][cpnx.PacedResourcePlace] instances (scales, grinders, group heads, wands). The engine
-  returns these automatically once consumed; action code never hands them back.
+  [`PacedResourcePlace`][cpnx.PacedResourcePlace] instances (scales, grinders, group heads, wands). Each borrowing
+  transition returns the permit through a matching output arc — a resource **self-loop** —
+  so the borrow-and-return is visible in the net structure (`M' = M − Pre + Post`); the
+  engine routes the consumed permit through that arc, and action code never hands it back.
 - `"ground_coffee"` / `"milk_ticket"` — intermediate work-in-progress tokens produced
   by the grind step, one feeding the espresso line and one the milk line.
 - `"espresso"` / `"oat_milk"` / `"dairy_milk"` — finished component tokens that
@@ -54,7 +56,8 @@ Base topology (always present)
 ------------------------------
 | Place | cpnx type | Cafe role |
 | --- | --- | --- |
-| `P_Ticket_Line` | [`Place`][cpnx.Place] | Unbounded FIFO of incoming order tickets |
+| `P_New_Order` | [`Place`][cpnx.Place] | The single front door — a customer's order enters here |
+| `P_Ticket_Line` | [`Place`][cpnx.Place] | Unbounded FIFO of tickets (written by `T_Take_Order`; rework returns here) |
 | `P_Digital_Scales` | [`ResourcePlace`][cpnx.ResourcePlace] | Shared pool of 3 scales |
 | `P_Burr_Grinder` | [`PacedResourcePlace`][cpnx.PacedResourcePlace] | Grinders, each with a cooldown |
 | `P_Ground_Coffee` | [`Place`][cpnx.Place] | Grounds awaiting a shot |

@@ -108,6 +108,41 @@ to watch the linter flag every one; `benchmarks/lint_cafe.py` prints the before/
 
 ::: cafe.stations.decidability_hazards
 
+## Blast-radius / impact analysis
+
+The linter tells you **which** transitions are hazards; it does not tell you **how far**
+each one's effect can spread. That is the job of the colour-domain blast-radius tracer
+([ADR 0008](https://github.com/philgresh/cpnx/blob/main/docs/adr/0008-color-domain-impact-analysis.md))
+— the sibling safety prong to ADR 0007's linter. A transition declares the token colour domain it mutates via the
+purely-declarative
+[`impacts_colors`][cpnx.Transition] annotation, and
+[`trace_impact`][cpnx.trace_impact] walks the static topology **forward** from that
+transition's output places, pruning any downstream place whose `color_set` cannot carry a
+declared colour (a cone-of-influence slice). The trace is a deliberate **over-approximation**:
+it may over-name, but it never omits a genuinely-reachable node.
+
+```python
+net = build_cafe(hazards=True)
+
+# How far does the inventory-gated grind reach downstream?
+impact = net.trace_impact("T_Stock_Check_Grind")
+print(sorted(impact.places), sorted(impact.transitions))
+
+# Fuse the two prongs: lint every enabling inscription, and attach a blast
+# radius for each transition that trips the linter OR declares impacts_colors.
+report = net.risk_report()
+#   report["findings"]      → which transitions are hazards (and why)
+#   report["impact_maps"]   → how far each one's effect spreads
+
+# Render the DOT with the blast radius shaded (impacted nodes filled, seed heavier).
+dot = net.to_dot(highlight_impact_from="T_Stock_Check_Grind")
+```
+
+`risk_report()` is the single verification/debugging entry point that fuses linting and
+tracing into one JSON-serialisable object. `benchmarks/impact_cafe.py` is the runnable
+companion to `benchmarks/lint_cafe.py`: where the latter prints the linter's before/after on
+`build_cafe(hazards=True)`, the former prints each hazard's blast radius.
+
 ## Shared helpers
 
 ::: cafe.support

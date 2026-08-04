@@ -1,3 +1,4 @@
+from cpnx.analysis import ImpactMap, risk_report, trace_impact
 from cpnx.engine import DriveResult, PetriNet
 from cpnx.linting import (
     CpnxLintWarning,
@@ -35,4 +36,7 @@ __all__ = [
     "CpnxLintWarning",
     "SideEffectLintError",
     "set_strict",
+    "ImpactMap",
+    "trace_impact",
+    "risk_report",
 ]

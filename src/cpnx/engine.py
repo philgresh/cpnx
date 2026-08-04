@@ -14,6 +14,7 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from typing import Callable, Iterator, TypeAlias, cast
 
+from cpnx.analysis import ImpactMap, risk_report, trace_impact
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace
 from cpnx.tokens import ERROR_COLOR, Token
 from cpnx.transitions import BindingPolicy, InputArc, OutputArc, SubstitutionTransition, Transition
@@ -1348,7 +1349,7 @@ class PetriNet:
         """
         return snapshot(self)
 
-    def to_dot(self) -> str:
+    def to_dot(self, *, highlight_impact_from: str | None = None) -> str:
         """Render the net's places, transitions, and arcs as a Graphviz DOT string.
 
         Delegates to the module-level [`to_dot`][cpnx.to_dot] function.
@@ -1357,11 +1358,56 @@ class PetriNet:
         Transition nodes are boxes. Arc labels include `count`,
         `consume_all`, and `settle_secs` where non-default.
 
+        Args:
+            highlight_impact_from: If given, the name of a transition whose forward
+                blast radius (see [`trace_impact`][cpnx.trace_impact]) is shaded in the
+                output: impacted places/transitions are filled, and the seed transition
+                is accented. `None` (default) renders the plain net, unchanged.
+
         Returns:
             A DOT language string. Render with Graphviz or paste into
             https://dreampuf.github.io/GraphvizOnline/.
+
+        Raises:
+            KeyError: if `highlight_impact_from` names no transition in this net
+                (raised before any DOT is produced).
         """
-        return to_dot(self)
+        return to_dot(self, highlight_impact_from=highlight_impact_from)
+
+    def trace_impact(self, transition_name: str, *, colors: object = None) -> ImpactMap:
+        """Trace the forward colour-domain blast radius of a transition.
+
+        Delegates to [`trace_impact`][cpnx.trace_impact]. See its docs for the walk,
+        the colour-pruning gate, and the over-approximation stance.
+
+        Args:
+            transition_name: The seed transition.
+            colors: Optional colour domain to trace; defaults to the transition's
+                [`impacts_colors`][cpnx.Transition] declaration.
+
+        Returns:
+            An [`ImpactMap`][cpnx.ImpactMap] of downstream places and transitions.
+
+        Raises:
+            KeyError: if `transition_name` is not a transition in this net.
+        """
+        return trace_impact(self, transition_name, colors=colors)
+
+    def risk_report(self) -> dict:
+        """Return a JSON-serialisable report fusing lint findings with blast radii.
+
+        Delegates to [`risk_report`][cpnx.risk_report]: for every transition it lints
+        the enabling inscriptions and, for any that trips the linter or declares
+        [`impacts_colors`][cpnx.Transition], attaches its blast radius. This is the
+        verification / debugging entry point that ties cpnx's two safety prongs
+        (best-effort side-effect linting, ADR 0007; colour-domain impact analysis,
+        ADR 0008) together.
+
+        Returns:
+            A dict with `"findings"` (per-transition lint hits) and `"impact_maps"`
+            (per-transition [`ImpactMap`][cpnx.ImpactMap] dicts).
+        """
+        return risk_report(self)
 
     # ------------------------------------------------------------------
     # Context manager — preferred over __del__ for deterministic shutdown
