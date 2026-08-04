@@ -13,6 +13,37 @@ from cafe.support import with_work
 from cpnx import BindingPolicy, InputArc, OutputArc, Transition
 
 
+def t_take_order(*, work_secs: float = 0.0) -> Transition:
+    """**T_Take_Order** — the register takes a customer's order and writes a ticket.
+
+    Cafe role:
+        The single front door of the shop. A customer arrives on `P_New_Order` wanting
+        something; the register writes it up and drops the ticket onto `P_Ticket_Line`,
+        where the bar takes over. This gives the net one legible external entry point
+        instead of tickets appearing on the rail from nowhere.
+
+    Demonstrates:
+        The simplest possible transition — a **1-in-1-out relocation** with no guard, no
+        resource, and a payload-preserving action. It is deliberately *neutral*: it does
+        **not** re-order or prioritise. VIP handling stays downstream — the order's
+        `mobile_pickup` flag rides through untouched and `T_Weigh_And_Grind`'s
+        `binding_priority_key` (`mobile_pickup_first`) pulls app orders ahead at the
+        grinder, where that preference is defined and measured. Keeping the door neutral
+        avoids double-locating the VIP logic and leaves the tuned priority-depth
+        behaviour exactly where it lives.
+
+    Args:
+        work_secs: Physical seconds the register occupies a worker.
+    """
+    return Transition(
+        name="T_Take_Order",
+        inputs=[InputArc("P_New_Order")],
+        outputs=[OutputArc("P_Ticket_Line")],
+        action=with_work(work_secs, lambda tokens: list(tokens)),
+        action_timeout_secs=0.5,
+    )
+
+
 def t_weigh_and_grind(
     *,
     work_secs: float = 0.0,
@@ -84,7 +115,17 @@ def t_weigh_and_grind(
     return Transition(
         name="T_Weigh_And_Grind",
         inputs=inputs,
-        outputs=[OutputArc("P_Ground_Coffee"), OutputArc("P_Milk_Queue")],
+        # The two permit arcs are **self-loops**: a matching OutputArc returns each
+        # borrowed permit to its pool, so the net expresses the return structurally
+        # (M' = M − Pre + Post) rather than relying on the engine's implicit
+        # leftover-return. The engine routes the consumed permit through the resource
+        # OutputArc; the action still returns only the two data tokens below.
+        outputs=[
+            OutputArc("P_Ground_Coffee"),
+            OutputArc("P_Milk_Queue"),
+            OutputArc("P_Digital_Scales"),
+            OutputArc("P_Burr_Grinder"),
+        ],
         action=with_work(work_secs, actions.weigh_and_grind),
         action_timeout_secs=1.0,
         guard=guard,
@@ -127,7 +168,10 @@ def t_pull_shot(
     return Transition(
         name="T_Pull_Shot",
         inputs=[InputArc("P_Ground_Coffee"), InputArc("P_Espresso_Machine")],
-        outputs=[OutputArc("P_Order_Tray")],
+        # `P_Espresso_Machine` is a **self-loop**: the group-head permit is returned via
+        # a matching OutputArc, so the borrow is visible in the net structure. On the
+        # failure path the permit is instead returned by atomic rollback (see below).
+        outputs=[OutputArc("P_Order_Tray"), OutputArc("P_Espresso_Machine")],
         action=with_work(work_secs, actions.make_pull_shot(channel_failure_rate, channel_seed)),
         action_timeout_secs=0.5,
         max_retries=1,
@@ -154,9 +198,13 @@ def t_steam_milk(*, work_secs: float = 0.0) -> Transition:
     return Transition(
         name="T_Steam_Milk",
         inputs=[InputArc("P_Milk_Queue"), InputArc("P_Steam_Wand")],
+        # The two `on_color` arcs are the conditional data outputs (exactly one fires
+        # per milk); `P_Steam_Wand` is an unconditional **self-loop** returning the wand
+        # permit to its pool, so the borrow-and-return is structural.
         outputs=[
             OutputArc.on_color("oat_milk", "P_Order_Tray"),
             OutputArc.on_color("dairy_milk", "P_Order_Tray"),
+            OutputArc("P_Steam_Wand"),
         ],
         action=with_work(work_secs, actions.steam_milk),
         action_timeout_secs=0.5,

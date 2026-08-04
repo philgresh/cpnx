@@ -42,6 +42,29 @@ def p_ticket_line() -> Place:
     return Place("P_Ticket_Line", schema=is_order)
 
 
+def p_new_order() -> Place:
+    """**P_New_Order** — the single front door: a customer arrives wanting something.
+
+    Cafe role:
+        The one place a customer's order enters the shop through. `T_Take_Order` (the
+        register) takes it and writes a ticket onto `P_Ticket_Line`. Modelling intake
+        as its own source place — rather than depositing straight onto the rail — is
+        what makes the net's *external* boundary a single, legible entry point instead
+        of several look-alike queues fed from outside.
+
+    Demonstrates:
+        A true **source place**: no transition produces into it (arc in-degree 0), so
+        its only tokens come from an external `deposit(...)`. `to_dot` renders it with a
+        dashed border for exactly that reason. `schema=is_order` keeps the same
+        `weight_g` contract as `P_Ticket_Line`, since the order carries its dose from
+        the moment it is placed. It is deliberately **not** where VIP/loyalty
+        prioritisation happens — the order's `mobile_pickup` flag rides through intake
+        untouched and is acted on downstream by `T_Weigh_And_Grind`'s
+        `binding_priority_key`, so the door stays a neutral, payload-preserving hand-off.
+    """
+    return Place("P_New_Order", schema=is_order)
+
+
 def p_digital_scales(capacity: int = 3) -> ResourcePlace:
     """**P_Digital_Scales** — the shared pool of bench scales.
 

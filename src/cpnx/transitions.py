@@ -5,6 +5,7 @@ import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Literal
 
+from cpnx.analysis import coerce_color_domain
 from cpnx.certification import is_inline_safe
 from cpnx.linting import lint_and_warn
 from cpnx.sandbox import verify_callable_purity
@@ -490,6 +491,21 @@ class Transition:
                — up to `binding_search_limit` times per resolution. It is purity-verified
                (no I/O) but *not* time-bounded, so it must be trivially cheap; an expensive
                key stalls every concurrent `deposit`/`step`/probe on the net.
+        impacts_colors: Optional **declarative** annotation naming the token colour
+               domain(s) this transition mutates or side-effects — e.g.
+               `impacts_colors={"order", "refund"}`. Purely a hint for
+               [`trace_impact`][cpnx.trace_impact] / [`PetriNet.risk_report`][cpnx.PetriNet.risk_report];
+               it is **never evaluated at run time** and does not affect firing. In the
+               spirit of high-level Petri net arc inscriptions (ISO/IEC 15909-1:2019),
+               which route tokens by colour, it lets the blast-radius tracer prune
+               downstream places whose `color_set` cannot carry a declared colour
+               (cone-of-influence slicing). Accepts any iterable of colour-name strings
+               (coerced to a `frozenset`); a **bare string raises `TypeError`** (pass
+               `{"order"}`, not `"order"`). `None` (default) means *undeclared* — the
+               tracer then treats the transition as impacting **every** colour (the
+               conservative over-approximation; an empty set, by contrast, is a
+               *narrowing* declaration). Cheap to add incrementally: it changes no
+               existing behaviour.
     """
 
     name: str
@@ -502,6 +518,7 @@ class Transition:
     max_retries: int | None = 5
     binding_policy: BindingPolicy | None = None
     binding_priority_key: Callable[[list[Token]], object] | None = None
+    impacts_colors: frozenset[str] | None = None
 
     def __setattr__(self, name, value):
         # Keep the inline-safe flag in sync with ``guard``, including post-construction
@@ -526,6 +543,11 @@ class Transition:
                 )
             verify_callable_purity(value)
             lint_and_warn(value, "binding_priority_key", stacklevel=3)
+        elif name == "impacts_colors":
+            # Declarative colour-domain annotation (not a callable): normalise any
+            # iterable of colour names to a frozenset, reject a bare string / non-str
+            # member. Consumed by the blast-radius tracer, never evaluated at run time.
+            value = coerce_color_domain(value, field="Transition.impacts_colors")
         super().__setattr__(name, value)
 
 

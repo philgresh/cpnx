@@ -90,8 +90,9 @@ def empty_knock_box(tokens: list[Token]) -> list[Token]:
         One motion, whatever is in the bin — there is no sorting or salvaging spent
         pucks, so the action just forwards every consumed puck token straight through to
         `P_Trash_Can` unchanged (aside from the resource permit, which is excluded here
-        and released back to `P_Espresso_Machine` by the engine's own resource-arc
-        bookkeeping, not by this action).
+        and returned to `P_Espresso_Machine` through the transition's matching resource
+        **self-loop** OutputArc — the engine routes the consumed permit there, not this
+        action).
 
     Demonstrates:
         The same **minimalism as experimental hygiene** used throughout this fixture
@@ -140,7 +141,10 @@ def transitions(*, work_secs: float = 0.0, min_pucks: int = 25) -> list[Transiti
                 InputArc("P_Knock_Box", consume_all=True),
                 InputArc("P_Espresso_Machine", count=1),
             ],
-            outputs=[OutputArc("P_Trash_Can")],
+            # `P_Espresso_Machine` is a **self-loop**: the group-head permit is held for
+            # the knock-out and returned via a matching OutputArc, so the borrow is
+            # structural rather than an implicit engine leftover-return.
+            outputs=[OutputArc("P_Trash_Can"), OutputArc("P_Espresso_Machine")],
             guard=make_lull_guard(min_pucks),
             action=with_work(work_secs, empty_knock_box),
             action_timeout_secs=0.5,

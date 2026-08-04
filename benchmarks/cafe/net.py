@@ -57,13 +57,22 @@ def build_cafe(
 ) -> PetriNet:
     """Wire up the Concurrency Cafe topology and return the (unstarted) [`PetriNet`][cpnx.PetriNet].
 
-    Flow: `P_Ticket_Line` → (weigh & grind, gated by the dose guard, using a scale and
-    a grinder) → `P_Ground_Coffee` / `P_Milk_Queue` in parallel → (pull shot, using a
-    group head / steam milk, using a wand) → `P_Order_Tray` (waits for both a shot and
-    a milk, and for the counter to settle) → (serve) → `P_Served`. A ticket whose
-    declared dose misses the tolerance band is reworked (`T_Rework_Dose`) and returned
-    to the back of `P_Ticket_Line` rather than ever reaching the grinder. Botched shots
-    are dead-lettered to `P_Trash_Can`.
+    Flow: a customer arrives on `P_New_Order` (the single front door) → (`T_Take_Order`,
+    the register writes a ticket) → `P_Ticket_Line` → (weigh & grind, gated by the dose
+    guard, using a scale and a grinder) → `P_Ground_Coffee` / `P_Milk_Queue` in parallel
+    → (pull shot, using a group head / steam milk, using a wand) → `P_Order_Tray` (waits
+    for both a shot and a milk, and for the counter to settle) → (serve) → `P_Served`. A
+    ticket whose declared dose misses the tolerance band is reworked (`T_Rework_Dose`)
+    and returned to the back of `P_Ticket_Line` rather than ever reaching the grinder.
+    Botched shots are dead-lettered to `P_Trash_Can`.
+
+    `P_Ticket_Line` remains directly depositable, so a micro-benchmark that wants to
+    isolate a single station (e.g. `bench_station_costs`) can bypass the intake and
+    stock the rail straight; the customer-facing drivers (throughput, concurrency, the
+    demo) deposit onto `P_New_Order` instead. VIP/loyalty prioritisation is unaffected —
+    intake is a neutral, payload-preserving hand-off, and `mobile_pickup_first` still
+    orders the grind. The opt-in station lanes below are deliberately separate
+    feature-probe workloads, each fed by its own benchmark, not part of this flow.
 
     This net is illustrative and **not conservation-checked**: transitions transform
     token colours and payloads rather than merely relocating fixed tokens, so
@@ -152,6 +161,7 @@ def build_cafe(
     dose_low, dose_high = dose_band(dose_tolerance_g)
 
     net_places = [
+        core_places.p_new_order(),
         core_places.p_ticket_line(),
         core_places.p_digital_scales(),
         core_places.p_burr_grinder(grinders=grinders, pacing_secs=pacing_secs),
@@ -165,6 +175,7 @@ def build_cafe(
     ]
 
     net_transitions = [
+        core_transitions.t_take_order(work_secs=work_secs),
         core_transitions.t_weigh_and_grind(
             work_secs=work_secs,
             dose_low=dose_low,

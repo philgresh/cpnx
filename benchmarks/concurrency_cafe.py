@@ -39,7 +39,8 @@ if __name__ == "__main__":
 
     with build_cafe() as net:
         for payload in orders:
-            net.deposit("P_Ticket_Line", Token(payload=payload))
+            # The single front door: customers arrive here, T_Take_Order writes tickets.
+            net.deposit("P_New_Order", Token(payload=payload))
 
         net.run(deadline=time.monotonic() + 2.0)
 

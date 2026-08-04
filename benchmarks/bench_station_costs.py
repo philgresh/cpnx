@@ -201,6 +201,9 @@ def _run_pipeline(n_orders: int, **flags) -> tuple[float, float]:
         for i, payload in enumerate(payloads):
             # Exactly one mobile ticket, deposited last so it sits deepest in the line.
             payload = {**payload, "mobile_pickup": i == n_orders - 1}
+            # Deposit STRAIGHT onto the rail (bypassing P_New_Order/T_Take_Order): this
+            # micro-benchmark measures the mobile ticket's priority depth at the grinder,
+            # which a trickle intake would dilute. P_Ticket_Line stays directly depositable.
             net.deposit("P_Ticket_Line", Token(payload=payload))
         result = drive_to_quiescence(net)
 
