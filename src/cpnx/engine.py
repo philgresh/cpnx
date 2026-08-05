@@ -219,8 +219,15 @@ class PetriNet:
     from multiple threads concurrently; transition *actions* themselves run outside that lock.
 
     Resource tokens (`Token.is_resource`) are always returned to their source place once a
-    firing completes, whether it succeeds or fails. For data tokens, the net supports four
-    error-handling dispositions:
+    firing completes, whether it succeeds or fails. On success that return is **structural**:
+    if a transition borrows from a `ResourcePlace` without declaring a matching `OutputArc`,
+    [`validate`][cpnx.PetriNet.validate] synthesizes the return arc (an explicit self-loop, an
+    `OutputArc` marked `synthesized=True`), so the permit's return is visible to
+    [`to_dot`][cpnx.PetriNet.to_dot], [`trace_impact`][cpnx.trace_impact], and structural
+    invariants rather than happening off-arc. This is behaviour-preserving and can be
+    suppressed per transition (`auto_return_resources=False`, or by declaring the arc
+    yourself); `consume_all` borrows and the failure/rollback return stay on the implicit
+    path. For data tokens, the net supports four error-handling dispositions:
 
     - **A. Colour-routed error (primary/canonical)** — the action catches its own
       exception, returns an error-coloured token, and output-arc conditions (e.g. using
@@ -551,6 +558,10 @@ class PetriNet:
         #: Whether the routing tables + dirty seed have been built for the current transition
         #: set. Reset by `add_transition`; rebuilt lazily by `_ensure_scheduler_ready`.
         self._scheduler_ready = False
+        #: Whether resource-return self-loops have been synthesized for the current topology.
+        #: Reset by `add_place`/`add_transition`; done once (idempotently) before the first
+        #: firing or introspection via `_ensure_resource_returns_synthesized`.
+        self._resource_returns_synthesized = False
         #: Place name -> transitions with an `InputArc` on it (adding tokens may enable them).
         self._input_routing: dict[str, list[Transition]] = {}
         #: Place name -> transitions with an *unconditional* `OutputArc` on it. Removing tokens
@@ -699,6 +710,8 @@ class PetriNet:
             self.places[place.name] = place
             if isinstance(place, PacedResourcePlace):
                 self._has_timed_features = True
+            # A newly-registered place may reclassify an arc as a resource borrow.
+            self._resource_returns_synthesized = False
 
     def _validate_new_transition(self, transition: Transition) -> None:
         if transition.name in self.places:
@@ -735,6 +748,8 @@ class PetriNet:
             # The transition set changed: the routing tables and dirty seed must be rebuilt
             # before the incremental scheduler is next consulted.
             self._scheduler_ready = False
+            # …and its resource borrows may need a synthesized return arc.
+            self._resource_returns_synthesized = False
 
     def deposit(self, place_name: str, token: Token) -> None:
         """Deposit `token` into `place_name`, auto-creating a bare place if it does not exist.
@@ -1052,6 +1067,10 @@ class PetriNet:
                 already been shut down, such as after exiting a `with` block). Any tokens
                 already consumed from input places are returned before the error propagates.
         """
+        # Synthesize resource-return arcs once, before any firing — covers callers that reach
+        # `step` without `validate` (direct `step`, `drive_to_quiescence`). Fast-path no-op
+        # after the first call.
+        self._ensure_resource_returns_synthesized()
         try:
             with self._lock:
                 selected = self._select_transition_to_fire()
@@ -1086,6 +1105,57 @@ class PetriNet:
 
         return fired
 
+    def _inject_resource_returns(self, transition: Transition) -> int:
+        """Append a synthesized `OutputArc` for each resource-pool `InputArc` this transition
+        borrows from without a matching `OutputArc`, so the permit's return is a real arc
+        (an explicit self-loop) rather than the invisible implicit leftover-return.
+
+        Behaviour-preserving: resource permits are already always returned on success (see
+        `_return_leftover_resources`); this only makes the flow structural, so `to_dot`,
+        `trace_impact`, and P-invariants read the pool honestly. Skips `consume_all` borrows
+        (a fixed-count arc cannot express "return however many you drained" — those stay on
+        the implicit path) and any transition opting out via `auto_return_resources=False`.
+        Returns the number of arcs appended. Caller holds `self._lock`.
+        """
+        if not transition.auto_return_resources:
+            return 0
+        returned_pools = {arc.place for arc in transition.outputs}
+        injected = 0
+        for arc in transition.inputs:
+            if arc.consume_all or arc.place in returned_pools:
+                continue
+            if not isinstance(self.places.get(arc.place), ResourcePlace):
+                continue
+            transition.outputs.append(OutputArc(place=arc.place, count=arc.count, synthesized=True))
+            returned_pools.add(arc.place)
+            injected += 1
+        return injected
+
+    def _synthesize_resource_returns_under_lock(self) -> None:
+        """Synthesize resource-return arcs for every transition, once. Caller holds `self._lock`."""
+        if self._resource_returns_synthesized:
+            return
+        injected = sum(self._inject_resource_returns(t) for t in self.transitions.values())
+        self._resource_returns_synthesized = True
+        if injected:
+            # Output arcs changed, so the incremental scheduler's routing tables must be rebuilt.
+            # Only invalidate when something was actually added — a net with no resource borrows
+            # must not disturb the scheduler's cached bindings (incremental-reconcile identity).
+            self._scheduler_ready = False
+
+    def _ensure_resource_returns_synthesized(self) -> None:
+        """Idempotently synthesize resource-return arcs before firing or introspection.
+
+        Lock-free fast path once done; acquires the lock only for the one-time synthesis, so
+        callers that do **not** already hold `self._lock` (`step`, `drive_to_quiescence`,
+        `to_dot`, `trace_impact`) can call it safely. `validate` holds the lock already and
+        calls `_synthesize_resource_returns_under_lock` directly.
+        """
+        if self._resource_returns_synthesized:
+            return
+        with self._lock:
+            self._synthesize_resource_returns_under_lock()
+
     def _validate_transition_arcs(self, transition_name: str, transition: Transition) -> None:
         for arc in transition.inputs + transition.outputs:
             if arc.place in self.transitions:
@@ -1103,6 +1173,15 @@ class PetriNet:
         that all transition arcs connect to valid, registered places rather than
         transitions. Called automatically at the start of [`run`][cpnx.PetriNet.run].
 
+        Also **synthesizes resource-return arcs** (once, idempotently): for every transition
+        that borrows from a [`ResourcePlace`][cpnx.ResourcePlace] via an `InputArc` with no
+        matching `OutputArc`, an `OutputArc(pool)` marked `synthesized=True` is appended so the
+        permit's return is expressed structurally. This is behaviour-preserving — permits were
+        already returned on success — and is suppressed per transition by declaring the arc
+        yourself or setting `auto_return_resources=False` (see
+        [`Transition`][cpnx.Transition]). `consume_all` resource borrows are left on the
+        implicit path.
+
         Raises:
             ValueError: If a name is registered as both a place and a transition.
             TypeError: If a transition's arc targets another transition's name.
@@ -1114,6 +1193,10 @@ class PetriNet:
             overlaps = set(self.places.keys()) & set(self.transitions.keys())
             if overlaps:
                 raise ValueError(f"Name overlap: '{list(overlaps)[0]}' is registered as both a Place and a Transition.")
+
+            # Make each resource borrow's return structural before validating arcs, so the
+            # synthesized return arcs are checked alongside the author's own.
+            self._synthesize_resource_returns_under_lock()
 
             for name, transition in self.transitions.items():
                 self._validate_transition_arcs(name, transition)
@@ -1372,6 +1455,9 @@ class PetriNet:
             KeyError: if `highlight_impact_from` names no transition in this net
                 (raised before any DOT is produced).
         """
+        # Ensure resource-return arcs exist so the graph is structurally honest even if the
+        # net has not been run/validated yet (one-time, idempotent).
+        self._ensure_resource_returns_synthesized()
         return to_dot(self, highlight_impact_from=highlight_impact_from)
 
     def trace_impact(self, transition_name: str, *, colors: object = None) -> ImpactMap:
@@ -1391,6 +1477,9 @@ class PetriNet:
         Raises:
             KeyError: if `transition_name` is not a transition in this net.
         """
+        # Resource returns must be structural for the tracer to see a pool as impacted by a
+        # borrowing transition (one-time, idempotent).
+        self._ensure_resource_returns_synthesized()
         return trace_impact(self, transition_name, colors=colors)
 
     def risk_report(self) -> dict:
@@ -1407,6 +1496,7 @@ class PetriNet:
             A dict with `"findings"` (per-transition lint hits) and `"impact_maps"`
             (per-transition [`ImpactMap`][cpnx.ImpactMap] dicts).
         """
+        self._ensure_resource_returns_synthesized()
         return risk_report(self)
 
     # ------------------------------------------------------------------

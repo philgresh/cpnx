@@ -100,3 +100,75 @@ class TestConcurrencyCafeRuns:
                 f"served={served}, trashed={trashed} exceed what {len(ORDERS)} orders could "
                 "possibly have produced — a token was double-counted or conjured from nowhere"
             )
+
+
+def _return_arc(net, transition: str, pool: str):
+    arcs = [a for a in net.transitions[transition].outputs if a.place == pool]
+    return arcs[0] if arcs else None
+
+
+def _strip_resource_returns(net) -> None:
+    for t in net.transitions.values():
+        t.outputs[:] = [a for a in t.outputs if not isinstance(net.places.get(a.place), ResourcePlace)]
+
+
+class TestConcurrencyCafeResourceReturnModes:
+    """ADR 0009: the cafe showcases all three resource-return modes in one net —
+    explicit (scales), synthesized (grinder, group head), and implicit/opt-out (wand)."""
+
+    def test_all_three_return_modes_coexist(self):
+        net = build_cafe()
+        net.validate()  # triggers synthesis
+
+        # explicit — the scale permit's return arc is author-declared.
+        scales = _return_arc(net, "T_Weigh_And_Grind", "P_Digital_Scales")
+        assert scales is not None and scales.synthesized is False
+
+        # synthesized (default) — grinder and group-head returns are added by the engine.
+        grinder = _return_arc(net, "T_Weigh_And_Grind", "P_Burr_Grinder")
+        assert grinder is not None and grinder.synthesized is True
+        espresso = _return_arc(net, "T_Pull_Shot", "P_Espresso_Machine")
+        assert espresso is not None and espresso.synthesized is True
+
+        # implicit (opt-out) — the wand borrow is left off-arc.
+        assert net.transitions["T_Steam_Milk"].auto_return_resources is False
+        assert _return_arc(net, "T_Steam_Milk", "P_Steam_Wand") is None
+
+    def test_only_the_wand_return_is_drawn_implicit(self):
+        dot = build_cafe().to_dot()
+        # Exactly one dashed implicit-return edge — the opted-out wand.
+        assert dot.count("return (implicit)") == 1
+        assert '"T_Steam_Milk" -> "P_Steam_Wand" [label="return (implicit)", style=dashed];' in dot
+        # The synthesized group-head return is a solid, ordinary arc.
+        assert '"T_Pull_Shot" -> "P_Espresso_Machine"' in dot
+
+    def test_terminal_places_are_sunk_to_the_far_right(self):
+        dot = build_cafe().to_dot()
+        rank = next((line for line in dot.splitlines() if "rank=sink" in line), "")
+        # The served-drinks sink and the dead-letter bin both end the flow, so both are sunk.
+        assert '"P_Served";' in rank
+        assert '"P_Trash_Can";' in rank
+        # A resource pool (consumed by a borrow) is never terminal.
+        assert '"P_Espresso_Machine";' not in rank
+
+    def test_synthesis_preserves_work_vs_all_explicit(self):
+        """A cafe relying on synthesis does the same work as one where every borrow is explicit."""
+        orders = [
+            {"ratio": "1:2", "weight_g": 18, "dairy_free": (i % 2 == 0), "mobile_pickup": (i % 3 == 0)}
+            for i in range(60)
+        ]
+
+        def work(strip_and_optin: bool) -> tuple[int, int]:
+            net = build_cafe(channel_failure_rate=0.0, seed=4242, max_workers=1)
+            if strip_and_optin:
+                # Force every borrow onto the synthesis path: drop the explicit scale arc and
+                # opt the wand back in, so all four returns are engine-synthesized.
+                _strip_resource_returns(net)
+                for t in net.transitions.values():
+                    t.auto_return_resources = True
+            for payload in orders:
+                net.deposit("P_New_Order", Token(payload=payload))
+            steps = net.drive_to_quiescence().steps
+            return steps, net.places["P_Served"].stats()["absorbed"]
+
+        assert work(strip_and_optin=True) == work(strip_and_optin=False)

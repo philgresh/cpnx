@@ -41,10 +41,17 @@ Token colours in play
 - `None` (order tickets) — an uncoloured data token carrying the customer's order as
   its `payload`: `ratio`, `weight_g`, `dairy_free`, `mobile_pickup`.
 - `"resource"` — permit tokens pre-filled into [`ResourcePlace`][cpnx.ResourcePlace] and
-  [`PacedResourcePlace`][cpnx.PacedResourcePlace] instances (scales, grinders, group heads, wands). Each borrowing
-  transition returns the permit through a matching output arc — a resource **self-loop** —
-  so the borrow-and-return is visible in the net structure (`M' = M − Pre + Post`); the
-  engine routes the consumed permit through that arc, and action code never hands it back.
+  [`PacedResourcePlace`][cpnx.PacedResourcePlace] instances (scales, grinders, group heads, wands). A borrowed
+  permit returns through a resource **self-loop** (`M' = M − Pre + Post`), and the cafe
+  deliberately shows all three ways cpnx expresses that return, so the fixture doubles as a
+  showcase of default *and* explicit behaviour:
+    - **explicit** — `T_Weigh_And_Grind` declares its own `OutputArc("P_Digital_Scales")`;
+    - **synthesized (default)** — the grinder and group-head borrows declare no return arc, so
+      the engine synthesizes the self-loop at [`validate`][cpnx.PetriNet.validate] (ADR 0009);
+    - **implicit (opt-out)** — `T_Steam_Milk` sets `auto_return_resources=False`, so the wand
+      permit rides the engine's raw off-arc leftover-return, drawn as a dashed
+      `return (implicit)` edge by [`to_dot`][cpnx.PetriNet.to_dot].
+  In every case action code never hands the permit back; the engine does.
 - `"ground_coffee"` / `"milk_ticket"` — intermediate work-in-progress tokens produced
   by the grind step, one feeding the espresso line and one the milk line.
 - `"espresso"` / `"oat_milk"` / `"dairy_milk"` — finished component tokens that

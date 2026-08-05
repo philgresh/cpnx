@@ -115,3 +115,121 @@ class TestPacedTransitionPipelining:
         assert len(net.places["output"].tokens) == 3
         # 3 jobs through 1 paced slot at 0.1s cooldown = at least 0.2s
         assert elapsed >= 0.18
+
+
+def _borrow_net(*, auto_return=True, declare_return=False, consume_all=False, paced=False):
+    """A transition that borrows one permit from `pool` to move `src` -> `sink`."""
+    net = PetriNet(max_workers=2)
+    net.add_place(Place("src"))
+    net.add_place(Place("sink"))
+    pool = PacedResourcePlace("pool", capacity=1, pacing_secs=0.0) if paced else ResourcePlace("pool", capacity=1)
+    net.add_place(pool)
+    outputs = [OutputArc("sink")]
+    if declare_return:
+        outputs.append(OutputArc("pool"))
+    net.add_transition(
+        Transition(
+            name="work",
+            inputs=[InputArc("src"), InputArc("pool", consume_all=consume_all)],
+            outputs=outputs,
+            action=lambda tokens: [t for t in tokens if not t.is_resource],
+            auto_return_resources=auto_return,
+        )
+    )
+    return net
+
+
+def _pool_output_arcs(net):
+    return [a for a in net.transitions["work"].outputs if a.place == "pool"]
+
+
+class TestResourceReturnSynthesis:
+    def test_validate_synthesizes_return_arc(self):
+        net = _borrow_net()
+        net.validate()
+        arcs = _pool_output_arcs(net)
+        assert len(arcs) == 1
+        assert arcs[0].synthesized is True
+        assert arcs[0].count == 1
+
+    def test_declared_self_loop_is_not_duplicated(self):
+        net = _borrow_net(declare_return=True)
+        net.validate()
+        arcs = _pool_output_arcs(net)
+        assert len(arcs) == 1
+        assert arcs[0].synthesized is False
+
+    def test_opt_out_skips_synthesis(self):
+        net = _borrow_net(auto_return=False)
+        net.validate()
+        assert _pool_output_arcs(net) == []
+
+    def test_consume_all_skips_synthesis(self):
+        net = _borrow_net(consume_all=True)
+        net.validate()
+        assert _pool_output_arcs(net) == []
+
+    def test_paced_resource_place_synthesizes(self):
+        net = _borrow_net(paced=True)
+        net.validate()
+        arcs = _pool_output_arcs(net)
+        assert len(arcs) == 1 and arcs[0].synthesized is True
+
+    def test_synthesis_is_idempotent(self):
+        net = _borrow_net()
+        net.validate()
+        net.validate()
+        assert len(_pool_output_arcs(net)) == 1
+
+    def test_synthesis_rearms_after_add_transition(self):
+        net = _borrow_net()
+        net.validate()
+        net.add_place(Place("sink2"))
+        net.add_transition(
+            Transition(
+                name="work2",
+                inputs=[InputArc("sink"), InputArc("pool")],
+                outputs=[OutputArc("sink2")],
+                action=lambda tokens: [t for t in tokens if not t.is_resource],
+            )
+        )
+        net.validate()
+        assert [a.place for a in net.transitions["work2"].outputs if a.place == "pool"] == ["pool"]
+
+    def test_behaviour_preserved_permit_returns_via_synthesized_arc(self):
+        net = _borrow_net()
+        net.deposit("src", Token(payload={"job": 1}))
+        net.run(deadline=time.monotonic() + 2.0)
+        assert len(net.places["sink"].tokens) == 1
+        # Permit returned to the pool through the (validated) synthesized deposit path.
+        assert len(net.places["pool"].tokens) == 1
+
+    def test_opt_out_still_returns_permit_via_implicit_path(self):
+        net = _borrow_net(auto_return=False)
+        net.deposit("src", Token(payload={"job": 1}))
+        net.run(deadline=time.monotonic() + 2.0)
+        assert len(net.places["sink"].tokens) == 1
+        assert len(net.places["pool"].tokens) == 1  # implicit leftover-return still works
+
+    def test_drive_to_quiescence_triggers_synthesis(self):
+        net = _borrow_net()
+        net.deposit("src", Token(payload={"job": 1}))
+        net.drive_to_quiescence()
+        assert _pool_output_arcs(net)[0].synthesized is True
+        assert len(net.places["pool"].tokens) == 1
+
+    def test_to_dot_draws_solid_return_not_implicit(self):
+        net = _borrow_net()
+        dot = net.to_dot()
+        # A real arc, not the dashed implicit-return edge.
+        assert '"work" -> "pool"' in dot
+        assert "return (implicit)" not in dot
+
+    def test_to_dot_keeps_implicit_edge_when_opted_out(self):
+        net = _borrow_net(auto_return=False)
+        dot = net.to_dot()
+        assert "return (implicit)" in dot
+
+    def test_trace_impact_sees_borrowed_pool(self):
+        net = _borrow_net()
+        assert "pool" in net.trace_impact("work").places

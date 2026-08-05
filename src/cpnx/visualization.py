@@ -96,6 +96,12 @@ def to_dot(net: "PetriNet", *, highlight_impact_from: str | None = None) -> str:
     permit **without** a matching output arc back to its pool (i.e. relying on the engine's
     implicit leftover-return rather than a structural self-loop).
 
+    **Terminal places** — those with incoming tokens but **no outgoing arc** (nothing consumes
+    from them: a `SinkPlace`, or the dead-letter bin whose only edges are the off-arc,
+    rank-less dead-letter channels) — are pinned to the sink rank via `{ rank=sink; ... }`, so
+    the flow reads left-to-right and endpoints land at the far right instead of floating at
+    rank 0. Inferred from the arc structure, so no place name is special-cased.
+
     Args:
         net: The [`PetriNet`][cpnx.PetriNet] instance to export.
         highlight_impact_from: If given, the name of a transition whose forward
@@ -134,9 +140,7 @@ def to_dot(net: "PetriNet", *, highlight_impact_from: str | None = None) -> str:
         # Nodes: Places (each contributes at most one legend "role").
         roles: set[str] = set()
         for name, place in places.items():
-            line, role = _place_node_line(
-                name, place, impact=impact, produced=produced, error_place=error_place
-            )
+            line, role = _place_node_line(name, place, impact=impact, produced=produced, error_place=error_place)
             lines.append(line)
             if role is not None:
                 roles.add(role)
@@ -155,6 +159,13 @@ def to_dot(net: "PetriNet", *, highlight_impact_from: str | None = None) -> str:
         deadletter, deadletter_drawn = _dead_letter_lines(transitions, error_place, places)
         lines.extend(deadletter)
 
+        # Pin terminal places (incoming tokens, no outgoing arc) to the sink rank, so a place
+        # like a dead-letter bin — whose only edges are off-arc (constraint=false) and thus
+        # rank-less — still lands at the far right where the flow ends, not floating left.
+        terminal_rank = _terminal_rank_line(_terminal_places(places, transitions, produced, error_place))
+        if terminal_rank is not None:
+            lines.append(terminal_rank)
+
         legend = _legend_line(
             has_resource=any(isinstance(p, ResourcePlace) for p in places.values()),
             roles=roles,
@@ -172,6 +183,32 @@ def to_dot(net: "PetriNet", *, highlight_impact_from: str | None = None) -> str:
 def _produced_places(transitions: dict) -> set[str]:
     """Names of places produced by at least one output arc (in-degree > 0)."""
     return {arc.place for t in transitions.values() for arc in t.outputs}
+
+
+def _consumed_places(transitions: dict) -> set[str]:
+    """Names of places consumed by at least one input arc (out-degree > 0)."""
+    return {arc.place for t in transitions.values() for arc in t.inputs}
+
+
+def _terminal_places(places: dict, transitions: dict, produced: set[str], error_place: str | None) -> list[str]:
+    """Places where the flow ends: they receive tokens but no transition consumes from them.
+
+    Inferred purely from the arc structure (no per-net hard-coding): a place with **no
+    outgoing arc** (`out-degree 0`) that still receives tokens — produced by an output arc, or
+    the dead-letter target — is terminal, so it belongs at the sink rank. Resource pools
+    (always consumed by a borrow) and external sources (never produced) are excluded.
+    """
+    consumed = _consumed_places(transitions)
+    return [name for name in places if name not in consumed and (name in produced or name == error_place)]
+
+
+def _terminal_rank_line(terminals: list[str]) -> str | None:
+    """A `{ rank=sink; ... }` group pinning terminal places to the last rank (far right under
+    `rankdir=LR`), or `None` when the net has none."""
+    if not terminals:
+        return None
+    nodes = " ".join(f'"{name}";' for name in terminals)
+    return f"  {{ rank=sink; {nodes} }}"
 
 
 def _place_fill_style(
@@ -213,8 +250,12 @@ def _place_node_line(
     attrs = [f"shape={shape}", f'label="{label}"']
 
     fill, style, role = _place_fill_style(
-        name, is_resource=is_resource, is_sink=is_sink, is_error=is_error,
-        impact=impact, produced=produced,
+        name,
+        is_resource=is_resource,
+        is_sink=is_sink,
+        is_error=is_error,
+        impact=impact,
+        produced=produced,
     )
     if fill is not None:
         attrs.append(f'fillcolor="{fill}"')
@@ -264,9 +305,7 @@ def _implicit_return_lines(transitions: dict, places: dict) -> list[str]:
     return lines
 
 
-def _dead_letter_lines(
-    transitions: dict, error_place: str | None, places: dict
-) -> tuple[list[str], bool]:
+def _dead_letter_lines(transitions: dict, error_place: str | None, places: dict) -> tuple[list[str], bool]:
     """Dashed, `constraint=false` dead-letter side channels from finite-`max_retries`
     transitions to the error place (engine failure routing), so it does not look isolated.
 
@@ -306,7 +345,7 @@ def _legend_line(
     if deadletter_drawn:
         legend.append("dashed red = dead-letter path")
     if has_implicit:
-        legend.append("dashed edge = implicit permit return")
+        legend.append("dashed edge = implicit permit return (auto_return_resources=False)")
     if impact is not None:
         legend.append(f"pink = blast radius of {impact.origin}")
     if not legend:

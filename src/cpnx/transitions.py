@@ -365,11 +365,18 @@ class OutputArc:
                    A boolean predicate: if annotated, its return type is checked to
                    be `bool` at construction (a non-`bool` annotation raises
                    `TypeError`); unannotated callables are accepted unchecked.
+        synthesized: `True` if the engine auto-added this arc rather than the
+                     author declaring it. The net synthesizes a return arc for a
+                     resource-pool `InputArc` that has no matching `OutputArc`, so
+                     the permit's return is expressed structurally (see
+                     `PetriNet.validate`). Excluded from equality; author-declared
+                     arcs default to `False`.
     """
 
     place: str
     count: int = 1
     condition: Callable[[list[Token]], bool] | None = field(default=None, compare=False)
+    synthesized: bool = field(default=False, compare=False)
 
     def __setattr__(self, name, value):
         # Keep the inline-safe flag in sync with ``condition``, including
@@ -506,6 +513,17 @@ class Transition:
                conservative over-approximation; an empty set, by contrast, is a
                *narrowing* declaration). Cheap to add incrementally: it changes no
                existing behaviour.
+        auto_return_resources: When `True` (default), the net synthesizes a return
+               arc at [`validate`][cpnx.PetriNet.validate] for any resource-pool
+               `InputArc` this transition borrows from without a matching
+               `OutputArc`, so the permit's return is expressed as a real arc (an
+               explicit self-loop) rather than the invisible implicit
+               leftover-return. This is behaviour-preserving — resource permits are
+               already always returned on success — but makes the flow legible to
+               [`to_dot`][cpnx.PetriNet.to_dot], [`trace_impact`][cpnx.trace_impact],
+               and structural invariants. Declaring your own `OutputArc(pool)`
+               already suppresses synthesis for that pool; set this `False` to
+               suppress it entirely and keep the raw implicit return.
     """
 
     name: str
@@ -519,6 +537,7 @@ class Transition:
     binding_policy: BindingPolicy | None = None
     binding_priority_key: Callable[[list[Token]], object] | None = None
     impacts_colors: frozenset[str] | None = None
+    auto_return_resources: bool = True
 
     def __setattr__(self, name, value):
         # Keep the inline-safe flag in sync with ``guard``, including post-construction
