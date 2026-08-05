@@ -125,7 +125,7 @@ def test_dead_letter_path_connects_the_error_place():
     dot = net.to_dot()
     # Pale, thin, unlabelled side channel; named once in the legend.
     assert '"t" -> "failed" [style=dashed, color="#e08a8a"' in dot
-    assert "constraint=false" in dot  # non-warping side channel
+    assert "constraint=true, weight=0" in dot  # ranked (so the bin sinks) but weightless (no warp)
     assert "dashed red = dead-letter path" in dot
 
 
@@ -143,9 +143,9 @@ def test_terminal_place_pinned_to_sink_rank():
     assert '"out";' in rank
 
 
-def test_dead_letter_bin_is_ranked_terminal_despite_only_offarc_edges():
-    """The error place's only edges are constraint=false dead-letter channels, yet it is
-    still inferred terminal and sunk to the far right rather than floating at rank 0."""
+def test_dead_letter_bin_is_ranked_terminal():
+    """The error place is a terminal (nothing consumes from it), so it is pinned to the sink
+    rank and lands at the far right rather than floating at rank 0 beside the sources."""
     net = PetriNet(error_place="failed")
     net.add_place(Place("a"))
     net.add_place(Place("b"))

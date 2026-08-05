@@ -90,11 +90,12 @@ def to_dot(net: "PetriNet", *, highlight_impact_from: str | None = None) -> str:
     and, when applicable, `consume_all` / `settle=<settle_secs>s`; each output arc an edge
     to its place. Two *off-arc* token paths are drawn dashed so no place looks isolated
     and no path is hidden: a **dead-letter** side channel (pale red, thin, unlabelled —
-    named once in the legend, `constraint=false` so it does not warp the layout) from every
-    transition with a finite `max_retries` to the error place — the engine's failure
-    routing; and a **`return (implicit)`** edge from any transition that borrows a resource
-    permit **without** a matching output arc back to its pool (i.e. relying on the engine's
-    implicit leftover-return rather than a structural self-loop).
+    named once in the legend; drawn `constraint=true, weight=0` so it ranks the error place
+    downstream of its feeders and fans in cleanly, yet exerts no pull that would warp the main
+    flow) from every transition with a finite `max_retries` to the error place — the engine's
+    failure routing; and a **`return (implicit)`** edge from any transition that borrows a
+    resource permit **without** a matching output arc back to its pool (i.e. relying on the
+    engine's implicit leftover-return rather than a structural self-loop).
 
     **Terminal places** — those with incoming tokens but **no outgoing arc** (nothing consumes
     from them: a `SinkPlace`, or the dead-letter bin whose only edges are the off-arc,
@@ -159,9 +160,11 @@ def to_dot(net: "PetriNet", *, highlight_impact_from: str | None = None) -> str:
         deadletter, deadletter_drawn = _dead_letter_lines(transitions, error_place, places)
         lines.extend(deadletter)
 
-        # Pin terminal places (incoming tokens, no outgoing arc) to the sink rank, so a place
-        # like a dead-letter bin — whose only edges are off-arc (constraint=false) and thus
-        # rank-less — still lands at the far right where the flow ends, not floating left.
+        # Pin terminal places (incoming tokens, no outgoing arc) to the sink rank, so every
+        # endpoint lands at the far right where the flow ends. The `constraint=true`
+        # dead-letter edges already rank the bin downstream of its feeders, but this guarantees
+        # terminal→far-right universally — e.g. a bin fed only by an early transition, which
+        # those edges alone would otherwise park mid-graph.
         terminal_rank = _terminal_rank_line(_terminal_places(places, transitions, produced, error_place))
         if terminal_rank is not None:
             lines.append(terminal_rank)
@@ -306,8 +309,15 @@ def _implicit_return_lines(transitions: dict, places: dict) -> list[str]:
 
 
 def _dead_letter_lines(transitions: dict, error_place: str | None, places: dict) -> tuple[list[str], bool]:
-    """Dashed, `constraint=false` dead-letter side channels from finite-`max_retries`
-    transitions to the error place (engine failure routing), so it does not look isolated.
+    """Dashed dead-letter side channels from finite-`max_retries` transitions to the error
+    place (engine failure routing), so it does not look isolated.
+
+    Drawn `constraint=true, weight=0`: the edges take part in ranking (so the error place is
+    placed downstream of every transition that feeds it, and the edges fan in cleanly toward
+    it) but carry zero weight, so they never pull nodes together to shorten themselves and thus
+    do not warp the main left→right flow. `constraint=false` would exclude them from layout
+    entirely, leaving them to spline across the diagram as long, wonky curves once the bin is
+    sunk to the far right.
 
     Returns `(lines, drawn)`; `drawn` gates the legend entry. Skips any transition that
     already has a real output arc to the error place.
@@ -324,7 +334,7 @@ def _dead_letter_lines(transitions: dict, error_place: str | None, places: dict)
         # so we don't repeat "dead-letter" on every one of these edges.
         lines.append(
             f'  "{tname}" -> "{error_place}" [style=dashed, color="{_DEADLETTER_COLOR}", '
-            f"penwidth=0.6, arrowsize=0.7, constraint=false];"
+            f"penwidth=0.6, arrowsize=0.7, constraint=true, weight=0];"
         )
     return lines, bool(lines)
 
