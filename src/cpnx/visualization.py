@@ -121,6 +121,12 @@ def to_dot(net: "PetriNet", *, highlight_impact_from: str | None = None) -> str:
     """
     from cpnx.places import ResourcePlace
 
+    # Make resource-return arcs structural before drawing, so the graph is honest even on a
+    # never-run net (ADR 0009). Done here — not only in `PetriNet.to_dot` — so the exported
+    # free-function form matches. One-time, idempotent, and outside the lock (`_ensure_...`
+    # acquires the same non-reentrant lock).
+    net._ensure_resource_returns_synthesized()
+
     # Compute the blast radius *before* taking the lock: trace_impact acquires the
     # same (non-reentrant) lock itself.
     impact = None

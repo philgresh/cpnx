@@ -74,6 +74,10 @@ built net re-synthesizes correctly.
 - **Asymmetric counts** (`InputArc(pool, count=2)` + `OutputArc(pool, count=1)`)
   already have a matching output arc by name, so no arc is synthesized and the
   residual permit is returned implicitly — same as before.
+- **Two `InputArc`s on the same pool** synthesize a single return arc (detection
+  dedupes by pool name), so the second borrowed permit rides the implicit path and
+  is invisible to `to_dot`. Still behaviour-preserving (both permits return); the
+  structural form is `InputArc(pool, count=2)`, which synthesizes `OutputArc(count=2)`.
 - The **failure/rollback** return (`_rollback_failed_transition`) is untouched: a
   failed firing must return the permit regardless of the self-loop (an explicit
   `OutputArc` would not fire when the action raised either), so it stays on the

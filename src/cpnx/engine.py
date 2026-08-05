@@ -1116,6 +1116,15 @@ class PetriNet:
         (a fixed-count arc cannot express "return however many you drained" — those stay on
         the implicit path) and any transition opting out via `auto_return_resources=False`.
         Returns the number of arcs appended. Caller holds `self._lock`.
+
+        Correctness rests on **permit fungibility**: every `ResourcePlace` permit is
+        `color="resource"` (see `ResourcePlace`), so appending the return arc *last* — after
+        the transition's data outputs — cannot mis-route a permit. The deposit plan matches
+        tokens to arcs by resource-vs-data class, not by pool or position, so a synthesized
+        arc always claims a consumed permit, never a data token. `returned_pools` dedupes by
+        pool **name**: a transition with two `InputArc`s on the *same* pool gets a single
+        return arc (the second permit rides the implicit path) — an anti-pattern best written
+        `InputArc(pool, count=2)`, which synthesizes an `OutputArc(count=2)` correctly.
         """
         if not transition.auto_return_resources:
             return 0
@@ -1455,9 +1464,8 @@ class PetriNet:
             KeyError: if `highlight_impact_from` names no transition in this net
                 (raised before any DOT is produced).
         """
-        # Ensure resource-return arcs exist so the graph is structurally honest even if the
-        # net has not been run/validated yet (one-time, idempotent).
-        self._ensure_resource_returns_synthesized()
+        # Resource-return synthesis happens inside the free `to_dot` (single source of truth),
+        # so the exported `cpnx.to_dot(net)` form is equally honest.
         return to_dot(self, highlight_impact_from=highlight_impact_from)
 
     def trace_impact(self, transition_name: str, *, colors: object = None) -> ImpactMap:
@@ -1477,9 +1485,8 @@ class PetriNet:
         Raises:
             KeyError: if `transition_name` is not a transition in this net.
         """
-        # Resource returns must be structural for the tracer to see a pool as impacted by a
-        # borrowing transition (one-time, idempotent).
-        self._ensure_resource_returns_synthesized()
+        # Resource-return synthesis happens inside the free `trace_impact` (single source of
+        # truth), so `cpnx.trace_impact(net, ...)` sees the borrowed pool too.
         return trace_impact(self, transition_name, colors=colors)
 
     def risk_report(self) -> dict:
@@ -1496,7 +1503,7 @@ class PetriNet:
             A dict with `"findings"` (per-transition lint hits) and `"impact_maps"`
             (per-transition [`ImpactMap`][cpnx.ImpactMap] dicts).
         """
-        self._ensure_resource_returns_synthesized()
+        # Synthesis happens inside the free `risk_report` (single source of truth).
         return risk_report(self)
 
     # ------------------------------------------------------------------

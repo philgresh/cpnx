@@ -87,7 +87,7 @@ def coerce_color_domain(value: object, *, field: str = "impacts_colors") -> froz
     if isinstance(value, str):
         raise TypeError(
             f"{field} must be a set of colour names, not a bare string; "
-            f'pass {{{value!r}}} to declare the single colour {value!r}.'
+            f"pass {{{value!r}}} to declare the single colour {value!r}."
         )
     if not isinstance(value, Iterable):
         raise TypeError(f"{field} must be None or an iterable of colour names (str); got {type(value).__name__}.")
@@ -189,6 +189,11 @@ def trace_impact(
     Raises:
         KeyError: if ``transition_name`` is not a transition in ``net``.
     """
+    # Make resource-return arcs structural before the static walk, so a borrowed pool is
+    # reachable (ADR 0009). Done here — not only in `PetriNet.trace_impact` — so the exported
+    # free-function form is honest too. One-time and idempotent; must run outside the lock
+    # (`_ensure_...` acquires the same non-reentrant lock).
+    net._ensure_resource_returns_synthesized()
     override = coerce_color_domain(colors, field="trace_impact(colors=...)")
 
     with net._lock:
@@ -305,6 +310,10 @@ def risk_report(net: "PetriNet") -> dict:
         colour-annotated.
     """
     from cpnx.linting import lint_callable  # local import: avoid import-time coupling
+
+    # Structural resource returns before tracing, so the exported free-function form matches
+    # `PetriNet.risk_report` (ADR 0009). Outside the lock; idempotent.
+    net._ensure_resource_returns_synthesized()
 
     with net._lock:
         transitions = list(net.transitions.values())

@@ -233,3 +233,38 @@ class TestResourceReturnSynthesis:
     def test_trace_impact_sees_borrowed_pool(self):
         net = _borrow_net()
         assert "pool" in net.trace_impact("work").places
+
+    def test_free_function_forms_synthesize_too(self):
+        """The exported free functions (`cpnx.trace_impact`/`to_dot`) must synthesize as well,
+        so they match their `PetriNet` method counterparts on a never-validated borrow net."""
+        import cpnx
+
+        assert "pool" in cpnx.trace_impact(_borrow_net(), "work").places
+        dot = cpnx.to_dot(_borrow_net())
+        assert '"work" -> "pool"' in dot and "return (implicit)" not in dot
+        # Method and free function agree on a net that actually borrows a permit.
+        assert cpnx.trace_impact(_borrow_net(), "work").places == _borrow_net().trace_impact("work").places
+
+    def test_failure_path_returns_permit_exactly_once(self):
+        """When the action raises with a synthesized return arc present, the permit is returned
+        once (by rollback), not twice (rollback + the synthesized OutputArc). Pool stays at
+        capacity; the synthesized deposit only runs on the success branch."""
+        net = PetriNet(max_workers=2)
+        net.add_place(Place("src"))
+        net.add_place(Place("sink"))
+        net.add_place(ResourcePlace("pool", capacity=1))
+
+        def boom(tokens):
+            raise RuntimeError("boom")
+
+        net.add_transition(
+            Transition("work", [InputArc("src"), InputArc("pool")], [OutputArc("sink")], action=boom, max_retries=0)
+        )
+        net.validate()
+        assert _pool_output_arcs(net)[0].synthesized is True  # a synthesized return arc exists
+        net.deposit("src", Token(payload={"job": 1}))
+        net.run(deadline=time.monotonic() + 2.0)
+
+        assert len(net.places["pool"].tokens) == 1  # returned exactly once, not doubled
+        assert len(net.places["sink"].tokens) == 0  # no success output
+        assert len(net.places["failed"].tokens) == 1  # data token dead-lettered
