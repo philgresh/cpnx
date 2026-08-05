@@ -115,16 +115,20 @@ def t_weigh_and_grind(
     return Transition(
         name="T_Weigh_And_Grind",
         inputs=inputs,
-        # The two permit arcs are **self-loops**: a matching OutputArc returns each
-        # borrowed permit to its pool, so the net expresses the return structurally
-        # (M' = M − Pre + Post) rather than relying on the engine's implicit
-        # leftover-return. The engine routes the consumed permit through the resource
-        # OutputArc; the action still returns only the two data tokens below.
+        # Two permit borrows, deliberately shown two different ways (see the cafe's
+        # module docstring for the full return-mode showcase):
+        #   • `P_Digital_Scales` — an **explicit self-loop**: the matching OutputArc
+        #     below returns the scale permit structurally (M' = M − Pre + Post).
+        #   • `P_Burr_Grinder` — **no** return arc, so the engine synthesizes the
+        #     self-loop at validate (ADR 0009). The marking effect is identical; this
+        #     just borrows the engine's default instead of hand-writing the arc, and
+        #     shows synthesis working for a *paced* pool too.
+        # Either way the action returns only the two data tokens below; the engine
+        # routes the borrowed permits back through the (declared or synthesized) arcs.
         outputs=[
             OutputArc("P_Ground_Coffee"),
             OutputArc("P_Milk_Queue"),
             OutputArc("P_Digital_Scales"),
-            OutputArc("P_Burr_Grinder"),
         ],
         action=with_work(work_secs, actions.weigh_and_grind),
         action_timeout_secs=1.0,
@@ -168,10 +172,12 @@ def t_pull_shot(
     return Transition(
         name="T_Pull_Shot",
         inputs=[InputArc("P_Ground_Coffee"), InputArc("P_Espresso_Machine")],
-        # `P_Espresso_Machine` is a **self-loop**: the group-head permit is returned via
-        # a matching OutputArc, so the borrow is visible in the net structure. On the
-        # failure path the permit is instead returned by atomic rollback (see below).
-        outputs=[OutputArc("P_Order_Tray"), OutputArc("P_Espresso_Machine")],
+        # `P_Espresso_Machine` is borrowed with **no** return arc, so the engine
+        # synthesizes the self-loop at validate (ADR 0009) — the group-head permit is
+        # still returned structurally on success, and on the failure path it is returned
+        # by atomic rollback (see below) exactly as before. Contrast T_Weigh_And_Grind's
+        # scale permit, which keeps its return arc explicit.
+        outputs=[OutputArc("P_Order_Tray")],
         action=with_work(work_secs, actions.make_pull_shot(channel_failure_rate, channel_seed)),
         action_timeout_secs=0.5,
         max_retries=1,
@@ -199,15 +205,19 @@ def t_steam_milk(*, work_secs: float = 0.0) -> Transition:
         name="T_Steam_Milk",
         inputs=[InputArc("P_Milk_Queue"), InputArc("P_Steam_Wand")],
         # The two `on_color` arcs are the conditional data outputs (exactly one fires
-        # per milk); `P_Steam_Wand` is an unconditional **self-loop** returning the wand
-        # permit to its pool, so the borrow-and-return is structural.
+        # per milk). `P_Steam_Wand` is borrowed but **opted out** of synthesis
+        # (`auto_return_resources=False`), so the wand permit rides the engine's raw
+        # implicit leftover-return — the off-arc path ADR 0009 otherwise replaces. This
+        # is the fixture's one deliberately-implicit borrow: `to_dot` draws it as a
+        # dashed `return (implicit)` edge, so the net shows all three return modes at
+        # once (explicit scales, synthesized grinder/espresso, implicit wand).
         outputs=[
             OutputArc.on_color("oat_milk", "P_Order_Tray"),
             OutputArc.on_color("dairy_milk", "P_Order_Tray"),
-            OutputArc("P_Steam_Wand"),
         ],
         action=with_work(work_secs, actions.steam_milk),
         action_timeout_secs=0.5,
+        auto_return_resources=False,
     )
 
 

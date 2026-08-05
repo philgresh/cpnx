@@ -55,14 +55,26 @@ def test_external_source_place_is_dashed():
 
 
 def test_implicit_resource_return_drawn_as_dashed_edge():
-    """A resource borrow with NO matching output arc gets a dashed 'return (implicit)' edge."""
+    """A borrow left on the implicit path (synthesis opted out) gets a dashed 'return (implicit)' edge.
+
+    By default the engine now synthesizes the return arc (a real self-loop), so the dashed
+    edge appears only when a transition opts out via ``auto_return_resources=False`` (or uses
+    a ``consume_all`` borrow). See ADR 0009.
+    """
     net = PetriNet()
     net.add_place(ResourcePlace("permits", capacity=1))
     net.add_place(Place("in"))
     net.add_place(Place("out"))
     net.add_transition(
-        # Borrows 'permits' but never outputs it back → engine returns it implicitly.
-        Transition("borrow", [InputArc("in"), InputArc("permits")], [OutputArc("out")], action=_passthrough)
+        # Borrows 'permits' but never outputs it back, and opts out of synthesis → the engine
+        # returns it implicitly (off-arc).
+        Transition(
+            "borrow",
+            [InputArc("in"), InputArc("permits")],
+            [OutputArc("out")],
+            action=_passthrough,
+            auto_return_resources=False,
+        )
     )
     dot = net.to_dot()
     assert '"borrow" -> "permits" [label="return (implicit)", style=dashed];' in dot
@@ -113,8 +125,47 @@ def test_dead_letter_path_connects_the_error_place():
     dot = net.to_dot()
     # Pale, thin, unlabelled side channel; named once in the legend.
     assert '"t" -> "failed" [style=dashed, color="#e08a8a"' in dot
-    assert "constraint=false" in dot  # non-warping side channel
+    assert "constraint=true, weight=0" in dot  # ranked (so the bin sinks) but weightless (no warp)
     assert "dashed red = dead-letter path" in dot
+
+
+def _rank_line(dot: str) -> str:
+    return next((line for line in dot.splitlines() if "rank=sink" in line), "")
+
+
+def test_terminal_place_pinned_to_sink_rank():
+    """A place with incoming tokens but no outgoing arc is pinned to the sink rank (far right)."""
+    net = PetriNet()
+    net.add_place(Place("in"))
+    net.add_place(Place("out"))  # produced by t, consumed by nobody → terminal
+    net.add_transition(Transition("t", [InputArc("in")], [OutputArc("out")], action=_passthrough))
+    rank = _rank_line(net.to_dot())
+    assert '"out";' in rank
+
+
+def test_dead_letter_bin_is_ranked_terminal():
+    """The error place is a terminal (nothing consumes from it), so it is pinned to the sink
+    rank and lands at the far right rather than floating at rank 0 beside the sources."""
+    net = PetriNet(error_place="failed")
+    net.add_place(Place("a"))
+    net.add_place(Place("b"))
+    net.add_transition(Transition("t", [InputArc("a")], [OutputArc("b")], action=_passthrough))
+    rank = _rank_line(net.to_dot())
+    assert '"failed";' in rank
+
+
+def test_source_and_intermediate_places_are_not_sunk():
+    """Only true terminals are sunk: a never-produced source and a consumed intermediate stay put."""
+    net = PetriNet()
+    net.add_place(Place("src"))
+    net.add_place(Place("mid"))
+    net.add_place(Place("dst"))
+    net.add_transition(Transition("t1", [InputArc("src")], [OutputArc("mid")], action=_passthrough))
+    net.add_transition(Transition("t2", [InputArc("mid")], [OutputArc("dst")], action=_passthrough))
+    rank = _rank_line(net.to_dot())
+    assert '"dst";' in rank  # terminal
+    assert '"mid";' not in rank  # consumed by t2 → not terminal
+    assert '"src";' not in rank  # never produced → a source, not terminal
 
 
 def test_infinite_retry_transition_has_no_dead_letter_edge():
@@ -122,9 +173,7 @@ def test_infinite_retry_transition_has_no_dead_letter_edge():
     net = PetriNet(error_place="failed")
     net.add_place(Place("a"))
     net.add_place(Place("b"))
-    net.add_transition(
-        Transition("t", [InputArc("b")], [OutputArc("a")], action=_passthrough, max_retries=None)
-    )
+    net.add_transition(Transition("t", [InputArc("b")], [OutputArc("a")], action=_passthrough, max_retries=None))
     dot = net.to_dot()
     assert '"t" -> "failed"' not in dot
 
