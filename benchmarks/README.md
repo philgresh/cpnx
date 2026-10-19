@@ -354,8 +354,8 @@ it considerably, and the result depends on the binding policy:
 
 | path | callable ÷ string |
 | --- | ---: |
-| `_is_transition_enabled`, LEGACY / FIRST | 2.0–2.6× |
-| `_resolve_binding`, LEGACY / FIRST | 2.0–2.6× |
+| `_is_transition_enabled`, FIRST | 2.0–2.6× |
+| `_resolve_binding`, FIRST | 2.0–2.6× |
 | `_resolve_binding`, RANDOM / PRIORITY | **15–16×** |
 
 Both numbers are real; they measure different things. The useful conclusion is

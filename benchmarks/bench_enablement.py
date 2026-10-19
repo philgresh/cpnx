@@ -72,14 +72,17 @@ def _accept_all_filter(token: Token) -> bool:
 
 
 def build_net(
-    binding_policy: BindingPolicy = BindingPolicy.LEGACY,
+    binding_policy: BindingPolicy = BindingPolicy.FIRST,
     guard_kind: str = "certified",
 ) -> tuple[PetriNet, Transition]:
     """A net whose single transition uses a certified or uncertified callable guard.
 
-    ``binding_policy`` selects the transition's binding-resolution strategy so the same
-    enablement check can be timed under ``LEGACY`` (leading-token check) and ``FIRST``
-    (deterministic-complete guarded search).
+    ``binding_policy`` selects the transition's binding-resolution strategy. ``FIRST``
+    short-circuits at the first satisfying binding; ``RANDOM``/``PRIORITY`` must enumerate the
+    whole candidate set, which is why ``main`` compares all three on the *firing* path
+    (``_time_resolve``) but only ``FIRST`` on the enablement probe — that probe short-circuits
+    identically whatever the policy. Every arm here carries a guard, so none takes the
+    guard-free head-only fast path.
 
     ``guard_kind`` is ``"certified"`` (evaluated inline) or ``"uncertified"`` (round-tripped
     through `_call_expr` -> the `_expr_executor` thread pool). Both compute the identical
@@ -164,16 +167,17 @@ def _ratio(uncertified_us: float, certified_us: float) -> str:
 def main() -> None:
     print("-- _is_transition_enabled: certified (inline) vs uncertified (executor) guard --")
     print("   predicate (both arms): len(tokens) >= 1 and tokens[0].color == 'data'")
-    for label, policy in (("LEGACY", BindingPolicy.LEGACY), ("FIRST", BindingPolicy.FIRST)):
-        certified_us = _time_policy(label, policy, guard_kind="certified")
-        uncertified_us = _time_policy(label, policy, guard_kind="uncertified")
-        print(f"   ratio [{label:8}]: uncertified/certified = {_ratio(uncertified_us, certified_us)}")
+    # Only FIRST is timed here: the probe short-circuits at the first satisfying binding for
+    # every policy, so RANDOM/PRIORITY would measure the same work. Their extra cost shows up
+    # on the firing path below, which is where they enumerate.
+    certified_us = _time_policy("FIRST", BindingPolicy.FIRST, guard_kind="certified")
+    uncertified_us = _time_policy("FIRST", BindingPolicy.FIRST, guard_kind="uncertified")
+    print(f"   ratio [{'FIRST':8}]: uncertified/certified = {_ratio(uncertified_us, certified_us)}")
     print()
 
     # Firing path: RANDOM/PRIORITY must scan all candidates, so they cost more than FIRST.
     print("-- _resolve_binding: certified (inline) vs uncertified (executor) guard --")
     for label, policy in (
-        ("LEGACY", BindingPolicy.LEGACY),
         ("FIRST", BindingPolicy.FIRST),
         ("RANDOM", BindingPolicy.RANDOM),
         ("PRIORITY", BindingPolicy.PRIORITY),

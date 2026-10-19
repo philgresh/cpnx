@@ -1,11 +1,27 @@
-"""Tests for BindingPolicy — opt-in binding search that fixes head-of-line blocking."""
+"""Tests for BindingPolicy — the binding search that fixes head-of-line blocking."""
 
+import inspect
+import os
 import time
+import warnings
+
+import pytest
 
 from cpnx.engine import PetriNet
+from cpnx.linting import _PACKAGE_ROOT
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace
 from cpnx.tokens import Token
-from cpnx.transitions import BindingPolicy, InputArc, OutputArc, Transition
+from cpnx.transitions import (
+    BindingPolicy,
+    CpnxDeprecationWarning,
+    InputArc,
+    OutputArc,
+    Transition,
+)
+
+#: Selecting the deprecated `LEGACY` policy warns by design. Tests that exercise what it
+#: *does* silence that here; the warning itself is asserted in `TestLegacyDeprecationWarning`.
+_SILENCE_LEGACY = pytest.mark.filterwarnings("ignore::cpnx.CpnxDeprecationWarning")
 
 
 def _fire_once(net):
@@ -22,7 +38,7 @@ def _fire_once(net):
 
 
 class TestHeadOfLineFix:
-    """Headline: FIRST fixes HoL blocking; LEGACY/default is unchanged."""
+    """Headline: FIRST fixes HoL blocking, and it is the default an unset transition inherits."""
 
     def _build(self, policy):
         net = PetriNet(
@@ -51,19 +67,239 @@ class TestHeadOfLineFix:
         remaining = {t.payload["sym"] for t in net.places["input"].tokens}
         assert remaining == {"AAPL"}
 
-    def test_legacy_does_not_fire_hol_blocked(self):
+    def test_unset_policy_defaults_to_first(self):
+        """An unset transition inherits the net default, which is FIRST — so HoL is fixed."""
+        net = self._build(None)  # inherit net default (FIRST)
+        net.run(deadline=time.monotonic() + 2.0)
+
+        out = net.places["output"].tokens
+        assert [t.payload["sym"] for t in out] == ["MSFT"]
+        assert {t.payload["sym"] for t in net.places["input"].tokens} == {"AAPL"}
+
+    def test_net_default_is_first(self):
+        """The net-wide default is FIRST, exposed on the `binding_policy` property."""
+        assert PetriNet().binding_policy is BindingPolicy.FIRST
+
+    @_SILENCE_LEGACY
+    def test_explicit_legacy_still_opts_out_of_the_fix(self):
+        """`LEGACY` survives one release as the opt-out, and still blocks head-of-line.
+
+        ADR 0001 step 2 asked for the default flip and the removal to land a deprecation
+        cycle apart, so 0.6.0 flips the default to `FIRST` while `LEGACY` keeps its exact
+        pre-0.6.0 semantics for anyone who needs a release to migrate. Removal is Phase 4.
+        """
         net = self._build(BindingPolicy.LEGACY)
         net.run(deadline=time.monotonic() + 0.3)
 
         assert len(net.places["output"].tokens) == 0
         assert {t.payload["sym"] for t in net.places["input"].tokens} == {"AAPL", "MSFT"}
 
-    def test_unset_policy_defaults_to_legacy(self):
-        net = self._build(None)  # inherit net default (LEGACY)
+    @_SILENCE_LEGACY
+    def test_net_wide_legacy_opt_out_covers_unset_transitions(self):
+        """The *net-level* opt-out works — the form the migration notes actually recommend.
+
+        `PetriNet(binding_policy=LEGACY)` with transitions left on `binding_policy=None` is
+        how an existing net defers the flip in one line, so it is pinned separately from the
+        per-transition opt-out above: the guarded transition inherits `LEGACY` and stays
+        head-only.
+        """
+        net = PetriNet(
+            places=[Place("input"), Place("output")],
+            binding_policy=BindingPolicy.LEGACY,
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                    guard=lambda toks: toks[0].payload["sym"] == "MSFT",
+                    # No per-transition policy: inherits the net-wide LEGACY opt-out.
+                )
+            ],
+        )
+        for sym in ("AAPL", "MSFT"):
+            net.deposit("input", Token(payload={"sym": sym}))
         net.run(deadline=time.monotonic() + 0.3)
 
         assert len(net.places["output"].tokens) == 0
         assert {t.payload["sym"] for t in net.places["input"].tokens} == {"AAPL", "MSFT"}
+
+    @_SILENCE_LEGACY
+    def test_transition_can_opt_back_in_under_a_legacy_net(self):
+        """A transition may take `FIRST` back even while the net default is the LEGACY opt-out."""
+        net = PetriNet(
+            places=[Place("input"), Place("output")],
+            binding_policy=BindingPolicy.LEGACY,
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                    guard=lambda toks: toks[0].payload["sym"] == "MSFT",
+                    binding_policy=BindingPolicy.FIRST,
+                )
+            ],
+        )
+        for sym in ("AAPL", "MSFT"):
+            net.deposit("input", Token(payload={"sym": sym}))
+        net.run(deadline=time.monotonic() + 2.0)
+
+        assert [t.payload["sym"] for t in net.places["output"].tokens] == ["MSFT"]
+        assert {t.payload["sym"] for t in net.places["input"].tokens} == {"AAPL"}
+
+
+class TestLegacyDeprecationWarning:
+    """`LEGACY` warns at run time wherever it can enter the system.
+
+    The 0.5.0 deprecation was documentation-only — no runtime signal at all — so these pin
+    that every entry point now warns, and that the warning cannot be swallowed by Python's
+    default filters.
+    """
+
+    def _transition(self, policy):
+        return Transition(
+            name="t",
+            inputs=[InputArc("input")],
+            outputs=[OutputArc("output")],
+            action=lambda toks: toks,
+            binding_policy=policy,
+        )
+
+    def test_net_constructor_warns(self):
+        with pytest.warns(CpnxDeprecationWarning, match="removed in 0.7.0"):
+            PetriNet(binding_policy=BindingPolicy.LEGACY)
+
+    def test_transition_constructor_warns(self):
+        with pytest.warns(CpnxDeprecationWarning, match="removed in 0.7.0"):
+            self._transition(BindingPolicy.LEGACY)
+
+    def test_net_policy_setter_warns(self):
+        net = PetriNet()
+        with pytest.warns(CpnxDeprecationWarning):
+            net.binding_policy = BindingPolicy.LEGACY
+        assert net.binding_policy is BindingPolicy.LEGACY  # the assignment still takes effect
+
+    def test_transition_reassignment_warns(self):
+        transition = self._transition(BindingPolicy.FIRST)
+        with pytest.warns(CpnxDeprecationWarning):
+            transition.binding_policy = BindingPolicy.LEGACY
+        assert transition.binding_policy is BindingPolicy.LEGACY
+
+    def test_warning_names_the_offending_transition(self):
+        """The message carries the transition name, so a large net says which one to fix."""
+        with pytest.warns(CpnxDeprecationWarning, match=r"Transition\(name='t'\)"):
+            self._transition(BindingPolicy.LEGACY)
+
+    @pytest.mark.parametrize("policy", [None, BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY])
+    def test_undeprecated_policies_are_silent(self, policy):
+        """Only LEGACY warns — above all the default, or every net would warn."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", CpnxDeprecationWarning)
+            self._transition(policy)
+            if policy is not None:
+                PetriNet(binding_policy=policy)
+            else:
+                PetriNet()
+
+    @pytest.mark.parametrize(
+        "select",
+        [
+            pytest.param(lambda t: PetriNet(binding_policy=BindingPolicy.LEGACY), id="net-constructor"),
+            pytest.param(lambda t: t(BindingPolicy.LEGACY), id="transition-constructor"),
+            pytest.param(lambda t: setattr(PetriNet(), "binding_policy", BindingPolicy.LEGACY), id="net-setter"),
+            pytest.param(
+                lambda t: setattr(t(BindingPolicy.FIRST), "binding_policy", BindingPolicy.LEGACY),
+                id="transition-reassignment",
+            ),
+        ],
+    )
+    def test_warning_points_at_the_caller(self, select):
+        """Every entry point blames the caller's own line, not a frame inside cpnx.
+
+        The four paths sit at different stack depths — the two constructors go through an
+        extra frame (`PetriNet.__init__`, or the `@dataclass`-generated `Transition.__init__`,
+        which reports as `<string>`) while the two assignments do not. A warning naming
+        `engine.py` or `<string>` tells the user nothing about which line of *their* net to
+        fix. This covers all four entry points by file; the exact *line* is pinned by
+        `test_construction_names_the_exact_line` / `test_reassignment_names_the_exact_line`,
+        which call inline — here the innermost user frame is the parametrised lambda, so the
+        expected line would have to be derived per-param rather than asserted directly.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            select(self._transition)
+
+        hits = [w for w in caught if issubclass(w.category, CpnxDeprecationWarning)]
+        assert len(hits) == 1
+        assert hits[0].filename == __file__
+
+    def test_construction_names_the_exact_line(self):
+        """Construction reports the caller's line, not the generated `__init__`'s.
+
+        Pinning the line matters because filename alone passes with a residual off-by-one:
+        the frames in between live in this file too.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            expected_lineno = inspect.currentframe().f_lineno + 1
+            PetriNet(binding_policy=BindingPolicy.LEGACY)
+
+        hit = next(w for w in caught if issubclass(w.category, CpnxDeprecationWarning))
+        assert (hit.filename, hit.lineno) == (__file__, expected_lineno)
+
+    def test_reassignment_names_the_exact_line(self):
+        """Post-construction reassignment reports the caller's line, one frame shallower."""
+        net = PetriNet()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            expected_lineno = inspect.currentframe().f_lineno + 1
+            net.binding_policy = BindingPolicy.LEGACY
+
+        hit = next(w for w in caught if issubclass(w.category, CpnxDeprecationWarning))
+        assert (hit.filename, hit.lineno) == (__file__, expected_lineno)
+
+    def test_warning_reaches_synthetic_caller_frames(self):
+        """User code with no real file — a REPL, a notebook cell, `exec` — still gets a line.
+
+        The frame walk has to step over the `@dataclass`-generated `__init__`, which also has
+        a synthetic filename. Rejecting *every* synthetic frame overshot the whole stack and
+        made `warnings` report `sys:1` — no file and no line at all — for anyone driving a net
+        from `python -c`, a REPL or a notebook. Only the generated `__init__` is skipped now.
+        """
+        source = "PetriNet(binding_policy=BindingPolicy.LEGACY)"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            exec(  # noqa: S102 - exercising attribution for exec'd user code is the point
+                compile(source, "<string>", "exec"),
+                {"PetriNet": PetriNet, "BindingPolicy": BindingPolicy},
+            )
+
+        hits = [w for w in caught if issubclass(w.category, CpnxDeprecationWarning)]
+        assert len(hits) == 1
+        assert hits[0].filename == "<string>"  # the caller's synthetic frame, not `sys`
+        assert hits[0].lineno == 1
+
+    def test_package_root_cannot_swallow_sibling_paths(self):
+        """The cpnx-frame test is separator-terminated, so `cpnx_user/` is not read as cpnx.
+
+        A bare `startswith` on the package directory also matched any sibling whose name
+        merely begins with it, so a user net in `.../cpnx_user/m.py` was walked straight past
+        and the warning landed on *its* caller instead.
+        """
+        assert _PACKAGE_ROOT.endswith(os.sep)
+        sibling = f"{_PACKAGE_ROOT.rstrip(os.sep)}_user{os.sep}m.py"
+        assert not sibling.startswith(_PACKAGE_ROOT)
+
+    def test_category_is_visible_under_default_filters(self):
+        """Not a `DeprecationWarning` subclass, so `ignore::DeprecationWarning` cannot hide it.
+
+        Python's default filters ignore `DeprecationWarning` outside `__main__`, which would
+        make this invisible to exactly the library users it must reach — repeating 0.5.0's
+        silent deprecation. Pinned because it is a deliberate choice, not an oversight.
+        """
+        assert issubclass(CpnxDeprecationWarning, UserWarning)
+        assert not issubclass(CpnxDeprecationWarning, DeprecationWarning)
 
 
 class TestDeterminism:
@@ -97,8 +333,8 @@ class TestDeterminism:
 
 
 class TestGuardFreeFastPath:
-    def test_first_no_guard_is_fifo_like_legacy(self):
-        """FIRST without a guard behaves identically to LEGACY: first count, FIFO."""
+    def test_first_no_guard_is_fifo_head_only(self):
+        """FIRST without a guard resolves head-only: the first `count` tokens, FIFO."""
         net = PetriNet(
             places=[Place("input"), Place("output")],
             transitions=[
@@ -144,9 +380,10 @@ class TestCountAndMultiArc:
         assert len(out_vs) == 2
         assert sum(out_vs) == 10
 
+    @_SILENCE_LEGACY
     def test_multi_arc_deep_combination(self):
         """Two input places, guard relates one token from each; heads don't match but a
-        deeper combination does. FIRST finds it; LEGACY does not."""
+        deeper combination does. FIRST finds it; the LEGACY opt-out does not."""
 
         def build(policy):
             net = PetriNet(
@@ -346,8 +583,6 @@ class TestExhaustionCallbackOffLock:
 
 class TestSearchLimitValidation:
     def test_negative_limit_rejected_at_construction(self):
-        import pytest
-
         for bad in (-2, -1, 0):
             with pytest.raises(ValueError, match="binding_search_limit must be >= 1"):
                 PetriNet(binding_search_limit=bad)
@@ -409,54 +644,106 @@ class TestConsumptionCorrectness:
 
 
 class TestPolicyOverride:
-    def test_net_first_transition_overrides_to_legacy(self):
-        """Net default FIRST, transition overrides LEGACY → HoL-blocked (no fire)."""
+    """A transition's own `binding_policy` wins over the net default, in either direction.
+
+    Both cases use a guard-free transition over the same three tokens, deposited so that the
+    head is *not* the minimum-`rank` token. Guard-free `FIRST` resolves head-only, while
+    `PRIORITY` enumerates and takes the minimum key — so which token is consumed names the
+    policy actually in force.
+    """
+
+    def _build(self, net_policy, transition_policy):
         net = PetriNet(
             places=[Place("input"), Place("output")],
-            binding_policy=BindingPolicy.FIRST,
+            binding_policy=net_policy,
             transitions=[
                 Transition(
                     name="t",
                     inputs=[InputArc("input")],
                     outputs=[OutputArc("output")],
                     action=lambda toks: toks,
-                    guard=lambda toks: toks[0].payload["sym"] == "MSFT",
-                    binding_policy=BindingPolicy.LEGACY,
+                    binding_policy=transition_policy,
+                    binding_priority_key=lambda toks: toks[0].payload["rank"],
                 )
             ],
         )
-        net.deposit("input", Token(payload={"sym": "AAPL"}))
-        net.deposit("input", Token(payload={"sym": "MSFT"}))
-        net.run(deadline=time.monotonic() + 0.3)
+        for rank in (2, 0, 1):  # head is rank 2; the minimum key is the second deposit
+            net.deposit("input", Token(payload={"rank": rank}))
+        return net
 
-        assert len(net.places["output"].tokens) == 0
-        assert len(net.places["input"].tokens) == 2
+    def test_net_first_transition_overrides_to_priority(self):
+        """Net default FIRST, transition overrides PRIORITY → min-key token, not the head."""
+        net = self._build(BindingPolicy.FIRST, BindingPolicy.PRIORITY)
+        _fire_once(net)
 
-    def test_net_legacy_transition_overrides_to_first(self):
-        """Net default LEGACY, transition overrides FIRST → searches and fires."""
+        assert [t.payload["rank"] for t in net.places["output"].tokens] == [0]
+        assert {t.payload["rank"] for t in net.places["input"].tokens} == {1, 2}
+
+    def test_net_priority_transition_overrides_to_first(self):
+        """Net default PRIORITY, transition overrides FIRST → head-only, ignoring the key."""
+        net = self._build(BindingPolicy.PRIORITY, BindingPolicy.FIRST)
+        _fire_once(net)
+
+        assert [t.payload["rank"] for t in net.places["output"].tokens] == [2]
+        assert {t.payload["rank"] for t in net.places["input"].tokens} == {0, 1}
+
+
+class TestGuardedPolicyOverride:
+    """The override also holds for a **guarded** transition — the shape the v0.6.0 flip moved.
+
+    A guarded transition never takes the head-only fast path, so both arms search. The guard
+    admits only `ok` tokens, and the `ok` ones are deposited out of rank order, so `FIRST`
+    (first satisfying in insertion order → rank 3) and `PRIORITY` (minimum key *among the
+    satisfying* bindings → rank 1) pick different tokens. The lowest rank overall sits on a
+    guard-failing token, so these also pin that the guard filters *before* the key ranks.
+    """
+
+    def _build(self, net_policy, transition_policy):
         net = PetriNet(
             places=[Place("input"), Place("output")],
-            binding_policy=BindingPolicy.LEGACY,
+            binding_policy=net_policy,
             transitions=[
                 Transition(
                     name="t",
                     inputs=[InputArc("input")],
                     outputs=[OutputArc("output")],
                     action=lambda toks: toks,
-                    guard=lambda toks: toks[0].payload["sym"] == "MSFT",
-                    binding_policy=BindingPolicy.FIRST,
+                    guard=lambda toks: toks[0].payload["ok"] is True,
+                    binding_policy=transition_policy,
+                    binding_priority_key=lambda toks: toks[0].payload["rank"],
                 )
             ],
         )
-        net.deposit("input", Token(payload={"sym": "AAPL"}))
-        net.deposit("input", Token(payload={"sym": "MSFT"}))
-        net.run(deadline=time.monotonic() + 2.0)
+        # rank 0 is the global minimum but fails the guard; the satisfying ranks are 3 then 1.
+        for ok, rank in ((False, 0), (True, 3), (True, 1), (False, 2)):
+            net.deposit("input", Token(payload={"ok": ok, "rank": rank}))
+        return net
 
-        assert [t.payload["sym"] for t in net.places["output"].tokens] == ["MSFT"]
-        assert {t.payload["sym"] for t in net.places["input"].tokens} == {"AAPL"}
+    def test_guarded_net_priority_transition_overrides_to_first(self):
+        """Net default PRIORITY, guarded transition overrides FIRST → first satisfying."""
+        net = self._build(BindingPolicy.PRIORITY, BindingPolicy.FIRST)
+        _fire_once(net)
+
+        assert [t.payload["rank"] for t in net.places["output"].tokens] == [3]
+        assert {t.payload["rank"] for t in net.places["input"].tokens} == {0, 1, 2}
+
+    def test_guarded_net_first_transition_overrides_to_priority(self):
+        """Net default FIRST, guarded transition overrides PRIORITY → min key among satisfying."""
+        net = self._build(BindingPolicy.FIRST, BindingPolicy.PRIORITY)
+        _fire_once(net)
+
+        assert [t.payload["rank"] for t in net.places["output"].tokens] == [1]
+        assert {t.payload["rank"] for t in net.places["input"].tokens} == {0, 2, 3}
+
+    def test_guarded_unset_transition_inherits_net_policy(self):
+        """A guarded transition with no policy of its own follows the net default (FIRST)."""
+        net = self._build(BindingPolicy.FIRST, None)
+        _fire_once(net)
+
+        assert [t.payload["rank"] for t in net.places["output"].tokens] == [3]
 
 
-class TestLegacyParitySanity:
+class TestHeadMatchSanity:
     def test_unset_net_guard_matches_head_fires_normally(self):
         """An unset-policy net with a guard matching the head fires once, normally."""
         fired: list[int] = []
@@ -678,8 +965,6 @@ class TestSearchPolicyExhaustion:
 
 class TestPriorityKeyErrorHandling:
     def test_non_callable_key_rejected_at_construction(self):
-        import pytest
-
         with pytest.raises(TypeError, match="binding_priority_key must be a callable or None"):
             Transition(
                 name="t",

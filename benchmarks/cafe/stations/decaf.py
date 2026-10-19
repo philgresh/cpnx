@@ -87,7 +87,7 @@ def transitions(*, work_secs: float = 0.0) -> list[Transition]:
 
     Demonstrates:
         A single input arc with a certified `filter` and **no `key`**, `count=1`, default
-        `LEGACY` policy — the minimal shape that reproduces the filter-only cliff
+        `FIRST` policy — the minimal shape that reproduces the filter-only cliff
         described in the module docstring. Nothing else on the transition (no guard, no
         `binding_priority_key`) so the cost measured is attributable to the arc alone.
 

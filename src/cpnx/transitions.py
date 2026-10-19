@@ -7,12 +7,58 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, Literal
 
 from cpnx.analysis import coerce_color_domain
 from cpnx.certification import is_inline_safe
-from cpnx.linting import lint_and_warn
+from cpnx.linting import _assignment_stacklevel, lint_and_warn
 from cpnx.sandbox import verify_callable_purity
 from cpnx.tokens import Token
 
 if TYPE_CHECKING:
     from cpnx.engine import PetriNet
+
+
+class CpnxDeprecationWarning(UserWarning):
+    """Warn that a deprecated cpnx API was used, naming the release that removes it.
+
+    A dedicated category so users can `warnings.filterwarnings` it independently —
+    silence it during a staged migration, or escalate it to an error for CI via
+    `filterwarnings("error", category=CpnxDeprecationWarning)` — without touching cpnx's
+    other warnings.
+
+    Note:
+        This deliberately subclasses `UserWarning`, **not** `DeprecationWarning`, so it is
+        **visible by default**. Python's default filters ignore `DeprecationWarning` outside
+        `__main__`, which would hide it from exactly the library users a deprecation is meant
+        to reach. cpnx has been bitten by a silent deprecation once already: `LEGACY` was
+        announced as deprecated in the 0.5.0 docs with no runtime signal whatsoever, so a net
+        relying on it had nothing to notice short of reading the changelog.
+    """
+
+
+def _warn_deprecated_policy(policy: "BindingPolicy", *, source: str) -> None:
+    """Emit the removal notice when a deprecated [`BindingPolicy`][cpnx.BindingPolicy] is selected.
+
+    Called from every entry point that can put a policy into force — `Transition.__setattr__`,
+    `PetriNet.__init__` and the `PetriNet.binding_policy` setter — so the warning fires wherever
+    `LEGACY` enters the system rather than only at one of them. A no-op for every other policy,
+    so the healthy path really does pay just one identity comparison: the `stacklevel` walk
+    happens *after* that check, never before it.
+
+    Args:
+        policy: The policy being selected; only `BindingPolicy.LEGACY` warns.
+        source: How it was selected, named in the message so a net with several transitions
+            says which one (e.g. `"Transition(name='t')"`).
+    """
+    if policy is not BindingPolicy.LEGACY:
+        return
+    warnings.warn(
+        f"{source}: BindingPolicy.LEGACY is deprecated and will be removed in 0.7.0. It is no "
+        "longer the default — that is now BindingPolicy.FIRST, with LEGACY kept selectable for "
+        "one release as the opt-out. FIRST is a strict superset (identical head "
+        "selection whenever the head satisfies the guard, plus the head-of-line fix when it "
+        "does not, and no search cost without a guard), so migrate by dropping the argument to "
+        "inherit the FIRST default, or passing binding_policy=BindingPolicy.FIRST explicitly.",
+        CpnxDeprecationWarning,
+        stacklevel=_assignment_stacklevel(),
+    )
 
 
 def _reject_string_expression(field: str, value) -> None:
@@ -97,7 +143,7 @@ class BindingPolicy(enum.Enum):
     """Strategy for choosing which input tokens bind a transition when it is enabled.
 
     In CPN theory a transition is enabled if *any* assignment of place tokens (a
-    *binding*) satisfies its guard. cpnx historically tested only the head of each
+    *binding*) satisfies its guard. cpnx before 0.3.1 tested only the head of each
     input place (FIFO, or reordered by [`InputArc.key`][cpnx.InputArc]), which
     causes **head-of-line blocking**: a place holding `[A, B]` whose guard wants `B`
     reports the transition disabled, because only `A` is ever tested. `BindingPolicy`
@@ -105,29 +151,28 @@ class BindingPolicy(enum.Enum):
     `docs/adr/0001-combinatorial-binding-search.md`.
 
     Attributes:
-        LEGACY: Test only the first `count` tokens of each input place (FIFO, or the
-            leading tokens of the [`InputArc.key`][cpnx.InputArc] ordering) and
-            evaluate the guard once against that single candidate set. This is the
-            historical behavior and the current default — reproducible, but subject
-            to head-of-line blocking. Choose this to preserve pre-0.3.1 semantics
-            exactly.
-
-            **Deprecated.** `LEGACY` exists only to keep nets written before 0.3.1
-            byte-for-byte unaffected during the migration window described in
-            `docs/adr/0001-combinatorial-binding-search.md`. `FIRST` is a strict
-            superset of `LEGACY` — identical head selection whenever the head
-            already satisfies the guard, plus the head-of-line fix when it doesn't
-            — so there is no remaining reason to choose `LEGACY` over it. **`LEGACY`
-            will be removed in v0.6.0**; migrate by passing
-            `binding_policy=BindingPolicy.FIRST` explicitly wherever `LEGACY` is
-            relied on today, including the `PetriNet`/`Transition` default (see the
-            Phase 3 note in `docs/adr/0001-combinatorial-binding-search.md`).
         FIRST: Search input-token combinations in a stable insertion order and select
             the **first** combination whose guard is satisfied. Complete (finds a valid
             binding if one exists anywhere in the place, fixing head-of-line blocking)
-            **and** deterministic (the same marking always yields the same binding). When
-            the transition has no guard, this is identical to `LEGACY` and incurs no
-            search cost.
+            **and** deterministic (the same marking always yields the same binding).
+            This is the default. When the transition has no guard, the first
+            candidate is the head and trivially satisfies, so resolution reduces to the
+            O(1) head selection and incurs no search cost.
+        LEGACY: Test only the first `count` tokens of each input place (FIFO, or the
+            leading tokens of the [`InputArc.key`][cpnx.InputArc] ordering) and evaluate
+            the guard once against that single candidate set. Reproducible, but subject to
+            head-of-line blocking.
+
+            **Deprecated — selecting it warns at run time
+            ([`CpnxDeprecationWarning`][cpnx.CpnxDeprecationWarning]) and it will be
+            removed in 0.7.0.** It was the default through 0.5.0; the default is now
+            `FIRST`, with `LEGACY` kept selectable for one release as the opt-out, so a net
+            that relied on head-only resolution has a cycle in which to migrate (ADR 0001
+            Phases 3–4). `FIRST` is a strict superset — identical head selection whenever
+            the head already satisfies the guard, plus the head-of-line fix when it doesn't,
+            and no search cost at all without a guard — so there is no remaining reason to
+            choose `LEGACY`. Migrate by deleting the argument to inherit the `FIRST` default,
+            or passing `binding_policy=BindingPolicy.FIRST` explicitly.
         RANDOM: Enumerate the satisfying combinations and select one **uniformly at
             random**. Reproducible when the owning [`PetriNet`][cpnx.PetriNet] is
             constructed with a `seed` (and `max_workers=1`); otherwise it varies run to
@@ -152,7 +197,8 @@ class BindingPolicy(enum.Enum):
           data dimension (the one that actually changes the guard result) varies first, and/or
           raise `binding_search_limit`.
         - For `FIRST` the first binding yielded is exactly `LEGACY`'s head selection, so
-          `FIRST` is a strict superset of `LEGACY`.
+          `FIRST` is a strict superset of `LEGACY` and a guard the head already satisfies
+          costs no search at all.
         - `RANDOM`/`PRIORITY` must scan the whole (bounded) candidate set, so they do not
           short-circuit and are typically costlier than `FIRST`. If the candidate space
           exceeds `binding_search_limit`, they select over the first `limit` candidates only
@@ -161,8 +207,8 @@ class BindingPolicy(enum.Enum):
           stall exactly like `FIRST`, not just fire over a smaller set.
     """
 
-    LEGACY = "legacy"
     FIRST = "first"
+    LEGACY = "legacy"
     RANDOM = "random"
     PRIORITY = "priority"
 
@@ -303,7 +349,7 @@ class InputArc:
                 verify_callable_purity(value)
                 # Best-effort advisory scan for side-effecting / non-deterministic
                 # trouble spots (see :mod:`cpnx.linting`); warns, or raises in strict mode.
-                lint_and_warn(value, f"InputArc.{name}", stacklevel=3)
+                lint_and_warn(value, f"InputArc.{name}")
                 if name == "filter":
                     _reject_non_bool_return("InputArc.filter", value)
             super().__setattr__(f"_{name}_inline_safe", _inline_safe_for(value))
@@ -386,7 +432,7 @@ class OutputArc:
             _reject_string_expression("OutputArc.condition", value)
             if callable(value):
                 verify_callable_purity(value)
-                lint_and_warn(value, "OutputArc.condition", stacklevel=3)
+                lint_and_warn(value, "OutputArc.condition")
                 _reject_non_bool_return("OutputArc.condition", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         super().__setattr__(name, value)
@@ -471,12 +517,13 @@ class Transition:
         binding_policy: How the engine resolves which input tokens bind this transition
                when checking enablement — see [`BindingPolicy`][cpnx.BindingPolicy].
                `None` (default) inherits the net-wide default set on
-               [`PetriNet`][cpnx.PetriNet] (itself `BindingPolicy.LEGACY` by default, though
-               `LEGACY` is **deprecated and will be removed in v0.6.0** — see
-               [`BindingPolicy`][cpnx.BindingPolicy]), so an unset transition behaves
-               exactly as before. Set `BindingPolicy.FIRST` to enable
-               deterministic-complete binding search (fixing head-of-line blocking) for
-               this transition only.
+               [`PetriNet`][cpnx.PetriNet] (itself `BindingPolicy.FIRST`), which
+               resolves head-only for a guard-free transition and searches only when a guard
+               is present. Set `BindingPolicy.RANDOM` or `BindingPolicy.PRIORITY` to select
+               *among* the satisfying bindings rather than taking the first, for this
+               transition only. Setting the deprecated `BindingPolicy.LEGACY` warns
+               ([`CpnxDeprecationWarning`][cpnx.CpnxDeprecationWarning]) and stops working in
+               0.7.0.
         binding_priority_key: Sort key used only under `BindingPolicy.PRIORITY`. A pure
                `Callable[[list[Token]], object]` (must be callable or `None` — string
                expressions are not supported and raise `TypeError` at assignment) mapping a
@@ -548,7 +595,7 @@ class Transition:
             _reject_string_expression("guard", value)
             if callable(value):
                 verify_callable_purity(value)
-                lint_and_warn(value, "guard", stacklevel=3)
+                lint_and_warn(value, "guard")
                 _reject_non_bool_return("guard", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         elif name == "binding_priority_key" and value is not None:
@@ -561,7 +608,14 @@ class Transition:
                     f"got {type(value).__name__}. String-expression keys are not supported."
                 )
             verify_callable_purity(value)
-            lint_and_warn(value, "binding_priority_key", stacklevel=3)
+            lint_and_warn(value, "binding_priority_key")
+        elif name == "binding_policy" and value is not None:
+            # Warns only for a deprecated policy, and from both paths into this method: the
+            # generated dataclass ``__init__`` as well as post-construction reassignment.
+            # ``name`` is declared before ``binding_policy`` so it is already assigned, but
+            # read it defensively so a field reorder degrades the message rather than raising.
+            owner = getattr(self, "name", "<unnamed>")
+            _warn_deprecated_policy(value, source=f"Transition(name={owner!r})")
         elif name == "impacts_colors":
             # Declarative colour-domain annotation (not a callable): normalise any
             # iterable of colour names to a frozenset, reject a bare string / non-str

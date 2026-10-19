@@ -1,7 +1,10 @@
 # ADR 0001 — Combinatorial Binding Search with Deterministic-Complete Default
 
-- **Status:** Accepted — Phase 1 shipped in 0.3.1 (`BindingPolicy.FIRST`); Phase 2 shipped in
-  0.3.2 (`BindingPolicy.RANDOM`/`PRIORITY`, `PetriNet(seed=...)`)
+- **Status:** Accepted; **amended** by Phases 3–4 (see "Deviation from step 2") — Phase 1 shipped in 0.3.1 (`BindingPolicy.FIRST`); Phase 2 shipped in
+  0.3.2 (`BindingPolicy.RANDOM`/`PRIORITY`, `PetriNet(seed=...)`); Phase 3 merged in
+  [#53](https://github.com/philgresh/cpnx/pull/53) (`FIRST` becomes the default, `LEGACY`
+  retained as a deprecated opt-out — unreleased; after 0.5.0, targeted at 0.6.0); Phase 4
+  *(planned)* removes `LEGACY` in 0.7.0
 - **Date:** 2026-07-02
 - **Deciders:** cpnx maintainers
 - **Related:** `docs/cpn-theory-audit.md` (Findings 1–3, §0 positioning)
@@ -93,11 +96,15 @@ consumed). Therefore it is **gated**:
    `BindingPolicy.FIRST`, selectable per-`Transition` (`Transition.binding_policy`) with
    a per-`PetriNet` default (`PetriNet(binding_policy=...)`); the search bound is
    `PetriNet.binding_search_limit` and exhaustion surfaces via
-   `PetriNet.on_binding_search_exhausted`. Off by default (`BindingPolicy.LEGACY`), so
-   existing nets are byte-for-byte unaffected. This is the escape hatch for conservative
-   users during the transition window.
+   `PetriNet.on_binding_search_exhausted`. It was off by default (`BindingPolicy.LEGACY`),
+   so existing nets were byte-for-byte unaffected — the escape hatch for conservative users
+   during the transition window. (Through 0.5.0 `LEGACY` was the default; Phase 3 below
+   flips that while keeping `LEGACY` selectable.)
 2. **Default-on later** — *(planned)* flip the default at a major version bump, retaining
    a `first_only`/legacy opt-out for one deprecation cycle.
+   *Carried out by Phases 3–4 below: Phase 3 flips the default and keeps `LEGACY` as the
+   opt-out, Phase 4 removes it one release later. See "Deviation from step 2" for the one
+   point on which it still differs.*
 
 **Phase 2 shipped in 0.3.2:** the `random` and `priority` policies land as
 `BindingPolicy.RANDOM`/`PRIORITY`. Both consume the same satisfying-binding enumeration as
@@ -109,7 +116,51 @@ scheduler's equal-priority tie-break so a seeded net replays end-to-end. To keep
 that never draws the RNG (only the actual firing resolution samples). Unlike `first`,
 `random`/`priority` cannot short-circuit and enumerate the full bounded candidate set; when
 that set exceeds `binding_search_limit` they select over a truncated prefix and fire the
-exhaustion callback. The default flip (Phase 3) remains planned.
+exhaustion callback.
+
+**Phase 3 — merged in [#53](https://github.com/philgresh/cpnx/pull/53), unreleased (after
+0.5.0, targeted at 0.6.0):** the **default flip**. `FIRST` becomes the default for both
+`PetriNet(binding_policy=...)` and the policy a `Transition` inherits when its own
+`binding_policy` is left `None`. `BindingPolicy.LEGACY` is **kept, and still works exactly as
+before** — this is the `first_only`/legacy opt-out step 2 asked for, and it is what makes the
+flip recoverable: a net that depended on head-only resolution sets `binding_policy=LEGACY`
+and is byte-for-byte unaffected while it migrates.
+
+Selecting `LEGACY` now emits `CpnxDeprecationWarning` at every entry point that can put it in
+force — `PetriNet(binding_policy=...)`, the `PetriNet.binding_policy` setter, and
+`Transition(binding_policy=...)` (including post-construction reassignment) — naming 0.7.0 as
+the removal. That warning is the substance of the deprecation cycle, and it is new here: the
+0.5.0 deprecation was **documentation-only**, so a net relying on `LEGACY` had no runtime
+signal at all. The category deliberately subclasses `UserWarning` rather than
+`DeprecationWarning`, because Python's default filters ignore `DeprecationWarning` outside
+`__main__` — which would have reproduced 0.5.0's silence in a subtler form.
+
+The flip is behaviour-changing for exactly one shape: a **guarded** transition that did not
+set a policy explicitly now searches instead of testing only the head, which is the
+head-of-line fix this ADR exists to deliver. Guard-free transitions are unaffected —
+`_is_head_only` still routes them to the same O(1) head resolution, so the no-guard fast path
+(and ADR 0005's count-only path) is unchanged.
+
+**Phase 4 — *(planned)*, 0.7.0:** remove `BindingPolicy.LEGACY`. One release after the flip,
+per step 2's deprecation cycle. At that point `FIRST` is a strict superset of everything
+`LEGACY` offered — identical head selection whenever the head satisfies the guard, plus the
+head-of-line fix when it does not — so there is deliberately **no replacement** for head-only
+resolution *with* a guard; the incompleteness was the only thing `LEGACY` uniquely provided,
+and it is the bug. A net that must bound the search to the head candidate can set
+`PetriNet(binding_search_limit=1)`, but that is net-wide and signals
+`on_binding_search_exhausted` whenever the head fails, so it is a diagnostic knob rather than
+a silent `LEGACY` equivalent.
+
+**Deviation from step 2.** Phases 3–4 carry out step 2 — flip, retain the opt-out for one
+cycle, then remove — on one point of difference, recorded here rather than by amending the
+step: step 2 said "at a major version bump", and this lands across *minor* bumps (0.5.0 →
+0.6.0 → 0.7.0). The project is pre-1.0 (`Development Status :: 3 - Alpha`), where semver
+allows breaking changes in a minor bump and where this repo has done exactly that before —
+ADR 0004 is "shipped in 0.4.0 (breaking; pre-1.0)". Waiting for 1.0 would also strand the
+head-of-line fix behind an opt-in indefinitely. Note that
+[#43](https://github.com/philgresh/cpnx/issues/43) and the 0.5.0 changelog announced the
+**removal** for v0.6.0; that is superseded here, because honouring step 2's deprecation cycle
+requires 0.6.0 to be the flip and 0.7.0 the removal.
 
 ## Rationale — why the determinism worry is smaller than it appears
 

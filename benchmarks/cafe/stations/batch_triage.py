@@ -88,7 +88,7 @@ def transitions(*, work_secs: float = 0.0) -> list[Transition]:
 
     Demonstrates:
         A single keyed input arc and nothing else: no guard, no filter, default
-        `LEGACY` policy, `count=1`. Under `LEGACY` the arc is read head-only, so the
+        `FIRST` policy, `count=1`. Guard-free, so the arc is read head-only and the
         key index is asked for just `count` tokens — the cheapest possible read of a
         deep keyed place, and the one the throughput benchmark's key-index rows
         measure.

@@ -143,7 +143,7 @@ def transitions(*, work_secs: float = 0.0) -> list[Transition]:
         uncertified, so `_ensure_key_index` never indexes `P_Specials_Queue` and every firing re-materialises
         and re-sorts the whole available pool via `_order_available`, with each token's key
         dispatched through the timeout-bounded expression executor rather than evaluated
-        inline. No guard, no filter, default `LEGACY` policy, `count=1` -- identical shape to
+        inline. No guard, no filter, default `FIRST` policy, `count=1` -- identical shape to
         `T_Batch_Triage_Serve`, so the only variable between the two stations is certification.
 
     Args:

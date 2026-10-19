@@ -84,7 +84,7 @@ def transitions(*, work_secs: float = 0.0, key: bool = False) -> list[Transition
 
     Demonstrates:
         With `key=False` (the default) this is deliberately the plainest transition in
-        the whole fixture: no guard, no `key`, no `filter`, default `LEGACY` policy,
+        the whole fixture: no guard, no `key`, no `filter`, default `FIRST` policy,
         one input arc, one output arc. [`Place.retrieve`][cpnx.Place.retrieve] has already filtered to matured
         tokens before the arc sees them, so plain FIFO over "whatever's ready" is all
         it needs — and that isolates the *timed store* as the only thing being

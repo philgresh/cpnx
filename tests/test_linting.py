@@ -11,6 +11,7 @@ suite needs no third-party network/DB drivers installed.
 """
 
 import datetime as datetime_mod
+import inspect
 import random
 import secrets
 import socket
@@ -23,7 +24,8 @@ from datetime import datetime as DatetimeClass
 
 import pytest
 
-from cpnx import InputArc, OutputArc, Token, Transition
+from cpnx import InputArc, OutputArc, Token, Transition, linting
+from cpnx import transitions as transitions_mod
 from cpnx.linting import (
     DATABASE,
     NETWORK,
@@ -242,6 +244,119 @@ def test_input_arc_filter_and_key_warn_at_construction():
         warnings.simplefilter("always")
         InputArc("in", filter=guard_random)
     assert any(issubclass(w.category, CpnxLintWarning) for w in caught)
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        pytest.param(
+            lambda: Transition(
+                name="t",
+                inputs=[InputArc("in")],
+                outputs=[OutputArc("out")],
+                action=_action,
+                guard=guard_clock_time,
+            ),
+            id="guard-at-construction",
+        ),
+        pytest.param(
+            lambda: setattr(
+                Transition(name="t", inputs=[InputArc("in")], outputs=[OutputArc("out")], action=_action),
+                "guard",
+                guard_clock_time,
+            ),
+            id="guard-reassigned",
+        ),
+        pytest.param(lambda: InputArc("in", key=guard_random), id="input-arc-key-at-construction"),
+        pytest.param(lambda: setattr(InputArc("in"), "key", guard_random), id="input-arc-key-reassigned"),
+        pytest.param(lambda: InputArc("in", filter=guard_random), id="input-arc-filter-at-construction"),
+        pytest.param(lambda: OutputArc("out", condition=guard_clock_time), id="output-arc-condition"),
+    ],
+)
+def test_lint_warning_points_at_the_caller(trigger):
+    """A finding must name the user's own line, not a frame inside cpnx.
+
+    These warnings exist to tell an author *which* guard/key/filter to fix, so the reported
+    location is load-bearing. Construction and reassignment reach the validators at different
+    stack depths — a dataclass assigns its fields through a generated ``__init__``, an extra
+    frame that reports as ``<string>`` and names no user code at all — so both are pinned
+    here by file; the exact line is pinned by ``test_guard_finding_names_the_exact_line`` and
+    ``test_guard_reassignment_names_the_exact_line``, which call inline (here the innermost
+    user frame is the parametrised lambda). See ``_assignment_stacklevel`` in
+    ``cpnx.transitions``.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        trigger()
+
+    hits = [w for w in caught if issubclass(w.category, CpnxLintWarning)]
+    assert hits, "expected a lint finding"
+    assert hits[0].filename == __file__
+
+
+def test_guard_finding_names_the_exact_line():
+    """A finding on a guard passed straight to the constructor reports the caller's line.
+
+    Filename alone would pass with a residual off-by-one, since the frames in between live in
+    this file too — so the line is asserted. This is the common case, and the one that used to
+    report ``<string>``.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        expected_lineno = inspect.currentframe().f_lineno + 1
+        Transition(name="t", inputs=[InputArc("in")], outputs=[OutputArc("out")], action=_action, guard=guard_random)
+
+    hit = next(w for w in caught if issubclass(w.category, CpnxLintWarning))
+    assert (hit.filename, hit.lineno) == (__file__, expected_lineno)
+
+
+def test_guard_reassignment_names_the_exact_line():
+    """Reassigning a guard post-construction reports the caller's line, one frame shallower."""
+    transition = Transition(name="t", inputs=[InputArc("in")], outputs=[OutputArc("out")], action=_action)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        expected_lineno = inspect.currentframe().f_lineno + 1
+        transition.guard = guard_random
+
+    hit = next(w for w in caught if issubclass(w.category, CpnxLintWarning))
+    assert (hit.filename, hit.lineno) == (__file__, expected_lineno)
+
+
+def test_clean_construction_never_walks_the_stack(monkeypatch):
+    """Resolving `stacklevel` is deferred until a warning is actually emitted.
+
+    The depth is found by walking frames, which is pure waste when there is nothing to report
+    — and *every* guard, key, filter and condition assignment went through it while the
+    `stacklevel` was computed eagerly at the call site. `lint_and_warn` and
+    `_warn_deprecated_policy` now resolve it themselves, after their early returns, so a clean
+    net pays nothing. Pinned because a call site re-adding an eager `stacklevel=` argument
+    would silently undo it.
+    """
+    calls = []
+    real = linting._assignment_stacklevel
+
+    def counting():
+        calls.append(1)
+        return real()
+
+    # `cpnx.transitions` bound the name at import, so both namespaces need patching.
+    monkeypatch.setattr(linting, "_assignment_stacklevel", counting)
+    monkeypatch.setattr(transitions_mod, "_assignment_stacklevel", counting)
+
+    Transition(
+        name="t",
+        inputs=[InputArc("in", key=key_clean)],
+        outputs=[OutputArc("out")],
+        action=_action,
+        guard=guard_clean,
+    )
+    assert calls == [], "a clean callable must not trigger frame inspection"
+
+    # A real finding still resolves the depth, so the deferral did not disable attribution.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", CpnxLintWarning)
+        Transition(name="t", inputs=[InputArc("in")], outputs=[OutputArc("out")], action=_action, guard=guard_random)
+    assert len(calls) == 1
 
 
 def test_clean_construction_emits_no_lint_warning():

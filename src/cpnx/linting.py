@@ -63,6 +63,7 @@ Known limitations (best-effort by construction)
 import ast
 import inspect
 import os
+import types
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -157,9 +158,7 @@ _NONDETERMINISTIC_MEMBERS: dict[str, frozenset[str]] = {
     ),
     "datetime": frozenset({"now", "utcnow", "today"}),
     "uuid": frozenset({"uuid1", "uuid4"}),  # uuid3/uuid5 are deterministic hashes
-    "secrets": frozenset(
-        {"token_hex", "token_bytes", "token_urlsafe", "randbelow", "randbits", "choice"}
-    ),
+    "secrets": frozenset({"token_hex", "token_bytes", "token_urlsafe", "randbelow", "randbits", "choice"}),
 }
 
 #: Attribute names distinctive enough to flag by name alone, for the case where the
@@ -208,6 +207,63 @@ class CpnxLintWarning(UserWarning):
 
 class SideEffectLintError(Exception):
     """Raised instead of warning when strict linting is enabled (see :func:`set_strict`)."""
+
+
+#: Directory holding cpnx's own modules, used to recognise cpnx frames when resolving the
+#: ``stacklevel`` a warning should report. See :func:`_assignment_stacklevel`.
+#: **Separator-terminated** so a sibling path that merely starts with the same characters —
+#: ``.../cpnx_user/app.py`` beside ``.../cpnx/`` — is not mistaken for cpnx's own code.
+_PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__)) + os.sep
+
+#: Depth used when the walk finds no frame outside cpnx (or frames are unavailable). Points at
+#: the frame that performed the assignment, which is right for a plain reassignment.
+_FALLBACK_STACKLEVEL = 3
+
+
+def _is_internal_frame(code: types.CodeType) -> bool:
+    """Whether a frame should be stepped over when attributing a warning to user code.
+
+    True for cpnx's own modules, and for the **generated** ``__init__`` a dataclass assigns its
+    fields through — synthesised code that names no user line, so a warning pointing at it is
+    useless. Crucially *not* true for the user's own synthesised frames: a REPL (``<stdin>``), a
+    notebook cell, or ``exec``'d source are real user code and must terminate the walk. They
+    are told apart by ``co_name``, which is ``"__init__"`` only for the generated one.
+    """
+    filename = code.co_filename
+    if filename.startswith(_PACKAGE_ROOT):
+        return True
+    return filename.startswith("<") and code.co_name == "__init__"
+
+
+def _assignment_stacklevel() -> int:
+    """``stacklevel`` that makes a warning name the user's own line.
+
+    These warnings exist to tell an author which ``guard``, ``key``, ``filter``, ``condition``
+    or policy to fix, so the reported location is the point of raising them. The right depth is
+    **not** a constant: a dataclass assigns its fields through a generated ``__init__``, one
+    frame deeper than a later reassignment. So instead of hard-coding a number per call site —
+    which is how the attribution was wrong before — this walks outward to the first frame
+    :func:`_is_internal_frame` does not claim.
+
+    Call it **from the function that calls** :func:`warnings.warn`, since that frame is
+    ``stacklevel`` 1; the walk counts outward from there. Call it *after* any early return that
+    decides no warning is needed, so the quiet path never pays for frame inspection.
+
+    Returns:
+        The ``stacklevel`` to pass :func:`warnings.warn`, or :data:`_FALLBACK_STACKLEVEL` when
+        no frame outside cpnx is found or frames are unavailable.
+    """
+    depth = 1
+    frame = inspect.currentframe()
+    frame = frame.f_back if frame is not None else None
+    while frame is not None:
+        if not _is_internal_frame(frame.f_code):
+            return depth
+        frame = frame.f_back
+        depth += 1
+    # Clamp *down*: on exhaustion ``depth`` has grown past the top of the stack, and passing an
+    # over-deep stacklevel makes ``warnings`` report ``sys:1`` — no file and no line at all.
+    return min(depth, _FALLBACK_STACKLEVEL)
 
 
 @dataclass(frozen=True)
@@ -384,7 +440,7 @@ def is_strict() -> bool:
     return _STRICT
 
 
-def lint_and_warn(func: Callable, role: str, *, stacklevel: int = 2) -> list[LintFinding]:
+def lint_and_warn(func: Callable, role: str, *, stacklevel: int | None = None) -> list[LintFinding]:
     """Lint *func* and surface any findings; the engine-facing entry point.
 
     Emits one :class:`CpnxLintWarning` per finding, prefixed with *role* (e.g.
@@ -392,10 +448,17 @@ def lint_and_warn(func: Callable, role: str, *, stacklevel: int = 2) -> list[Lin
     strict mode (:func:`set_strict`) the first finding raises
     :class:`SideEffectLintError` instead. Returns the findings so callers can also
     inspect them programmatically. Non-callables and unseeable bodies yield ``[]``.
+
+    ``stacklevel`` defaults to ``None``, meaning *resolve it here* via
+    :func:`_assignment_stacklevel` — deliberately **after** the no-findings early return, so a
+    clean callable never pays for walking the stack. Pass an explicit depth only from a call
+    site that sits at a fixed, known distance from the user's code.
     """
     findings = lint_callable(func)
     if not findings:
         return findings
+    if stacklevel is None:
+        stacklevel = _assignment_stacklevel()
     if _STRICT:
         first = findings[0]
         raise SideEffectLintError(
