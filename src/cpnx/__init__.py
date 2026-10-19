@@ -9,7 +9,14 @@ from cpnx.linting import (
 )
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace, ThresholdPlace
 from cpnx.tokens import AVAILABLE_NOW, ERROR_COLOR, FrozenDict, Token
-from cpnx.transitions import BindingPolicy, InputArc, OutputArc, SubstitutionTransition, Transition
+from cpnx.transitions import (
+    BindingPolicy,
+    CpnxDeprecationWarning,
+    InputArc,
+    OutputArc,
+    SubstitutionTransition,
+    Transition,
+)
 from cpnx.visualization import snapshot, to_dot
 
 __all__ = [
@@ -34,6 +41,7 @@ __all__ = [
     "lint_callable",
     "LintFinding",
     "CpnxLintWarning",
+    "CpnxDeprecationWarning",
     "SideEffectLintError",
     "set_strict",
     "ImpactMap",

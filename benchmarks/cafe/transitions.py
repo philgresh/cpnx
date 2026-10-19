@@ -270,11 +270,13 @@ def t_rework_dose(*, work_secs: float = 0.0, dose_low: float, dose_high: float) 
         `P_Ticket_Line` for an out-of-spec ticket rather than only testing the head.
         Through 0.5.0 the default was the head-only `LEGACY` policy and this station
         relied on it, reworking a ticket only once it reached the head and leaving
-        `T_Weigh_And_Grind`'s PRIORITY search to skip past the rest. Now that `LEGACY`
-        is gone the completeness is unconditional: a bad dose anywhere in the line is
-        reworked on the next check. That is strictly more work per enabling check
+        `T_Weigh_And_Grind`'s PRIORITY search to skip past the rest. Since the 0.6.0
+        default flip the completeness is unconditional: a bad dose anywhere in the line
+        is reworked on the next check. That is strictly more work per enabling check
         (bounded by `binding_search_limit`) for a strictly earlier rework, and it is the
-        one place in the fixture where the default flip is observable.
+        one place in the fixture where the flip is observable. Pinning
+        `binding_policy=BindingPolicy.LEGACY` here would restore the old behaviour for
+        one more release; the fixture deliberately takes the new default instead.
 
     Args:
         work_secs: Physical seconds the station occupies a worker.

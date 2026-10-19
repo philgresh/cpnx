@@ -113,11 +113,11 @@ of two conditions:
    on every step (`_reservoir_pick` for `RANDOM`, `_reduce_min_key` for `PRIORITY`). An
    incremental scheduler resolves each transition a different number of times than a full scan
    would — exactly the point of the optimization — which would shift the seeded RNG stream and
-   break the pinned golden sequence in `tests/test_seeded_determinism.py`. `FIRST` (the default)
-   draws RNG only once, for the scheduler's own tie-break among enabled
-   candidates (`_rng.choice(candidates)`), which advances the stream by candidate-count only —
-   a quantity the maintained enabled set reproduces exactly. `FIRST` is therefore
-   safe under the fast path; `RANDOM`/`PRIORITY` are not.
+   break the pinned golden sequence in `tests/test_seeded_determinism.py`. `FIRST` (the default
+   since 0.6.0) and the deprecated `LEGACY` draw RNG only once, for the scheduler's own
+   tie-break among enabled candidates (`_rng.choice(candidates)`), which advances the stream by
+   candidate-count only — a quantity the maintained enabled set reproduces exactly. Those two
+   policies are therefore safe under the fast path; `RANDOM`/`PRIORITY` are not.
 
 A naive dirty set — mark a place dirty on deposit, re-scan only its consumers — misses four
 re-enablement hazards. Each is handled explicitly above rather than assumed away:
@@ -147,7 +147,7 @@ re-enablement hazards. Each is handled explicitly above rather than assumed away
   full scan did.
 - **(d) RNG-stream determinism.** Resolving a different number of transitions than a full scan
   would changes how many RNG draws occur when a policy samples during resolution.
-  `RANDOM`/`PRIORITY` are excluded from the fast path (condition 2); `FIRST` draws RNG
+  `RANDOM`/`PRIORITY` are excluded from the fast path (condition 2); `FIRST`/`LEGACY` draw RNG
   only at the scheduler's tie-break, which the maintained enabled set reproduces identically, so
   the same-seed-twice guarantee (`test_seeded_determinism.py`) holds under either path. One
   subtlety the tie-break exposes: the winner is `_rng.choice` indexing into a priority bucket, so

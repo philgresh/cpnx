@@ -1,11 +1,18 @@
 """Tests for BindingPolicy — the binding search that fixes head-of-line blocking."""
 
 import time
+import warnings
+
+import pytest
 
 from cpnx.engine import PetriNet
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace
 from cpnx.tokens import Token
-from cpnx.transitions import BindingPolicy, InputArc, OutputArc, Transition
+from cpnx.transitions import BindingPolicy, CpnxDeprecationWarning, InputArc, OutputArc, Transition
+
+#: Selecting the deprecated `LEGACY` policy warns by design. Tests that exercise what it
+#: *does* silence that here; the warning itself is asserted in `TestLegacyDeprecationWarning`.
+_SILENCE_LEGACY = pytest.mark.filterwarnings("ignore::cpnx.CpnxDeprecationWarning")
 
 
 def _fire_once(net):
@@ -63,6 +70,84 @@ class TestHeadOfLineFix:
     def test_net_default_is_first(self):
         """The net-wide default is FIRST, exposed on the `binding_policy` property."""
         assert PetriNet().binding_policy is BindingPolicy.FIRST
+
+    @_SILENCE_LEGACY
+    def test_explicit_legacy_still_opts_out_of_the_fix(self):
+        """`LEGACY` survives one release as the opt-out, and still blocks head-of-line.
+
+        ADR 0001 step 2 asked for the default flip and the removal to land a deprecation
+        cycle apart, so 0.6.0 flips the default to `FIRST` while `LEGACY` keeps its exact
+        pre-0.6.0 semantics for anyone who needs a release to migrate. Removal is Phase 4.
+        """
+        net = self._build(BindingPolicy.LEGACY)
+        net.run(deadline=time.monotonic() + 0.3)
+
+        assert len(net.places["output"].tokens) == 0
+        assert {t.payload["sym"] for t in net.places["input"].tokens} == {"AAPL", "MSFT"}
+
+
+class TestLegacyDeprecationWarning:
+    """`LEGACY` warns at run time wherever it can enter the system.
+
+    The 0.5.0 deprecation was documentation-only — no runtime signal at all — so these pin
+    that every entry point now warns, and that the warning cannot be swallowed by Python's
+    default filters.
+    """
+
+    def _transition(self, policy):
+        return Transition(
+            name="t",
+            inputs=[InputArc("input")],
+            outputs=[OutputArc("output")],
+            action=lambda toks: toks,
+            binding_policy=policy,
+        )
+
+    def test_net_constructor_warns(self):
+        with pytest.warns(CpnxDeprecationWarning, match="removed in 0.7.0"):
+            PetriNet(binding_policy=BindingPolicy.LEGACY)
+
+    def test_transition_constructor_warns(self):
+        with pytest.warns(CpnxDeprecationWarning, match="removed in 0.7.0"):
+            self._transition(BindingPolicy.LEGACY)
+
+    def test_net_policy_setter_warns(self):
+        net = PetriNet()
+        with pytest.warns(CpnxDeprecationWarning):
+            net.binding_policy = BindingPolicy.LEGACY
+        assert net.binding_policy is BindingPolicy.LEGACY  # the assignment still takes effect
+
+    def test_transition_reassignment_warns(self):
+        transition = self._transition(BindingPolicy.FIRST)
+        with pytest.warns(CpnxDeprecationWarning):
+            transition.binding_policy = BindingPolicy.LEGACY
+        assert transition.binding_policy is BindingPolicy.LEGACY
+
+    def test_warning_names_the_offending_transition(self):
+        """The message carries the transition name, so a large net says which one to fix."""
+        with pytest.warns(CpnxDeprecationWarning, match=r"Transition\(name='t'\)"):
+            self._transition(BindingPolicy.LEGACY)
+
+    @pytest.mark.parametrize("policy", [None, BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY])
+    def test_undeprecated_policies_are_silent(self, policy):
+        """Only LEGACY warns — above all the default, or every net would warn."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", CpnxDeprecationWarning)
+            self._transition(policy)
+            if policy is not None:
+                PetriNet(binding_policy=policy)
+            else:
+                PetriNet()
+
+    def test_category_is_visible_under_default_filters(self):
+        """Not a `DeprecationWarning` subclass, so `ignore::DeprecationWarning` cannot hide it.
+
+        Python's default filters ignore `DeprecationWarning` outside `__main__`, which would
+        make this invisible to exactly the library users it must reach — repeating 0.5.0's
+        silent deprecation. Pinned because it is a deliberate choice, not an oversight.
+        """
+        assert issubclass(CpnxDeprecationWarning, UserWarning)
+        assert not issubclass(CpnxDeprecationWarning, DeprecationWarning)
 
 
 class TestDeterminism:
@@ -143,32 +228,41 @@ class TestCountAndMultiArc:
         assert len(out_vs) == 2
         assert sum(out_vs) == 10
 
+    @_SILENCE_LEGACY
     def test_multi_arc_deep_combination(self):
-        """Two input places, guard relates one token from each; the heads don't match but a
-        deeper combination does, and FIRST searches across both arcs to find it."""
-        net = PetriNet(
-            places=[Place("a"), Place("b"), Place("output")],
-            transitions=[
-                Transition(
-                    name="t",
-                    inputs=[InputArc("a"), InputArc("b")],
-                    outputs=[OutputArc("output", count=2)],
-                    action=lambda toks: toks,
-                    guard=lambda toks: toks[0].payload["k"] == toks[1].payload["k"],
-                    binding_policy=BindingPolicy.FIRST,
-                )
-            ],
-        )
-        # heads: a=1, b=2 (mismatch). Deeper: a has 2, b has 1 → pair on k=2 or k=1
-        net.deposit("a", Token(payload={"k": 1}))
-        net.deposit("a", Token(payload={"k": 2}))
-        net.deposit("b", Token(payload={"k": 2}))
-        net.deposit("b", Token(payload={"k": 1}))
+        """Two input places, guard relates one token from each; heads don't match but a
+        deeper combination does. FIRST finds it; the LEGACY opt-out does not."""
 
-        _fire_once(net)
-        out = net.places["output"].tokens
+        def build(policy):
+            net = PetriNet(
+                places=[Place("a"), Place("b"), Place("output")],
+                transitions=[
+                    Transition(
+                        name="t",
+                        inputs=[InputArc("a"), InputArc("b")],
+                        outputs=[OutputArc("output", count=2)],
+                        action=lambda toks: toks,
+                        guard=lambda toks: toks[0].payload["k"] == toks[1].payload["k"],
+                        binding_policy=policy,
+                    )
+                ],
+            )
+            # heads: a=1, b=2 (mismatch). Deeper: a has 2, b has 1 → pair on k=2 or k=1
+            net.deposit("a", Token(payload={"k": 1}))
+            net.deposit("a", Token(payload={"k": 2}))
+            net.deposit("b", Token(payload={"k": 2}))
+            net.deposit("b", Token(payload={"k": 1}))
+            return net
+
+        first_net = build(BindingPolicy.FIRST)
+        _fire_once(first_net)
+        out = first_net.places["output"].tokens
         assert len(out) == 2
         assert out[0].payload["k"] == out[1].payload["k"]
+
+        legacy_net = build(BindingPolicy.LEGACY)
+        legacy_net.run(deadline=time.monotonic() + 0.3)
+        assert len(legacy_net.places["output"].tokens) == 0
 
 
 class TestSearchLimitExhaustion:
@@ -337,8 +431,6 @@ class TestExhaustionCallbackOffLock:
 
 class TestSearchLimitValidation:
     def test_negative_limit_rejected_at_construction(self):
-        import pytest
-
         for bad in (-2, -1, 0):
             with pytest.raises(ValueError, match="binding_search_limit must be >= 1"):
                 PetriNet(binding_search_limit=bad)
@@ -721,8 +813,6 @@ class TestSearchPolicyExhaustion:
 
 class TestPriorityKeyErrorHandling:
     def test_non_callable_key_rejected_at_construction(self):
-        import pytest
-
         with pytest.raises(TypeError, match="binding_priority_key must be a callable or None"):
             Transition(
                 name="t",
