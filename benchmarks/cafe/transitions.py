@@ -270,7 +270,7 @@ def t_rework_dose(*, work_secs: float = 0.0, dose_low: float, dose_high: float) 
         `P_Ticket_Line` for an out-of-spec ticket rather than only testing the head.
         Through 0.5.0 the default was the head-only `LEGACY` policy and this station
         relied on it, reworking a ticket only once it reached the head and leaving
-        `T_Weigh_And_Grind`'s PRIORITY search to skip past the rest. Since the 0.6.0
+        `T_Weigh_And_Grind`'s PRIORITY search to skip past the rest. Since the
         default flip the completeness is unconditional: a bad dose anywhere in the line
         is reworked on the next check. That is strictly more work per enabling check
         (bounded by `binding_search_limit`) for a strictly earlier rework, and it is the

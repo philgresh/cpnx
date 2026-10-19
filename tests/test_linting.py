@@ -11,6 +11,7 @@ suite needs no third-party network/DB drivers installed.
 """
 
 import datetime as datetime_mod
+import inspect
 import random
 import secrets
 import socket
@@ -278,7 +279,10 @@ def test_lint_warning_points_at_the_caller(trigger):
     location is load-bearing. Construction and reassignment reach the validators at different
     stack depths — a dataclass assigns its fields through a generated ``__init__``, an extra
     frame that reports as ``<string>`` and names no user code at all — so both are pinned
-    here. See ``_assignment_stacklevel`` in ``cpnx.transitions``.
+    here by file; the exact line is pinned by ``test_guard_finding_names_the_exact_line`` and
+    ``test_guard_reassignment_names_the_exact_line``, which call inline (here the innermost
+    user frame is the parametrised lambda). See ``_assignment_stacklevel`` in
+    ``cpnx.transitions``.
     """
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -287,6 +291,34 @@ def test_lint_warning_points_at_the_caller(trigger):
     hits = [w for w in caught if issubclass(w.category, CpnxLintWarning)]
     assert hits, "expected a lint finding"
     assert hits[0].filename == __file__
+
+
+def test_guard_finding_names_the_exact_line():
+    """A finding on a guard passed straight to the constructor reports the caller's line.
+
+    Filename alone would pass with a residual off-by-one, since the frames in between live in
+    this file too — so the line is asserted. This is the common case, and the one that used to
+    report ``<string>``.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        expected_lineno = inspect.currentframe().f_lineno + 1
+        Transition(name="t", inputs=[InputArc("in")], outputs=[OutputArc("out")], action=_action, guard=guard_random)
+
+    hit = next(w for w in caught if issubclass(w.category, CpnxLintWarning))
+    assert (hit.filename, hit.lineno) == (__file__, expected_lineno)
+
+
+def test_guard_reassignment_names_the_exact_line():
+    """Reassigning a guard post-construction reports the caller's line, one frame shallower."""
+    transition = Transition(name="t", inputs=[InputArc("in")], outputs=[OutputArc("out")], action=_action)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        expected_lineno = inspect.currentframe().f_lineno + 1
+        transition.guard = guard_random
+
+    hit = next(w for w in caught if issubclass(w.category, CpnxLintWarning))
+    assert (hit.filename, hit.lineno) == (__file__, expected_lineno)
 
 
 def test_clean_construction_emits_no_lint_warning():

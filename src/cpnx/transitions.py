@@ -1,6 +1,7 @@
 import enum
 import inspect
 import os
+import types
 import typing
 import warnings
 import weakref
@@ -36,57 +37,58 @@ class CpnxDeprecationWarning(UserWarning):
 
 
 #: Directory holding cpnx's own modules, used to recognise cpnx frames when resolving the
-#: `stacklevel` a warning should report. See `_assignment_stacklevel`.
-_PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__))
+#: `stacklevel` a warning should report. See `_assignment_stacklevel`. **Separator-terminated**
+#: so a sibling path that merely starts with the same characters — `.../cpnx_user/app.py`
+#: beside `.../cpnx/` — is not mistaken for cpnx's own code and walked past.
+_PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__)) + os.sep
 
-#: Depth returned when the stack cannot be walked (no frame support) or holds no caller
-#: outside cpnx. Points at the assigning frame, which is right for a plain reassignment.
+#: Depth used when the walk finds no frame outside cpnx (or frames are unavailable). Points
+#: at the frame that performed the assignment, which is right for a plain reassignment.
 _FALLBACK_STACKLEVEL = 3
 
 
-def _assignment_stacklevel(*, emitter_frames: int = 1) -> int:
+def _is_internal_frame(code: "types.CodeType") -> bool:
+    """Whether a frame should be stepped over when attributing a warning to user code.
+
+    True for cpnx's own modules, and for the **generated** `__init__` a dataclass assigns its
+    fields through — synthesised code that names no user line, so a warning pointing at it is
+    useless. Crucially *not* true for the user's own synthesised frames: a REPL (`<stdin>`), a
+    notebook cell, or `exec`'d source are real user code and must terminate the walk. They are
+    told apart by `co_name`, which is `"__init__"` only for the generated one.
+    """
+    filename = code.co_filename
+    if filename.startswith(_PACKAGE_ROOT):
+        return True
+    return filename.startswith("<") and code.co_name == "__init__"
+
+
+def _assignment_stacklevel() -> int:
     """`stacklevel` that makes a `__setattr__` warning name the user's own line.
 
     These warnings exist to tell an author which `guard`, `key`, `filter`, `condition` or
-    policy to fix, so the reported location is the whole point of raising them. Getting it
-    right means counting frames, and the count is **not** fixed: a dataclass assigns its
-    fields through a *generated* `__init__`, an extra frame that reports as `<string>` and
-    names no user code at all, whereas a later reassignment comes straight from the caller.
-
-    Rather than hard-code a number per call site, this walks outward from the caller (the
-    `__setattr__`) and returns the depth of the first frame that is neither cpnx's own code
-    nor synthesised (`<string>`, `<frozen ...>`). That is robust to the construction-vs-
-    reassignment difference *and* to however many cpnx frames happen to intervene, so it
-    cannot be silently invalidated by refactoring the validators — which a fixed depth can,
-    and which is exactly how the attribution was wrong before.
-
-    Note:
-        Walking the stack also avoids inspecting the instance, which an earlier version did
-        (testing a field's presence in `obj.__dict__` to detect construction). That read
-        breaks outright — `AttributeError` — on a `@dataclass(slots=True)` class, so it
-        quietly coupled every warning path to these dataclasses *not* being slotted.
-
-    Args:
-        emitter_frames: How many frames sit between this helper's caller and the
-            `warnings.warn` call, i.e. the helpers that actually emit (1 for
-            `lint_and_warn` or `_warn_deprecated_policy` called straight from a
-            `__setattr__`). Raise it if a call site gains another wrapper.
+    policy to fix, so the reported location is the point of raising them. The right depth is
+    **not** a constant: a dataclass assigns its fields through a generated `__init__`, one
+    frame deeper than a later reassignment. So instead of hard-coding a number per call site —
+    which is how the attribution was wrong before — this walks outward from the caller (the
+    `__setattr__`) to the first frame `_is_internal_frame` does not claim.
 
     Returns:
-        The `stacklevel` to pass the emitting helper so the warning names the caller's line.
+        The `stacklevel` to pass the emitting helper. Falls back to `_FALLBACK_STACKLEVEL`
+        when no frame outside cpnx is found, or frames are unavailable.
     """
+    # 1 is the emitting helper (`lint_and_warn` / `_warn_deprecated_policy`), so the
+    # `__setattr__` that called this helper is 2. Call sites must invoke the emitter directly.
+    depth = 2
     frame = inspect.currentframe()
-    # Start at this helper's caller — the `__setattr__` — which is `emitter_frames + 1`
-    # levels above the `warnings.warn` call that will follow.
     frame = frame.f_back if frame is not None else None
-    depth = emitter_frames + 1
     while frame is not None:
-        filename = frame.f_code.co_filename
-        if not filename.startswith(_PACKAGE_ROOT) and not filename.startswith("<"):
+        if not _is_internal_frame(frame.f_code):
             return depth
         frame = frame.f_back
         depth += 1
-    return max(depth, _FALLBACK_STACKLEVEL)
+    # Clamp *down*: on exhaustion `depth` has grown past the top of the stack, and passing an
+    # over-deep stacklevel makes `warnings` report `sys:1` — no file and no line at all.
+    return min(depth, _FALLBACK_STACKLEVEL)
 
 
 def _warn_deprecated_policy(policy: "BindingPolicy", *, source: str, stacklevel: int) -> None:
@@ -108,8 +110,8 @@ def _warn_deprecated_policy(policy: "BindingPolicy", *, source: str, stacklevel:
         return
     warnings.warn(
         f"{source}: BindingPolicy.LEGACY is deprecated and will be removed in 0.7.0. It is no "
-        "longer the default — 0.6.0 flipped that to BindingPolicy.FIRST and kept LEGACY "
-        "selectable for one release as the opt-out. FIRST is a strict superset (identical head "
+        "longer the default — that is now BindingPolicy.FIRST, with LEGACY kept selectable for "
+        "one release as the opt-out. FIRST is a strict superset (identical head "
         "selection whenever the head satisfies the guard, plus the head-of-line fix when it "
         "does not, and no search cost without a guard), so migrate by dropping the argument to "
         "inherit the FIRST default, or passing binding_policy=BindingPolicy.FIRST explicitly.",
@@ -212,7 +214,7 @@ class BindingPolicy(enum.Enum):
             the **first** combination whose guard is satisfied. Complete (finds a valid
             binding if one exists anywhere in the place, fixing head-of-line blocking)
             **and** deterministic (the same marking always yields the same binding).
-            This is the default since 0.6.0. When the transition has no guard, the first
+            This is the default. When the transition has no guard, the first
             candidate is the head and trivially satisfies, so resolution reduces to the
             O(1) head selection and incurs no search cost.
         LEGACY: Test only the first `count` tokens of each input place (FIFO, or the
@@ -222,8 +224,8 @@ class BindingPolicy(enum.Enum):
 
             **Deprecated — selecting it warns at run time
             ([`CpnxDeprecationWarning`][cpnx.CpnxDeprecationWarning]) and it will be
-            removed in 0.7.0.** It was the default through 0.5.0; 0.6.0 flipped the default
-            to `FIRST` and kept `LEGACY` selectable for one release as the opt-out, so a net
+            removed in 0.7.0.** It was the default through 0.5.0; the default is now
+            `FIRST`, with `LEGACY` kept selectable for one release as the opt-out, so a net
             that relied on head-only resolution has a cycle in which to migrate (ADR 0001
             Phases 3–4). `FIRST` is a strict superset — identical head selection whenever
             the head already satisfies the guard, plus the head-of-line fix when it doesn't,
@@ -574,7 +576,7 @@ class Transition:
         binding_policy: How the engine resolves which input tokens bind this transition
                when checking enablement — see [`BindingPolicy`][cpnx.BindingPolicy].
                `None` (default) inherits the net-wide default set on
-               [`PetriNet`][cpnx.PetriNet] (itself `BindingPolicy.FIRST` since 0.6.0), which
+               [`PetriNet`][cpnx.PetriNet] (itself `BindingPolicy.FIRST`), which
                resolves head-only for a guard-free transition and searches only when a guard
                is present. Set `BindingPolicy.RANDOM` or `BindingPolicy.PRIORITY` to select
                *among* the satisfying bindings rather than taking the first, for this

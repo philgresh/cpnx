@@ -403,9 +403,9 @@ class PetriNet:
                          guard-free transition). A transition may override this via its
                          own `binding_policy`.
 
-                         The default was `BindingPolicy.LEGACY` through 0.5.0; 0.6.0
-                         flipped it to `FIRST` and kept `LEGACY` selectable for one
-                         release as the opt-out. Passing `LEGACY` warns
+                         The default was `BindingPolicy.LEGACY` through 0.5.0; it is now
+                         `FIRST`, with `LEGACY` kept selectable for one release as the
+                         opt-out. Passing `LEGACY` warns
                          ([`CpnxDeprecationWarning`][cpnx.CpnxDeprecationWarning]) and
                          stops working in 0.7.0. See
                          `docs/adr/0001-combinatorial-binding-search.md`.
@@ -453,13 +453,14 @@ class PetriNet:
         self.timeout_secs = timeout_secs
         self.expr_timeout_secs = expr_timeout_secs
         self.retry_delay = retry_delay
-        #: Backing field for the `binding_policy` property. Set directly here (the property
-        #: setter recomputes `_has_search_policy_transition`, which needs `self.transitions`
-        #: to already exist — it does not yet at this point in construction). Because the
-        #: setter is bypassed, its deprecation notice is emitted explicitly here.
+        # The property setter is bypassed just below, so its deprecation notice is emitted
+        # explicitly here instead.
         _warn_deprecated_policy(
             binding_policy, source="PetriNet(binding_policy=...)", stacklevel=_assignment_stacklevel()
         )
+        #: Backing field for the `binding_policy` property. Set directly here (the property
+        #: setter recomputes `_has_search_policy_transition`, which needs `self.transitions`
+        #: to already exist — it does not yet at this point in construction).
         self._binding_policy = binding_policy
         if binding_search_limit < 1:
             raise ValueError(f"binding_search_limit must be >= 1, got {binding_search_limit}.")

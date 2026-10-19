@@ -1,5 +1,7 @@
 """Tests for BindingPolicy — the binding search that fixes head-of-line blocking."""
 
+import inspect
+import os
 import time
 import warnings
 
@@ -8,7 +10,14 @@ import pytest
 from cpnx.engine import PetriNet
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace
 from cpnx.tokens import Token
-from cpnx.transitions import BindingPolicy, CpnxDeprecationWarning, InputArc, OutputArc, Transition
+from cpnx.transitions import (
+    _PACKAGE_ROOT,
+    BindingPolicy,
+    CpnxDeprecationWarning,
+    InputArc,
+    OutputArc,
+    Transition,
+)
 
 #: Selecting the deprecated `LEGACY` policy warns by design. Tests that exercise what it
 #: *does* silence that here; the warning itself is asserted in `TestLegacyDeprecationWarning`.
@@ -210,10 +219,12 @@ class TestLegacyDeprecationWarning:
 
         The four paths sit at different stack depths — the two constructors go through an
         extra frame (`PetriNet.__init__`, or the `@dataclass`-generated `Transition.__init__`,
-        which reports as `<string>`) while the two assignments do not — so each needs its own
-        `stacklevel`. A warning naming `engine.py` or `<string>` tells the user nothing about
-        which line of *their* net to fix, so the attribution is pinned here rather than left
-        to inspection.
+        which reports as `<string>`) while the two assignments do not. A warning naming
+        `engine.py` or `<string>` tells the user nothing about which line of *their* net to
+        fix. This covers all four entry points by file; the exact *line* is pinned by
+        `test_construction_names_the_exact_line` / `test_reassignment_names_the_exact_line`,
+        which call inline — here the innermost user frame is the parametrised lambda, so the
+        expected line would have to be derived per-param rather than asserted directly.
         """
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -222,6 +233,63 @@ class TestLegacyDeprecationWarning:
         hits = [w for w in caught if issubclass(w.category, CpnxDeprecationWarning)]
         assert len(hits) == 1
         assert hits[0].filename == __file__
+
+    def test_construction_names_the_exact_line(self):
+        """Construction reports the caller's line, not the generated `__init__`'s.
+
+        Pinning the line matters because filename alone passes with a residual off-by-one:
+        the frames in between live in this file too.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            expected_lineno = inspect.currentframe().f_lineno + 1
+            PetriNet(binding_policy=BindingPolicy.LEGACY)
+
+        hit = next(w for w in caught if issubclass(w.category, CpnxDeprecationWarning))
+        assert (hit.filename, hit.lineno) == (__file__, expected_lineno)
+
+    def test_reassignment_names_the_exact_line(self):
+        """Post-construction reassignment reports the caller's line, one frame shallower."""
+        net = PetriNet()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            expected_lineno = inspect.currentframe().f_lineno + 1
+            net.binding_policy = BindingPolicy.LEGACY
+
+        hit = next(w for w in caught if issubclass(w.category, CpnxDeprecationWarning))
+        assert (hit.filename, hit.lineno) == (__file__, expected_lineno)
+
+    def test_warning_reaches_synthetic_caller_frames(self):
+        """User code with no real file — a REPL, a notebook cell, `exec` — still gets a line.
+
+        The frame walk has to step over the `@dataclass`-generated `__init__`, which also has
+        a synthetic filename. Rejecting *every* synthetic frame overshot the whole stack and
+        made `warnings` report `sys:1` — no file and no line at all — for anyone driving a net
+        from `python -c`, a REPL or a notebook. Only the generated `__init__` is skipped now.
+        """
+        source = "PetriNet(binding_policy=BindingPolicy.LEGACY)"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            exec(  # noqa: S102 - exercising attribution for exec'd user code is the point
+                compile(source, "<string>", "exec"),
+                {"PetriNet": PetriNet, "BindingPolicy": BindingPolicy},
+            )
+
+        hits = [w for w in caught if issubclass(w.category, CpnxDeprecationWarning)]
+        assert len(hits) == 1
+        assert hits[0].filename == "<string>"  # the caller's synthetic frame, not `sys`
+        assert hits[0].lineno == 1
+
+    def test_package_root_cannot_swallow_sibling_paths(self):
+        """The cpnx-frame test is separator-terminated, so `cpnx_user/` is not read as cpnx.
+
+        A bare `startswith` on the package directory also matched any sibling whose name
+        merely begins with it, so a user net in `.../cpnx_user/m.py` was walked straight past
+        and the warning landed on *its* caller instead.
+        """
+        assert _PACKAGE_ROOT.endswith(os.sep)
+        sibling = f"{_PACKAGE_ROOT.rstrip(os.sep)}_user{os.sep}m.py"
+        assert not sibling.startswith(_PACKAGE_ROOT)
 
     def test_category_is_visible_under_default_filters(self):
         """Not a `DeprecationWarning` subclass, so `ignore::DeprecationWarning` cannot hide it.

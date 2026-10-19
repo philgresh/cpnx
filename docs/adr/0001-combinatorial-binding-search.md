@@ -1,6 +1,6 @@
 # ADR 0001 — Combinatorial Binding Search with Deterministic-Complete Default
 
-- **Status:** Accepted — Phase 1 shipped in 0.3.1 (`BindingPolicy.FIRST`); Phase 2 shipped in
+- **Status:** Accepted; **amended** by Phases 3–4 (see "Deviation from step 2") — Phase 1 shipped in 0.3.1 (`BindingPolicy.FIRST`); Phase 2 shipped in
   0.3.2 (`BindingPolicy.RANDOM`/`PRIORITY`, `PetriNet(seed=...)`); Phase 3 merged in
   [#53](https://github.com/philgresh/cpnx/pull/53) (`FIRST` becomes the default, `LEGACY`
   retained as a deprecated opt-out — unreleased; after 0.5.0, targeted at 0.6.0); Phase 4
