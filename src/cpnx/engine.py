@@ -23,6 +23,7 @@ from cpnx.transitions import (
     OutputArc,
     SubstitutionTransition,
     Transition,
+    _assignment_stacklevel,
     _warn_deprecated_policy,
 )
 from cpnx.visualization import snapshot, to_dot
@@ -456,7 +457,9 @@ class PetriNet:
         #: setter recomputes `_has_search_policy_transition`, which needs `self.transitions`
         #: to already exist — it does not yet at this point in construction). Because the
         #: setter is bypassed, its deprecation notice is emitted explicitly here.
-        _warn_deprecated_policy(binding_policy, source="PetriNet(binding_policy=...)", stacklevel=3)
+        _warn_deprecated_policy(
+            binding_policy, source="PetriNet(binding_policy=...)", stacklevel=_assignment_stacklevel()
+        )
         self._binding_policy = binding_policy
         if binding_search_limit < 1:
             raise ValueError(f"binding_search_limit must be >= 1, got {binding_search_limit}.")
@@ -635,9 +638,9 @@ class PetriNet:
         # Warn *before* taking the lock: a user filter promoting this to an error must not
         # raise mid-update, which would leave `_binding_policy` reassigned while
         # `_has_search_policy_transition` and `_scheduler_ready` still describe the old one.
-        # stacklevel 3, not 2: `_warn_deprecated_policy` wraps `warnings.warn`, so 1 is the
-        # helper, 2 is this setter, and 3 is the assignment in the caller's own code.
-        _warn_deprecated_policy(value, source="PetriNet.binding_policy", stacklevel=3)
+        # The depth is resolved by walking out to the first non-cpnx frame rather than
+        # hard-coded, so it survives refactoring; see `_assignment_stacklevel`.
+        _warn_deprecated_policy(value, source="PetriNet.binding_policy", stacklevel=_assignment_stacklevel())
         with self._lock:
             self._binding_policy = value
             # A new default can flip any policy-unset transition's *effective* policy in either
