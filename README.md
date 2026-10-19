@@ -119,6 +119,42 @@ A transition is **enabled** when all input places contain sufficient tokens and 
 
 **Atomic Rollback & Bounded Retry:** if a transition action raises, the engine catches the exception. Resource tokens are returned to their original source places immediately. Data tokens are rolled back to their source places (with a delay and incremented `attempts` counter) up to `max_retries` times (default 5). Once the retry limit is exhausted, data tokens are routed to `error_place` (default `"failed"`), allowing the net to safely quiesce. Callbacks (`on_error`, `on_token_dead_lettered`) fire for observability. The `error_place` can be configured as a `SinkPlace` to avoid memory leaks from failure accumulation in long-lived streaming nets.
 
+**Retry Backoff (`RetryPolicy`):** how long a rolled-back token waits before each retry is a **per-transition** policy, because retry behaviour belongs to the dependency a transition talks to — a throttled third-party API and a local write want very different pacing. The schedule is capped exponential backoff with optional full jitter, the shape recommended by the AWS Builders' Library ([Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/)) and used by the AWS SDKs' `standard` retry mode:
+
+```python
+delay = min(delay * backoff ** attempts, max_delay)
+if jitter:
+    delay = uniform(0, delay)   # "full jitter"
+```
+
+```python
+from cpnx import PetriNet, RetryPolicy, Transition
+
+# Pace a throttled API: 0.5s, 1s, 2s, 4s, ... capped at 30s, jittered.
+flaky_api = RetryPolicy(delay=0.5, backoff=2.0, max_delay=30.0, jitter=True)
+
+net = PetriNet(retry_policy=RetryPolicy(delay=0.1))   # default for the rest of the net
+
+net.add_transition(
+    Transition(
+        name="charge_card",
+        inputs=[InputArc("pending")],
+        outputs=[OutputArc("charged")],
+        action=charge,
+        retry_policy=flaky_api,   # this dependency's own schedule
+        max_retries=8,            # how many times; the policy says how long
+    )
+)
+```
+
+A transition that sets no `retry_policy` inherits the net's, which defaults to `RetryPolicy()` — a flat 1-second delay, exactly what cpnx did before policies existed. `PetriNet(retry_delay=...)` remains as shorthand for `retry_policy=RetryPolicy(delay=...)`. Guidance:
+
+- **Always cap.** `backoff > 1.0` with `max_delay=None` grows without bound, and under `max_retries=None` the exponent eventually saturates to infinity (parking the token for good).
+- **Jitter when failures correlate.** A downstream outage or a throttled API fails a whole batch of tokens at once; without jitter they all retry in lockstep, re-creating the spike that caused the failure. Full jitter spreads them out. It can draw a near-zero delay, so it bounds the *aggregate* retry rate rather than each token's individual wait.
+- **Reproducibility.** Jitter draws from a dedicated RNG — one stream per net, seeded by `PetriNet(seed=...)` or injected as `retry_rng=random.Random(0)` — kept separate from the stream driving scheduling and `BindingPolicy.RANDOM`, so how often actions fail cannot shift a seeded firing sequence.
+
+A policy is an immutable, comparable value, so one instance can be shared by every transition that talks to the same dependency. Fields are validated on construction, and the net's `retry_policy`/`retry_delay` on assignment: a negative delay (retry scheduled in the past, so a hot loop), a `NaN` (compares false against every clock, so the token is never retrievable again), an infinity, a backoff below 1, or a non-number raises where it is written rather than surfacing inside the next rollback.
+
 ### Canonical Error Handling (Colour Routing)
 
 The most robust and mathematically sound way to handle errors in Coloured Petri Nets is to catch exceptions inside the action and return an **error-coloured token**. Output arcs can then use `condition` predicates to route success tokens to normal places and error tokens to an error sink. This preserves token conservation (1-in-1-out) and keeps the firing rules pure.
@@ -268,6 +304,20 @@ class Transition:
     priority: int = 10  # lower fires first among equally-enabled transitions
     action_timeout_secs: float | None = None
     max_retries: int | None = 5  # default 5. None = infinite retry.
+    retry_policy: RetryPolicy | None = None  # None = inherit the net's default
+```
+
+### `RetryPolicy`
+
+[→ Full API reference](https://philgresh.github.io/cpnx/latest/reference/transitions/#cpnx.RetryPolicy)
+
+```python
+@dataclass(frozen=True)
+class RetryPolicy:
+    delay: float = 1.0               # base: the wait before the first retry
+    backoff: float = 1.0             # multiplier per failed attempt; must be >= 1.0
+    max_delay: float | None = None   # ceiling on one delay, applied before jitter
+    jitter: bool = False             # draw uniformly from [0, capped delay]
 ```
 
 ### `PetriNet`
@@ -280,7 +330,13 @@ class PetriNet:
                  places: list[Place] | None = None,
                  transitions: list[Transition] | None = None,
                  cooldown_interval: float = 0.05, timeout_secs: float = 1.0,
-                 expr_timeout_secs: float = 0.1, retry_delay: float = 1.0): ...
+                 expr_timeout_secs: float = 0.1,
+                 retry_delay: float | None = None,   # shorthand for RetryPolicy(delay=...)
+                 binding_policy: BindingPolicy = BindingPolicy.LEGACY,
+                 binding_search_limit: int = 1000, seed: int | None = None,
+                 *,
+                 retry_policy: RetryPolicy | None = None,  # default for transitions with none
+                 retry_rng: random.Random | None = None): ...
 
     def add_place(self, place: Place) -> None: ...
     def add_transition(self, transition: Transition) -> None: ...

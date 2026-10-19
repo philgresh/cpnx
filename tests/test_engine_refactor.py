@@ -3,8 +3,14 @@ from unittest.mock import patch
 
 import pytest
 
-from cpnx.engine import PetriNet, _enact_planned_deposits, _return_leftover_resources, _rollback_failed_transition
+from cpnx.engine import (
+    PetriNet,
+    _enact_planned_deposits,
+    _return_leftover_resources,
+    _rollback_failed_transition,
+)
 from cpnx.places import Place
+from cpnx.retries import RetryPolicy, _RetrySchedule
 from cpnx.tokens import Token
 from cpnx.transitions import OutputArc, Transition
 
@@ -264,7 +270,12 @@ def test_rollback_failed_transition():
     token_sources = [("p_in", res_token), ("p_in", token)]
 
     deposited, dl_data, data_tokens = _rollback_failed_transition(
-        transition, token_sources, deposit=fake_deposit, retry_delay=0.0, error_place="__error__", ref_time=10.0
+        transition,
+        token_sources,
+        retry=_RetrySchedule(default=RetryPolicy(delay=0.0)),
+        deposit=fake_deposit,
+        error_place="__error__",
+        ref_time=10.0,
     )
 
     assert len(deposited) == 2
@@ -282,7 +293,12 @@ def test_rollback_failed_transition():
     token_sources2 = [("p_in", token2)]
 
     deposited2, dl_data2, data_tokens2 = _rollback_failed_transition(
-        transition, token_sources2, deposit=fake_deposit, retry_delay=0.0, error_place="__error__", ref_time=10.0
+        transition,
+        token_sources2,
+        retry=_RetrySchedule(default=RetryPolicy(delay=0.0)),
+        deposit=fake_deposit,
+        error_place="__error__",
+        ref_time=10.0,
     )
 
     assert len(deposited2) == 1
@@ -791,7 +807,9 @@ def test_rollback_data_token():
 
     # Below retries: should evolve attempt count and schedule in future,
     # relative to the caller-supplied reference time (not the wall clock).
-    dest, rb_tok, is_dl = _rollback_data_token(tok, "src", t, 5.0, "err", 10.0)
+    dest, rb_tok, is_dl = _rollback_data_token(
+        tok, "src", t, _RetrySchedule(default=RetryPolicy(delay=5.0)), "err", 10.0
+    )
     assert dest == "src"
     assert rb_tok.attempts == 1
     assert rb_tok.available_at == 15.0
@@ -799,7 +817,9 @@ def test_rollback_data_token():
 
     # Above retries: dead-lettered
     tok2 = Token(attempts=2)
-    dest, rb_tok, is_dl = _rollback_data_token(tok2, "src", t, 5.0, "err", 10.0)
+    dest, rb_tok, is_dl = _rollback_data_token(
+        tok2, "src", t, _RetrySchedule(default=RetryPolicy(delay=5.0)), "err", 10.0
+    )
     assert dest == "err"
     assert is_dl
     assert rb_tok.available_at == 0.0
@@ -844,13 +864,17 @@ def test_process_rollback_token():
     p = ResourcePlace("p", 1)
     tok_res = p.retrieve(1)[0]
 
-    dest, rb_tok, is_dl = _process_rollback_token(tok_res, "src", t, 5.0, "err", 10.0)
+    dest, rb_tok, is_dl = _process_rollback_token(
+        tok_res, "src", t, _RetrySchedule(default=RetryPolicy(delay=5.0)), "err", 10.0
+    )
     assert dest == "src"
     assert rb_tok is tok_res
     assert not is_dl
 
     tok_data = Token(attempts=0)
-    dest2, rb_tok2, is_dl2 = _process_rollback_token(tok_data, "src", t, 5.0, "err", 10.0)
+    dest2, rb_tok2, is_dl2 = _process_rollback_token(
+        tok_data, "src", t, _RetrySchedule(default=RetryPolicy(delay=5.0)), "err", 10.0
+    )
     assert dest2 == "src"
     assert rb_tok2.attempts == 1
     assert rb_tok2.available_at == 15.0

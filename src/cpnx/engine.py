@@ -11,11 +11,12 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterator, TypeAlias, cast
 
 from cpnx.analysis import ImpactMap, risk_report, trace_impact
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace
+from cpnx.retries import DEFAULT_RETRY_POLICY, RetryPolicy, _RetrySchedule, _validated_retry_number
 from cpnx.tokens import ERROR_COLOR, Token
 from cpnx.transitions import (
     BindingPolicy,
@@ -156,13 +157,13 @@ def _rollback_data_token(
     t: Token,
     src_name: str,
     transition: Transition,
-    retry_delay: float,
+    retry: _RetrySchedule,
     error_place: str,
     ref_time: float,
 ) -> tuple[str, Token, bool]:
     max_retries = transition.max_retries
     if max_retries is None or t.attempts < max_retries:
-        retry_at = ref_time + retry_delay
+        retry_at = ref_time + retry.delay_for(transition.retry_policy, t.attempts)
         return src_name, t.evolve(available_at=retry_at, attempts=t.attempts + 1), False
     return error_place, t.evolve(available_at=0.0), True
 
@@ -171,40 +172,43 @@ def _process_rollback_token(
     t: Token,
     src_name: str,
     transition: Transition,
-    retry_delay: float,
+    retry: _RetrySchedule,
     error_place: str,
     ref_time: float,
 ) -> tuple[str, Token, bool]:
     if t.is_resource:
         return src_name, t, False
-    return _rollback_data_token(t, src_name, transition, retry_delay, error_place, ref_time)
+    return _rollback_data_token(t, src_name, transition, retry, error_place, ref_time)
 
 
 def _rollback_failed_transition(
     transition: Transition,
     token_sources: list[tuple[str, Token]],
     *,
+    retry: _RetrySchedule,
     deposit: _DepositFn,
-    retry_delay: float,
     error_place: str,
     ref_time: float,
 ) -> tuple[list[tuple[str, Token]], list[Token], list[Token]]:
     """Return all consumed tokens to their source places after a failed firing.
 
     ``deposit`` must be a callable that is safe to invoke under the engine lock —
-    callers are responsible for holding it before calling this function.
+    callers are responsible for holding it before calling this function. The same applies to
+    ``retry``, whose jitter RNG is drawn here.
 
-    ``retry_delay`` is applied against ``ref_time``, so a retried token's ``available_at``
-    lands on the same clock as pacing/settle checks. Callers pass the net's resolved clock
-    (`PetriNet._get_model_time_under_lock`), which is the logical clock when one is set and
-    ``time.monotonic()`` otherwise.
+    ``retry`` resolves the delay from the transition's own
+    [`RetryPolicy`][cpnx.RetryPolicy] (falling back to the net's default) and the token's
+    `Token.attempts` count. That delay is applied against ``ref_time``, so a retried token's
+    ``available_at`` lands on the same clock as pacing/settle checks. Callers pass the net's
+    resolved clock (`PetriNet._get_model_time_under_lock`), which is the logical clock when
+    one is set and ``time.monotonic()`` otherwise.
     """
     deposited: list[tuple[str, Token]] = []
     dead_lettered_data_tokens: list[Token] = []
     data_tokens = [t for _, t in token_sources if not t.is_resource]
     for src_name, t in token_sources:
         dest, rollback_t, is_dead_letter = _process_rollback_token(
-            t, src_name, transition, retry_delay, error_place, ref_time
+            t, src_name, transition, retry, error_place, ref_time
         )
         deposit(dest, rollback_t)
         deposited.append((dest, rollback_t))
@@ -241,9 +245,13 @@ class PetriNet:
       `OutputArc.condition`) route success vs error tokens to different places. This
       preserves firing rules and token conservation (1-in-1-out).
     - **B. Bounded atomic-retry** — on action failure/exception, the data token is rolled
-      back to its source place with a delay (`retry_delay`) and an incremented `attempts`
-      counter, retrying up to `Transition.max_retries` times (default 5). Once exhausted,
-      it is dead-lettered to `error_place`.
+      back to its source place with a delay and an incremented `attempts` counter, retrying
+      up to `Transition.max_retries` times (default 5). Once exhausted, it is dead-lettered
+      to `error_place`. The delay is per *attempt* and comes from the transition's
+      [`RetryPolicy`][cpnx.RetryPolicy] (or this net's `retry_policy` when it declares
+      none): capped exponential backoff, `min(delay * backoff ** attempts, max_delay)`,
+      drawn uniformly from `[0, that]` when the policy sets `jitter`. The default policy is
+      a flat 1-second delay on every attempt.
     - **C. Immediate dead-letter** — setting `max_retries=0` on a transition routes any
       action failure immediately to `error_place`.
     - **D. Output schema violation** — when an output token fails the target place's
@@ -266,7 +274,11 @@ class PetriNet:
         timeout_secs: Maximum execution time in seconds for transition action callables.
         expr_timeout_secs: Maximum execution time in seconds for guard and arc-selection
             expression callables.
-        retry_delay: Delay in seconds applied to data tokens rolled back on transient failure.
+        retry_policy: Default [`RetryPolicy`][cpnx.RetryPolicy] — how long a rolled-back
+            data token waits before each retry — for transitions that declare none of their
+            own. Validated on assignment, so it stays safe to retune on a live net.
+        retry_delay: View onto `retry_policy.delay`, the wait before the first retry.
+            Assigning it swaps in a default policy with that delay.
         places: Mapping of registered place name to `Place` instance.
         transitions: Mapping of registered transition name to `Transition` instance.
         on_transition_fired: Optional callback `(transition_name: str, duration_secs: float)
@@ -340,10 +352,13 @@ class PetriNet:
         cooldown_interval: float = 0.05,
         timeout_secs: float = 1.0,
         expr_timeout_secs: float = 0.1,
-        retry_delay: float = 1.0,
+        retry_delay: float | None = None,
         binding_policy: BindingPolicy = BindingPolicy.FIRST,
         binding_search_limit: int = 1000,
         seed: int | None = None,
+        *,
+        retry_policy: RetryPolicy | None = None,
+        retry_rng: random.Random | None = None,
     ) -> None:
         """Construct the net, its thread pools, and register any initial places/transitions.
 
@@ -393,8 +408,12 @@ class PetriNet:
                                values have a slow or diverging `__lt__` can hold the lock past
                                any timeout. Keys should return plain comparables (numbers,
                                strings, tuples thereof).
-            retry_delay: Delay in seconds to apply to data tokens when rolling them
-                         back to their source places on transient failure (default: 1.0).
+            retry_delay: Shorthand for `retry_policy=RetryPolicy(delay=...)`: the base
+                         delay in seconds before a rolled-back data token's first retry
+                         (default: 1.0). Mutually exclusive with `retry_policy` — passing
+                         both raises `ValueError`, since they would set the same thing.
+                         `PetriNet.retry_delay` stays readable and assignable either way; it
+                         is a view onto the default policy's `delay`.
             binding_policy: Net-wide default strategy for resolving which input tokens
                          bind a transition — see [`BindingPolicy`][cpnx.BindingPolicy].
                          Defaults to `BindingPolicy.FIRST` (deterministic-complete
@@ -442,16 +461,36 @@ class PetriNet:
                          own `PetriNet` with its own RNG, so seed subnets separately if they
                          contain `RANDOM` transitions. Seeded streams are not stable across
                          cpnx versions.
+            retry_policy: Default [`RetryPolicy`][cpnx.RetryPolicy] for transitions that
+                         declare none of their own — how long a rolled-back data token waits
+                         before each retry (capped exponential backoff, optionally jittered).
+                         Defaults to `RetryPolicy()`, a flat 1-second delay, which is what
+                         cpnx did before policies existed. A transition paces its own
+                         dependency by setting [`Transition.retry_policy`][cpnx.Transition];
+                         this is only the fallback. Mutually exclusive with `retry_delay`.
+            retry_rng: Jitter source, used only by a policy with `jitter=True`. One
+                         stream per net, shared by every transition's policy. Defaults to a
+                         private `random.Random(seed)` — reproducible under `seed` but a
+                         **separate stream** from the one driving scheduling and
+                         `BindingPolicy.RANDOM`, so how often actions fail cannot shift the
+                         seeded firing sequence. Pass an instance to control the draws
+                         directly (e.g. `random.Random(0)` in a test). Drawn only under the
+                         engine lock, so it is never used concurrently.
 
         Raises:
-            ValueError: If `binding_search_limit < 1`.
+            ValueError: If `binding_search_limit < 1`; if both `retry_delay` and
+                `retry_policy` are given; or if `retry_delay` is negative, `NaN`, or
+                infinite. A `retry_policy` validates its own fields — see
+                [`RetryPolicy`][cpnx.RetryPolicy].
+            TypeError: If `retry_delay` is not a number, `retry_policy` is not a
+                `RetryPolicy`, or `retry_rng` has no callable `uniform(a, b)`.
         """
         self.max_workers = max_workers
         self.error_place = error_place
         self.cooldown_interval = cooldown_interval
         self.timeout_secs = timeout_secs
         self.expr_timeout_secs = expr_timeout_secs
-        self.retry_delay = retry_delay
+        self._init_retry(retry_delay, retry_policy, retry_rng, seed)
         # The property setter is bypassed just below, so its deprecation notice is emitted
         # explicitly here instead.
         _warn_deprecated_policy(binding_policy, source="PetriNet(binding_policy=...)")
@@ -647,6 +686,73 @@ class PetriNet:
             )
             # Enabled-set caches were built under the old policy; force a rebuild before reuse.
             self._scheduler_ready = False
+
+    def _init_retry(
+        self,
+        retry_delay: float | None,
+        retry_policy: RetryPolicy | None,
+        retry_rng: random.Random | None,
+        seed: int | None,
+    ) -> None:
+        """Wire up the net's default retry schedule and its jitter stream.
+
+        Everything is validated here, at construction, so the rollback path never has to:
+        it runs under the engine lock holding tokens it has consumed but not yet returned,
+        so raising there would strand them.
+        """
+        if retry_delay is not None and retry_policy is not None:
+            raise ValueError(
+                "Pass retry_delay or retry_policy, not both — retry_delay is shorthand for "
+                f"RetryPolicy(delay=...). Got retry_delay={retry_delay} and {retry_policy!r}."
+            )
+        # Both go through their validating property setters below.
+        self.retry_policy = retry_policy if retry_policy is not None else DEFAULT_RETRY_POLICY
+        if retry_delay is not None:
+            self.retry_delay = retry_delay
+
+        if retry_rng is not None and not callable(getattr(retry_rng, "uniform", None)):
+            raise TypeError(f"retry_rng must have a callable `uniform(a, b)`, got {type(retry_rng).__name__}.")
+        #: Jitter source for retry delays, deliberately a *separate* stream from `_rng`: a
+        #: draw per failed firing must not shift the seeded scheduling/binding sequence (see
+        #: the `seed` and `retry_rng` arguments). Drawn only under the engine lock.
+        self._retry_rng = retry_rng if retry_rng is not None else random.Random(seed)
+
+    # --- Retry schedule (see `RetryPolicy` and the `retry_*` constructor arguments) ---
+    # Properties, not plain attributes, so a value that cannot schedule a sane retry is
+    # rejected where the mistake is made — at the assignment — rather than later, inside the
+    # rollback that would have used it. No lock: each is a single attribute, and a policy is
+    # an immutable value, so a concurrent change swaps one whole valid schedule for another.
+
+    @property
+    def retry_policy(self) -> RetryPolicy:
+        """Default [`RetryPolicy`][cpnx.RetryPolicy] for transitions that declare none.
+
+        A transition's own [`retry_policy`][cpnx.Transition] wins when it has one; this is
+        the fallback. Assigning anything but a `RetryPolicy` raises `TypeError`.
+        """
+        return self._retry_policy
+
+    @retry_policy.setter
+    def retry_policy(self, value: RetryPolicy) -> None:
+        if not isinstance(value, RetryPolicy):
+            raise TypeError(f"retry_policy must be a RetryPolicy, got {type(value).__name__}: {value!r}.")
+        self._retry_policy = value
+
+    @property
+    def retry_delay(self) -> float:
+        """Base delay in seconds before a rolled-back data token's first retry.
+
+        A view onto the default policy's [`delay`][cpnx.RetryPolicy]: reading it returns
+        `retry_policy.delay`, and assigning it swaps in a default policy with the new delay,
+        leaving the rest of the schedule alone. Assigning a non-number, a negative, `NaN`,
+        or an infinity raises.
+        """
+        return self._retry_policy.delay
+
+    @retry_delay.setter
+    def retry_delay(self, value: float) -> None:
+        delay = cast(float, _validated_retry_number("retry_delay", value, minimum=0.0))
+        self._retry_policy = replace(self._retry_policy, delay=delay)
 
     def _call_expr(self, fn, *args, timeout: float | None = None):
         t = timeout if timeout is not None else self.timeout_secs
@@ -2581,6 +2687,15 @@ class PetriNet:
             spins += 1
             time.sleep(0)
 
+    def _resolve_retry_schedule(self) -> _RetrySchedule:
+        """Bind this net's default policy to its jitter stream for one rollback.
+
+        Built per failed firing rather than cached, so `retry_policy`/`retry_delay` stay
+        live-tunable; the per-transition policy is resolved against this default inside the
+        rollback, where the failing transition is known.
+        """
+        return _RetrySchedule(default=self._retry_policy, rng=self._retry_rng)
+
     def _commit_or_rollback_transition(
         self,
         transition: Transition,
@@ -2607,8 +2722,8 @@ class PetriNet:
             deposited, dl_data, data_tokens = _rollback_failed_transition(
                 transition,
                 token_sources,
+                retry=self._resolve_retry_schedule(),
                 deposit=self._deposit_under_lock,
-                retry_delay=self.retry_delay,
                 error_place=self.error_place,
                 ref_time=self._get_model_time_under_lock(),
             )
