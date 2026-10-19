@@ -158,8 +158,8 @@ not CPN arc expressions.  Consider a future `OutputArc` mode that accepts a
 ### Finding 2 — InputArc.expression is a Token-Ordering Function, not an Arc Expression
 
 **Severity:** Deliberate specialisation (see §0). Documentation gap only. Concrete
-symptom is head-of-line blocking, resolved opt-in by `BindingPolicy.FIRST` — see
-`docs/adr/0001-combinatorial-binding-search.md`.
+symptom is head-of-line blocking, resolved by `BindingPolicy.FIRST` — opt-in from 0.3.1,
+the default since 0.6.0 — see `docs/adr/0001-combinatorial-binding-search.md`.
 
 **Formal requirement:** `E(p,t)⟨b⟩` evaluates to a multiset that is consumed
 from place `p`.  The key point is that arc expressions are evaluated **under a

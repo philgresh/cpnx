@@ -10,7 +10,7 @@ Transitions fire work over the thread pool; arcs connect them to places.
 
 ::: cpnx.OutputArc
 
-`BindingPolicy` selects how a transition resolves which input tokens bind it — the legacy leading-token check, or a deterministic-complete binding search.
+`BindingPolicy` selects how a transition resolves which input tokens bind it — the deterministic-complete binding search (`FIRST`, the default), or a selection *among* the satisfying bindings (`RANDOM`, `PRIORITY`).
 
 ::: cpnx.BindingPolicy
 

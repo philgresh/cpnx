@@ -97,7 +97,7 @@ class BindingPolicy(enum.Enum):
     """Strategy for choosing which input tokens bind a transition when it is enabled.
 
     In CPN theory a transition is enabled if *any* assignment of place tokens (a
-    *binding*) satisfies its guard. cpnx historically tested only the head of each
+    *binding*) satisfies its guard. cpnx before 0.3.1 tested only the head of each
     input place (FIFO, or reordered by [`InputArc.key`][cpnx.InputArc]), which
     causes **head-of-line blocking**: a place holding `[A, B]` whose guard wants `B`
     reports the transition disabled, because only `A` is ever tested. `BindingPolicy`
@@ -105,29 +105,13 @@ class BindingPolicy(enum.Enum):
     `docs/adr/0001-combinatorial-binding-search.md`.
 
     Attributes:
-        LEGACY: Test only the first `count` tokens of each input place (FIFO, or the
-            leading tokens of the [`InputArc.key`][cpnx.InputArc] ordering) and
-            evaluate the guard once against that single candidate set. This is the
-            historical behavior and the current default — reproducible, but subject
-            to head-of-line blocking. Choose this to preserve pre-0.3.1 semantics
-            exactly.
-
-            **Deprecated.** `LEGACY` exists only to keep nets written before 0.3.1
-            byte-for-byte unaffected during the migration window described in
-            `docs/adr/0001-combinatorial-binding-search.md`. `FIRST` is a strict
-            superset of `LEGACY` — identical head selection whenever the head
-            already satisfies the guard, plus the head-of-line fix when it doesn't
-            — so there is no remaining reason to choose `LEGACY` over it. **`LEGACY`
-            will be removed in v0.6.0**; migrate by passing
-            `binding_policy=BindingPolicy.FIRST` explicitly wherever `LEGACY` is
-            relied on today, including the `PetriNet`/`Transition` default (see the
-            Phase 3 note in `docs/adr/0001-combinatorial-binding-search.md`).
         FIRST: Search input-token combinations in a stable insertion order and select
             the **first** combination whose guard is satisfied. Complete (finds a valid
             binding if one exists anywhere in the place, fixing head-of-line blocking)
-            **and** deterministic (the same marking always yields the same binding). When
-            the transition has no guard, this is identical to `LEGACY` and incurs no
-            search cost.
+            **and** deterministic (the same marking always yields the same binding).
+            This is the default. When the transition has no guard, the first candidate
+            is the head and trivially satisfies, so resolution reduces to the O(1) head
+            selection and incurs no search cost.
         RANDOM: Enumerate the satisfying combinations and select one **uniformly at
             random**. Reproducible when the owning [`PetriNet`][cpnx.PetriNet] is
             constructed with a `seed` (and `max_workers=1`); otherwise it varies run to
@@ -151,8 +135,9 @@ class BindingPolicy(enum.Enum):
           permutations. List resource arcs **before** data arcs in `Transition.inputs` so the
           data dimension (the one that actually changes the guard result) varies first, and/or
           raise `binding_search_limit`.
-        - For `FIRST` the first binding yielded is exactly `LEGACY`'s head selection, so
-          `FIRST` is a strict superset of `LEGACY`.
+        - For `FIRST` the first binding yielded is exactly the head selection (the leading
+          `count` tokens of each arc), so a guard that the head already satisfies costs no
+          search at all.
         - `RANDOM`/`PRIORITY` must scan the whole (bounded) candidate set, so they do not
           short-circuit and are typically costlier than `FIRST`. If the candidate space
           exceeds `binding_search_limit`, they select over the first `limit` candidates only
@@ -161,7 +146,6 @@ class BindingPolicy(enum.Enum):
           stall exactly like `FIRST`, not just fire over a smaller set.
     """
 
-    LEGACY = "legacy"
     FIRST = "first"
     RANDOM = "random"
     PRIORITY = "priority"
@@ -471,12 +455,11 @@ class Transition:
         binding_policy: How the engine resolves which input tokens bind this transition
                when checking enablement — see [`BindingPolicy`][cpnx.BindingPolicy].
                `None` (default) inherits the net-wide default set on
-               [`PetriNet`][cpnx.PetriNet] (itself `BindingPolicy.LEGACY` by default, though
-               `LEGACY` is **deprecated and will be removed in v0.6.0** — see
-               [`BindingPolicy`][cpnx.BindingPolicy]), so an unset transition behaves
-               exactly as before. Set `BindingPolicy.FIRST` to enable
-               deterministic-complete binding search (fixing head-of-line blocking) for
-               this transition only.
+               [`PetriNet`][cpnx.PetriNet] (itself `BindingPolicy.FIRST` by default), which
+               resolves head-only for a guard-free transition and searches only when a guard
+               is present. Set `BindingPolicy.RANDOM` or `BindingPolicy.PRIORITY` to select
+               *among* the satisfying bindings rather than taking the first, for this
+               transition only.
         binding_priority_key: Sort key used only under `BindingPolicy.PRIORITY`. A pure
                `Callable[[list[Token]], object]` (must be callable or `None` — string
                expressions are not supported and raise `TypeError` at assignment) mapping a

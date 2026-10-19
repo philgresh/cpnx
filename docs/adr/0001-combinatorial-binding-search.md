@@ -96,8 +96,8 @@ consumed). Therefore it is **gated**:
    `PetriNet.on_binding_search_exhausted`. Off by default (`BindingPolicy.LEGACY`), so
    existing nets are byte-for-byte unaffected. This is the escape hatch for conservative
    users during the transition window.
-2. **Default-on later** — *(planned)* flip the default at a major version bump, retaining
-   a `first_only`/legacy opt-out for one deprecation cycle.
+2. **Default-on later** — flip the default, retaining a legacy opt-out for one deprecation
+   cycle. **Shipped in 0.6.0** (see Phase 3 below).
 
 **Phase 2 shipped in 0.3.2:** the `random` and `priority` policies land as
 `BindingPolicy.RANDOM`/`PRIORITY`. Both consume the same satisfying-binding enumeration as
@@ -109,7 +109,23 @@ scheduler's equal-priority tie-break so a seeded net replays end-to-end. To keep
 that never draws the RNG (only the actual firing resolution samples). Unlike `first`,
 `random`/`priority` cannot short-circuit and enumerate the full bounded candidate set; when
 that set exceeds `binding_search_limit` they select over a truncated prefix and fire the
-exhaustion callback. The default flip (Phase 3) remains planned.
+exhaustion callback.
+
+**Phase 3 shipped in 0.6.0:** `BindingPolicy.LEGACY` is **removed** and `FIRST` is the
+default for both `PetriNet(binding_policy=...)` and the policy a `Transition` inherits when
+its own `binding_policy` is left `None`. `LEGACY` was deprecated in 0.5.0 — one release
+cycle, as step 2 above required. The removal is behaviour-changing for exactly one shape: a
+**guarded** transition that did not set a policy explicitly now searches instead of testing
+only the head, which is the head-of-line fix this ADR exists to deliver. Guard-free
+transitions are unaffected — `_is_head_only` still routes them to the same O(1) head
+resolution, so the no-guard fast path (and ADR 0005's count-only path) is unchanged.
+
+There is deliberately **no replacement** for head-only resolution *with* a guard: `FIRST` is
+a strict superset, so the only thing `LEGACY` offered was the incompleteness itself. A net
+that genuinely needs the search bounded to the head binding can set
+`PetriNet(binding_search_limit=1)`, which tries exactly the head candidate — but that is a
+net-wide bound and signals `on_binding_search_exhausted` when the head fails, so it is a
+diagnostic knob, not a silent equivalent of `LEGACY`.
 
 ## Rationale — why the determinism worry is smaller than it appears
 

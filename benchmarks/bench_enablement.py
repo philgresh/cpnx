@@ -72,14 +72,16 @@ def _accept_all_filter(token: Token) -> bool:
 
 
 def build_net(
-    binding_policy: BindingPolicy = BindingPolicy.LEGACY,
+    binding_policy: BindingPolicy = BindingPolicy.FIRST,
     guard_kind: str = "certified",
 ) -> tuple[PetriNet, Transition]:
     """A net whose single transition uses a certified or uncertified callable guard.
 
     ``binding_policy`` selects the transition's binding-resolution strategy so the same
-    enablement check can be timed under ``LEGACY`` (leading-token check) and ``FIRST``
-    (deterministic-complete guarded search).
+    enablement check can be timed under ``FIRST`` (deterministic-complete guarded search,
+    short-circuiting at the first satisfying binding) and under ``RANDOM``/``PRIORITY``
+    (which must enumerate the whole candidate set). Every arm here carries a guard, so none
+    takes the guard-free head-only fast path.
 
     ``guard_kind`` is ``"certified"`` (evaluated inline) or ``"uncertified"`` (round-tripped
     through `_call_expr` -> the `_expr_executor` thread pool). Both compute the identical
@@ -164,7 +166,7 @@ def _ratio(uncertified_us: float, certified_us: float) -> str:
 def main() -> None:
     print("-- _is_transition_enabled: certified (inline) vs uncertified (executor) guard --")
     print("   predicate (both arms): len(tokens) >= 1 and tokens[0].color == 'data'")
-    for label, policy in (("LEGACY", BindingPolicy.LEGACY), ("FIRST", BindingPolicy.FIRST)):
+    for label, policy in (("FIRST", BindingPolicy.FIRST),):
         certified_us = _time_policy(label, policy, guard_kind="certified")
         uncertified_us = _time_policy(label, policy, guard_kind="uncertified")
         print(f"   ratio [{label:8}]: uncertified/certified = {_ratio(uncertified_us, certified_us)}")
@@ -173,7 +175,6 @@ def main() -> None:
     # Firing path: RANDOM/PRIORITY must scan all candidates, so they cost more than FIRST.
     print("-- _resolve_binding: certified (inline) vs uncertified (executor) guard --")
     for label, policy in (
-        ("LEGACY", BindingPolicy.LEGACY),
         ("FIRST", BindingPolicy.FIRST),
         ("RANDOM", BindingPolicy.RANDOM),
         ("PRIORITY", BindingPolicy.PRIORITY),

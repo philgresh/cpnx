@@ -34,7 +34,7 @@ Demonstrates:
     multiplies how many guard evaluations sit behind a single firing — `C(pool, count)` of them, capped
     by the search limit. `binding_policy=BindingPolicy.PRIORITY` forces the engine to
     actually enumerate that space (searching for the min-[`cup_score`][cafe.stations.cupping.cup_score] satisfying
-    flight) rather than accepting the head group the way `LEGACY`/guard-free `FIRST` would. If the
+    flight) rather than accepting the head group the way a guard-free `FIRST` would. If the
     bench holds mixed origins and every satisfying combination happens to live beyond the
     first `binding_search_limit + 1` candidates the truncated prefix covers, the transition
     reads as **disabled** for that check — a stall reachable purely from candidate-space

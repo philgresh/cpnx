@@ -422,7 +422,7 @@ class TestFallbackParity:
                     inputs=[InputArc("input")],
                     outputs=[OutputArc("output")],
                     action=lambda tokens: tokens,
-                    # No per-transition policy: effective policy == the net default (LEGACY now).
+                    # No per-transition policy: effective policy == the net default (FIRST now).
                 )
             ],
         )
@@ -437,7 +437,7 @@ class TestFallbackParity:
         assert net._scheduler_ready is False  # caches invalidated for the next reconcile
 
         # And back again — the flag is recomputed, not latched, so eligibility is restored.
-        net.binding_policy = BindingPolicy.LEGACY
+        net.binding_policy = BindingPolicy.FIRST
         assert net._has_search_policy_transition is False
         assert net._incremental_eligible is True
 
@@ -483,7 +483,7 @@ def _make_tie_action(name: str, firings: list[tuple[str, int]]):
 
 
 def _build_tie_net(firings: list[tuple[str, int]]) -> PetriNet:
-    """Three equal-priority, guard-free LEGACY transitions racing for one shared place.
+    """Three equal-priority, guard-free FIRST transitions racing for one shared place.
 
     No RANDOM/PRIORITY transition and no timed feature, so `_incremental_eligible` stays
     `True` and selection goes through `_select_incremental`'s priority-bucket tie-break.
@@ -527,7 +527,7 @@ class TestGoldenOrderDeterminismLegacyTie:
 
     Unlike `tests/test_seeded_determinism.py` (which exercises RANDOM/PRIORITY/FIRST and
     therefore runs on the *fallback* full-scan path via `_has_search_policy_transition`),
-    this net has ONLY equal-priority, guard-free LEGACY transitions competing for the head
+    this net has ONLY equal-priority, guard-free FIRST transitions competing for the head
     token of a shared input place — so `net._incremental_eligible` stays `True` and this pins
     `_select_incremental`'s O(1) bucket + `_rng.choice` tie-break specifically.
 
