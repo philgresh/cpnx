@@ -24,7 +24,8 @@ from datetime import datetime as DatetimeClass
 
 import pytest
 
-from cpnx import InputArc, OutputArc, Token, Transition
+from cpnx import InputArc, OutputArc, Token, Transition, linting
+from cpnx import transitions as transitions_mod
 from cpnx.linting import (
     DATABASE,
     NETWORK,
@@ -319,6 +320,43 @@ def test_guard_reassignment_names_the_exact_line():
 
     hit = next(w for w in caught if issubclass(w.category, CpnxLintWarning))
     assert (hit.filename, hit.lineno) == (__file__, expected_lineno)
+
+
+def test_clean_construction_never_walks_the_stack(monkeypatch):
+    """Resolving `stacklevel` is deferred until a warning is actually emitted.
+
+    The depth is found by walking frames, which is pure waste when there is nothing to report
+    — and *every* guard, key, filter and condition assignment went through it while the
+    `stacklevel` was computed eagerly at the call site. `lint_and_warn` and
+    `_warn_deprecated_policy` now resolve it themselves, after their early returns, so a clean
+    net pays nothing. Pinned because a call site re-adding an eager `stacklevel=` argument
+    would silently undo it.
+    """
+    calls = []
+    real = linting._assignment_stacklevel
+
+    def counting():
+        calls.append(1)
+        return real()
+
+    # `cpnx.transitions` bound the name at import, so both namespaces need patching.
+    monkeypatch.setattr(linting, "_assignment_stacklevel", counting)
+    monkeypatch.setattr(transitions_mod, "_assignment_stacklevel", counting)
+
+    Transition(
+        name="t",
+        inputs=[InputArc("in", key=key_clean)],
+        outputs=[OutputArc("out")],
+        action=_action,
+        guard=guard_clean,
+    )
+    assert calls == [], "a clean callable must not trigger frame inspection"
+
+    # A real finding still resolves the depth, so the deferral did not disable attribution.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", CpnxLintWarning)
+        Transition(name="t", inputs=[InputArc("in")], outputs=[OutputArc("out")], action=_action, guard=guard_random)
+    assert len(calls) == 1
 
 
 def test_clean_construction_emits_no_lint_warning():

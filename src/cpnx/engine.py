@@ -23,7 +23,6 @@ from cpnx.transitions import (
     OutputArc,
     SubstitutionTransition,
     Transition,
-    _assignment_stacklevel,
     _warn_deprecated_policy,
 )
 from cpnx.visualization import snapshot, to_dot
@@ -455,9 +454,7 @@ class PetriNet:
         self.retry_delay = retry_delay
         # The property setter is bypassed just below, so its deprecation notice is emitted
         # explicitly here instead.
-        _warn_deprecated_policy(
-            binding_policy, source="PetriNet(binding_policy=...)", stacklevel=_assignment_stacklevel()
-        )
+        _warn_deprecated_policy(binding_policy, source="PetriNet(binding_policy=...)")
         #: Backing field for the `binding_policy` property. Set directly here (the property
         #: setter recomputes `_has_search_policy_transition`, which needs `self.transitions`
         #: to already exist — it does not yet at this point in construction).
@@ -639,9 +636,7 @@ class PetriNet:
         # Warn *before* taking the lock: a user filter promoting this to an error must not
         # raise mid-update, which would leave `_binding_policy` reassigned while
         # `_has_search_policy_transition` and `_scheduler_ready` still describe the old one.
-        # The depth is resolved by walking out to the first non-cpnx frame rather than
-        # hard-coded, so it survives refactoring; see `_assignment_stacklevel`.
-        _warn_deprecated_policy(value, source="PetriNet.binding_policy", stacklevel=_assignment_stacklevel())
+        _warn_deprecated_policy(value, source="PetriNet.binding_policy")
         with self._lock:
             self._binding_policy = value
             # A new default can flip any policy-unset transition's *effective* policy in either

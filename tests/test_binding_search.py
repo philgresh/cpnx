@@ -8,10 +8,10 @@ import warnings
 import pytest
 
 from cpnx.engine import PetriNet
+from cpnx.linting import _PACKAGE_ROOT
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace
 from cpnx.tokens import Token
 from cpnx.transitions import (
-    _PACKAGE_ROOT,
     BindingPolicy,
     CpnxDeprecationWarning,
     InputArc,

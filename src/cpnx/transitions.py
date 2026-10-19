@@ -1,7 +1,4 @@
 import enum
-import inspect
-import os
-import types
 import typing
 import warnings
 import weakref
@@ -10,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, Literal
 
 from cpnx.analysis import coerce_color_domain
 from cpnx.certification import is_inline_safe
-from cpnx.linting import lint_and_warn
+from cpnx.linting import _assignment_stacklevel, lint_and_warn
 from cpnx.sandbox import verify_callable_purity
 from cpnx.tokens import Token
 
@@ -36,75 +33,19 @@ class CpnxDeprecationWarning(UserWarning):
     """
 
 
-#: Directory holding cpnx's own modules, used to recognise cpnx frames when resolving the
-#: `stacklevel` a warning should report. See `_assignment_stacklevel`. **Separator-terminated**
-#: so a sibling path that merely starts with the same characters — `.../cpnx_user/app.py`
-#: beside `.../cpnx/` — is not mistaken for cpnx's own code and walked past.
-_PACKAGE_ROOT = os.path.dirname(os.path.abspath(__file__)) + os.sep
-
-#: Depth used when the walk finds no frame outside cpnx (or frames are unavailable). Points
-#: at the frame that performed the assignment, which is right for a plain reassignment.
-_FALLBACK_STACKLEVEL = 3
-
-
-def _is_internal_frame(code: "types.CodeType") -> bool:
-    """Whether a frame should be stepped over when attributing a warning to user code.
-
-    True for cpnx's own modules, and for the **generated** `__init__` a dataclass assigns its
-    fields through — synthesised code that names no user line, so a warning pointing at it is
-    useless. Crucially *not* true for the user's own synthesised frames: a REPL (`<stdin>`), a
-    notebook cell, or `exec`'d source are real user code and must terminate the walk. They are
-    told apart by `co_name`, which is `"__init__"` only for the generated one.
-    """
-    filename = code.co_filename
-    if filename.startswith(_PACKAGE_ROOT):
-        return True
-    return filename.startswith("<") and code.co_name == "__init__"
-
-
-def _assignment_stacklevel() -> int:
-    """`stacklevel` that makes a `__setattr__` warning name the user's own line.
-
-    These warnings exist to tell an author which `guard`, `key`, `filter`, `condition` or
-    policy to fix, so the reported location is the point of raising them. The right depth is
-    **not** a constant: a dataclass assigns its fields through a generated `__init__`, one
-    frame deeper than a later reassignment. So instead of hard-coding a number per call site —
-    which is how the attribution was wrong before — this walks outward from the caller (the
-    `__setattr__`) to the first frame `_is_internal_frame` does not claim.
-
-    Returns:
-        The `stacklevel` to pass the emitting helper. Falls back to `_FALLBACK_STACKLEVEL`
-        when no frame outside cpnx is found, or frames are unavailable.
-    """
-    # 1 is the emitting helper (`lint_and_warn` / `_warn_deprecated_policy`), so the
-    # `__setattr__` that called this helper is 2. Call sites must invoke the emitter directly.
-    depth = 2
-    frame = inspect.currentframe()
-    frame = frame.f_back if frame is not None else None
-    while frame is not None:
-        if not _is_internal_frame(frame.f_code):
-            return depth
-        frame = frame.f_back
-        depth += 1
-    # Clamp *down*: on exhaustion `depth` has grown past the top of the stack, and passing an
-    # over-deep stacklevel makes `warnings` report `sys:1` — no file and no line at all.
-    return min(depth, _FALLBACK_STACKLEVEL)
-
-
-def _warn_deprecated_policy(policy: "BindingPolicy", *, source: str, stacklevel: int) -> None:
+def _warn_deprecated_policy(policy: "BindingPolicy", *, source: str) -> None:
     """Emit the removal notice when a deprecated [`BindingPolicy`][cpnx.BindingPolicy] is selected.
 
     Called from every entry point that can put a policy into force — `Transition.__setattr__`,
     `PetriNet.__init__` and the `PetriNet.binding_policy` setter — so the warning fires wherever
     `LEGACY` enters the system rather than only at one of them. A no-op for every other policy,
-    so the healthy path pays one identity comparison.
+    so the healthy path really does pay just one identity comparison: the `stacklevel` walk
+    happens *after* that check, never before it.
 
     Args:
         policy: The policy being selected; only `BindingPolicy.LEGACY` warns.
         source: How it was selected, named in the message so a net with several transitions
             says which one (e.g. `"Transition(name='t')"`).
-        stacklevel: Passed through to `warnings.warn` so the warning points at the caller's
-            own line rather than inside cpnx.
     """
     if policy is not BindingPolicy.LEGACY:
         return
@@ -116,7 +57,7 @@ def _warn_deprecated_policy(policy: "BindingPolicy", *, source: str, stacklevel:
         "does not, and no search cost without a guard), so migrate by dropping the argument to "
         "inherit the FIRST default, or passing binding_policy=BindingPolicy.FIRST explicitly.",
         CpnxDeprecationWarning,
-        stacklevel=stacklevel,
+        stacklevel=_assignment_stacklevel(),
     )
 
 
@@ -408,7 +349,7 @@ class InputArc:
                 verify_callable_purity(value)
                 # Best-effort advisory scan for side-effecting / non-deterministic
                 # trouble spots (see :mod:`cpnx.linting`); warns, or raises in strict mode.
-                lint_and_warn(value, f"InputArc.{name}", stacklevel=_assignment_stacklevel())
+                lint_and_warn(value, f"InputArc.{name}")
                 if name == "filter":
                     _reject_non_bool_return("InputArc.filter", value)
             super().__setattr__(f"_{name}_inline_safe", _inline_safe_for(value))
@@ -491,7 +432,7 @@ class OutputArc:
             _reject_string_expression("OutputArc.condition", value)
             if callable(value):
                 verify_callable_purity(value)
-                lint_and_warn(value, "OutputArc.condition", stacklevel=_assignment_stacklevel())
+                lint_and_warn(value, "OutputArc.condition")
                 _reject_non_bool_return("OutputArc.condition", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         super().__setattr__(name, value)
@@ -654,7 +595,7 @@ class Transition:
             _reject_string_expression("guard", value)
             if callable(value):
                 verify_callable_purity(value)
-                lint_and_warn(value, "guard", stacklevel=_assignment_stacklevel())
+                lint_and_warn(value, "guard")
                 _reject_non_bool_return("guard", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         elif name == "binding_priority_key" and value is not None:
@@ -667,18 +608,14 @@ class Transition:
                     f"got {type(value).__name__}. String-expression keys are not supported."
                 )
             verify_callable_purity(value)
-            lint_and_warn(value, "binding_priority_key", stacklevel=_assignment_stacklevel())
+            lint_and_warn(value, "binding_priority_key")
         elif name == "binding_policy" and value is not None:
             # Warns only for a deprecated policy, and from both paths into this method: the
             # generated dataclass ``__init__`` as well as post-construction reassignment.
             # ``name`` is declared before ``binding_policy`` so it is already assigned, but
             # read it defensively so a field reorder degrades the message rather than raising.
             owner = getattr(self, "name", "<unnamed>")
-            _warn_deprecated_policy(
-                value,
-                source=f"Transition(name={owner!r})",
-                stacklevel=_assignment_stacklevel(),
-            )
+            _warn_deprecated_policy(value, source=f"Transition(name={owner!r})")
         elif name == "impacts_colors":
             # Declarative colour-domain annotation (not a callable): normalise any
             # iterable of colour names to a frozenset, reject a bare string / non-str
