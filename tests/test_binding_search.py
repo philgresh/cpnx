@@ -444,6 +444,61 @@ class TestPolicyOverride:
         assert {t.payload["rank"] for t in net.places["input"].tokens} == {0, 1}
 
 
+class TestGuardedPolicyOverride:
+    """The override also holds for a **guarded** transition — the shape the v0.6.0 flip moved.
+
+    A guarded transition never takes the head-only fast path, so both arms search. The guard
+    admits only `ok` tokens, and the `ok` ones are deposited out of rank order, so `FIRST`
+    (first satisfying in insertion order → rank 3) and `PRIORITY` (minimum key *among the
+    satisfying* bindings → rank 1) pick different tokens. The lowest rank overall sits on a
+    guard-failing token, so these also pin that the guard filters *before* the key ranks.
+    """
+
+    def _build(self, net_policy, transition_policy):
+        net = PetriNet(
+            places=[Place("input"), Place("output")],
+            binding_policy=net_policy,
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                    guard=lambda toks: toks[0].payload["ok"] is True,
+                    binding_policy=transition_policy,
+                    binding_priority_key=lambda toks: toks[0].payload["rank"],
+                )
+            ],
+        )
+        # rank 0 is the global minimum but fails the guard; the satisfying ranks are 3 then 1.
+        for ok, rank in ((False, 0), (True, 3), (True, 1), (False, 2)):
+            net.deposit("input", Token(payload={"ok": ok, "rank": rank}))
+        return net
+
+    def test_guarded_net_priority_transition_overrides_to_first(self):
+        """Net default PRIORITY, guarded transition overrides FIRST → first satisfying."""
+        net = self._build(BindingPolicy.PRIORITY, BindingPolicy.FIRST)
+        _fire_once(net)
+
+        assert [t.payload["rank"] for t in net.places["output"].tokens] == [3]
+        assert {t.payload["rank"] for t in net.places["input"].tokens} == {0, 1, 2}
+
+    def test_guarded_net_first_transition_overrides_to_priority(self):
+        """Net default FIRST, guarded transition overrides PRIORITY → min key among satisfying."""
+        net = self._build(BindingPolicy.FIRST, BindingPolicy.PRIORITY)
+        _fire_once(net)
+
+        assert [t.payload["rank"] for t in net.places["output"].tokens] == [1]
+        assert {t.payload["rank"] for t in net.places["input"].tokens} == {0, 2, 3}
+
+    def test_guarded_unset_transition_inherits_net_policy(self):
+        """A guarded transition with no policy of its own follows the net default (FIRST)."""
+        net = self._build(BindingPolicy.FIRST, None)
+        _fire_once(net)
+
+        assert [t.payload["rank"] for t in net.places["output"].tokens] == [3]
+
+
 class TestHeadMatchSanity:
     def test_unset_net_guard_matches_head_fires_normally(self):
         """An unset-policy net with a guard matching the head fires once, normally."""

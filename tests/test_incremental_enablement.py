@@ -522,7 +522,7 @@ def _build_tie_net(firings: list[tuple[str, int]]) -> PetriNet:
     return net
 
 
-class TestGoldenOrderDeterminismLegacyTie:
+class TestGoldenOrderDeterminismGuardFreeTie:
     """Pin the incremental scheduler's firing order for a seeded, guard-free tie net.
 
     Unlike `tests/test_seeded_determinism.py` (which exercises RANDOM/PRIORITY/FIRST and

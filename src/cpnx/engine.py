@@ -1747,7 +1747,7 @@ class PetriNet:
         to what the search will look at rather than to the depth of the place — the whole
         point of the index. The two cases:
 
-        - **head-only** (guard-free `FIRST`): `_resolve_input_tokens` takes the leading
+        - **head-only** (per `_is_head_only`): `_resolve_input_tokens` takes the leading
           `count`, so `count` tokens is exactly enough.
         - **searching**: `_iter_candidate_bindings` keeps the first `binding_search_limit + 1`
           *combinations* per arc, and for `count > 1` those reach further into the ordering
@@ -1766,12 +1766,17 @@ class PetriNet:
             pools.append((arc, available))
         return pools
 
-    def _is_head_only(self, transition: Transition, policy: BindingPolicy) -> bool:
+    @staticmethod
+    def _is_head_only(transition: Transition, policy: BindingPolicy) -> bool:
         """Whether `transition` resolves via the O(1) head binding rather than a search.
 
-        `FIRST` with no guard reduces to the head (the first candidate is the head and
-        trivially satisfies). `RANDOM`/`PRIORITY` must always enumerate — even guard-free,
-        they select *among* eligible groups, not just the head.
+        This is the **canonical** statement of the head-only rule; the docstrings that mention
+        it elsewhere (`_gather_arc_pools`, `_resolve_binding`, `_resolve_input_tokens`,
+        `_qualifies_for_count_only`) defer here. `FIRST` with no guard reduces to the head (the
+        first candidate is the head and trivially satisfies). `RANDOM`/`PRIORITY` must always
+        enumerate — even guard-free, they select *among* eligible groups, not just the head.
+
+        Depends only on its arguments (no net state), hence `staticmethod`.
         """
         return policy is BindingPolicy.FIRST and transition.guard is None
 
@@ -1815,10 +1820,10 @@ class PetriNet:
         """Whether `transition` may take the count-only `consume_all` fast path.
 
         Excludes anything that would read tokens before firing (a `guard` or a
-        `binding_priority_key`) or that enumerates rather than taking the head
-        (`RANDOM`/`PRIORITY`), and requires at least one `consume_all` arc — the only arc
-        shape whose ordinary resolution is unbounded. See `_try_count_only_binding` for why
-        this exact set keeps the deferral behaviour- and RNG-identical.
+        `binding_priority_key`) or that enumerates rather than taking the head (per
+        `_is_head_only`), and requires at least one `consume_all` arc — the only arc shape
+        whose ordinary resolution is unbounded. See `_try_count_only_binding` for why this
+        exact set keeps the deferral behaviour- and RNG-identical.
         """
         return (
             transition.guard is None
@@ -1864,8 +1869,8 @@ class PetriNet:
         Gathers each input arc's eligible tokens, then selects a guard-satisfying binding
         according to the transition's effective [`BindingPolicy`][cpnx.BindingPolicy]:
 
-        - guard-free `FIRST`: take the first `count` tokens of each arc (its head, or the
-          leading tokens of the arc's `key` ordering) — O(1), no search.
+        - **head-only** (per `_is_head_only`): take the first `count` tokens of each arc (its
+          head, or the leading tokens of the arc's `key` ordering) — O(1), no search.
         - `FIRST` with a guard: return the first guard-satisfying combination in insertion
           order.
         - `RANDOM`: return a uniformly-random guard-satisfying combination (drawing from the
@@ -2412,12 +2417,10 @@ class PetriNet:
         resolved, so a selection that yields fewer (or none) disables the
         transition rather than firing with a short or zero-length token list.
 
-        Used by `_head_binding` to build the head selection whenever a transition
-        resolves head-only — a guard-free `BindingPolicy.FIRST` transition (see
-        `_is_head_only`).
-        Guard-free `RANDOM`/`PRIORITY` do **not** use this path; they enumerate. The
-        multiplicity rule applies either way, so a short selection disables the transition
-        rather than firing with too few tokens.
+        Used by `_head_binding` to build the head selection whenever a transition resolves
+        head-only (`_is_head_only` defines which those are). Guard-free `RANDOM`/`PRIORITY`
+        do **not** use this path; they enumerate. The multiplicity rule applies either way,
+        so a short selection disables the transition rather than firing with too few tokens.
         """
         if arc.consume_all:
             # A draining arc takes the whole available pool untouched — `key` and `filter`

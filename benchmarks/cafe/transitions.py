@@ -268,13 +268,13 @@ def t_rework_dose(*, work_secs: float = 0.0, dose_low: float, dose_high: float) 
         Also the fixture's one guarded transition left on the **default**
         [`BindingPolicy.FIRST`][cpnx.BindingPolicy] over a deep place, so it searches
         `P_Ticket_Line` for an out-of-spec ticket rather than only testing the head.
-        Through v0.5.0 the default was the head-only `LEGACY` policy and this station
+        Through 0.5.0 the default was the head-only `LEGACY` policy and this station
         relied on it, reworking a ticket only once it reached the head and leaving
-        `T_Weigh_And_Grind`'s PRIORITY search to skip past the rest. With `LEGACY`
-        removed in v0.6.0 the completeness is unconditional: a bad dose anywhere in the
-        line is reworked on the next check. That is strictly more work per enabling
-        check (bounded by `binding_search_limit`) for a strictly earlier rework, and it
-        is the one place in the fixture where the v0.6.0 default flip is observable.
+        `T_Weigh_And_Grind`'s PRIORITY search to skip past the rest. Now that `LEGACY`
+        is gone the completeness is unconditional: a bad dose anywhere in the line is
+        reworked on the next check. That is strictly more work per enabling check
+        (bounded by `binding_search_limit`) for a strictly earlier rework, and it is the
+        one place in the fixture where the default flip is observable.
 
     Args:
         work_secs: Physical seconds the station occupies a worker.
