@@ -169,7 +169,15 @@ def _rollback_data_token(
 ) -> tuple[str, Token, bool]:
     max_retries = transition.max_retries
     if max_retries is None or t.attempts < max_retries:
-        retry_at = ref_time + retry.delay_for(transition.retry_policy, t.attempts)
+        delay = retry.delay_for(transition.retry_policy, t.attempts)
+        # A positive delay must land strictly after `ref_time`, which `+` alone does not
+        # guarantee: one ULP at monotonic-clock magnitudes is ~2e-9s, so a small jitter draw
+        # can round straight back to `ref_time`. A retry that lands *on* the clock is not
+        # pushed onto the reactivation heap (`_mark_place_dirty` requires
+        # `available_at > now`) and re-fires inside the same `drive_to_quiescence` tick
+        # without advancing `ticks` — the same float hazard already guarded in
+        # `_pending_settle_boundary` and `drive_to_quiescence`.
+        retry_at = max(ref_time + delay, math.nextafter(ref_time, math.inf)) if delay > 0.0 else ref_time
         return src_name, t.evolve(available_at=retry_at, attempts=t.attempts + 1), False
     return error_place, t.evolve(available_at=0.0), True
 
@@ -284,7 +292,7 @@ class PetriNet:
             data token waits before each retry — for transitions that declare none of their
             own. Validated on assignment, so it stays safe to retune on a live net.
         retry_delay: View onto `retry_policy.delay`, the wait before the first retry.
-            Assigning it swaps in a default policy with that delay.
+            Assigning it keeps the rest of the schedule and moves only `delay`.
         places: Mapping of registered place name to `Place` instance.
         transitions: Mapping of registered transition name to `Transition` instance.
         on_transition_fired: Optional callback `(transition_name: str, duration_secs: float)
@@ -809,11 +817,23 @@ class PetriNet:
 
         Args:
             new_time: The new logical timestamp. Must be strictly greater than the current
-                model time (if one has already been set).
+                model time (if one has already been set), and must be finite.
 
         Raises:
-            ValueError: If `new_time` is less than or equal to the current model time.
+            ValueError: If `new_time` is less than or equal to the current model time, or is
+                not finite.
         """
+        if not math.isfinite(new_time):
+            # A non-finite clock is unrecoverable, not merely odd: at `_model_time = inf`
+            # every `available_at > t_limit` comparison is false, so tokens parked at
+            # infinity mature immediately and *every* finite delay, cooldown and settle
+            # window in the net collapses to "already elapsed". Reject it at the setter so no
+            # caller — `drive_to_quiescence` included — can get the net into that state.
+            raise ValueError(
+                f"Clock mutability violation: the global clock must be finite, got {new_time}. "
+                "A non-finite clock makes every delay, cooldown, and settle window compare as "
+                "already elapsed."
+            )
         with self._lock:
             if self._model_time is not None and new_time <= self._model_time:
                 raise ValueError(
@@ -2673,10 +2693,19 @@ class PetriNet:
         completion), so [`drive_to_quiescence`][cpnx.PetriNet.drive_to_quiescence] stops instead of
         advancing the clock forever. Called only between firings, after `_await_inflight`, so no
         worker thread is mutating the marking.
+
+        A non-finite boundary is treated as no boundary at all. An uncapped `RetryPolicy` whose
+        delay has saturated parks its token at `available_at = inf`, which is unreachable by
+        definition: advancing the clock to it would be both a lie and ruinous, since at
+        `_model_time = inf` that token matures again immediately and every finite delay in the
+        net collapses with it. Reporting `None` lets the drive stop on a genuinely parked token
+        instead of spinning on it forever.
         """
         now = self.model_time
         candidates = [
-            b for b in (self._earliest_cooldown_boundary(now), self._earliest_settle_boundary(now)) if b is not None
+            b
+            for b in (self._earliest_cooldown_boundary(now), self._earliest_settle_boundary(now))
+            if b is not None and math.isfinite(b)
         ]
         return min(candidates, default=None)
 

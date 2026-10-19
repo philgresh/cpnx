@@ -15,6 +15,7 @@ local write wants 50 ms flat. A transition that declares none inherits the net's
 ([`PetriNet.retry_policy`][cpnx.PetriNet]).
 """
 
+import contextlib
 import math
 import random
 import warnings
@@ -53,7 +54,8 @@ def _validated_retry_number(
     Raises:
         TypeError: If `value` is not a real number (or `None` without `allow_none`).
         ValueError: If `value` is `NaN`, below `minimum`, or infinite without
-            `allow_infinite`.
+            `allow_infinite` — including an `int` too large to be a `float` at all, which
+            is an infinity by any other name.
     """
     if value is None:
         if allow_none:
@@ -61,7 +63,16 @@ def _validated_retry_number(
         raise TypeError(f"{name} must be a number, got None.")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{name} must be a number, got {type(value).__name__}: {value!r}.")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        # A Python `int` has no bound, so `10**400` reaches here as a legal number that no
+        # `float` can hold. Report it as the out-of-range value it is, not as the raw
+        # `OverflowError` from the conversion — this function promises TypeError/ValueError.
+        raise ValueError(
+            f"{name} must be within the float range, got an int of {value.bit_length()} bits. "
+            "A delay that large parks the token for good."
+        ) from exc
     if math.isnan(number):
         raise ValueError(
             f"{name} must not be NaN. A NaN delay compares false against every clock, so the "
@@ -131,9 +142,16 @@ class RetryPolicy:
             (`PetriNet(retry_rng=...)`, seeded by `PetriNet(seed=...)`).
 
     Raises:
-        TypeError: If `delay`, `backoff`, or `max_delay` is not a number.
+        TypeError: If `delay`, `backoff`, or `max_delay` is not a number, or `jitter` is not
+            a `bool`.
         ValueError: If `delay` or `max_delay` is negative, `backoff < 1.0`, any is `NaN`,
-            or `delay`/`backoff` is infinite.
+            `delay`/`backoff` is infinite, or any is an `int` too large to be a `float`.
+
+    Note:
+        Numeric fields are stored as `float`, so `RetryPolicy(delay=1, backoff=2).delay`
+        reads back as `1.0`. The coercion is load-bearing, not cosmetic: `int ** int` is
+        arbitrary-precision and never overflows, so an `int` backoff would grow without
+        bound instead of saturating at the ceiling described under `max_delay`.
 
     Example:
         ```python
@@ -159,19 +177,39 @@ class RetryPolicy:
     jitter: bool = False
 
     def __post_init__(self) -> None:
-        """Reject a schedule that could not retry sanely. See `_validated_retry_number`."""
-        _validated_retry_number("RetryPolicy.delay", self.delay, minimum=0.0)
-        _validated_retry_number(
-            "RetryPolicy.backoff",
-            self.backoff,
-            minimum=1.0,
-            hint=(
-                " A multiplier below 1 shrinks the delay on every attempt, which turns a "
-                "persistent failure into a retry storm."
+        """Reject a schedule that could not retry sanely, and store the fields as `float`.
+
+        See `_validated_retry_number`. Keeping the *coerced* value matters as much as the
+        check: an `int` field would make `backoff ** attempt` arbitrary-precision integer
+        arithmetic, which never raises `OverflowError`, so `delay_for` would hand the
+        rollback a 1000-bit `int` instead of saturating — and `ref_time + delay` would then
+        raise `OverflowError` outside `_RetrySchedule.delay_for`'s guard, stranding every
+        token not yet re-deposited. `float ** int` saturates where this class says it does.
+        """
+        if not isinstance(self.jitter, bool):
+            # Checked because a truthy non-bool (`jitter="false"`) would silently turn jitter
+            # *on*, which is the opposite of what it reads as.
+            raise TypeError(f"RetryPolicy.jitter must be a bool, got {type(self.jitter).__name__}: {self.jitter!r}.")
+        object.__setattr__(self, "delay", _validated_retry_number("RetryPolicy.delay", self.delay, minimum=0.0))
+        object.__setattr__(
+            self,
+            "backoff",
+            _validated_retry_number(
+                "RetryPolicy.backoff",
+                self.backoff,
+                minimum=1.0,
+                hint=(
+                    " A multiplier below 1 shrinks the delay on every attempt, which turns a "
+                    "persistent failure into a retry storm."
+                ),
             ),
         )
-        _validated_retry_number(
-            "RetryPolicy.max_delay", self.max_delay, minimum=0.0, allow_none=True, allow_infinite=True
+        object.__setattr__(
+            self,
+            "max_delay",
+            _validated_retry_number(
+                "RetryPolicy.max_delay", self.max_delay, minimum=0.0, allow_none=True, allow_infinite=True
+            ),
         )
 
     def delay_for(self, attempt: int, rng: random.Random | None = None) -> float:
@@ -188,26 +226,72 @@ class RetryPolicy:
         Returns:
             The delay in seconds, `min(delay * backoff ** attempt, max_delay)`, drawn
             uniformly from `[0, that]` when `jitter` is set and `rng` is given.
+
+        Raises:
+            ValueError: If `attempt` is negative. A negative attempt silently returned
+                `delay` (the `attempt > 0` branch is skipped), hiding the caller's bug.
+            TypeError: If `rng.uniform` returns anything but a non-negative finite number.
         """
-        delay = self.delay
-        if delay and self.backoff != 1.0 and attempt > 0:
-            # A zero base stays zero for every attempt and every backoff, so it skips the
-            # growth entirely — otherwise the overflow below would turn `0 * huge` (still 0)
-            # into an infinite park.
-            try:
-                delay = delay * self.backoff**attempt
-            except OverflowError:
-                # An unbounded (`max_retries=None`) net with `backoff > 1` can run the
-                # exponent past the float range. Saturate rather than raise; an uncapped
-                # policy then parks the token, which is why `max_delay` is advised.
-                delay = math.inf
-        if self.max_delay is not None and delay > self.max_delay:
-            delay = self.max_delay
+        if attempt < 0:
+            raise ValueError(f"RetryPolicy.delay_for: attempt must be >= 0 (0 is the first retry), got {attempt}.")
+        delay = self._capped(self._grown(attempt))
         if self.jitter and rng is not None and math.isfinite(delay):
             # Full jitter: uniform over the whole capped window. `uniform(0, inf)` can
             # produce a NaN, so an infinite window is left unjittered (it is already a park).
-            delay = rng.uniform(0.0, delay)
+            delay = _validated_jitter_sample(rng.uniform(0.0, delay), delay)
         return delay
+
+    def _capped(self, delay: float) -> float:
+        """Clamp `delay` to `max_delay`, which is applied before jitter."""
+        if self.max_delay is not None and delay > self.max_delay:
+            return self.max_delay
+        return delay
+
+    def _grown(self, attempt: int) -> float:
+        """Return `delay * backoff ** attempt`, saturating at infinity rather than raising.
+
+        Two short-circuits come first, for the cases where the exponent cannot change the
+        answer. A zero base stays zero for every attempt and every backoff — without this the
+        saturation below would turn `0 * huge` (still 0) into an infinite park. And a base
+        already at or above the cap can only grow into it, so the result is `max_delay`
+        whatever the exponent — worth skipping, because `backoff ** attempt` is real work at a
+        large `attempt`.
+        """
+        if not self.delay or self.backoff == 1.0 or attempt == 0:
+            return self.delay
+        if self.max_delay is not None and self.delay >= self.max_delay:
+            return self.max_delay
+        try:
+            return self.delay * self.backoff**attempt
+        except OverflowError:
+            pass
+        # `backoff ** attempt` overflowed, but that is the *intermediate* term: with a base
+        # below 1.0 the true product can still be finite (`0.1 * 2**1024` is 1.8e307). Redo it
+        # in log space, where the base pulls the exponent back down, before concluding that an
+        # unbounded (`max_retries=None`) net has genuinely run past the float range. An
+        # uncapped policy that really does overflow parks the token, which is why `max_delay`
+        # is advised.
+        try:
+            return math.exp(math.log(self.delay) + attempt * math.log(self.backoff))
+        except (OverflowError, ValueError):
+            return math.inf
+
+
+def _validated_jitter_sample(sample: object, window: float) -> float:
+    """Return `sample` as a float once it is a usable delay, else raise.
+
+    `validated_jitter_rng` proves a generator can serve a draw at construction, but it can
+    only probe `uniform(0.0, 0.0)` — a source that returns `None`, a string, a `NaN` or a
+    negative on a *real* window slips past it. Each of those is silently destructive rather
+    than loud: a non-number defers its `TypeError` to `ref_time + delay` in the engine's
+    rollback, outside the guard that keeps a rollback from stranding tokens; a `NaN`
+    `available_at` compares false against every clock and corrupts the cooling heaps'
+    ordering; a negative schedules the retry in the past. Raising here instead puts the
+    failure *inside* `_RetrySchedule.delay_for`, which falls back to the unjittered delay.
+    """
+    if isinstance(sample, bool) or not isinstance(sample, (int, float)) or not math.isfinite(sample) or sample < 0.0:
+        raise TypeError(f"retry_rng.uniform(0.0, {window}) must return a non-negative finite number, got {sample!r}.")
+    return float(sample)
 
 
 #: The schedule a net falls back on for transitions that declare no `retry_policy`:
@@ -261,7 +345,11 @@ def validated_jitter_rng(rng: object, *, name: str = "retry_rng") -> random.Rand
         ) from exc
     finally:
         if state is not None:
-            setstate(state)
+            # Suppressed: restoring the stream is a courtesy to the caller, not a validity
+            # test. A duck-typed source whose `setstate` raises must not mask the probe's own
+            # TypeError above, nor fail a generator that just proved it can draw.
+            with contextlib.suppress(Exception):
+                setstate(state)
     if isinstance(sample, bool) or not isinstance(sample, (int, float)) or not math.isfinite(sample):
         raise TypeError(f"{name}.uniform(0.0, 0.0) must return a finite number, got {sample!r}.")
     return cast(random.Random, rng)
@@ -289,16 +377,26 @@ class _RetrySchedule:
         caller-supplied, and `PetriNet` proves it works with a trial draw at construction
         (`validated_jitter_rng`), so this is the belt behind that brace: a draw that fails
         anyway degrades to the unjittered delay and warns, rather than losing work.
+
+        "Never raises" is meant literally, so neither the warning nor the fallback may raise
+        either: `warnings.warn` *does* raise under `-W error` (a common test setting), and
+        recomputing the unjittered delay would re-raise anything that was not the draw's
+        fault. The last resort is a zero delay — an immediate retry is recoverable, a
+        stranded token is not.
         """
         policy = retry_policy or self.default
         try:
             return policy.delay_for(attempt, self.rng)
         except Exception as exc:  # noqa: BLE001 — a rollback must not raise; see the docstring
-            warnings.warn(
-                f"Retry jitter draw failed ({type(exc).__name__}: {exc}); falling back to the "
-                f"unjittered delay for attempt {attempt}. Check the generator passed as "
-                "`PetriNet(retry_rng=...)`.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return policy.delay_for(attempt)
+            with contextlib.suppress(Exception):  # `-W error` would turn this warning into a raise
+                warnings.warn(
+                    f"Retry jitter draw failed ({type(exc).__name__}: {exc}); falling back to the "
+                    f"unjittered delay for attempt {attempt}. Check the generator passed as "
+                    "`PetriNet(retry_rng=...)`.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            try:
+                return policy.delay_for(attempt)
+            except Exception:  # noqa: BLE001 — the jitter was not the cause; retry immediately
+                return 0.0

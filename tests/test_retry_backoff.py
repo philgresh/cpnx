@@ -18,13 +18,14 @@ import math
 import random
 import threading
 import time
+import warnings
 from dataclasses import replace
 
 import pytest
 
 from cpnx.engine import PetriNet
 from cpnx.places import Place, ResourcePlace
-from cpnx.retries import DEFAULT_RETRY_POLICY, RetryPolicy, _RetrySchedule
+from cpnx.retries import DEFAULT_RETRY_POLICY, RetryPolicy, _RetrySchedule, validated_jitter_rng
 from cpnx.tokens import Token
 from cpnx.transitions import InputArc, OutputArc, Transition
 
@@ -662,3 +663,239 @@ class TestSetterLocking:
         with net._lock:  # would block/deadlock if the failed setter had kept it
             pass
         assert net.retry_policy == DEFAULT_RETRY_POLICY
+
+
+class TestFieldsAreCoercedToFloat:
+    """`int` fields must not survive construction, or the backoff becomes bigint arithmetic.
+
+    `int ** int` is arbitrary-precision and *never* raises `OverflowError`, so an `int`-typed
+    policy skipped the saturation in `delay_for` and handed the rollback a thousand-bit `int`.
+    `ref_time + delay` then raised `OverflowError` in `_rollback_data_token` — outside
+    `_RetrySchedule.delay_for`'s guard — stranding every token not yet re-deposited.
+    """
+
+    def test_integer_fields_are_stored_as_floats(self):
+        policy = RetryPolicy(delay=2, backoff=3, max_delay=12)
+        assert isinstance(policy.delay, float)
+        assert isinstance(policy.backoff, float)
+        assert isinstance(policy.max_delay, float)
+
+    def test_an_integer_policy_saturates_instead_of_growing_a_bigint(self):
+        """Regression: this returned a 1329-bit `int`, which `ref_time + delay` cannot add."""
+        delay = RetryPolicy(delay=1, backoff=100).delay_for(200)
+        assert delay == math.inf
+        assert 100.0 + delay == math.inf  # the addition that used to raise
+
+    def test_an_integer_policy_does_not_strand_tokens(self):
+        """End-to-end: the data token, the permit, and `on_error` all survive."""
+        with PetriNet(max_workers=1, retry_policy=RetryPolicy(delay=1, backoff=100)) as net:
+            net.advance_time(100.0)
+            net.add_place(Place("in"))
+            net.add_place(ResourcePlace("permit", capacity=2))
+            errors: list[tuple] = []
+            net.on_error = lambda *a: errors.append(a)
+            net.add_transition(
+                Transition(
+                    name="t",
+                    inputs=[InputArc("in"), InputArc("permit")],
+                    outputs=[OutputArc("permit")],
+                    action=_boom,
+                    max_retries=None,
+                )
+            )
+            net.deposit("in", Token(payload={"n": 1}, attempts=200))
+
+            assert net.step() is True
+            _settle(net)
+
+            assert len(net.marking["in"]) == 1
+            assert len(net.places["permit"]) == 2
+            assert len(errors) == 1
+
+    def test_an_int_beyond_the_float_range_is_a_value_error(self):
+        """`float(10**400)` raises `OverflowError`; the validator promises TypeError/ValueError."""
+        with pytest.raises(ValueError, match="within the float range"):
+            RetryPolicy(delay=1, backoff=10**400)
+
+
+class TestSaturationDoesNotPoisonTheClock:
+    """A saturated delay parks its token; it must not drag the logical clock to infinity.
+
+    At `_model_time = inf` every `available_at > t_limit` comparison is false, so the parked
+    token matures again immediately *and* every other finite delay, cooldown and settle
+    window in the net collapses to "already elapsed".
+    """
+
+    def test_advance_time_rejects_a_non_finite_clock(self):
+        net = PetriNet()
+        with pytest.raises(ValueError, match="must be finite"):
+            net.advance_time(math.inf)
+        with pytest.raises(ValueError, match="must be finite"):
+            net.advance_time(math.nan)
+
+    def test_a_parked_token_does_not_hang_the_drive(self):
+        """Regression: `drive_to_quiescence` spun forever inside one tick, ignoring `max_ticks`."""
+        policy = RetryPolicy(delay=1e300, backoff=1e9)  # attempt 1 overflows -> inf
+        assert policy.delay_for(1) == math.inf
+
+        with _retry_net(retry_policy=policy) as net:
+            net.deposit("in", Token(payload={"n": 1}))
+            result = net.drive_to_quiescence(max_ticks=5)
+
+        assert result.ticks <= 5
+        assert math.isfinite(net.model_time)
+
+    def test_a_non_finite_boundary_is_treated_as_unreachable(self):
+        with _retry_net(retry_policy=RetryPolicy(delay=1e300, backoff=1e9)) as net:
+            net.advance_time(100.0)
+            net.deposit("in", Token(payload={"n": 1}, attempts=5))
+            assert net.step() is True
+            _settle(net)
+            (parked,) = net.marking["in"]
+            assert parked.available_at == math.inf
+            assert net._next_availability_boundary() is None
+
+
+class TestSmallBaseDoesNotOverflowEarly:
+    """`backoff ** attempt` can overflow while `delay * backoff ** attempt` is still finite."""
+
+    def test_a_sub_unit_base_keeps_its_finite_product(self):
+        """Regression: returned `inf` because `2.0 ** 1024` overflows on its own."""
+        assert RetryPolicy(delay=0.1, backoff=2.0).delay_for(1024) == pytest.approx(
+            math.exp(math.log(0.1) + 1024 * math.log(2.0))
+        )
+
+    def test_a_sub_unit_base_is_not_pinned_to_the_cap(self):
+        """Regression: returned the 1e305 cap instead of the true 1.8e298."""
+        assert RetryPolicy(delay=1e-10, backoff=2.0, max_delay=1e305).delay_for(1024) == pytest.approx(1.7976931e298)
+
+    def test_a_genuine_overflow_still_saturates(self):
+        assert RetryPolicy(delay=1e300, backoff=2.0).delay_for(1024) == math.inf
+
+    def test_a_base_at_the_cap_skips_the_exponent(self):
+        """A base already at the ceiling can only grow into it, whatever the attempt."""
+        policy = RetryPolicy(delay=10.0, backoff=2.0, max_delay=10.0)
+        assert _schedule(policy, 3) == [10.0, 10.0, 10.0]
+        assert policy.delay_for(2_000_000) == 10.0  # would be real work without the short-circuit
+
+
+class TestABogusJitterDrawCannotCorruptTheSchedule:
+    """`validated_jitter_rng` can only probe `uniform(0.0, 0.0)`; a real window may differ."""
+
+    @staticmethod
+    def _rng_returning(value):
+        class Bogus(random.Random):
+            def uniform(self, a, b):
+                return 0.0 if b == 0.0 else value
+
+        return Bogus()
+
+    @pytest.mark.parametrize(
+        "bogus",
+        [None, "x", math.nan, -5.0, math.inf, True],
+        ids=["none", "string", "nan", "negative", "infinite", "bool"],
+    )
+    def test_each_bogus_draw_falls_back_to_the_unjittered_delay(self, bogus):
+        schedule = _RetrySchedule(default=RetryPolicy(delay=1.0, jitter=True), rng=self._rng_returning(bogus))
+        with pytest.warns(RuntimeWarning, match="Retry jitter draw failed"):
+            assert schedule.delay_for(None, 0) == 1.0
+
+    def test_a_bogus_draw_does_not_strand_tokens(self):
+        """`None` used to defer its `TypeError` to `ref_time + delay`, outside the guard."""
+        policy = RetryPolicy(delay=1.0, jitter=True)
+        with PetriNet(max_workers=1, retry_policy=policy, retry_rng=self._rng_returning(None)) as net:
+            net.advance_time(100.0)
+            net.add_place(Place("in"))
+            net.add_place(ResourcePlace("permit", capacity=1))
+            net.add_transition(
+                Transition(
+                    name="t",
+                    inputs=[InputArc("in"), InputArc("permit")],
+                    outputs=[OutputArc("permit")],
+                    action=_boom,
+                    max_retries=5,
+                )
+            )
+            net.deposit("in", Token(payload={"n": 1}))
+            with pytest.warns(RuntimeWarning, match="Retry jitter draw failed"):
+                assert net.step() is True
+                _settle(net)
+            (rolled_back,) = net.marking["in"]
+            assert rolled_back.available_at == 101.0
+            assert len(net.places["permit"]) == 1
+
+
+class TestTheRollbackGuardHoldsUnderWarningsAsErrors:
+    """`-W error` makes `warnings.warn` raise, which would escape the "never raises" guard."""
+
+    def test_the_fallback_survives_warnings_as_errors(self):
+        class Hostile(random.Random):
+            def uniform(self, a, b):
+                if b == 0.0:
+                    return 0.0
+                raise RuntimeError("rng exploded")
+
+        schedule = _RetrySchedule(default=RetryPolicy(delay=1.0, jitter=True), rng=Hostile())
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert schedule.delay_for(None, 0) == 1.0
+
+
+class TestARetryLandsStrictlyAfterTheClock:
+    """A positive delay absorbed by float rounding would re-fire inside the same tick.
+
+    `_mark_place_dirty` only schedules a reactivation for `available_at > now`, so a retry
+    that rounds back onto `ref_time` is never re-queued — the hazard already guarded in
+    `_pending_settle_boundary` and `drive_to_quiescence`.
+    """
+
+    def test_a_sub_ulp_delay_still_advances_the_token(self):
+        ref = 1e16  # one ULP here is 2.0, so any delay below 1.0 is absorbed by `+`
+        assert ref + 1e-9 == ref  # the absorption this guards against
+
+        policy = RetryPolicy(delay=1e-9)
+        with _retry_net(retry_policy=policy) as net:
+            net.advance_time(ref)
+            net.deposit("in", Token(payload={"n": 1}))
+            assert net.step() is True
+            _settle(net)
+            (rolled_back,) = net.marking["in"]
+
+        assert rolled_back.available_at > ref
+
+    def test_a_zero_delay_still_lands_on_the_clock(self):
+        """A genuinely zero delay means "retry now" and must not be nudged forward."""
+        with _retry_net(retry_policy=RetryPolicy(delay=0.0)) as net:
+            net.advance_time(100.0)
+            net.deposit("in", Token(payload={"n": 1}))
+            assert net.step() is True
+            _settle(net)
+            (rolled_back,) = net.marking["in"]
+
+        assert rolled_back.available_at == 100.0
+
+
+class TestLoudRejectionOfCallerMistakes:
+    def test_a_non_bool_jitter_is_rejected(self):
+        """`jitter="false"` is truthy, so it would silently turn jitter *on*."""
+        with pytest.raises(TypeError, match="jitter must be a bool"):
+            RetryPolicy(jitter="false")
+        with pytest.raises(TypeError, match="jitter must be a bool"):
+            RetryPolicy(jitter=1)
+
+    def test_a_negative_attempt_is_rejected(self):
+        """It used to return `delay`, silently hiding the caller's bug."""
+        with pytest.raises(ValueError, match="attempt must be >= 0"):
+            RetryPolicy(delay=2.0, backoff=3.0).delay_for(-1)
+
+    def test_a_stub_setstate_cannot_fail_a_working_generator(self):
+        """Restoring the stream is a courtesy, not a validity test."""
+
+        class StubState(random.Random):
+            def getstate(self):
+                return ("stub",)
+
+            def setstate(self, state):
+                raise RuntimeError("setstate stub exploded")
+
+        assert validated_jitter_rng(StubState()) is not None
