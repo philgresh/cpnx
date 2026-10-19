@@ -17,7 +17,9 @@ local write wants 50 ms flat. A transition that declares none inherits the net's
 
 import math
 import random
+import warnings
 from dataclasses import dataclass
+from typing import cast
 
 
 def _validated_retry_number(
@@ -89,6 +91,18 @@ class RetryPolicy:
     dependency on its own terms; a transition that declares none inherits the net's default
     ([`PetriNet.retry_policy`][cpnx.PetriNet]). How *many* times a transition retries before
     its tokens are dead-lettered stays `Transition.max_retries`.
+
+    **The attempt index is per token, not per transition.** `Token.attempts` counts "failed
+    firings this token has been rolled back from" anywhere in the net, and `Token.evolve`
+    carries it forward, so a token that failed three times upstream arrives already at
+    attempt 3: under `RetryPolicy(delay=0.5, backoff=2.0)` its *first* retry at the next
+    transition waits 4 s, not 0.5 s. `Transition.max_retries` reads the same counter and so
+    has the same property — that token also has three of its retries already spent. This is
+    the documented meaning of `attempts` rather than an artefact of backoff, but backoff
+    makes it far more visible, so: on a net where tokens cross several fallible transitions,
+    either keep `backoff=1.0` (flat, no accumulation to notice), set a `max_delay` low
+    enough to bound the inherited growth, or have the action return a token with
+    `attempts=0` once it has made progress, which resets the budget for the stages ahead.
 
     Immutable, comparable and cheap, so one policy can be shared by many transitions.
     Fields are validated on construction — a schedule that could only stall or hot-loop is
@@ -165,7 +179,9 @@ class RetryPolicy:
 
         Args:
             attempt: The token's `Token.attempts` count at the moment it failed, so its
-                first failure is `0`.
+                first failure *anywhere in the net* is `0`. The counter travels with the
+                token, so a token carrying failures from an upstream transition starts
+                further along this schedule — see the class docstring.
             rng: Jitter source, used only when `jitter` is set. The engine always supplies
                 one; called directly without it, the delay is the unjittered ceiling.
 
@@ -174,9 +190,12 @@ class RetryPolicy:
             uniformly from `[0, that]` when `jitter` is set and `rng` is given.
         """
         delay = self.delay
-        if self.backoff != 1.0 and attempt > 0:
+        if delay and self.backoff != 1.0 and attempt > 0:
+            # A zero base stays zero for every attempt and every backoff, so it skips the
+            # growth entirely — otherwise the overflow below would turn `0 * huge` (still 0)
+            # into an infinite park.
             try:
-                delay = self.delay * self.backoff**attempt
+                delay = delay * self.backoff**attempt
             except OverflowError:
                 # An unbounded (`max_retries=None`) net with `backoff > 1` can run the
                 # exponent past the float range. Saturate rather than raise; an uncapped
@@ -196,6 +215,58 @@ class RetryPolicy:
 DEFAULT_RETRY_POLICY = RetryPolicy()
 
 
+def validated_jitter_rng(rng: object, *, name: str = "retry_rng") -> random.Random:
+    """Return `rng` once a trial draw proves it can actually serve jitter.
+
+    A jitter source is the one piece of caller-supplied code the engine invokes *on the
+    rollback path* — under the engine lock, holding tokens that have been consumed but not
+    yet returned — so a broken one must be rejected here, at construction. Checking that
+    `uniform` merely *exists and is callable* is not enough: `random.Random` (the class,
+    not an instance) passes that test and then raises on the draw, because the unbound
+    method takes `self`. So this draws for real and requires a usable number back.
+
+    The trial draw consumes randomness, which would shift the caller's stream and make a
+    seeded generator produce a different jitter sequence than the same seed does elsewhere.
+    So the state is snapshotted and restored around the probe when the generator supports
+    `getstate`/`setstate` (every `random.Random` does); a duck-typed source without them
+    keeps the draw, since validating it matters more than its stream position.
+
+    Args:
+        rng: The candidate jitter source.
+        name: Parameter name, used in the error messages.
+
+    Returns:
+        `rng` unchanged, typed as a `random.Random`, its stream left where it was.
+
+    Raises:
+        TypeError: If `rng` has no callable `uniform`, if a trial `uniform(0.0, 0.0)` call
+            raises, or if it returns anything but a real, finite number.
+    """
+    draw = getattr(rng, "uniform", None)
+    if not callable(draw):
+        raise TypeError(f"{name} must have a callable `uniform(a, b)`, got {type(rng).__name__}.")
+    getstate, setstate = getattr(rng, "getstate", None), getattr(rng, "setstate", None)
+    state = None
+    if callable(getstate) and callable(setstate):
+        try:
+            state = getstate()
+        except Exception:  # noqa: BLE001,S110 — unusable state support; the draw below reports why
+            state = None
+    try:
+        sample = draw(0.0, 0.0)
+    except Exception as exc:  # noqa: BLE001 — any failure here means it cannot serve a draw
+        raise TypeError(
+            f"{name}.uniform(0.0, 0.0) raised {type(exc).__name__}: {exc}. Pass a random "
+            f"generator *instance* (e.g. `random.Random(0)`), not the class itself."
+        ) from exc
+    finally:
+        if state is not None:
+            setstate(state)
+    if isinstance(sample, bool) or not isinstance(sample, (int, float)) or not math.isfinite(sample):
+        raise TypeError(f"{name}.uniform(0.0, 0.0) must return a finite number, got {sample!r}.")
+    return cast(random.Random, rng)
+
+
 @dataclass(frozen=True)
 class _RetrySchedule:
     """A net's resolved retry context: its default policy plus its jitter stream.
@@ -209,5 +280,25 @@ class _RetrySchedule:
     rng: random.Random | None = None
 
     def delay_for(self, retry_policy: RetryPolicy | None, attempt: int) -> float:
-        """Return the delay for `attempt` under `retry_policy`, or the net default if `None`."""
-        return (retry_policy or self.default).delay_for(attempt, self.rng)
+        """Return the delay for `attempt` under `retry_policy`, or the net default if `None`.
+
+        Never raises. This is called from `_rollback_failed_transition`, which returns
+        consumed tokens to their places one at a time and has no `except` of its own, so an
+        exception here would strand every token not yet re-deposited — silently, with
+        `on_error` unfired and the net reporting itself quiescent. The jitter source is
+        caller-supplied, and `PetriNet` proves it works with a trial draw at construction
+        (`validated_jitter_rng`), so this is the belt behind that brace: a draw that fails
+        anyway degrades to the unjittered delay and warns, rather than losing work.
+        """
+        policy = retry_policy or self.default
+        try:
+            return policy.delay_for(attempt, self.rng)
+        except Exception as exc:  # noqa: BLE001 — a rollback must not raise; see the docstring
+            warnings.warn(
+                f"Retry jitter draw failed ({type(exc).__name__}: {exc}); falling back to the "
+                f"unjittered delay for attempt {attempt}. Check the generator passed as "
+                "`PetriNet(retry_rng=...)`.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return policy.delay_for(attempt)

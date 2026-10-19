@@ -16,7 +16,9 @@ Three layers are covered:
 
 import math
 import random
+import threading
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -66,7 +68,10 @@ def _observed_delays(net: PetriNet, retries: int, place: str = "in") -> list[flo
     """Fire `retries` failing firings on the logical clock, collecting each retry delay.
 
     The clock is advanced to exactly the token's `available_at` each round, so the next
-    delay is read as `available_at - now` with no wall-clock interference.
+    delay is read as `available_at - now` with no wall-clock interference. A zero delay —
+    which full jitter can draw, however unlikely — leaves `available_at` *equal* to the
+    clock, and `advance_time` demands a strict increase, so that round skips the advance
+    rather than raising.
     """
     now = 100.0
     net.advance_time(now)
@@ -78,8 +83,9 @@ def _observed_delays(net: PetriNet, retries: int, place: str = "in") -> list[flo
         _settle(net)
         (rolled_back,) = net.marking[place]
         delays.append(rolled_back.available_at - now)
-        now = rolled_back.available_at
-        net.advance_time(now)
+        if rolled_back.available_at > now:
+            now = rolled_back.available_at
+            net.advance_time(now)
     return delays
 
 
@@ -451,3 +457,208 @@ class TestLiveMutability:
         with _retry_net(transition_policy=RetryPolicy(delay=1.0)) as net:
             net.transitions["t"].retry_policy = RetryPolicy(delay=0.5, backoff=4.0)
             assert _observed_delays(net, 3) == [0.5, 2.0, 8.0]
+
+
+class TestJitterSourceCannotStrandTokens:
+    """A jitter source is the only caller-supplied code the engine calls *mid-rollback*.
+
+    `_rollback_failed_transition` returns consumed tokens to their places one at a time and
+    has no `except` of its own, and `_execute_transition` wraps it in `try/finally` only —
+    so an exception from a draw would strand every token not yet re-deposited, silently,
+    with `on_error` unfired and the net reporting itself quiescent. Two defences: the
+    generator is proved usable by a trial draw at construction, and a draw that fails anyway
+    degrades to the unjittered delay.
+    """
+
+    def test_a_generator_class_is_rejected_at_construction(self):
+        """`random.Random` (the class) has a callable `uniform`, but the draw needs `self`.
+
+        Regression: `callable(getattr(rng, "uniform", None))` accepted it, and the net then
+        lost the data token *and* the resource permit on the first failed firing.
+        """
+        with pytest.raises(TypeError, match=r"retry_rng\.uniform\(0\.0, 0\.0\) raised TypeError"):
+            PetriNet(retry_rng=random.Random)
+
+    @pytest.mark.parametrize("sample", [None, "0.5", float("nan"), math.inf, True])
+    def test_a_generator_returning_a_non_number_is_rejected(self, sample):
+        class Bogus:
+            def uniform(self, a, b):
+                return sample
+
+        with pytest.raises(TypeError, match=r"must return a finite number"):
+            PetriNet(retry_rng=Bogus())
+
+    def test_a_generator_without_uniform_is_rejected(self):
+        with pytest.raises(TypeError, match="retry_rng must have a callable `uniform"):
+            PetriNet(retry_rng=object())
+
+    def test_validation_leaves_the_injected_stream_where_it_was(self):
+        """The trial draw must not consume randomness from a caller's seeded generator."""
+        net = PetriNet(retry_rng=random.Random(42))
+        reference = random.Random(42)
+        assert [net._retry_rng.random() for _ in range(3)] == [reference.random() for _ in range(3)]
+
+    def test_a_draw_that_fails_anyway_keeps_every_token(self):
+        """The belt behind the brace: no token loss even from a generator that lies."""
+
+        class Hostile(random.Random):
+            def uniform(self, a, b):
+                if b == 0.0:
+                    return 0.0  # pass the construction probe
+                raise RuntimeError("rng exploded")
+
+        policy = RetryPolicy(delay=1.0, jitter=True)
+        with PetriNet(max_workers=1, retry_policy=policy, retry_rng=Hostile()) as net:
+            net.advance_time(100.0)
+            net.add_place(Place("in"))
+            net.add_place(ResourcePlace("permit", capacity=1))
+            errors: list[tuple] = []
+            net.on_error = lambda *a: errors.append(a)
+            net.add_transition(
+                Transition(
+                    name="t",
+                    inputs=[InputArc("in"), InputArc("permit")],
+                    outputs=[OutputArc("permit")],
+                    action=_boom,
+                    max_retries=5,
+                )
+            )
+            net.deposit("in", Token(payload={"n": 1}))
+
+            with pytest.warns(RuntimeWarning, match="Retry jitter draw failed"):
+                assert net.step() is True
+                _settle(net)
+
+            # Nothing vanished: the data token is rolled back, the permit is returned...
+            (rolled_back,) = net.marking["in"]
+            assert rolled_back.attempts == 1
+            assert len(net.places["permit"]) == 1
+            assert net.marking["failed"] == ()
+            # ...the delay fell back to the unjittered schedule...
+            assert rolled_back.available_at == 101.0
+            # ...and the failure was still reported.
+            assert len(errors) == 1
+
+    def test_the_fallback_is_the_unjittered_delay(self):
+        class Hostile(random.Random):
+            def uniform(self, a, b):
+                if b == 0.0:
+                    return 0.0
+                raise RuntimeError("nope")
+
+        schedule = _RetrySchedule(default=RetryPolicy(delay=1.0, backoff=2.0, jitter=True), rng=Hostile())
+        with pytest.warns(RuntimeWarning, match="Retry jitter draw failed"):
+            assert [schedule.delay_for(None, n) for n in range(3)] == [1.0, 2.0, 4.0]
+
+
+class TestIndependentJitterStream:
+    """The jitter stream must neither shift nor *mirror* the scheduler's stream."""
+
+    def test_the_two_seeded_streams_emit_different_numbers(self):
+        """Regression: both were `random.Random(seed)`, so they emitted identical draws."""
+        net = PetriNet(seed=11)
+        assert [net._rng.random() for _ in range(5)] != [net._retry_rng.random() for _ in range(5)]
+
+    def test_the_jitter_stream_is_still_reproducible_from_seed(self):
+        a = PetriNet(seed=11)
+        b = PetriNet(seed=11)
+        assert [a._retry_rng.random() for _ in range(5)] == [b._retry_rng.random() for _ in range(5)]
+
+    def test_different_seeds_give_different_jitter_streams(self):
+        a = PetriNet(seed=11)
+        b = PetriNet(seed=12)
+        assert [a._retry_rng.random() for _ in range(5)] != [b._retry_rng.random() for _ in range(5)]
+
+
+class TestZeroBaseStaysZero:
+    """A zero base is a flat zero schedule, whatever the backoff or the attempt count."""
+
+    @pytest.mark.parametrize("attempt", [0, 1, 3, 1000, 5000])
+    def test_zero_delay_never_becomes_an_infinite_park(self, attempt):
+        """Regression: the `OverflowError` guard saturated to `inf` even for a zero base,
+        where the true product (`0 * huge`) is still `0` — parking the token for good."""
+        assert RetryPolicy(delay=0.0, backoff=2.0).delay_for(attempt) == 0.0
+
+    def test_zero_delay_with_jitter_is_still_zero(self):
+        assert RetryPolicy(delay=0.0, backoff=2.0, jitter=True).delay_for(5000, random.Random(0)) == 0.0
+
+    def test_a_positive_base_still_saturates(self):
+        assert RetryPolicy(delay=1e-300, backoff=2.0).delay_for(5000) == math.inf
+
+
+class TestAttemptIndexIsPerToken:
+    """`Token.attempts` counts failures across the whole net, and `evolve` carries it on.
+
+    Pinned rather than changed: `attempts` is *documented* as "failed firings this token has
+    been rolled back from", and `Transition.max_retries` reads the same counter, so the
+    scope is the existing contract — backoff only makes it visible. Changing it would mean
+    redefining `max_retries` too.
+    """
+
+    def test_evolve_carries_attempts_across_transitions(self):
+        assert Token().evolve(attempts=3).evolve(payload_updates={"x": 1}).attempts == 3
+
+    def test_inherited_attempts_start_a_token_further_along_the_schedule(self):
+        policy = RetryPolicy(delay=0.5, backoff=2.0)
+        assert policy.delay_for(0) == 0.5  # a fresh token
+        assert policy.delay_for(3) == 4.0  # after three failures anywhere upstream
+
+    def test_an_action_can_reset_the_budget_on_progress(self):
+        """The documented escape hatch: return `attempts=0` once the token has progressed."""
+        policy = RetryPolicy(delay=0.5, backoff=2.0)
+        progressed = Token(attempts=3).evolve(attempts=0)
+        assert policy.delay_for(progressed.attempts) == 0.5
+
+    def test_a_cap_bounds_the_inherited_growth(self):
+        policy = RetryPolicy(delay=0.5, backoff=2.0, max_delay=1.0)
+        assert [policy.delay_for(n) for n in (0, 3, 50)] == [0.5, 1.0, 1.0]
+
+
+class TestSetterLocking:
+    def test_retry_delay_assignment_is_atomic_over_the_whole_policy(self):
+        """`retry_delay` is a read-modify-write of the policy, so it must hold the lock.
+
+        Asserted structurally — the setter must not leave a half-applied policy — plus a
+        hammer below for the concurrent case.
+        """
+        net = PetriNet(retry_policy=RetryPolicy(delay=1.0, backoff=2.0, max_delay=9.0))
+        net.retry_delay = 3.0
+        assert net.retry_policy == RetryPolicy(delay=3.0, backoff=2.0, max_delay=9.0)
+
+    def test_concurrent_assignments_never_produce_a_torn_policy(self):
+        net = PetriNet()
+        policies = [RetryPolicy(delay=d, backoff=2.0, max_delay=float(d) + 1.0) for d in (1.0, 2.0, 3.0)]
+        stop = threading.Event()
+        seen: list[RetryPolicy] = []
+
+        def writer_policy():
+            while not stop.is_set():
+                for p in policies:
+                    net.retry_policy = p
+
+        def writer_delay():
+            while not stop.is_set():
+                net.retry_delay = 7.0
+
+        threads = [threading.Thread(target=writer_policy), threading.Thread(target=writer_delay)]
+        for t in threads:
+            t.start()
+        for _ in range(2000):
+            seen.append(net.retry_policy)
+        stop.set()
+        for t in threads:
+            t.join()
+
+        # Every observed policy is one a writer could have written: either a whole policy
+        # from the list, or one of those with only `delay` moved to 7.0.
+        legal = {p for p in policies} | {replace(p, delay=7.0) for p in policies}
+        assert set(seen) <= legal
+
+    def test_a_rejected_assignment_does_not_block_the_net(self):
+        """Validation runs before the lock, so a bad value cannot hold it."""
+        net = PetriNet()
+        with pytest.raises(ValueError):
+            net.retry_delay = -1.0
+        with net._lock:  # would block/deadlock if the failed setter had kept it
+            pass
+        assert net.retry_policy == DEFAULT_RETRY_POLICY

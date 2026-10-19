@@ -151,6 +151,7 @@ A transition that sets no `retry_policy` inherits the net's, which defaults to `
 
 - **Always cap.** `backoff > 1.0` with `max_delay=None` grows without bound, and under `max_retries=None` the exponent eventually saturates to infinity (parking the token for good).
 - **Jitter when failures correlate.** A downstream outage or a throttled API fails a whole batch of tokens at once; without jitter they all retry in lockstep, re-creating the spike that caused the failure. Full jitter spreads them out. It can draw a near-zero delay, so it bounds the *aggregate* retry rate rather than each token's individual wait.
+- **The attempt index is per token, not per transition.** `Token.attempts` counts failures anywhere in the net and `evolve` carries it forward, so a token that failed three times upstream starts at attempt 3 here: under `RetryPolicy(delay=0.5, backoff=2.0)` its *first* retry at this transition waits 4s. `max_retries` reads the same counter, so that token also has three retries already spent. On nets where tokens cross several fallible transitions, keep `backoff=1.0`, bound it with `max_delay`, or have the action return a token with `attempts=0` once it has made progress.
 - **Reproducibility.** Jitter draws from a dedicated RNG — one stream per net, seeded by `PetriNet(seed=...)` or injected as `retry_rng=random.Random(0)` — kept separate from the stream driving scheduling and `BindingPolicy.RANDOM`, so how often actions fail cannot shift a seeded firing sequence.
 
 A policy is an immutable, comparable value, so one instance can be shared by every transition that talks to the same dependency. Fields are validated on construction, and the net's `retry_policy`/`retry_delay` on assignment: a negative delay (retry scheduled in the past, so a hot loop), a `NaN` (compares false against every clock, so the token is never retrievable again), an infinity, a backoff below 1, or a non-number raises where it is written rather than surfacing inside the next rollback.
@@ -332,7 +333,7 @@ class PetriNet:
                  cooldown_interval: float = 0.05, timeout_secs: float = 1.0,
                  expr_timeout_secs: float = 0.1,
                  retry_delay: float | None = None,   # shorthand for RetryPolicy(delay=...)
-                 binding_policy: BindingPolicy = BindingPolicy.LEGACY,
+                 binding_policy: BindingPolicy = BindingPolicy.FIRST,
                  binding_search_limit: int = 1000, seed: int | None = None,
                  *,
                  retry_policy: RetryPolicy | None = None,  # default for transitions with none

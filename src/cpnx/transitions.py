@@ -62,6 +62,20 @@ def _warn_deprecated_policy(policy: "BindingPolicy", *, source: str) -> None:
     )
 
 
+def _reject_non_callable_priority_key(value) -> None:
+    """Reject a `binding_priority_key` that is not callable.
+
+    String-expression keys are deferred (see ADR 0001), so a non-callable is rejected
+    loudly rather than letting a truthy string be used as a key and raise on every
+    candidate at run time, which would silently livelock the engine.
+    """
+    if not callable(value):
+        raise TypeError(
+            "binding_priority_key must be a callable or None; "
+            f"got {type(value).__name__}. String-expression keys are not supported."
+        )
+
+
 def _reject_non_retry_policy(value) -> None:
     """Reject a `retry_policy` that is not a [`RetryPolicy`][cpnx.RetryPolicy] or `None`.
 
@@ -527,6 +541,12 @@ class Transition:
                `0` means route data token(s) to `error_place` on the first failure.
                `N > 0` means retry up to `N` times, then route to `error_place`. Default is 5.
                How *long* each of those retries waits is `retry_policy`.
+
+               The budget is counted on `Token.attempts`, which travels **with the token**
+               across transitions (`Token.evolve` carries it forward), so a token that
+               already failed twice upstream arrives with two of its `N` retries spent.
+               Have the action return a token with `attempts=0` once it has made progress
+               if each stage should get a fresh budget.
         retry_policy: How long a rolled-back data token waits before each retry — capped
                exponential backoff with optional full jitter; see
                [`RetryPolicy`][cpnx.RetryPolicy]. Set it per transition because retry
@@ -538,7 +558,10 @@ class Transition:
                an unset transition behaves exactly as before. A policy is an immutable
                value, so one instance can be shared by every transition that talks to the
                same dependency. Assigning anything but a `RetryPolicy` or `None` raises
-               `TypeError`.
+               `TypeError`. Note the schedule is indexed by `Token.attempts`, which counts
+               failures across the **whole net**, so an inherited count starts a token
+               further along this transition's schedule — see
+               [`RetryPolicy`][cpnx.RetryPolicy].
         binding_policy: How the engine resolves which input tokens bind this transition
                when checking enablement — see [`BindingPolicy`][cpnx.BindingPolicy].
                `None` (default) inherits the net-wide default set on
@@ -625,14 +648,7 @@ class Transition:
                 _reject_non_bool_return("guard", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         elif name == "binding_priority_key" and value is not None:
-            # String-expression keys are deferred (see ADR 0001), so reject non-callables
-            # loudly rather than letting a truthy string be used as a key and raise on every
-            # candidate at run time (which would silently livelock the engine).
-            if not callable(value):
-                raise TypeError(
-                    "binding_priority_key must be a callable or None; "
-                    f"got {type(value).__name__}. String-expression keys are not supported."
-                )
+            _reject_non_callable_priority_key(value)
             verify_callable_purity(value)
             lint_and_warn(value, "binding_priority_key")
         elif name == "binding_policy" and value is not None:

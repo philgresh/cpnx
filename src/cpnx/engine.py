@@ -16,7 +16,13 @@ from typing import Callable, Iterator, TypeAlias, cast
 
 from cpnx.analysis import ImpactMap, risk_report, trace_impact
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace
-from cpnx.retries import DEFAULT_RETRY_POLICY, RetryPolicy, _RetrySchedule, _validated_retry_number
+from cpnx.retries import (
+    DEFAULT_RETRY_POLICY,
+    RetryPolicy,
+    _RetrySchedule,
+    _validated_retry_number,
+    validated_jitter_rng,
+)
 from cpnx.tokens import ERROR_COLOR, Token
 from cpnx.transitions import (
     BindingPolicy,
@@ -485,6 +491,9 @@ class PetriNet:
             TypeError: If `retry_delay` is not a number, `retry_policy` is not a
                 `RetryPolicy`, or `retry_rng` has no callable `uniform(a, b)`.
         """
+        #: Created first: the `retry_policy`/`retry_delay` setters below take it, and
+        #: `_init_retry` goes through them.
+        self._lock = threading.Lock()
         self.max_workers = max_workers
         self.error_place = error_place
         self.cooldown_interval = cooldown_interval
@@ -506,7 +515,6 @@ class PetriNet:
         self._model_time: float | None = None
         self.places: dict[str, Place] = {}
         self.transitions: dict[str, Transition] = {}
-        self._lock = threading.Lock()
         self._running_count = 0
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._action_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cpnx-action")
@@ -710,18 +718,26 @@ class PetriNet:
         if retry_delay is not None:
             self.retry_delay = retry_delay
 
-        if retry_rng is not None and not callable(getattr(retry_rng, "uniform", None)):
-            raise TypeError(f"retry_rng must have a callable `uniform(a, b)`, got {type(retry_rng).__name__}.")
-        #: Jitter source for retry delays, deliberately a *separate* stream from `_rng`: a
-        #: draw per failed firing must not shift the seeded scheduling/binding sequence (see
-        #: the `seed` and `retry_rng` arguments). Drawn only under the engine lock.
-        self._retry_rng = retry_rng if retry_rng is not None else random.Random(seed)
+        #: Jitter source for retry delays, an *independent* stream from `_rng`: a draw per
+        #: failed firing must not shift the seeded scheduling/binding sequence, and jitter
+        #: must not mirror the scheduler's draws either — so a seeded net derives this one
+        #: from a salted seed rather than re-seeding with the same integer, which would
+        #: emit the identical sequence. Drawn only under the engine lock.
+        #: A caller-supplied generator is proved usable here, at construction, by a trial
+        #: draw: the rollback path invokes it while holding consumed tokens.
+        self._retry_rng = (
+            validated_jitter_rng(retry_rng)
+            if retry_rng is not None
+            else random.Random(None if seed is None else f"cpnx-retry-jitter:{seed}")
+        )
 
     # --- Retry schedule (see `RetryPolicy` and the `retry_*` constructor arguments) ---
     # Properties, not plain attributes, so a value that cannot schedule a sane retry is
     # rejected where the mistake is made — at the assignment — rather than later, inside the
-    # rollback that would have used it. No lock: each is a single attribute, and a policy is
-    # an immutable value, so a concurrent change swaps one whole valid schedule for another.
+    # rollback that would have used it. Both setters validate *before* taking the engine
+    # lock, so a rejected assignment never blocks the net, and both then write under it:
+    # `retry_delay` is a read-modify-write over the whole policy (it preserves the other
+    # fields), so an unlocked write would drop a concurrent `retry_policy` assignment.
 
     @property
     def retry_policy(self) -> RetryPolicy:
@@ -736,7 +752,8 @@ class PetriNet:
     def retry_policy(self, value: RetryPolicy) -> None:
         if not isinstance(value, RetryPolicy):
             raise TypeError(f"retry_policy must be a RetryPolicy, got {type(value).__name__}: {value!r}.")
-        self._retry_policy = value
+        with self._lock:
+            self._retry_policy = value
 
     @property
     def retry_delay(self) -> float:
@@ -752,7 +769,8 @@ class PetriNet:
     @retry_delay.setter
     def retry_delay(self, value: float) -> None:
         delay = cast(float, _validated_retry_number("retry_delay", value, minimum=0.0))
-        self._retry_policy = replace(self._retry_policy, delay=delay)
+        with self._lock:
+            self._retry_policy = replace(self._retry_policy, delay=delay)
 
     def _call_expr(self, fn, *args, timeout: float | None = None):
         t = timeout if timeout is not None else self.timeout_secs
