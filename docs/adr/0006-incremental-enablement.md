@@ -114,7 +114,7 @@ of two conditions:
    incremental scheduler resolves each transition a different number of times than a full scan
    would — exactly the point of the optimization — which would shift the seeded RNG stream and
    break the pinned golden sequence in `tests/test_seeded_determinism.py`. `FIRST` (the
-   default) and the deprecated `LEGACY` draw RNG only once, for the scheduler's own
+   default) draws RNG only once, for the scheduler's own
    tie-break among enabled candidates (`_rng.choice(candidates)`), which advances the stream by
    candidate-count only — a quantity the maintained enabled set reproduces exactly. Those two
    policies are therefore safe under the fast path; `RANDOM`/`PRIORITY` are not.
@@ -147,7 +147,7 @@ re-enablement hazards. Each is handled explicitly above rather than assumed away
   full scan did.
 - **(d) RNG-stream determinism.** Resolving a different number of transitions than a full scan
   would changes how many RNG draws occur when a policy samples during resolution.
-  `RANDOM`/`PRIORITY` are excluded from the fast path (condition 2); `FIRST`/`LEGACY` draw RNG
+  `RANDOM`/`PRIORITY` are excluded from the fast path (condition 2); `FIRST` draws RNG
   only at the scheduler's tie-break, which the maintained enabled set reproduces identically, so
   the same-seed-twice guarantee (`test_seeded_determinism.py`) holds under either path. One
   subtlety the tie-break exposes: the winner is `_rng.choice` indexing into a priority bucket, so

@@ -30,7 +30,6 @@ from cpnx.transitions import (
     OutputArc,
     SubstitutionTransition,
     Transition,
-    _warn_deprecated_policy,
 )
 from cpnx.visualization import snapshot, to_dot
 
@@ -435,12 +434,10 @@ class PetriNet:
                          guard-free transition). A transition may override this via its
                          own `binding_policy`.
 
-                         The default was `BindingPolicy.LEGACY` through 0.5.0; it is now
-                         `FIRST`, with `LEGACY` kept selectable for one release as the
-                         opt-out. Passing `LEGACY` warns
-                         ([`CpnxDeprecationWarning`][cpnx.CpnxDeprecationWarning]) and
-                         stops working in 0.7.0. See
-                         `docs/adr/0001-combinatorial-binding-search.md`.
+                         The default was the head-only `BindingPolicy.LEGACY` through
+                         0.5.0. 0.6.0 made `FIRST` the default and kept `LEGACY` as a
+                         warning-emitting opt-out; 0.7.0 removed it, so the name no longer
+                         exists. See `docs/adr/0001-combinatorial-binding-search.md`.
             binding_search_limit: Maximum number of input-token combinations tried per
                          enablement check when a transition uses `BindingPolicy.FIRST`
                          (default: 1000). Bounds both the work and the memory of a search
@@ -508,9 +505,6 @@ class PetriNet:
         self.timeout_secs = timeout_secs
         self.expr_timeout_secs = expr_timeout_secs
         self._init_retry(retry_delay, retry_policy, retry_rng, seed)
-        # The property setter is bypassed just below, so its deprecation notice is emitted
-        # explicitly here instead.
-        _warn_deprecated_policy(binding_policy, source="PetriNet(binding_policy=...)")
         #: Backing field for the `binding_policy` property. Set directly here (the property
         #: setter recomputes `_has_search_policy_transition`, which needs `self.transitions`
         #: to already exist — it does not yet at this point in construction).
@@ -652,7 +646,7 @@ class PetriNet:
         #: `priority` value -> list of selection-enabled transition names at that priority.
         #: Selection picks the minimum non-empty bucket, so `step` is O(1). Maintained by
         #: swap-remove (`_bucket_add`/`_bucket_remove`), so bucket order is not registration
-        #: order — safe because eligible (`FIRST`/`LEGACY`) nets draw RNG only for the tie-break,
+        #: order — safe because eligible (`FIRST`) nets draw RNG only for the tie-break,
         #: whose stream advance depends on candidate *count*, not order.
         self._priority_buckets: dict[int, list[str]] = {}
         #: Transition name -> its index within its priority bucket (for O(1) swap-remove).
@@ -688,10 +682,6 @@ class PetriNet:
 
     @binding_policy.setter
     def binding_policy(self, value: BindingPolicy) -> None:
-        # Warn *before* taking the lock: a user filter promoting this to an error must not
-        # raise mid-update, which would leave `_binding_policy` reassigned while
-        # `_has_search_policy_transition` and `_scheduler_ready` still describe the old one.
-        _warn_deprecated_policy(value, source="PetriNet.binding_policy")
         with self._lock:
             self._binding_policy = value
             # A new default can flip any policy-unset transition's *effective* policy in either
@@ -1094,7 +1084,7 @@ class PetriNet:
         """Recompute one transition's membership in the enabled + potentially-enabled sets.
 
         Resolves the timing-aware binding **once** (never drawing the seeded RNG on the eligible
-        `FIRST`/`LEGACY` path, so a variable per-reconcile count cannot perturb the tie-break
+        `FIRST` path, so a variable per-reconcile count cannot perturb the tie-break
         stream, and re-evaluating no more than needed — see `_arc_key_evaluated_once` regression).
         A satisfiable timing-aware binding is a fortiori potentially-enabled; the timing-ignoring
         probe is needed only to catch a transition currently blocked *solely* by a cooling
@@ -1936,15 +1926,13 @@ class PetriNet:
 
         This is the **canonical** statement of the head-only rule; the docstrings that mention
         it elsewhere (`_gather_arc_pools`, `_resolve_binding`, `_resolve_input_tokens`,
-        `_qualifies_for_count_only`) defer here. The deprecated `LEGACY` always uses the head.
-        `FIRST` with no guard reduces to the head (the first candidate is the head and
-        trivially satisfies). `RANDOM`/`PRIORITY` must always enumerate — even guard-free,
-        they select *among* eligible groups, not just the head.
+        `_qualifies_for_count_only`) defer here. `FIRST` with no guard reduces to the head
+        (the first candidate is the head and trivially satisfies). `RANDOM`/`PRIORITY` must
+        always enumerate — even guard-free, they select *among* eligible groups, not just the
+        head.
 
         Depends only on its arguments (no net state), hence `staticmethod`.
         """
-        if policy is BindingPolicy.LEGACY:
-            return True
         return policy is BindingPolicy.FIRST and transition.guard is None
 
     def _try_count_only_binding(

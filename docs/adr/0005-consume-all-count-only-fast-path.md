@@ -60,7 +60,7 @@ by count alone, defer materialization to firing.
 
 1. `transition.guard is None`,
 2. `transition.binding_priority_key is None`,
-3. the transition is **head-only** (the deprecated `LEGACY`, or guard-free `FIRST` — see
+3. the transition is **head-only** (guard-free `FIRST` — see
    `_is_head_only`),
 4. at least one input arc has `consume_all=True`.
 

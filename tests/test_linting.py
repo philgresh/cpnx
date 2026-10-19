@@ -25,7 +25,6 @@ from datetime import datetime as DatetimeClass
 import pytest
 
 from cpnx import InputArc, OutputArc, Token, Transition, linting
-from cpnx import transitions as transitions_mod
 from cpnx.linting import (
     DATABASE,
     NETWORK,
@@ -327,10 +326,13 @@ def test_clean_construction_never_walks_the_stack(monkeypatch):
 
     The depth is found by walking frames, which is pure waste when there is nothing to report
     — and *every* guard, key, filter and condition assignment went through it while the
-    `stacklevel` was computed eagerly at the call site. `lint_and_warn` and
-    `_warn_deprecated_policy` now resolve it themselves, after their early returns, so a clean
-    net pays nothing. Pinned because a call site re-adding an eager `stacklevel=` argument
-    would silently undo it.
+    `stacklevel` was computed eagerly at the call site. `lint_and_warn` now resolves it
+    itself, after its early returns, so a clean net pays nothing. Pinned because a call site
+    re-adding an eager `stacklevel=` argument would silently undo it.
+
+    Only the `linting` namespace is patched: `cpnx.transitions` used to bind the name at
+    import for the `BindingPolicy.LEGACY` deprecation notice, which went away with `LEGACY`
+    in 0.7.0, so `lint_and_warn` is now the only caller.
     """
     calls = []
     real = linting._assignment_stacklevel
@@ -339,9 +341,7 @@ def test_clean_construction_never_walks_the_stack(monkeypatch):
         calls.append(1)
         return real()
 
-    # `cpnx.transitions` bound the name at import, so both namespaces need patching.
     monkeypatch.setattr(linting, "_assignment_stacklevel", counting)
-    monkeypatch.setattr(transitions_mod, "_assignment_stacklevel", counting)
 
     Transition(
         name="t",

@@ -160,7 +160,7 @@ not CPN arc expressions.  Consider a future `OutputArc` mode that accepts a
 **Severity:** Deliberate specialisation (see §0). Documentation gap only. Concrete
 symptom is head-of-line blocking, resolved by `BindingPolicy.FIRST` — opt-in from 0.3.1, and
 the default from the next release, with the old head-only behaviour kept one more release as
-the deprecated `LEGACY` opt-out (ADR 0001 Phases 3–4, merged but unreleased) — see
+the `LEGACY` opt-out, removed in 0.7.0 (ADR 0001 Phases 3–4) — see
 `docs/adr/0001-combinatorial-binding-search.md`.
 
 **Formal requirement:** `E(p,t)⟨b⟩` evaluates to a multiset that is consumed

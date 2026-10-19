@@ -10,7 +10,7 @@ Transitions fire work over the thread pool; arcs connect them to places.
 
 ::: cpnx.OutputArc
 
-`BindingPolicy` selects how a transition resolves which input tokens bind it — the deterministic-complete binding search (`FIRST`, the default), a selection *among* the satisfying bindings (`RANDOM`, `PRIORITY`), or the deprecated head-only check (`LEGACY`, which warns and is removed in 0.7.0).
+`BindingPolicy` selects how a transition resolves which input tokens bind it — the deterministic-complete binding search (`FIRST`, the default), or a selection *among* the satisfying bindings (`RANDOM`, `PRIORITY`). The head-only `LEGACY` check was removed in 0.7.0.
 
 ::: cpnx.CpnxDeprecationWarning
 
