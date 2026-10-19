@@ -162,13 +162,6 @@ head-of-line fix behind an opt-in indefinitely. Note that
 **removal** for v0.6.0; that is superseded here, because honouring step 2's deprecation cycle
 requires 0.6.0 to be the flip and 0.7.0 the removal.
 
-There is deliberately **no replacement** for head-only resolution *with* a guard: `FIRST` is
-a strict superset, so the only thing `LEGACY` offered was the incompleteness itself. A net
-that genuinely needs the search bounded to the head binding can set
-`PetriNet(binding_search_limit=1)`, which tries exactly the head candidate — but that is a
-net-wide bound and signals `on_binding_search_exhausted` when the head fails, so it is a
-diagnostic knob, not a silent equivalent of `LEGACY`.
-
 ## Rationale — why the determinism worry is smaller than it appears
 
 cpnx is **already nondeterministic** at a coarser grain than binding selection:

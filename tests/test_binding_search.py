@@ -85,6 +85,60 @@ class TestHeadOfLineFix:
         assert len(net.places["output"].tokens) == 0
         assert {t.payload["sym"] for t in net.places["input"].tokens} == {"AAPL", "MSFT"}
 
+    @_SILENCE_LEGACY
+    def test_net_wide_legacy_opt_out_covers_unset_transitions(self):
+        """The *net-level* opt-out works — the form the migration notes actually recommend.
+
+        `PetriNet(binding_policy=LEGACY)` with transitions left on `binding_policy=None` is
+        how an existing net defers the flip in one line, so it is pinned separately from the
+        per-transition opt-out above: the guarded transition inherits `LEGACY` and stays
+        head-only.
+        """
+        net = PetriNet(
+            places=[Place("input"), Place("output")],
+            binding_policy=BindingPolicy.LEGACY,
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                    guard=lambda toks: toks[0].payload["sym"] == "MSFT",
+                    # No per-transition policy: inherits the net-wide LEGACY opt-out.
+                )
+            ],
+        )
+        for sym in ("AAPL", "MSFT"):
+            net.deposit("input", Token(payload={"sym": sym}))
+        net.run(deadline=time.monotonic() + 0.3)
+
+        assert len(net.places["output"].tokens) == 0
+        assert {t.payload["sym"] for t in net.places["input"].tokens} == {"AAPL", "MSFT"}
+
+    @_SILENCE_LEGACY
+    def test_transition_can_opt_back_in_under_a_legacy_net(self):
+        """A transition may take `FIRST` back even while the net default is the LEGACY opt-out."""
+        net = PetriNet(
+            places=[Place("input"), Place("output")],
+            binding_policy=BindingPolicy.LEGACY,
+            transitions=[
+                Transition(
+                    name="t",
+                    inputs=[InputArc("input")],
+                    outputs=[OutputArc("output")],
+                    action=lambda toks: toks,
+                    guard=lambda toks: toks[0].payload["sym"] == "MSFT",
+                    binding_policy=BindingPolicy.FIRST,
+                )
+            ],
+        )
+        for sym in ("AAPL", "MSFT"):
+            net.deposit("input", Token(payload={"sym": sym}))
+        net.run(deadline=time.monotonic() + 2.0)
+
+        assert [t.payload["sym"] for t in net.places["output"].tokens] == ["MSFT"]
+        assert {t.payload["sym"] for t in net.places["input"].tokens} == {"AAPL"}
+
 
 class TestLegacyDeprecationWarning:
     """`LEGACY` warns at run time wherever it can enter the system.
@@ -138,6 +192,36 @@ class TestLegacyDeprecationWarning:
                 PetriNet(binding_policy=policy)
             else:
                 PetriNet()
+
+    @pytest.mark.parametrize(
+        "select",
+        [
+            pytest.param(lambda t: PetriNet(binding_policy=BindingPolicy.LEGACY), id="net-constructor"),
+            pytest.param(lambda t: t(BindingPolicy.LEGACY), id="transition-constructor"),
+            pytest.param(lambda t: setattr(PetriNet(), "binding_policy", BindingPolicy.LEGACY), id="net-setter"),
+            pytest.param(
+                lambda t: setattr(t(BindingPolicy.FIRST), "binding_policy", BindingPolicy.LEGACY),
+                id="transition-reassignment",
+            ),
+        ],
+    )
+    def test_warning_points_at_the_caller(self, select):
+        """Every entry point blames the caller's own line, not a frame inside cpnx.
+
+        The four paths sit at different stack depths — the two constructors go through an
+        extra frame (`PetriNet.__init__`, or the `@dataclass`-generated `Transition.__init__`,
+        which reports as `<string>`) while the two assignments do not — so each needs its own
+        `stacklevel`. A warning naming `engine.py` or `<string>` tells the user nothing about
+        which line of *their* net to fix, so the attribution is pinned here rather than left
+        to inspection.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            select(self._transition)
+
+        hits = [w for w in caught if issubclass(w.category, CpnxDeprecationWarning)]
+        assert len(hits) == 1
+        assert hits[0].filename == __file__
 
     def test_category_is_visible_under_default_filters(self):
         """Not a `DeprecationWarning` subclass, so `ignore::DeprecationWarning` cannot hide it.

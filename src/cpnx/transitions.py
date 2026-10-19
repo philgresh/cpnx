@@ -33,6 +33,38 @@ class CpnxDeprecationWarning(UserWarning):
     """
 
 
+def _assignment_stacklevel(obj: object, field: str, *, base: int = 3) -> int:
+    """`stacklevel` that makes a `__setattr__` warning name the user's own line.
+
+    Every warning raised while validating an assignment is emitted by a helper called
+    *directly* from a `__setattr__`, so counting out from that helper: 1 is the helper itself,
+    2 is `__setattr__`, and 3 is whatever assigned the field. That last frame is what differs.
+    A dataclass assigns its fields through a **generated** `__init__`, which is an extra frame
+    *and* reports as `<string>` — naming no user code at all — whereas a later reassignment
+    comes straight from the caller. So construction needs one more level than reassignment.
+
+    The two are told apart by `field`'s presence in the instance `__dict__`: the generated
+    `__init__` is what first puts it there, and these validators all run *before* the value
+    lands, so an absent field means construction. That beats threading a flag through every
+    call site, and unlike a hard-coded number it stays correct for any field.
+
+    Note:
+        Callers must invoke the warning helper directly, with no intervening frame — adding
+        one shifts every depth below. `InputArc._warn_if_drain_ignores_selection` is the
+        exception that proves the rule: it *is* an extra frame, so it takes its own
+        `stacklevel` and is passed 4 from `__post_init__` against 3 from `__setattr__`.
+
+    Args:
+        obj: The instance being mutated.
+        field: The field being assigned, whose presence in `obj.__dict__` is the test.
+        base: Depth for the reassignment case. Construction is one deeper.
+
+    Returns:
+        `base` when `field` is already set (reassignment), `base + 1` during construction.
+    """
+    return base if field in obj.__dict__ else base + 1
+
+
 def _warn_deprecated_policy(policy: "BindingPolicy", *, source: str, stacklevel: int) -> None:
     """Emit the removal notice when a deprecated [`BindingPolicy`][cpnx.BindingPolicy] is selected.
 
@@ -350,7 +382,7 @@ class InputArc:
                 verify_callable_purity(value)
                 # Best-effort advisory scan for side-effecting / non-deterministic
                 # trouble spots (see :mod:`cpnx.linting`); warns, or raises in strict mode.
-                lint_and_warn(value, f"InputArc.{name}", stacklevel=3)
+                lint_and_warn(value, f"InputArc.{name}", stacklevel=_assignment_stacklevel(self, name))
                 if name == "filter":
                     _reject_non_bool_return("InputArc.filter", value)
             super().__setattr__(f"_{name}_inline_safe", _inline_safe_for(value))
@@ -433,7 +465,7 @@ class OutputArc:
             _reject_string_expression("OutputArc.condition", value)
             if callable(value):
                 verify_callable_purity(value)
-                lint_and_warn(value, "OutputArc.condition", stacklevel=3)
+                lint_and_warn(value, "OutputArc.condition", stacklevel=_assignment_stacklevel(self, name))
                 _reject_non_bool_return("OutputArc.condition", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         super().__setattr__(name, value)
@@ -596,7 +628,7 @@ class Transition:
             _reject_string_expression("guard", value)
             if callable(value):
                 verify_callable_purity(value)
-                lint_and_warn(value, "guard", stacklevel=3)
+                lint_and_warn(value, "guard", stacklevel=_assignment_stacklevel(self, name))
                 _reject_non_bool_return("guard", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
         elif name == "binding_priority_key" and value is not None:
@@ -609,16 +641,18 @@ class Transition:
                     f"got {type(value).__name__}. String-expression keys are not supported."
                 )
             verify_callable_purity(value)
-            lint_and_warn(value, "binding_priority_key", stacklevel=3)
+            lint_and_warn(value, "binding_priority_key", stacklevel=_assignment_stacklevel(self, name))
         elif name == "binding_policy" and value is not None:
-            # Warns only for a deprecated policy. Reached from the generated dataclass
-            # ``__init__`` as well as post-construction reassignment, so both paths are
-            # covered; ``stacklevel=3`` aims at the caller for the construction path, matching
-            # the lint calls above.
+            # Warns only for a deprecated policy, and from both paths into this method: the
+            # generated dataclass ``__init__`` as well as post-construction reassignment.
             # ``name`` is declared before ``binding_policy`` so it is already assigned, but
             # read it defensively so a field reorder degrades the message rather than raising.
             owner = getattr(self, "name", "<unnamed>")
-            _warn_deprecated_policy(value, source=f"Transition(name={owner!r})", stacklevel=3)
+            _warn_deprecated_policy(
+                value,
+                source=f"Transition(name={owner!r})",
+                stacklevel=_assignment_stacklevel(self, name),
+            )
         elif name == "impacts_colors":
             # Declarative colour-domain annotation (not a callable): normalise any
             # iterable of colour names to a frozenset, reject a bare string / non-str

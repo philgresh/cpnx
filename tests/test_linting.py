@@ -244,6 +244,51 @@ def test_input_arc_filter_and_key_warn_at_construction():
     assert any(issubclass(w.category, CpnxLintWarning) for w in caught)
 
 
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        pytest.param(
+            lambda: Transition(
+                name="t",
+                inputs=[InputArc("in")],
+                outputs=[OutputArc("out")],
+                action=_action,
+                guard=guard_clock_time,
+            ),
+            id="guard-at-construction",
+        ),
+        pytest.param(
+            lambda: setattr(
+                Transition(name="t", inputs=[InputArc("in")], outputs=[OutputArc("out")], action=_action),
+                "guard",
+                guard_clock_time,
+            ),
+            id="guard-reassigned",
+        ),
+        pytest.param(lambda: InputArc("in", key=guard_random), id="input-arc-key-at-construction"),
+        pytest.param(lambda: setattr(InputArc("in"), "key", guard_random), id="input-arc-key-reassigned"),
+        pytest.param(lambda: InputArc("in", filter=guard_random), id="input-arc-filter-at-construction"),
+        pytest.param(lambda: OutputArc("out", condition=guard_clock_time), id="output-arc-condition"),
+    ],
+)
+def test_lint_warning_points_at_the_caller(trigger):
+    """A finding must name the user's own line, not a frame inside cpnx.
+
+    These warnings exist to tell an author *which* guard/key/filter to fix, so the reported
+    location is load-bearing. Construction and reassignment reach the validators at different
+    stack depths — a dataclass assigns its fields through a generated ``__init__``, an extra
+    frame that reports as ``<string>`` and names no user code at all — so both are pinned
+    here. See ``_assignment_stacklevel`` in ``cpnx.transitions``.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        trigger()
+
+    hits = [w for w in caught if issubclass(w.category, CpnxLintWarning)]
+    assert hits, "expected a lint finding"
+    assert hits[0].filename == __file__
+
+
 def test_clean_construction_emits_no_lint_warning():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")

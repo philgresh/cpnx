@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Note on sequencing: [#43](https://github.com/philgresh/cpnx/issues/43) and the 0.5.0 changelog announced `LEGACY`'s **removal** for v0.6.0. That is superseded — ADR 0001's migration plan asked for the default flip and the removal to land in separate releases one deprecation cycle apart, with `LEGACY` surviving as the opt-out in between, and since `LEGACY` was still the *default* in 0.5.0 that cycle had not actually run yet. 0.6.0 is therefore the flip, and 0.7.0 the removal.
 
+### Fixed
+
+- **A side-effect lint finding raised while *constructing* a transition or arc now names the user's own line instead of `<string>`.** [`CpnxLintWarning`][cpnx.CpnxLintWarning] exists to tell an author which `guard`, `key`, `filter` or `condition` to fix, so the reported location is the whole point — but every lint site in `cpnx.transitions` passed a fixed `stacklevel=3`, which is correct only for post-construction *reassignment*. A dataclass assigns its fields through a **generated** `__init__`, one frame deeper, and that frame reports as `<string>`: so the common case — a finding on a callable passed straight to `Transition(...)`, `InputArc(...)` or `OutputArc(...)` — pointed at generated code naming no user line at all, while the rarer reassignment case was right. Affected `Transition.guard`, `Transition.binding_priority_key`, `InputArc.key`, `InputArc.filter` and `OutputArc.condition`. The depth is now resolved per assignment by a shared helper (`_assignment_stacklevel`) that distinguishes the two paths by whether the field is already present in the instance `__dict__` — the generated `__init__` is what first puts it there, and the validators all run before the value lands. `InputArc._warn_if_drain_ignores_selection`, which already took its own `stacklevel` and was passed the correct depth from each path, is unchanged. Regression tests in [`tests/test_linting.py`](tests/test_linting.py) pin `WarningMessage.filename` for construction *and* reassignment across all five fields.
+
 ## [0.5.0] — 2026-07-27
 
 ### Added

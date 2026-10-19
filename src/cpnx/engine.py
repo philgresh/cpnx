@@ -635,7 +635,9 @@ class PetriNet:
         # Warn *before* taking the lock: a user filter promoting this to an error must not
         # raise mid-update, which would leave `_binding_policy` reassigned while
         # `_has_search_policy_transition` and `_scheduler_ready` still describe the old one.
-        _warn_deprecated_policy(value, source="PetriNet.binding_policy", stacklevel=2)
+        # stacklevel 3, not 2: `_warn_deprecated_policy` wraps `warnings.warn`, so 1 is the
+        # helper, 2 is this setter, and 3 is the assignment in the caller's own code.
+        _warn_deprecated_policy(value, source="PetriNet.binding_policy", stacklevel=3)
         with self._lock:
             self._binding_policy = value
             # A new default can flip any policy-unset transition's *effective* policy in either

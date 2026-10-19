@@ -157,9 +157,7 @@ _NONDETERMINISTIC_MEMBERS: dict[str, frozenset[str]] = {
     ),
     "datetime": frozenset({"now", "utcnow", "today"}),
     "uuid": frozenset({"uuid1", "uuid4"}),  # uuid3/uuid5 are deterministic hashes
-    "secrets": frozenset(
-        {"token_hex", "token_bytes", "token_urlsafe", "randbelow", "randbits", "choice"}
-    ),
+    "secrets": frozenset({"token_hex", "token_bytes", "token_urlsafe", "randbelow", "randbits", "choice"}),
 }
 
 #: Attribute names distinctive enough to flag by name alone, for the case where the
