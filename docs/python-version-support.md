@@ -369,10 +369,19 @@ with mutable attributes and a `__hash__` passes straight through. Recursion keep
 rejections that matter (verified, not just asserted: a shallow `frozendict` over a live `dict`,
 and either type holding a hashable-but-mutable object, are all still rejected).
 
-One inconsistency this leaves, flagged rather than changed: `frozenset` is still trusted as a
-leaf, and a `frozenset` can hold that same hashable-but-mutable object. Tightening it would be
-the consistent move, but it would de-certify callables that pass today, so it belongs in its
-own change rather than riding along here.
+That reasoning then applied to `frozenset` too, which was still trusted as a leaf and can hold
+the same hashable-but-mutable object — so it is now walked as well, and `_IMMUTABLE_LEAVES`
+holds only types with no contents to inspect. Worth noting how the gap survived: the comment
+above `_IMMUTABLE_LEAVES` already *claimed* "tuples/frozensets are checked recursively" while
+`frozenset` sat in the leaf tuple, short-circuiting before the recursion it pointed at. The
+documented intent was right and the implementation silently disagreed with it, which is the
+kind of divergence a reader is least likely to catch — the comment reassures you that the
+case is handled.
+
+This is a **tightening**: a callable closing over a `frozenset` whose members are not
+themselves immutable now falls back to the executor instead of running inline. That is the
+safe direction, and the rejection is pinned in both directions (a `frozenset` of scalars, of
+tuples and of frozensets still certifies; one holding a live object does not).
 
 **Free-threading (PEP 779 official in 3.14) — the most relevant item, and the one worth
 following up.** cpnx is a threading library: a `ThreadPoolExecutor`, an engine lock, cooling

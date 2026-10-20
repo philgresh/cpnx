@@ -69,10 +69,11 @@ _ITERATION_BUILTINS = frozenset({"sorted", "next", "any", "all"})
 #: Names permitted in call position when the callee is a bare ``Name``.
 _ALLOWED_CALL_NAMES = frozenset(SandboxEvaluator.ALLOWED_BUILTINS) | _ITERATION_BUILTINS
 
-#: Immutable leaf types a closure cell (free variable) may hold. ``bool`` is a
-#: subclass of ``int`` and needs no separate entry. Tuples/frozensets are checked
-#: recursively (see :func:`_is_immutable`).
-_IMMUTABLE_LEAVES = (int, float, str, bytes, bool, type(None), frozenset)
+#: Immutable leaf types a closure cell (free variable) may hold — types with no contents to
+#: inspect, so membership alone settles it. ``bool`` is a subclass of ``int`` and needs no
+#: separate entry. Containers are *not* leaves: tuples, frozensets and frozen mappings are
+#: walked recursively instead (see :func:`_is_immutable`).
+_IMMUTABLE_LEAVES = (int, float, str, bytes, bool, type(None))
 
 #: Frozen mapping types whose *contents* decide the answer: [`FrozenDict`][cpnx.FrozenDict]
 #: and, on 3.15+, :pep:`814`'s builtin ``frozendict``. A frozen lookup table read once at
@@ -122,10 +123,19 @@ def is_inline_safe(func: Callable) -> bool:
 
 
 def _is_immutable(value: object) -> bool:
-    """True if *value* is deeply immutable (safe to close over)."""
+    """True if *value* is deeply immutable (safe to close over).
+
+    Every immutable *container* is walked rather than trusted, because being frozen bounds
+    what the container does, not what its members do. A ``frozenset`` requires only that its
+    members be **hashable**, and a user-defined class is hashable by identity by default even
+    while holding mutable attributes — so ``frozenset({thing})`` was admitted while
+    ``thing.items`` stayed live and observable from a guard proven to be closed-world. The
+    same argument already applies to ``tuple`` and to the frozen mappings, which is why all
+    three recurse through here.
+    """
     if isinstance(value, _IMMUTABLE_LEAVES):
         return True
-    if isinstance(value, tuple):
+    if isinstance(value, (tuple, frozenset)):
         return all(_is_immutable(item) for item in value)
     if isinstance(value, _FROZEN_MAPPINGS):
         return all(_is_immutable(key) and _is_immutable(item) for key, item in value.items())

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A certified callable may no longer close over a `frozenset` whose members are not themselves
+  immutable.** `cpnx.certification` decides what a callable can close over and still earn the
+  **inline** execution path — run directly under the engine lock, with no timeout — so that
+  decision has to mean the closed-over value cannot change between firings. `frozenset` was
+  trusted outright, but being frozen bounds what the *container* does, not what its members do:
+  a `frozenset` requires only that its members be **hashable**, and every Python class is
+  hashable by identity unless it says otherwise, so `frozenset({thing})` was accepted while
+  `thing`'s attributes stayed live and observable from the guard. Frozen containers are now
+  walked instead of trusted, which is what the code already claimed to do and what `tuple` and
+  the frozen mappings already did.
+
+  **This is a tightening, and it can change performance rather than behaviour.** A callable
+  closing over such a `frozenset` now fails certification and runs on the executor instead of
+  inline (~90× per evaluation), and an [`InputArc`][cpnx.InputArc] `key`/`filter` that does so
+  loses its place's key index. Nothing is rejected that was previously accepted — certification
+  only ever chooses *how* a callable runs, never *whether* — so no net stops working. A
+  `frozenset` of scalars, tuples or other frozensets is unaffected, which covers the lookup-set
+  idiom the arc and transition docs recommend; if you are hitting this, the closed-over set
+  holds objects, and converting them to tuples or scalars restores the inline path.
+
 ### Added
 
 - **Official Python 3.15 support, and 3.14 is now a blocking CI entry.** Both versions run the

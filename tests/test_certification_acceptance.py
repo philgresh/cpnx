@@ -98,12 +98,29 @@ def test_factory_closure_over_two_immutable_floats():
 
 
 def test_closure_over_frozenset_and_tuple_of_immutables():
-    # frozenset is an immutable leaf type directly; a tuple is walked
-    # recursively and accepted so long as every element is itself immutable.
+    # Both are walked recursively and accepted so long as every member is itself immutable.
     allowed_colors = frozenset({"lead", "gold"})
     allowed_weights = (1.0, 2.0, 3.0)
 
     fn = lambda toks: toks[0].color in allowed_colors and toks[0].payload["w"] in allowed_weights  # noqa: E731
+    _assert_certified(fn)
+
+
+def test_closure_over_nested_frozen_containers():
+    # The recursion has to terminate on nested immutables rather than give up on them: a
+    # frozenset of tuples and a tuple of frozensets are both still closed-world.
+    by_pair = frozenset({("lead", 1), ("gold", 2)})
+    tiers = (frozenset({"lead"}), frozenset({"gold"}))
+
+    fn = lambda toks: (toks[0].color, 1) in by_pair and toks[0].color in tiers[0]  # noqa: E731
+    _assert_certified(fn)
+
+
+def test_closure_over_empty_frozenset():
+    # Nothing to walk, so nothing can be mutable.
+    nothing = frozenset()
+
+    fn = lambda toks: toks[0].color not in nothing  # noqa: E731
     _assert_certified(fn)
 
 

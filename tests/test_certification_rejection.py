@@ -17,6 +17,17 @@ _MUTABLE_LIST = [True]
 _CONST_TUPLE = (1, 2, 3)
 
 
+class _HashableButMutable:
+    """Hashable, so a frozen container accepts it; mutable, so closing over it is not safe.
+
+    Python gives every class identity-based ``__hash__`` by default, so this needs no
+    ``__hash__`` of its own — which is the point: the hazard is the *default*, not an opt-in.
+    """
+
+    def __init__(self) -> None:
+        self.items: list[int] = []
+
+
 def _assert_rejected(fn, reason_contains: str | None = None) -> None:
     verdict = certify(fn)
     assert verdict.certified is False
@@ -143,6 +154,24 @@ def test_comprehension_over_non_parameter_iterable_is_rejected():
     # iteration-bounds check from the mutable-read check: `_CONST_TUPLE` is
     # itself immutable, so the sole disqualifying property is the bounds rule.
     _assert_rejected(lambda toks: any(x > 0 for x in _CONST_TUPLE), "not bounded")
+
+
+def test_closure_over_frozenset_holding_mutable_state_is_rejected():
+    # Being frozen bounds what the *container* does, not what its members do. A frozenset
+    # requires only that its members be hashable, and a user-defined class is hashable by
+    # identity by default even while holding mutable attributes — so this frozenset is
+    # immutable while `.items` stays live and observable, which is exactly the "guard closes
+    # over external mutable state" hazard the closure rule exists to catch.
+    live = frozenset({_HashableButMutable()})
+
+    _assert_rejected(lambda toks: toks[0] in live, "mutable")
+
+
+def test_closure_over_tuple_of_frozensets_holding_mutable_state_is_rejected():
+    # The recursion has to reach through both container layers, not just the outer one.
+    nested = (frozenset({_HashableButMutable()}),)
+
+    _assert_rejected(lambda toks: toks[0] in nested[0], "mutable")
 
 
 def test_private_attribute_access():
