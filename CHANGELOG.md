@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A certified callable may no longer close over a `frozenset` whose members are not themselves
+  immutable.** `cpnx.certification` decides what a callable can close over and still earn the
+  **inline** execution path — run directly under the engine lock, with no timeout — so that
+  decision has to mean the closed-over value cannot change between firings. `frozenset` was
+  trusted outright, but being frozen bounds what the *container* does, not what its members do:
+  a `frozenset` requires only that its members be **hashable**, and every Python class is
+  hashable by identity unless it says otherwise, so `frozenset({thing})` was accepted while
+  `thing`'s attributes stayed live and observable from the guard. Frozen containers are now
+  walked instead of trusted, which is what the code already claimed to do and what `tuple` and
+  the frozen mappings already did.
+
+  **This is a tightening, and it can change performance rather than behaviour.** A callable
+  closing over such a `frozenset` now fails certification and runs on the executor instead of
+  inline (~90× per evaluation), and an [`InputArc`][cpnx.InputArc] `key`/`filter` that does so
+  loses its place's key index. Nothing is rejected that was previously accepted — certification
+  only ever chooses *how* a callable runs, never *whether* — so no net stops working. A
+  `frozenset` of scalars, tuples or other frozensets is unaffected, which covers the lookup-set
+  idiom the arc and transition docs recommend; if you are hitting this, the closed-over set
+  holds objects, and converting them to tuples or scalars restores the inline path.
+
+### Added
+
+- **Official Python 3.15 support, and 3.14 is now a blocking CI entry.** Both versions run the
+  full suite, `ruff` and the complexity gate on every PR; 3.14 had been stable for a year while
+  still pinned `experimental` with `continue-on-error`, which meant its failures were invisible.
+  The supported floor is **unchanged** — `requires-python = ">=3.10"` — and no shipped code uses
+  version-specific syntax.
+
+- **Guards and arc callables now handle 3.14/3.15 syntax correctly.** `cpnx.certification`,
+  `cpnx.sandbox` and `cpnx.linting` inspect the Python syntax of your callables, so new grammar
+  needs explicit handling. Covered, with regression tests: PEP 750 t-strings, PEP 798 unpacking
+  in comprehensions, and PEP 810 lazy imports.
+
+  Three fixes matter if you are on 3.15:
+
+  - **`lazy import` no longer breaks certification or linting.** A deferred import leaves a
+    proxy in the module until first use, which cpnx read at construction time. The linter
+    **missed every hazard reached through a lazy import** (a `lazy import sqlite3` hid a
+    `sqlite3.connect` in a guard that an eager import flags), the certifier wrongly rejected
+    lazily-imported helpers and constants — dropping those callables off the fast inline path —
+    and a verdict could change depending on whether the callable had been called yet. Lazy and
+    eager imports now behave identically.
+  - **Comprehension unpacking is now bounds-checked.** `[*xs for t in toks]` iterates `xs`, so
+    it is subject to the same rule as `for x in xs`: it must be derived from the callable's
+    argument. It previously escaped that check, which let a certified guard iterate unrelated
+    data — and chain comprehensions for polynomial blow-up — while running inline under the
+    engine lock with no timeout.
+  - **Frozen lookup tables are now closable.** Closing over a [`FrozenDict`][cpnx.FrozenDict]
+    (or 3.15's builtin `frozendict`) no longer fails certification, so the recommended
+    "read immutable data once at construction time" idiom keeps the inline path and the arc key
+    index. Contents are checked recursively, so a frozen mapping holding mutable state is still
+    rejected — note 3.15's `frozendict` is **shallow**, and so is not a substitute for
+    `FrozenDict`'s recursive freeze.
+
+  Full audit, including the 3.15 removals and deprecations checked against cpnx (none reachable)
+  and the new features assessed and declined:
+  [`docs/python-version-support.md`](https://github.com/philgresh/cpnx/blob/main/docs/python-version-support.md).
+
 ## [0.7.0] — 2026-10-20
 
 ### Removed

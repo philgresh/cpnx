@@ -11,6 +11,7 @@ copyright: Copyright &copy; Phil Gresham — MIT License
 exclude_docs: |
   cpn-theory-audit.md
   handoff-cpn-binding-evaluation.md
+  python-version-support.md
   adr/
 
 theme:

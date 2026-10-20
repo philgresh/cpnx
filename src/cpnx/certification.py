@@ -51,11 +51,14 @@ a compiled string expression, both of which are frozen at construction.
 """
 
 import ast
+import builtins
 import inspect
+import types
 from collections.abc import Callable
 from dataclasses import dataclass
 
 from .sandbox import SandboxEvaluator, _find_target_node
+from .tokens import FrozenDict
 
 #: Builtins that iterate/reduce a finite iterable. Added on top of the string
 #: sandbox's arithmetic/coercion set because the real guard corpus needs them
@@ -66,10 +69,27 @@ _ITERATION_BUILTINS = frozenset({"sorted", "next", "any", "all"})
 #: Names permitted in call position when the callee is a bare ``Name``.
 _ALLOWED_CALL_NAMES = frozenset(SandboxEvaluator.ALLOWED_BUILTINS) | _ITERATION_BUILTINS
 
-#: Immutable leaf types a closure cell (free variable) may hold. ``bool`` is a
-#: subclass of ``int`` and needs no separate entry. Tuples/frozensets are checked
-#: recursively (see :func:`_is_immutable`).
-_IMMUTABLE_LEAVES = (int, float, str, bytes, bool, type(None), frozenset)
+#: Immutable leaf types a closure cell (free variable) may hold — types with no contents to
+#: inspect, so membership alone settles it. ``bool`` is a subclass of ``int`` and needs no
+#: separate entry. Containers are *not* leaves: tuples, frozensets and frozen mappings are
+#: walked recursively instead (see :func:`_is_immutable`).
+_IMMUTABLE_LEAVES = (int, float, str, bytes, bool, type(None))
+
+#: Frozen mapping types whose *contents* decide the answer: [`FrozenDict`][cpnx.FrozenDict]
+#: and, on 3.15+, :pep:`814`'s builtin ``frozendict``. A frozen lookup table read once at
+#: construction time is the idiom the arc/transition docs recommend for a certifiable
+#: callable, so rejecting it pushed users off the inline path (and arcs off the key index)
+#: for doing exactly what they were told.
+#:
+#: Neither type is trusted blanketly, because neither is *deeply* immutable on its own.
+#: ``frozendict`` is shallow by design — ``frozendict({"a": {"b": 1}})`` still holds a live
+#: ``dict`` — and ``FrozenDict``, though it recursively freezes nested ``dict``/``list``
+#: values, admits any *hashable* value, so a custom object with mutable attributes passes
+#: straight through. So both recurse through :func:`_is_immutable` on keys *and* values.
+_FROZEN_MAPPINGS = tuple(t for t in (FrozenDict, getattr(builtins, "frozendict", None)) if t is not None)
+
+#: ``types.LazyImportType`` on 3.15+ (:pep:`810`), else ``None``.
+_LAZY_IMPORT_TYPE = getattr(types, "LazyImportType", None)
 
 
 @dataclass(frozen=True)
@@ -103,11 +123,22 @@ def is_inline_safe(func: Callable) -> bool:
 
 
 def _is_immutable(value: object) -> bool:
-    """True if *value* is deeply immutable (safe to close over)."""
+    """True if *value* is deeply immutable (safe to close over).
+
+    Every immutable *container* is walked rather than trusted, because being frozen bounds
+    what the container does, not what its members do. A ``frozenset`` requires only that its
+    members be **hashable**, and a user-defined class is hashable by identity by default even
+    while holding mutable attributes — so ``frozenset({thing})`` was admitted while
+    ``thing.items`` stayed live and observable from a guard proven to be closed-world. The
+    same argument already applies to ``tuple`` and to the frozen mappings, which is why all
+    three recurse through here.
+    """
     if isinstance(value, _IMMUTABLE_LEAVES):
         return True
-    if isinstance(value, tuple):
+    if isinstance(value, (tuple, frozenset)):
         return all(_is_immutable(item) for item in value)
+    if isinstance(value, _FROZEN_MAPPINGS):
+        return all(_is_immutable(key) and _is_immutable(item) for key, item in value.items())
     return False
 
 
@@ -155,16 +186,60 @@ def _resolve_name(func: Callable, name: str) -> object:
 
     Returns the sentinel :data:`_UNRESOLVED` if the name is neither a closure
     cell nor a module global (e.g. a builtin, or a genuinely undefined name).
+
+    "As *func* would at call time" is load-bearing on 3.15+, where a name can be a deferred
+    import that has not happened yet — see :func:`_force_lazy_import`.
     """
     code = func.__code__
     if name in code.co_freevars and func.__closure__ is not None:
         cell = func.__closure__[code.co_freevars.index(name)]
         try:
-            return cell.cell_contents
+            return _force_lazy_import(cell.cell_contents)
         except ValueError:  # empty cell (recursive def not yet bound)
             return _UNRESOLVED
     globals_ = getattr(func, "__globals__", {})
-    return globals_.get(name, _UNRESOLVED)
+    return _force_lazy_import(globals_.get(name, _UNRESOLVED))
+
+
+def _force_lazy_import(value: object) -> object:
+    """Resolve a :pep:`810` deferred import, so a name resolves to what it will *be* when called.
+
+    On 3.15+, ``lazy import m`` / ``lazy from m import sym`` leaves a
+    :class:`types.LazyImportType` proxy in ``__globals__``. CPython resolves it when
+    ``LOAD_GLOBAL`` executes — *not* when a dict lookup hands it to Python — so inspecting at
+    construction time otherwise sees the proxy rather than the module, function or constant it
+    stands for. Three things went wrong because of that, all of them silent:
+
+    * the certifier rejected a genuinely certifiable helper as ``call to non-function``, and an
+      immutable constant as ``reads mutable/uncertified external``, dropping the callable off
+      the inline path (and an arc ``key``/``filter`` off its place's key index);
+    * :mod:`cpnx.linting` missed every hazard reached through a lazy import, because the proxy
+      resolves to no package — ``lazy import sqlite3`` then hid ``sqlite3.connect`` in a guard
+      that an eager ``import sqlite3`` flags; and
+    * *calling* the guard once resolved the proxy, so a later verdict flipped. A certification
+      that depends on whether anything happened to invoke the callable first is the worst of
+      the three, and the reason this resolves eagerly rather than reporting "unresolved".
+
+    There is no way to *test* for a proxy: it is deliberately transparent, so ``isinstance``
+    and ``type()`` report the eventual object, and any attribute access resolves and forwards
+    (``proxy.resolve()`` raises :exc:`AttributeError` from the *resolved* object). So this
+    calls the unbound ``resolve`` descriptor, which bypasses that forwarding. A
+    :exc:`TypeError` means the value was never a proxy — the overwhelmingly common case.
+
+    Note this does defeat the deferral for names a guard actually mentions. That is the narrow,
+    deliberate price: ``_resolve_name`` is only reached for names in the callable's own AST, and
+    a guard that references a module needs it imported when it fires anyway.
+    """
+    if _LAZY_IMPORT_TYPE is None or value is _UNRESOLVED:
+        return value
+    try:
+        return _LAZY_IMPORT_TYPE.resolve(value)
+    except TypeError:
+        return value  # not a lazy proxy
+    except Exception:
+        # A deferred import that cannot be satisfied raises here instead of at first use.
+        # Report it as unresolved: that is what the name is, and this path must never raise.
+        return _UNRESOLVED
 
 
 _UNRESOLVED = object()
@@ -259,11 +334,16 @@ class _Certifier:
 
     @staticmethod
     def _check_comprehension(node: ast.AST, params: frozenset[str]) -> Verdict:
-        """Each generator must iterate something rooted at a parameter or an in-comp target.
+        """Everything the comprehension *iterates* must be rooted at a parameter or an in-comp target.
 
         This is what bounds iteration: the only finite iterables we admit are the
         engine-built argument(s) and things derived from them within the same
         comprehension. Iterating anything else is rejected.
+
+        Two positions iterate, not one. Every generator's ``iter`` does, and so does the
+        expression a :pep:`798` comprehension unpacks (:func:`_unpacked_element`) — which the
+        AST puts outside ``generators``, so it has to be checked separately or it is admitted
+        unchecked.
         """
         targets = {name for gen in node.generators for name in _comp_target_names(gen.target)}
         allowed_roots = params | targets
@@ -271,6 +351,9 @@ class _Certifier:
             root = _root_name(generator.iter)
             if root not in allowed_roots:
                 return Verdict(False, "iteration not bounded by the argument")
+        unpacked = _unpacked_element(node)
+        if unpacked is not None and _root_name(unpacked) not in allowed_roots:
+            return Verdict(False, "unpacked iteration not bounded by the argument")
         return Verdict(True)
 
     def _check_call(self, node: ast.Call, func: Callable, stack: frozenset[Callable]) -> Verdict:
@@ -297,6 +380,30 @@ class _Certifier:
         if inner.certified:
             return Verdict(True)
         return Verdict(False, f"call to uncertified '{name}': {inner.reason}")
+
+
+def _unpacked_element(node: ast.AST) -> ast.AST | None:
+    """The expression a :pep:`798` comprehension *unpacks*, or ``None`` if it unpacks nothing.
+
+    ``[*xs for t in ts]`` (3.15+) is sugar for ``[x for t in ts for x in xs]``: the unpacked
+    ``xs`` is iterated exactly like a ``for``-clause's ``iter``, and its length multiplies the
+    result. But the AST stores it in ``elt`` (wrapped in :class:`ast.Starred`) rather than in
+    ``generators``, so :meth:`_Certifier._check_comprehension` does not see it there and would
+    admit it unchecked — letting ``[*anything for t in ts]`` iterate a module global or a
+    function local that the equivalent ``for x in anything`` clause is rejected for.
+
+    ``{**m for t in ts}`` is the dict spelling, and puts the unpacked mapping in ``key`` with
+    ``value`` left as ``None`` — the opposite side from :class:`ast.Dict`, where ``{**m}`` is
+    ``keys=[None]``.
+
+    A comprehension that unpacks nothing returns ``None``: a plain ``elt`` is *evaluated* once
+    per iteration rather than iterated, so it must not be bounds-checked. On ≤3.14 the syntax
+    is a :exc:`SyntaxError`, so neither branch can fire and this is always ``None``.
+    """
+    if isinstance(node, ast.DictComp):
+        return node.key if getattr(node, "value", None) is None else None
+    element = getattr(node, "elt", None)
+    return element.value if isinstance(element, ast.Starred) else None
 
 
 def _comp_target_names(target: ast.AST) -> list[str]:
