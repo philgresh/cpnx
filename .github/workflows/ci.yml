@@ -8,10 +8,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every supported version blocks. A version claimed in pyproject.toml's classifiers
+        # must not be able to fail invisibly — which is what `experimental` below allows, so
+        # the two must never disagree. Add a prerelease here *and* to `include` as
+        # `experimental: true`, and promote it to a bare entry when its classifier is claimed.
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
-        include:
-          - python-version: "3.15"
-            experimental: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,6 +27,9 @@ jobs:
           bad=$(radon cc src/cpnx --min C -s)
           if [ -n "$bad" ]; then echo "Complexity gate FAILED — rank C or worse:"; echo "$bad"; exit 1; fi
           echo "Complexity gate passed."
+      # No entry sets `experimental`, so this is currently always false. It is kept as the
+      # hook for the next prerelease; note it covers only pytest, so an experimental entry
+      # still fails the job on an install, ruff or radon error.
       - run: pytest tests/ -v
         continue-on-error: ${{ matrix.experimental == true }}
 

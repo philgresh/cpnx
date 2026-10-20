@@ -73,24 +73,53 @@ inside it. Verified: a guard whose interpolation calls `open()` is rejected by *
 `ast.walk` descends into `Interpolation.value` normally. Pinned by
 `tests/test_new_grammar_support.py`.
 
-### 2.2 PEP 798 unpacking in comprehensions (3.15) — `Starred` in `elt`. Benign.
+### 2.2 PEP 798 unpacking in comprehensions (3.15) — `Starred` in `elt`. **Was a real hole; fixed.**
 
-`[*a for a in rows]` parses to `ListComp(elt=Starred(...), generators=[...])`. The `Starred`
-lands in `elt`, a position the certifier does not inspect: `_check_comprehension` reads only
-`node.generators`, checking each `iter` is rooted at a parameter or an in-comprehension
-target. The bound on iteration is unaffected by what the element expression does, so the
-termination proof still holds.
+**This section previously concluded "benign". That was wrong, and the error is instructive.**
 
-The original analysis of this feature stopped at the list-comprehension case and left the
-conclusion resting on a reasoning step ("a `Starred` in `elt` cannot smuggle anything past
-the walk") rather than an observation. Both gaps are now closed:
+`[*a for a in rows]` parses to `ListComp(elt=Starred(...), generators=[...])`. The reasoning
+was: the `Starred` lands in `elt`, `_check_comprehension` reads only `node.generators`, so the
+bound on iteration is unaffected by what the element expression does. The second step does not
+follow from the first. `[*xs for t in ts]` is sugar for `[x for t in ts for x in xs]` — `xs` is
+**iterated**, and its length multiplies the result. So the unpacked expression is a second
+iteration source that the bounds check simply never looked at:
 
-* **Every form PEP 798 touches** is checked, not just `ListComp` — the PEP also covers set
-  comprehensions, dict comprehensions (`**`), generator expressions and async generator
-  expressions. All stay correctly bounded.
-* **The reasoning step is now an observation.** `[*t.value for t in _ELSEWHERE]` is rejected
-  (`iteration not bounded by the argument`), and `[*open(t.value) for t in tokens]` is
-  rejected by both certification and the purity sandbox. The element expression *is* walked.
+```python
+[x for _ in toks for x in _CONST_TUPLE]   # rejected: "iteration not bounded by the argument"
+[*_CONST_TUPLE for _ in toks]            # was CERTIFIED — the same iteration, unchecked
+```
+
+Unpacking was therefore a way to iterate exactly what the `for`-clause check exists to forbid:
+a module global, or a function local. The local case is the sharp one, because locals compose:
+
+```python
+def guard(toks):
+    s1 = [*toks for _ in toks]   # len(toks) ** 2
+    s2 = [*s1 for _ in toks]     # len(toks) ** 3
+    s3 = [*s2 for _ in toks]     # len(toks) ** 4
+```
+
+`k` such lines iterate `O(len(toks) ** (k + 1))` — and certification grants the inline path,
+*under the engine lock, with no timeout*. The pre-3.15 spelling of the same amplification
+(`for x in s1`) was already rejected, so this was a regression in the termination guarantee
+introduced purely by the new grammar, not a pre-existing gap.
+
+**The fix** is `_unpacked_element`: `_check_comprehension` now bounds-checks the unpacked
+expression against the same `params | targets` roots as every generator's `iter`, for all four
+forms the PEP touches (`[*x …]`, `{*x …}`, `{**x …}`, `(*x …)`). A plain `elt` is still *not*
+bounds-checked, because it is evaluated once per iteration rather than iterated.
+
+**What the original testing got wrong**, since the lesson generalises: the test asserted the
+rejection with `[*t.value for t in _ELSEWHERE]`, which puts `_ELSEWHERE` in the `iter`
+position — the path that was already checked. It passed, and the passing test was read as
+confirming the `elt` reasoning. Writing a test for the position you reasoned about is not the
+same as writing one for the position you are worried about. The pin is now
+`[*_ELSEWHERE for t in tokens]`.
+
+Separately, and still true: the element expression *is* walked, so
+`[*open(t.value) for t in tokens]` is rejected by both certification and the purity sandbox.
+Admitting the container never stopped `ast.walk` descending into it. That part of the original
+claim held; the bounds claim did not.
 
 One asymmetry found along the way and worth recording, because it would trip anyone adding a
 `DictComp` branch later: `{**d for d in ds}` parses with the unpacked expression in **`key`**
@@ -105,7 +134,12 @@ so `DictComp.value` can now be `None` where it was always an expression node. cp
 unaffected (nothing reads `DictComp.value`, and `ast.walk`/`iter_child_nodes` skip `None`
 children), but the two unpacking spellings put the `None` on opposite sides. Pinned.
 
-### 2.3 PEP 810 lazy imports (3.15) — the `is_lazy` field. Benign.
+### 2.3 PEP 810 lazy imports (3.15) — the `is_lazy` field is benign; the **runtime proxy was not**.
+
+The AST half of this feature is benign, and was the only half the first pass looked at. The
+runtime half — what a deferred import leaves *in the module* — broke both inspecting modules.
+
+#### 2.3.1 The AST half (benign)
 
 `ast.Import` and `ast.ImportFrom` gained `is_lazy`. Both cpnx call sites match on the node
 class, so the field is invisible to them:
@@ -129,6 +163,63 @@ still isolate the guard from.
 
 `lazy` is a **soft** keyword: `lazy = 1`, `def f(lazy)`, `lazy.foo = 2` and `import lazy` all
 still parse. No existing identifier breaks.
+
+#### 2.3.2 The runtime half — `types.LazyImportType` in `__globals__`. **Was broken; fixed.**
+
+`lazy import m` leaves a `types.LazyImportType` proxy in the module dict. CPython resolves it
+when `LOAD_GLOBAL` executes — **not** when a dict lookup hands it to Python. Both inspecting
+modules read names through `certification._resolve_name`, i.e. `func.__globals__.get(name)`,
+at *construction* time, before the callable has ever run. So they saw the proxy, and all three
+consequences were silent:
+
+| | eager `import sqlite3` | `lazy import sqlite3` (before the fix) |
+| --- | --- | --- |
+| `lint_callable` on a guard calling `sqlite3.connect` | `[('database', 'sqlite3.connect')]` | `[]` |
+| `certify` of a guard calling a lazily-imported helper | `Verdict(True)` | `Verdict(False, "call to non-function 'helper'")` |
+| `certify` of a guard reading a lazily-imported constant | `Verdict(True)` | `Verdict(False, "reads mutable/uncertified external 'MAX_BATCH'")` |
+
+The linter column is the dangerous one: `lazy import` silently switched off hazard detection,
+because the proxy resolves to no defining package, so the "resolve the symbol to the package
+that defines it" strategy found `builtins` or nothing. A guard doing `sqlite3.connect()` in
+enabling logic stopped being reported at all — a false negative in the advisory safety layer,
+not merely a missed optimisation.
+
+The certifier columns are false *rejections*, which are safe but expensive: they drop the
+callable off the inline path (~90× per evaluation) and, for an arc `key`/`filter`, off its
+place's key index. Worst of the three, though, was that **the verdict depended on call order**:
+invoking the guard once resolved the proxy via `LOAD_GLOBAL`, so an identical callable
+certified `False` before and `True` after. A safety verdict that is a function of unrelated
+history is indefensible, and is why the fix resolves eagerly rather than reporting "unresolved".
+
+**The fix** is `_force_lazy_import`, applied to both lookup paths in `_resolve_name` (globals
+*and* closure cells). Getting at the proxy is awkward, and the awkwardness is the point: the
+proxy is **deliberately transparent**, so there is no way to test for one —
+
+```python
+isinstance(v, types.LazyImportType)   # False, even as the first touch
+type(v) is types.LazyImportType       # False
+v.resolve()                           # AttributeError, from the *resolved* object
+repr(v)                               # "<lazy_import 'h.MAX'>"  <- the only non-invasive read
+```
+
+`isinstance` and `type()` report the eventual object, and any attribute access resolves and
+forwards. The fix therefore calls the **unbound** `types.LazyImportType.resolve` descriptor,
+which bypasses that forwarding; a `TypeError` means the value was never a proxy (the common
+case), and an `ImportError` from a deferred import that cannot be satisfied is reported as
+`_UNRESOLVED` rather than raising on a construction path that must not raise. After the fix,
+every cell in the table above matches the eager column exactly, and the order dependence is
+gone — both pinned against an eager control in `tests/test_new_grammar_support.py`.
+
+Two honest caveats. **This defeats the deferral** for names a guard actually mentions:
+`_resolve_name` is only reached for names in the callable's own AST, and a guard referencing a
+module needs it imported when it fires anyway, so the cost is narrow and deliberate — but it
+is real, and a user who marked an import lazy specifically to avoid importing it will still pay
+for it if a guard names it. **And this is the part least verifiable from 3.15.0b4**: the proxy
+mechanics above are beta observations, and b4 already proved divergent from the release once
+(§2.3.1). The fix is written defensively — no `types.LazyImportType`, no behaviour change; a
+`TypeError` is treated as "not a proxy" — so the worst case on a changed final release is that
+resolution silently stops happening and the pre-fix symptoms return, rather than an exception
+on a construction path. CI on the real 3.15.0 is the authoritative check.
 
 ## 3. Breaking changes — audited against cpnx
 
@@ -178,9 +269,24 @@ tripping a Python-level deprecation.
 * **Frame-walk attribution.** `linting._assignment_stacklevel()` returns the same value on
   3.13, 3.14 and 3.15 (`1` from a non-internal caller; `_FALLBACK_STACKLEVEL = 3`), and
   `_PACKAGE_ROOT` resolves identically. `tests/test_linting.py` passes on all three.
-* **PEP 649/749 deferred annotation evaluation (3.14).** cpnx strips annotations at the *AST*
-  level in `_strip_annotations`, before any evaluation, so lazy evaluation of annotations
-  cannot change a verdict. Unaffected.
+* **PEP 649/749 deferred annotation evaluation (3.14).** No behaviour change, but the earlier
+  wording here ("cpnx strips annotations at the AST level, so lazy evaluation cannot change a
+  verdict") was too broad: it describes `certification._strip_annotations` and overlooked that
+  `transitions._reject_non_bool_return` calls `typing.get_type_hints(value)` at *runtime*, on
+  every `Transition.guard`, `InputArc.filter` and `OutputArc.condition` assignment. Under PEP
+  649 that call is now what triggers `value.__annotate__()`, so cpnx is the thing forcing
+  evaluation rather than merely reading an already-evaluated `__annotations__`. `sandbox.py`
+  and `linting.py` do not strip annotations at all; they do not need to, since neither reads
+  an annotation's *value* — only certification walks names that an annotation could introduce.
+
+  One consequence is worth stating because it looks like a bug: an unresolvable parameter
+  annotation (a `TYPE_CHECKING`-only import, a forward reference) makes `get_type_hints` raise
+  `NameError` before it can inspect `"return"`, so a genuinely wrong `-> int` on that callable
+  is *not* rejected. That is the documented, deliberate contract — `_reject_non_bool_return`
+  lists "Unresolvable → pass" among its conservative cases, because the annotation is advisory
+  and must never break construction. It is also **not** a 3.14 change: `get_type_hints` raises
+  the same `NameError` on 3.13, 3.14 and 3.15 for the same callable, so PEP 649 moves *when*
+  annotations are evaluated without changing this outcome.
 * **`unittest.assertWarns` no longer swallows non-matching warnings.** cpnx's suite uses
   `pytest.warns`, not `assertWarns`.
 
@@ -249,6 +355,25 @@ PEP 814's `frozendict` is **shallow**: `frozendict({"a": {"b": 1}})` still holds
 `dict` subclass. So it is not a drop-in, and the deep-freeze and eager-hash semantics are the
 load-bearing parts. Revisit only if a leaf-only fast path is ever measured to matter.
 
+**`frozendict` is now *recognised*, though, which is a different question from adopting it.**
+`certification._is_immutable` decides what a certified callable may close over, and it accepted
+only scalars, `frozenset` and recursive `tuple`s — so a guard closing over a frozen lookup
+table was rejected as reading "mutable/uncertified external" state. That hit the idiom the
+`InputArc`/`Transition` docs actively recommend (read immutable data once at construction
+time), and the penalty was invisible: the callable silently lost the inline path, and an arc
+`key`/`filter` silently lost its place's key index. Both `FrozenDict` and, on 3.15+, builtin
+`frozendict` are now accepted — **by recursing into keys and values, not by trusting the
+type**, because neither is deeply immutable on its own: `frozendict` is shallow by design, and
+`FrozenDict` freezes nested `dict`/`list` values but admits *any hashable* value, so an object
+with mutable attributes and a `__hash__` passes straight through. Recursion keeps the
+rejections that matter (verified, not just asserted: a shallow `frozendict` over a live `dict`,
+and either type holding a hashable-but-mutable object, are all still rejected).
+
+One inconsistency this leaves, flagged rather than changed: `frozenset` is still trusted as a
+leaf, and a `frozenset` can hold that same hashable-but-mutable object. Tightening it would be
+the consistent move, but it would de-certify callables that pass today, so it belongs in its
+own change rather than riding along here.
+
 **Free-threading (PEP 779 official in 3.14) — the most relevant item, and the one worth
 following up.** cpnx is a threading library: a `ThreadPoolExecutor`, an engine lock, cooling
 heaps. It is the natural beneficiary of a GIL-free build, and also what such a build is most
@@ -287,12 +412,33 @@ right next step and belongs in its own PR, where a failure means something speci
 
 ## 6. Residual risk
 
-The gap this release does not close: certification's correctness under a *future* grammar
-rests on the same structural argument each time — that an unmatched node class is inert and
-that `ast.walk` still reaches the expressions inside it. Both held for 3.14 and 3.15, and
-both are now pinned by tests, so the next release that breaks either fails loudly instead of
-silently widening what counts as inline-safe. What is *not* pinned is a construct nobody has
-thought of: a future node that is both unmatched **and** capable of binding or iterating
-something, in a position no existing test covers, would reproduce the same shape of gap. The
-mitigation is the one applied here — enumerate `_fields` across versions and diff, rather
-than read the changelog and trust it.
+Certification's correctness under a *future* grammar rests on the same structural argument
+each time — that an unmatched node class is inert, and that `ast.walk` still reaches the
+expressions inside it. Both held for 3.14 and 3.15 and are now pinned by tests. What is *not*
+pinned is a construct nobody has thought of: a future node that is both unmatched **and**
+capable of binding or iterating something, in a position no existing test covers, reproduces
+the same shape of gap.
+
+That is not hypothetical, which is the main lesson of this release. PEP 798 **was** exactly
+such a construct, and the first pass through this document called it benign (§2.2). Two things
+produced that miss, and both are worth naming because the diff-the-`_fields` method does not
+catch either:
+
+1. **A node can iterate without being a generator.** The audit asked "does any node class or
+   field change?", saw only `Starred` in a new position, and stopped. The question that
+   mattered was "does anything new get *iterated*?" — and `_fields` diffing cannot answer it,
+   because the node class was old and the field was old. Only reading the PEP's desugaring
+   (`[*xs for t in ts]` → `for x in xs`) answers it.
+2. **A test can confirm the wrong position.** The pin was written for the `iter` position, which
+   was already checked, and it passed — which read as confirmation of a claim about the `elt`
+   position. A test that exercises the path you reasoned *about* rather than the path you are
+   *worried about* is worse than no test, because it converts an open question into a settled
+   one.
+
+So the honest statement of residual risk is: the mechanical checks here (diff `_fields`, run
+the suite on every interpreter, `-W error`) are necessary and were not sufficient. They
+established that nothing *crashes*; they could not establish that nothing new is *admitted*.
+For a whitelist proof, every release still needs the question asked deliberately, per feature:
+*can this construct bind a name, iterate a sequence, or defer a lookup?* PEP 798 could iterate
+and PEP 810 could defer a lookup; both slipped through a pass that only looked for new node
+classes.
