@@ -238,8 +238,8 @@ def _is_internal_frame(code: types.CodeType) -> bool:
 def _assignment_stacklevel() -> int:
     """``stacklevel`` that makes a warning name the user's own line.
 
-    These warnings exist to tell an author which ``guard``, ``key``, ``filter``, ``condition``
-    or policy to fix, so the reported location is the point of raising them. The right depth is
+    These warnings exist to tell an author which ``guard``, ``key``, ``filter`` or
+    ``condition`` to fix, so the reported location is the point of raising them. The right depth is
     **not** a constant: a dataclass assigns its fields through a generated ``__init__``, one
     frame deeper than a later reassignment. So instead of hard-coding a number per call site —
     which is how the attribution was wrong before — this walks outward to the first frame

@@ -116,8 +116,8 @@ of two conditions:
    break the pinned golden sequence in `tests/test_seeded_determinism.py`. `FIRST` (the
    default) draws RNG only once, for the scheduler's own
    tie-break among enabled candidates (`_rng.choice(candidates)`), which advances the stream by
-   candidate-count only — a quantity the maintained enabled set reproduces exactly. Those two
-   policies are therefore safe under the fast path; `RANDOM`/`PRIORITY` are not.
+   candidate-count only — a quantity the maintained enabled set reproduces exactly. `FIRST`
+   is therefore safe under the fast path; `RANDOM`/`PRIORITY` are not.
 
 A naive dirty set — mark a place dirty on deposit, re-scan only its consumers — misses four
 re-enablement hazards. Each is handled explicitly above rather than assumed away:

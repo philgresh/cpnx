@@ -112,6 +112,76 @@ class TestLegacyIsRemoved:
                 PetriNet() if policy is None else PetriNet(binding_policy=policy)
 
 
+class TestBindingPolicyIsValidatedAtAssignment:
+    """A wrong `binding_policy` must be loud, because nothing downstream re-checks it.
+
+    `_effective_policy` returns whatever is stored and `_is_head_only` tests
+    `policy is BindingPolicy.FIRST`, which just comes back `False` for anything else. So an
+    unvalidated typo or a `None` net default silently drops every guard-free transition off
+    the O(1) head resolution *and* ADR 0005's `consume_all` count-only fast path, re-routing
+    them through a full binding search — a large, puzzling slowdown with no error to trace.
+
+    Unvalidated since the policy was introduced; the gap matters more now that `LEGACY` is
+    gone, because `binding_policy="legacy"` and a net-level `binding_policy=None` are the two
+    things a net migrating off it is most likely to try.
+    """
+
+    def _transition(self, policy):
+        return Transition(
+            name="t",
+            inputs=[InputArc("input")],
+            outputs=[OutputArc("output")],
+            action=lambda toks: toks,
+            binding_policy=policy,
+        )
+
+    @pytest.mark.parametrize("bad", ["legacy", "first", 0, 1, True, object()], ids=type)
+    def test_a_non_policy_is_rejected_on_a_transition(self, bad):
+        with pytest.raises(TypeError, match="must be a BindingPolicy"):
+            self._transition(bad)
+
+    @pytest.mark.parametrize("bad", ["legacy", "first", 0, object()], ids=type)
+    def test_a_non_policy_is_rejected_on_a_net(self, bad):
+        with pytest.raises(TypeError, match="must be a BindingPolicy"):
+            PetriNet(binding_policy=bad)
+        net = PetriNet()
+        with pytest.raises(TypeError, match="must be a BindingPolicy"):
+            net.binding_policy = bad
+
+    def test_none_still_means_inherit_on_a_transition(self):
+        """`None` is the documented "inherit the net default" on a transition, so it stays legal."""
+        assert self._transition(None).binding_policy is None
+
+    def test_none_is_rejected_on_a_net(self):
+        """A net *is* the default — there is nothing above it to inherit, so `None` is a mistake."""
+        with pytest.raises(TypeError, match="no default to inherit"):
+            PetriNet(binding_policy=None)
+        net = PetriNet()
+        with pytest.raises(TypeError, match="no default to inherit"):
+            net.binding_policy = None
+
+    def test_every_real_policy_is_accepted(self):
+        for policy in BindingPolicy:
+            assert PetriNet(binding_policy=policy).binding_policy is policy
+            assert self._transition(policy).binding_policy is policy
+
+    def test_a_rejected_net_assignment_does_not_block_the_net(self):
+        """Validation runs before the lock, so a bad value cannot hold it or half-apply."""
+        net = PetriNet()
+        with pytest.raises(TypeError):
+            net.binding_policy = "legacy"
+        with net._lock:  # would block if the failed setter had kept it
+            pass
+        assert net.binding_policy is BindingPolicy.FIRST
+
+    def test_a_guard_free_transition_keeps_its_fast_path(self):
+        """The regression this guards: a valid net still resolves head-only."""
+        net = PetriNet(places=[Place("in"), Place("out")])
+        t = Transition(name="t", inputs=[InputArc("in")], outputs=[OutputArc("out")], action=lambda toks: toks)
+        net.add_transition(t)
+        assert PetriNet._is_head_only(t, net._effective_policy(t)) is True
+
+
 class TestDeprecationWarningCategorySurvives:
     """`CpnxDeprecationWarning` outlives `LEGACY`: it is the project's deprecation category.
 

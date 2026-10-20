@@ -30,6 +30,7 @@ from cpnx.transitions import (
     OutputArc,
     SubstitutionTransition,
     Transition,
+    _reject_non_binding_policy,
 )
 from cpnx.visualization import snapshot, to_dot
 
@@ -432,7 +433,10 @@ class PetriNet:
                          Defaults to `BindingPolicy.FIRST` (deterministic-complete
                          binding search, which resolves head-only and search-free for a
                          guard-free transition). A transition may override this via its
-                         own `binding_policy`.
+                         own `binding_policy`. Must be a `BindingPolicy` member —
+                         unlike `Transition(binding_policy=None)`, `None` is rejected
+                         here, because a net *is* the default and has nothing to inherit
+                         from.
 
                          The default was the head-only `BindingPolicy.LEGACY` through
                          0.5.0. 0.6.0 made `FIRST` the default and kept `LEGACY` as a
@@ -494,7 +498,8 @@ class PetriNet:
                 infinite. A `retry_policy` validates its own fields — see
                 [`RetryPolicy`][cpnx.RetryPolicy].
             TypeError: If `retry_delay` is not a number, `retry_policy` is not a
-                `RetryPolicy`, or `retry_rng` has no callable `uniform(a, b)`.
+                `RetryPolicy`, `retry_rng` has no callable `uniform(a, b)`, or
+                `binding_policy` is not a `BindingPolicy` (including `None`).
         """
         #: Created first: the `retry_policy`/`retry_delay` setters below take it, and
         #: `_init_retry` goes through them.
@@ -507,7 +512,9 @@ class PetriNet:
         self._init_retry(retry_delay, retry_policy, retry_rng, seed)
         #: Backing field for the `binding_policy` property. Set directly here (the property
         #: setter recomputes `_has_search_policy_transition`, which needs `self.transitions`
-        #: to already exist — it does not yet at this point in construction).
+        #: to already exist — it does not yet at this point in construction), so the setter's
+        #: validation is applied explicitly first.
+        _reject_non_binding_policy(binding_policy, name="PetriNet(binding_policy=...)", allow_none=False)
         self._binding_policy = binding_policy
         if binding_search_limit < 1:
             raise ValueError(f"binding_search_limit must be >= 1, got {binding_search_limit}.")
@@ -682,6 +689,10 @@ class PetriNet:
 
     @binding_policy.setter
     def binding_policy(self, value: BindingPolicy) -> None:
+        # Validated *before* the lock, so a rejected value cannot leave `_binding_policy`
+        # reassigned while `_has_search_policy_transition` and `_scheduler_ready` still
+        # describe the old one — the same ordering the retry setters use.
+        _reject_non_binding_policy(value, name="PetriNet.binding_policy", allow_none=False)
         with self._lock:
             self._binding_policy = value
             # A new default can flip any policy-unset transition's *effective* policy in either
@@ -1948,8 +1959,9 @@ class PetriNet:
             - `None` if it qualifies but is not currently enabled.
 
         **Why this is safe.** The only things that read an arc's tokens between resolution and
-        firing are a transition `guard` and a `binding_priority_key` (see `_head_binding` /
-        `_min_key_pick`). A transition with neither, resolved head-only, inspects no token
+        firing are a transition `guard` and a `binding_priority_key` (see
+        `_iter_satisfying_bindings` / `_min_key_pick`). A transition with neither, resolved
+        head-only, inspects no token
         before it fires and draws **no RNG** while resolving — so deferring a `consume_all`
         arc's whole-pool read to consume time is behaviour-identical, and in particular cannot
         perturb the seeded RNG stream that `test_seeded_determinism` pins. Non-`consume_all`
@@ -2078,16 +2090,29 @@ class PetriNet:
         return next(self._iter_satisfying_bindings(transition, pools), None) is not None
 
     def _head_binding(self, transition: Transition, pools: list[tuple[InputArc, list[Token]]]) -> _Binding | None:
-        """Build the head binding (first `count` per arc) and accept it only if the guard holds."""
+        """Build the head binding: the first `count` tokens per arc, in the arc's own order.
+
+        Both callers reach this only through `_is_head_only`, which is now exactly
+        "`FIRST` and no guard" — `BindingPolicy.LEGACY`, removed in 0.7.0, was the one policy
+        that routed a *guarded* transition here. So the guard is `None` on every real call, and
+        flattening the binding to check it would allocate a throwaway `list[Token]` on every
+        guard-free resolution and every enabledness probe, for a check that cannot fail.
+
+        The check is kept rather than deleted, because "the caller guarantees no guard" is a
+        precondition no signature enforces: a future call site added without the
+        `_is_head_only` gate would otherwise fire a guarded transition on its head without
+        consulting the guard. Guarding the *guard* on `transition.guard is not None` keeps that
+        safety while paying nothing on the hot path.
+        """
         binding: _Binding = []
         for arc, available in pools:
             tokens = self._resolve_input_tokens(arc, available, transition_name=transition.name)
             if tokens is None:
                 return None
             binding.append((arc, tokens))
-        if self._check_transition_guard(transition, _flatten_binding(binding)):
-            return binding
-        return None
+        if transition.guard is not None and not self._check_transition_guard(transition, _flatten_binding(binding)):
+            return None
+        return binding
 
     def _iter_satisfying_bindings(
         self, transition: Transition, pools: list[tuple[InputArc, list[Token]]]

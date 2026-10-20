@@ -41,6 +41,41 @@ class CpnxDeprecationWarning(UserWarning):
     """
 
 
+def _reject_non_binding_policy(value, *, name: str, allow_none: bool) -> None:
+    """Reject a `binding_policy` that is not a [`BindingPolicy`][cpnx.BindingPolicy].
+
+    Checked at assignment because a wrong value is otherwise *silently* degrading rather than
+    loud. Nothing downstream re-validates it: `_effective_policy` returns whatever it holds,
+    and `PetriNet._is_head_only` tests `policy is BindingPolicy.FIRST`, which simply comes back
+    `False` for anything else. So a typo'd string or a `None` net default drops every
+    guard-free transition in the net off the O(1) head resolution *and* ADR 0005's
+    `consume_all` count-only fast path, re-routing them through a full binding search that can
+    fire `on_binding_search_exhausted` on a deep place — a large, puzzling slowdown with no
+    error to trace it to.
+
+    `None` is legal on a `Transition` (it means "inherit the net default") but not on a
+    `PetriNet`, which *is* the default and so must name a real policy. That asymmetry is the
+    reason for `allow_none`: `PetriNet(binding_policy=None)` reads as "inherit" by analogy with
+    `Transition(binding_policy=None)` and `PetriNet(retry_policy=None)`, but there is nothing
+    above a net to inherit from.
+
+    Args:
+        value: The value being assigned.
+        name: Field name, used in the error message.
+        allow_none: Whether `None` is a legal value here.
+    """
+    if value is None and allow_none:
+        return
+    if isinstance(value, BindingPolicy):
+        return
+    hint = (
+        " Pass a BindingPolicy member (e.g. BindingPolicy.FIRST), or None to inherit the net default."
+        if allow_none
+        else " Pass a BindingPolicy member (e.g. BindingPolicy.FIRST); a net has no default to inherit."
+    )
+    raise TypeError(f"{name} must be a BindingPolicy, got {type(value).__name__}: {value!r}.{hint}")
+
+
 def _reject_non_callable_priority_key(value) -> None:
     """Reject a `binding_priority_key` that is not callable.
 
@@ -611,6 +646,8 @@ class Transition:
             _reject_non_callable_priority_key(value)
             verify_callable_purity(value)
             lint_and_warn(value, "binding_priority_key")
+        elif name == "binding_policy":
+            _reject_non_binding_policy(value, name="Transition.binding_policy", allow_none=True)
         elif name == "retry_policy":
             _reject_non_retry_policy(value)
         elif name == "impacts_colors":
