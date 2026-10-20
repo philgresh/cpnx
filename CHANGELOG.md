@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.7.0] — 2026-10-19
-
 ### Removed
 
 - **`BindingPolicy.LEGACY` is removed — ADR 0001 Phase 4.** The head-only check that evaluated a guard once against the leading `count` tokens of each input place is gone: the enum member, the `_is_head_only` branch that routed it to the O(1) head resolution, and the `CpnxDeprecationWarning` that announced its removal. It was the net-wide default through 0.5.0; 0.6.0 flipped the default to [`BindingPolicy.FIRST`][cpnx.BindingPolicy] and kept `LEGACY` selectable for exactly one release as a warning-emitting opt-out, which is the deprecation cycle ADR 0001 step 2 asked for. That window has now closed, so `BindingPolicy.LEGACY` raises `AttributeError` and `BindingPolicy("legacy")` raises `ValueError`.

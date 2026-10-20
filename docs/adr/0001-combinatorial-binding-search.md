@@ -1,10 +1,12 @@
 # ADR 0001 — Combinatorial Binding Search with Deterministic-Complete Default
 
-- **Status:** Accepted; **complete** — amended by Phases 3–4 (see "Deviation from step 2").
-  Phase 1 shipped in 0.3.1 (`BindingPolicy.FIRST`); Phase 2 shipped in
+- **Status:** Accepted; **all phases merged** — amended by Phases 3–4 (see "Deviation from
+  step 2"). Phase 1 shipped in 0.3.1 (`BindingPolicy.FIRST`); Phase 2 shipped in
   0.3.2 (`BindingPolicy.RANDOM`/`PRIORITY`, `PetriNet(seed=...)`); Phase 3 shipped in
   0.6.0 via [#53](https://github.com/philgresh/cpnx/pull/53) (`FIRST` becomes the default,
-  `LEGACY` retained as a deprecated opt-out); Phase 4 shipped in 0.7.0 (`LEGACY` removed)
+  `LEGACY` retained as a deprecated opt-out); Phase 4 merged in
+  [#56](https://github.com/philgresh/cpnx/pull/56) (`LEGACY` removed) — unreleased, targeted
+  at 0.7.0
 - **Date:** 2026-07-02
 - **Deciders:** cpnx maintainers
 - **Related:** `docs/cpn-theory-audit.md` (Findings 1–3, §0 positioning)
@@ -141,8 +143,9 @@ head-of-line fix this ADR exists to deliver. Guard-free transitions are unaffect
 `_is_head_only` still routes them to the same O(1) head resolution, so the no-guard fast path
 (and ADR 0005's count-only path) is unchanged.
 
-**Phase 4 — shipped in 0.7.0:** `BindingPolicy.LEGACY` is removed. One release after the
-flip, per step 2's deprecation cycle. At that point `FIRST` is a strict superset of everything
+**Phase 4 — merged in [#56](https://github.com/philgresh/cpnx/pull/56), unreleased (targeted
+at 0.7.0):** `BindingPolicy.LEGACY` is removed. One release after the flip, per step 2's
+deprecation cycle. At that point `FIRST` is a strict superset of everything
 `LEGACY` offered — identical head selection whenever the head satisfies the guard, plus the
 head-of-line fix when it does not — so there is deliberately **no replacement** for head-only
 resolution *with* a guard; the incompleteness was the only thing `LEGACY` uniquely provided,
