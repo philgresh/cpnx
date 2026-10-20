@@ -15,13 +15,16 @@ built as a runtime string and never appears as a literal in this file — the pa
 """
 
 import ast
+import builtins
 import importlib.util
 import sys
 
 import pytest
 
-from cpnx.certification import _Certifier, _check_structural, certify
+from cpnx.certification import _Certifier, _check_structural, _is_immutable, certify
+from cpnx.linting import lint_callable
 from cpnx.sandbox import verify_callable_purity
+from cpnx.tokens import FrozenDict
 
 _PY314 = sys.version_info >= (3, 14)
 _PY315 = sys.version_info >= (3, 15)
@@ -123,11 +126,47 @@ def test_unpacking_comprehension_stays_bounded_by_the_argument():
 
 
 @pytest.mark.skipif(not _PY315, reason="PEP 798 comprehension unpacking is 3.15+ syntax")
-def test_unpacking_comprehension_over_a_global_is_still_rejected():
-    # Unpacking must not become a way to iterate something the engine did not build.
+def test_unpacking_comprehension_over_a_global_in_the_iter_position_is_rejected():
+    # The ordinary bound, unaffected by the unpacking: the `for` clause still has to iterate
+    # something the engine built.
     verdict = _comprehension_verdict("[*t.value for t in _ELSEWHERE]", frozenset({"tokens"}))
     assert verdict.certified is False
     assert "not bounded" in verdict.reason
+
+
+@pytest.mark.skipif(not _PY315, reason="PEP 798 comprehension unpacking is 3.15+ syntax")
+@pytest.mark.parametrize(
+    "source",
+    [
+        "[*_ELSEWHERE for t in tokens]",
+        "{*_ELSEWHERE for t in tokens}",
+        "{**_ELSEWHERE for t in tokens}",
+        "(*_ELSEWHERE for t in tokens)",
+        "[*local_list for t in tokens]",
+    ],
+)
+def test_unpacked_expression_is_bounds_checked_like_an_iter_clause(source):
+    # The position that actually needed closing. `[*xs for t in ts]` iterates `xs` just as
+    # `for x in xs` would, but the AST puts it in `elt`/`key` rather than `generators`, so
+    # before this check it was admitted unchecked: unpacking became a way to iterate a module
+    # global or a function local that the equivalent `for` clause is rejected for.
+    verdict = _comprehension_verdict(source, frozenset({"tokens"}))
+    assert verdict.certified is False
+    assert "not bounded" in verdict.reason
+
+
+@pytest.mark.skipif(not _PY315, reason="PEP 798 comprehension unpacking is 3.15+ syntax")
+def test_chained_local_unpacking_cannot_amplify_iteration(tmp_path):
+    # Why the above matters beyond tidiness. Each line multiplies the result by len(toks), so
+    # k lines iterate O(len(toks) ** (k + 1)) — inline, under the engine lock, with no timeout.
+    # The pre-3.15 spelling of the same amplification (`for x in s1`) was already rejected.
+    guard = _load_guard(
+        tmp_path,
+        "grammar_chained_unpack",
+        "def guard(toks):\n    s1 = [*toks for _ in toks]\n    s2 = [*s1 for _ in toks]\n    return len(s2) > 0\n",
+        "guard",
+    )
+    assert certify(guard).certified is False
 
 
 @pytest.mark.skipif(not _PY315, reason="PEP 798 comprehension unpacking is 3.15+ syntax")
@@ -180,6 +219,84 @@ def test_lazy_import_is_rejected_despite_the_new_is_lazy_field():
         assert verdict.reason == "import"
 
 
+def _lazy_guard_module(tmp_path, module_name, *, lazy):
+    """Write a guard module whose imports are deferred (``lazy=True``) or eager, and load it.
+
+    The eager build is the control: a deferred import must give a callable the *same* verdict
+    and the same lint findings as an ordinary one, because it names the same objects.
+    """
+    (tmp_path / "lazy_helpers.py").write_text(
+        "MAX_BATCH = 10\n\n\ndef helper(n):\n    return n > 0\n", encoding="utf-8"
+    )
+    source = (
+        "lazy import sqlite3\n"
+        "lazy from lazy_helpers import helper, MAX_BATCH\n"
+        "\n\n"
+        "def guard_hazard(tokens):\n"
+        "    return sqlite3.connect(':memory:') is not None\n"
+        "\n\n"
+        "def guard_helper(tokens):\n"
+        "    return helper(len(tokens))\n"
+        "\n\n"
+        "def guard_const(tokens):\n"
+        "    return len(tokens) < MAX_BATCH\n"
+    )
+    if not lazy:
+        source = source.replace("lazy ", "")
+    path = tmp_path / f"{module_name}.py"
+    path.write_text(source, encoding="utf-8")
+    sys.path.insert(0, str(tmp_path))
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        del sys.modules[module_name]
+        sys.path.remove(str(tmp_path))
+
+
+@pytest.mark.skipif(not _PY315, reason="PEP 810 lazy imports are 3.15+ syntax")
+def test_lazy_imported_hazard_is_still_linted(tmp_path):
+    # A deferred import leaves a proxy in __globals__ that resolves to no package, so the
+    # linter's "resolve the symbol to its defining package" strategy silently missed every
+    # hazard reached this way — `lazy import sqlite3` hid a `sqlite3.connect` in a guard.
+    lazy_mod = _lazy_guard_module(tmp_path, "lazy_hazard_mod", lazy=True)
+    eager_mod = _lazy_guard_module(tmp_path, "eager_hazard_mod", lazy=False)
+    lazy_findings = [(f.category, f.symbol) for f in lint_callable(lazy_mod.guard_hazard)]
+    eager_findings = [(f.category, f.symbol) for f in lint_callable(eager_mod.guard_hazard)]
+    assert lazy_findings == eager_findings
+    assert ("database", "sqlite3.connect") in lazy_findings
+
+
+@pytest.mark.skipif(not _PY315, reason="PEP 810 lazy imports are 3.15+ syntax")
+def test_lazy_imported_helper_and_constant_still_certify(tmp_path):
+    # The proxy is not a function and not an immutable leaf, so before resolution the certifier
+    # rejected both ("call to non-function", "reads mutable/uncertified external") and dropped
+    # the callable off the inline path for using a language feature that changes nothing.
+    lazy_mod = _lazy_guard_module(tmp_path, "lazy_ok_mod", lazy=True)
+    eager_mod = _lazy_guard_module(tmp_path, "eager_ok_mod", lazy=False)
+    for name in ("guard_helper", "guard_const"):
+        lazy_verdict = certify(getattr(lazy_mod, name))
+        eager_verdict = certify(getattr(eager_mod, name))
+        assert lazy_verdict.certified is eager_verdict.certified, name
+        assert lazy_verdict.certified is True, f"{name}: {lazy_verdict.reason}"
+
+
+@pytest.mark.skipif(not _PY315, reason="PEP 810 lazy imports are 3.15+ syntax")
+def test_certification_of_a_lazy_import_does_not_depend_on_call_order(tmp_path):
+    # The worst of the three symptoms: invoking the guard resolved the proxy via LOAD_GLOBAL,
+    # so an identical callable certified differently depending on whether anything had called
+    # it yet. A safety verdict must not be a function of unrelated history.
+    module = _lazy_guard_module(tmp_path, "lazy_order_mod", lazy=True)
+    before = certify(module.guard_const)
+    module.guard_const([1, 2])
+    after = certify(module.guard_const)
+    assert before.certified == after.certified
+    assert before.certified is True
+
+
 @pytest.mark.skipif(not _PY315, reason="PEP 810 lazy imports are 3.15+ syntax")
 def test_module_level_lazy_import_does_not_disturb_a_guard_in_the_same_file(tmp_path):
     # PEP 810 permits `lazy` only at module scope, so a lazy import can never appear
@@ -191,4 +308,66 @@ def test_module_level_lazy_import_does_not_disturb_a_guard_in_the_same_file(tmp_
         "lazy import json\n\n\ndef guard(tokens):\n    return len(tokens) > 0\n",
         "guard",
     )
+    assert certify(guard).certified is True
+
+
+# --------------------------------------------------------------------------
+# PEP 814 — frozendict (Python 3.15), alongside cpnx's own FrozenDict
+# --------------------------------------------------------------------------
+
+
+class _HashableButMutable:
+    """Hashable, so a frozen mapping accepts it; mutable, so closing over it is not safe."""
+
+    def __init__(self) -> None:
+        self.items: list[int] = []
+
+    def __hash__(self) -> int:
+        return 1
+
+
+def _frozen_mapping_types():
+    types_ = [FrozenDict]
+    if _PY315:
+        types_.append(builtins.frozendict)
+    return types_
+
+
+@pytest.mark.parametrize("frozen", _frozen_mapping_types())
+def test_a_frozen_lookup_table_of_scalars_is_closable(frozen):
+    # The arc/transition docs tell consumers to certify a callable by closing over immutable
+    # data read at construction time; a frozen mapping is the obvious way to write a lookup
+    # table, and rejecting it pushed them off the inline path (and arcs off the key index)
+    # for following that advice.
+    assert _is_immutable(frozen({"gold": 1, "silver": 2})) is True
+    assert _is_immutable(frozen({})) is True
+
+
+@pytest.mark.parametrize("frozen", _frozen_mapping_types())
+def test_a_frozen_mapping_holding_mutable_state_is_still_rejected(frozen):
+    # Being frozen is not being deeply immutable, so neither type is trusted blanketly:
+    # `frozendict` is shallow by design, and `FrozenDict` admits any *hashable* value even
+    # though it freezes nested dicts and lists. Both must fail on a live object.
+    assert _is_immutable(frozen({"k": _HashableButMutable()})) is False
+    assert _is_immutable(frozen({_HashableButMutable(): 1})) is False
+
+
+@pytest.mark.skipif(not _PY315, reason="PEP 814 frozendict is a 3.15+ builtin")
+def test_builtin_frozendict_shallowness_is_detected():
+    # The concrete difference from FrozenDict: `frozendict` does not freeze what it holds, so
+    # this one still owns a live dict that a guard could observe changing between firings.
+    shallow = builtins.frozendict({"a": {"b": 1}})
+    assert isinstance(shallow["a"], dict)
+    assert _is_immutable(shallow) is False
+    # FrozenDict freezes the same nesting on the way in, so it stays closable.
+    assert _is_immutable(FrozenDict({"a": {"b": 1}})) is True
+
+
+@pytest.mark.parametrize("frozen", _frozen_mapping_types())
+def test_guard_closing_over_a_frozen_lookup_table_certifies(frozen):
+    table = frozen({"gold": 1})
+
+    def guard(tokens):
+        return table.get("gold", 99) > 0
+
     assert certify(guard).certified is True
