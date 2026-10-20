@@ -198,15 +198,29 @@ rather than indicating a discrepancy.
 | 3.15.0b4 | 891 passed, 48 warnings | clean | clean | A (3.709) |
 | 3.15.0b4 free-threaded | 891 passed, 48 warnings | clean | clean | A (3.709) |
 
-### Caveat on the 3.15 interpreter
+### Confirmed on the real 3.15.0 in CI
 
-`3.15.0b4` is dated Jul 2026; `3.15.0` final is Oct 2026. Beta 4 is past feature freeze, so
-the grammar and `ast` surface should match the final release — but it is demonstrably *not*
-identical in behaviour, since it fails to enforce PEP 810's module-scope restriction (§2.3).
-`uv 0.11.32`'s download index does not yet list 3.15.0 final. **CI's `actions/setup-python`
-gets the real 3.15.0, and that remains the authoritative signal**; the local run is strong
-evidence, not proof. This is exactly why 3.15 enters the matrix as the `experimental` entry
-rather than as a support claim.
+The local 3.15 runs above used `3.15.0b4`, the newest interpreter `uv 0.11.32`'s download
+index offers. That was strong evidence rather than proof, and deliberately so: b4 is past
+feature freeze, but it is demonstrably *not* behaviourally identical to the release, since it
+fails to enforce PEP 810's module-scope restriction (§2.3).
+
+CI closes that gap. `actions/setup-python@v5` resolves `python-version: "3.15"` to the newest
+**stable** entry in its version manifest, which is **3.15.0 final** (`"3.14"` likewise
+resolves to 3.14.8 — newer than the 3.14.6 tested locally). On that interpreter the suite
+reports **891 passed, 48 warnings**, identical to the local b4 run and with the same eight
+`CpnxLintWarning` call sites, and `ruff` and the radon gate are clean.
+
+Worth knowing when reading CI for this matrix: the 3.15 job runs under `continue-on-error`,
+which reports a **failing** pytest step as `conclusion: success`. The job's conclusion field
+therefore cannot be used to judge the experimental entry — the step's log has to be read for
+the actual pytest summary line. The result above is from the log, not the conclusion.
+
+3.15 stays the `experimental` entry despite being green on the real release: the point of
+that slot is that a *future* 3.15.x patch release regressing cpnx should not block an
+unrelated PR, and 3.15 has had one patch release's worth of field exposure. Promote it to
+blocking on the same reasoning that promoted 3.14 — once it has been stable long enough that
+silent failures are the bigger risk.
 
 ### Reproducing
 
