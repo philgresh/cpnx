@@ -1,6 +1,5 @@
 """Tests for BindingPolicy — the binding search that fixes head-of-line blocking."""
 
-import inspect
 import os
 import time
 import warnings
@@ -18,10 +17,6 @@ from cpnx.transitions import (
     OutputArc,
     Transition,
 )
-
-#: Selecting the deprecated `LEGACY` policy warns by design. Tests that exercise what it
-#: *does* silence that here; the warning itself is asserted in `TestLegacyDeprecationWarning`.
-_SILENCE_LEGACY = pytest.mark.filterwarnings("ignore::cpnx.CpnxDeprecationWarning")
 
 
 def _fire_once(net):
@@ -80,81 +75,55 @@ class TestHeadOfLineFix:
         """The net-wide default is FIRST, exposed on the `binding_policy` property."""
         assert PetriNet().binding_policy is BindingPolicy.FIRST
 
-    @_SILENCE_LEGACY
-    def test_explicit_legacy_still_opts_out_of_the_fix(self):
-        """`LEGACY` survives one release as the opt-out, and still blocks head-of-line.
 
-        ADR 0001 step 2 asked for the default flip and the removal to land a deprecation
-        cycle apart, so 0.6.0 flips the default to `FIRST` while `LEGACY` keeps its exact
-        pre-0.6.0 semantics for anyone who needs a release to migrate. Removal is Phase 4.
-        """
-        net = self._build(BindingPolicy.LEGACY)
-        net.run(deadline=time.monotonic() + 0.3)
+class TestLegacyIsRemoved:
+    """`BindingPolicy.LEGACY` is gone in 0.7.0 — ADR 0001 Phase 4.
 
-        assert len(net.places["output"].tokens) == 0
-        assert {t.payload["sym"] for t in net.places["input"].tokens} == {"AAPL", "MSFT"}
+    It was the default through 0.5.0, became a warning-emitting opt-out in 0.6.0, and is
+    removed here. `FIRST` is a strict superset, so there is deliberately no replacement for
+    head-only resolution *with* a guard: that incompleteness was the head-of-line bug.
+    """
 
-    @_SILENCE_LEGACY
-    def test_net_wide_legacy_opt_out_covers_unset_transitions(self):
-        """The *net-level* opt-out works — the form the migration notes actually recommend.
+    def test_the_enum_member_no_longer_exists(self):
+        assert not hasattr(BindingPolicy, "LEGACY")
+        assert {p.name for p in BindingPolicy} == {"FIRST", "RANDOM", "PRIORITY"}
 
-        `PetriNet(binding_policy=LEGACY)` with transitions left on `binding_policy=None` is
-        how an existing net defers the flip in one line, so it is pinned separately from the
-        per-transition opt-out above: the guarded transition inherits `LEGACY` and stays
-        head-only.
-        """
-        net = PetriNet(
-            places=[Place("input"), Place("output")],
-            binding_policy=BindingPolicy.LEGACY,
-            transitions=[
+    def test_the_old_value_is_not_revivable_by_string(self):
+        """`BindingPolicy("legacy")` must fail too, not resurrect it through the value."""
+        with pytest.raises(ValueError, match="legacy"):
+            BindingPolicy("legacy")
+
+    def test_a_net_can_no_longer_select_it(self):
+        with pytest.raises(AttributeError):
+            PetriNet(binding_policy=BindingPolicy.LEGACY)  # type: ignore[attr-defined]
+
+    def test_nothing_warns_on_the_surviving_policies(self):
+        """The deprecation warning went with it: no policy emits one now."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", CpnxDeprecationWarning)
+            for policy in (None, BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY):
                 Transition(
                     name="t",
                     inputs=[InputArc("input")],
                     outputs=[OutputArc("output")],
                     action=lambda toks: toks,
-                    guard=lambda toks: toks[0].payload["sym"] == "MSFT",
-                    # No per-transition policy: inherits the net-wide LEGACY opt-out.
+                    binding_policy=policy,
                 )
-            ],
-        )
-        for sym in ("AAPL", "MSFT"):
-            net.deposit("input", Token(payload={"sym": sym}))
-        net.run(deadline=time.monotonic() + 0.3)
-
-        assert len(net.places["output"].tokens) == 0
-        assert {t.payload["sym"] for t in net.places["input"].tokens} == {"AAPL", "MSFT"}
-
-    @_SILENCE_LEGACY
-    def test_transition_can_opt_back_in_under_a_legacy_net(self):
-        """A transition may take `FIRST` back even while the net default is the LEGACY opt-out."""
-        net = PetriNet(
-            places=[Place("input"), Place("output")],
-            binding_policy=BindingPolicy.LEGACY,
-            transitions=[
-                Transition(
-                    name="t",
-                    inputs=[InputArc("input")],
-                    outputs=[OutputArc("output")],
-                    action=lambda toks: toks,
-                    guard=lambda toks: toks[0].payload["sym"] == "MSFT",
-                    binding_policy=BindingPolicy.FIRST,
-                )
-            ],
-        )
-        for sym in ("AAPL", "MSFT"):
-            net.deposit("input", Token(payload={"sym": sym}))
-        net.run(deadline=time.monotonic() + 2.0)
-
-        assert [t.payload["sym"] for t in net.places["output"].tokens] == ["MSFT"]
-        assert {t.payload["sym"] for t in net.places["input"].tokens} == {"AAPL"}
+                PetriNet() if policy is None else PetriNet(binding_policy=policy)
 
 
-class TestLegacyDeprecationWarning:
-    """`LEGACY` warns at run time wherever it can enter the system.
+class TestBindingPolicyIsValidatedAtAssignment:
+    """A wrong `binding_policy` must be loud, because nothing downstream re-checks it.
 
-    The 0.5.0 deprecation was documentation-only — no runtime signal at all — so these pin
-    that every entry point now warns, and that the warning cannot be swallowed by Python's
-    default filters.
+    `_effective_policy` returns whatever is stored and `_is_head_only` tests
+    `policy is BindingPolicy.FIRST`, which just comes back `False` for anything else. So an
+    unvalidated typo or a `None` net default silently drops every guard-free transition off
+    the O(1) head resolution *and* ADR 0005's `consume_all` count-only fast path, re-routing
+    them through a full binding search — a large, puzzling slowdown with no error to trace.
+
+    Unvalidated since the policy was introduced; the gap matters more now that `LEGACY` is
+    gone, because `binding_policy="legacy"` and a net-level `binding_policy=None` are the two
+    things a net migrating off it is most likely to try.
     """
 
     def _transition(self, policy):
@@ -166,140 +135,82 @@ class TestLegacyDeprecationWarning:
             binding_policy=policy,
         )
 
-    def test_net_constructor_warns(self):
-        with pytest.warns(CpnxDeprecationWarning, match="removed in 0.7.0"):
-            PetriNet(binding_policy=BindingPolicy.LEGACY)
+    @pytest.mark.parametrize("bad", ["legacy", "first", 0, 1, True, object()], ids=type)
+    def test_a_non_policy_is_rejected_on_a_transition(self, bad):
+        with pytest.raises(TypeError, match="must be a BindingPolicy"):
+            self._transition(bad)
 
-    def test_transition_constructor_warns(self):
-        with pytest.warns(CpnxDeprecationWarning, match="removed in 0.7.0"):
-            self._transition(BindingPolicy.LEGACY)
-
-    def test_net_policy_setter_warns(self):
+    @pytest.mark.parametrize("bad", ["legacy", "first", 0, object()], ids=type)
+    def test_a_non_policy_is_rejected_on_a_net(self, bad):
+        with pytest.raises(TypeError, match="must be a BindingPolicy"):
+            PetriNet(binding_policy=bad)
         net = PetriNet()
-        with pytest.warns(CpnxDeprecationWarning):
-            net.binding_policy = BindingPolicy.LEGACY
-        assert net.binding_policy is BindingPolicy.LEGACY  # the assignment still takes effect
+        with pytest.raises(TypeError, match="must be a BindingPolicy"):
+            net.binding_policy = bad
 
-    def test_transition_reassignment_warns(self):
-        transition = self._transition(BindingPolicy.FIRST)
-        with pytest.warns(CpnxDeprecationWarning):
-            transition.binding_policy = BindingPolicy.LEGACY
-        assert transition.binding_policy is BindingPolicy.LEGACY
+    def test_none_still_means_inherit_on_a_transition(self):
+        """`None` is the documented "inherit the net default" on a transition, so it stays legal."""
+        assert self._transition(None).binding_policy is None
 
-    def test_warning_names_the_offending_transition(self):
-        """The message carries the transition name, so a large net says which one to fix."""
-        with pytest.warns(CpnxDeprecationWarning, match=r"Transition\(name='t'\)"):
-            self._transition(BindingPolicy.LEGACY)
-
-    @pytest.mark.parametrize("policy", [None, BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY])
-    def test_undeprecated_policies_are_silent(self, policy):
-        """Only LEGACY warns — above all the default, or every net would warn."""
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", CpnxDeprecationWarning)
-            self._transition(policy)
-            if policy is not None:
-                PetriNet(binding_policy=policy)
-            else:
-                PetriNet()
-
-    @pytest.mark.parametrize(
-        "select",
-        [
-            pytest.param(lambda t: PetriNet(binding_policy=BindingPolicy.LEGACY), id="net-constructor"),
-            pytest.param(lambda t: t(BindingPolicy.LEGACY), id="transition-constructor"),
-            pytest.param(lambda t: setattr(PetriNet(), "binding_policy", BindingPolicy.LEGACY), id="net-setter"),
-            pytest.param(
-                lambda t: setattr(t(BindingPolicy.FIRST), "binding_policy", BindingPolicy.LEGACY),
-                id="transition-reassignment",
-            ),
-        ],
-    )
-    def test_warning_points_at_the_caller(self, select):
-        """Every entry point blames the caller's own line, not a frame inside cpnx.
-
-        The four paths sit at different stack depths — the two constructors go through an
-        extra frame (`PetriNet.__init__`, or the `@dataclass`-generated `Transition.__init__`,
-        which reports as `<string>`) while the two assignments do not. A warning naming
-        `engine.py` or `<string>` tells the user nothing about which line of *their* net to
-        fix. This covers all four entry points by file; the exact *line* is pinned by
-        `test_construction_names_the_exact_line` / `test_reassignment_names_the_exact_line`,
-        which call inline — here the innermost user frame is the parametrised lambda, so the
-        expected line would have to be derived per-param rather than asserted directly.
-        """
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            select(self._transition)
-
-        hits = [w for w in caught if issubclass(w.category, CpnxDeprecationWarning)]
-        assert len(hits) == 1
-        assert hits[0].filename == __file__
-
-    def test_construction_names_the_exact_line(self):
-        """Construction reports the caller's line, not the generated `__init__`'s.
-
-        Pinning the line matters because filename alone passes with a residual off-by-one:
-        the frames in between live in this file too.
-        """
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            expected_lineno = inspect.currentframe().f_lineno + 1
-            PetriNet(binding_policy=BindingPolicy.LEGACY)
-
-        hit = next(w for w in caught if issubclass(w.category, CpnxDeprecationWarning))
-        assert (hit.filename, hit.lineno) == (__file__, expected_lineno)
-
-    def test_reassignment_names_the_exact_line(self):
-        """Post-construction reassignment reports the caller's line, one frame shallower."""
+    def test_none_is_rejected_on_a_net(self):
+        """A net *is* the default — there is nothing above it to inherit, so `None` is a mistake."""
+        with pytest.raises(TypeError, match="no default to inherit"):
+            PetriNet(binding_policy=None)
         net = PetriNet()
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            expected_lineno = inspect.currentframe().f_lineno + 1
-            net.binding_policy = BindingPolicy.LEGACY
+        with pytest.raises(TypeError, match="no default to inherit"):
+            net.binding_policy = None
 
-        hit = next(w for w in caught if issubclass(w.category, CpnxDeprecationWarning))
-        assert (hit.filename, hit.lineno) == (__file__, expected_lineno)
+    def test_every_real_policy_is_accepted(self):
+        for policy in BindingPolicy:
+            assert PetriNet(binding_policy=policy).binding_policy is policy
+            assert self._transition(policy).binding_policy is policy
 
-    def test_warning_reaches_synthetic_caller_frames(self):
-        """User code with no real file — a REPL, a notebook cell, `exec` — still gets a line.
+    def test_a_rejected_net_assignment_does_not_block_the_net(self):
+        """Validation runs before the lock, so a bad value cannot hold it or half-apply."""
+        net = PetriNet()
+        with pytest.raises(TypeError):
+            net.binding_policy = "legacy"
+        with net._lock:  # would block if the failed setter had kept it
+            pass
+        assert net.binding_policy is BindingPolicy.FIRST
 
-        The frame walk has to step over the `@dataclass`-generated `__init__`, which also has
-        a synthetic filename. Rejecting *every* synthetic frame overshot the whole stack and
-        made `warnings` report `sys:1` — no file and no line at all — for anyone driving a net
-        from `python -c`, a REPL or a notebook. Only the generated `__init__` is skipped now.
+    def test_a_guard_free_transition_keeps_its_fast_path(self):
+        """The regression this guards: a valid net still resolves head-only."""
+        net = PetriNet(places=[Place("in"), Place("out")])
+        t = Transition(name="t", inputs=[InputArc("in")], outputs=[OutputArc("out")], action=lambda toks: toks)
+        net.add_transition(t)
+        assert PetriNet._is_head_only(t, net._effective_policy(t)) is True
+
+
+class TestDeprecationWarningCategorySurvives:
+    """`CpnxDeprecationWarning` outlives `LEGACY`: it is the project's deprecation category.
+
+    Nothing emits it today, but its contract is public API — users were told to add
+    `filterwarnings` entries for it — and the next deprecation inherits that contract, so
+    these pin the two properties that made it worth having.
+    """
+
+    def test_category_is_visible_under_default_filters(self):
+        """Not a `DeprecationWarning` subclass, so `ignore::DeprecationWarning` cannot hide it.
+
+        Python's default filters ignore `DeprecationWarning` outside `__main__`, which would
+        make it invisible to exactly the library users it must reach — repeating 0.5.0's
+        silent deprecation. Pinned because it is a deliberate choice, not an oversight.
         """
-        source = "PetriNet(binding_policy=BindingPolicy.LEGACY)"
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            exec(  # noqa: S102 - exercising attribution for exec'd user code is the point
-                compile(source, "<string>", "exec"),
-                {"PetriNet": PetriNet, "BindingPolicy": BindingPolicy},
-            )
-
-        hits = [w for w in caught if issubclass(w.category, CpnxDeprecationWarning)]
-        assert len(hits) == 1
-        assert hits[0].filename == "<string>"  # the caller's synthetic frame, not `sys`
-        assert hits[0].lineno == 1
+        assert issubclass(CpnxDeprecationWarning, UserWarning)
+        assert not issubclass(CpnxDeprecationWarning, DeprecationWarning)
 
     def test_package_root_cannot_swallow_sibling_paths(self):
         """The cpnx-frame test is separator-terminated, so `cpnx_user/` is not read as cpnx.
 
         A bare `startswith` on the package directory also matched any sibling whose name
         merely begins with it, so a user net in `.../cpnx_user/m.py` was walked straight past
-        and the warning landed on *its* caller instead.
+        and a warning landed on *its* caller instead. `_assignment_stacklevel` still backs
+        the lint warnings, so this stays pinned.
         """
         assert _PACKAGE_ROOT.endswith(os.sep)
         sibling = f"{_PACKAGE_ROOT.rstrip(os.sep)}_user{os.sep}m.py"
         assert not sibling.startswith(_PACKAGE_ROOT)
-
-    def test_category_is_visible_under_default_filters(self):
-        """Not a `DeprecationWarning` subclass, so `ignore::DeprecationWarning` cannot hide it.
-
-        Python's default filters ignore `DeprecationWarning` outside `__main__`, which would
-        make this invisible to exactly the library users it must reach — repeating 0.5.0's
-        silent deprecation. Pinned because it is a deliberate choice, not an oversight.
-        """
-        assert issubclass(CpnxDeprecationWarning, UserWarning)
-        assert not issubclass(CpnxDeprecationWarning, DeprecationWarning)
 
 
 class TestDeterminism:
@@ -380,10 +291,9 @@ class TestCountAndMultiArc:
         assert len(out_vs) == 2
         assert sum(out_vs) == 10
 
-    @_SILENCE_LEGACY
     def test_multi_arc_deep_combination(self):
         """Two input places, guard relates one token from each; heads don't match but a
-        deeper combination does. FIRST finds it; the LEGACY opt-out does not."""
+        deeper combination does. FIRST finds it."""
 
         def build(policy):
             net = PetriNet(
@@ -411,10 +321,6 @@ class TestCountAndMultiArc:
         out = first_net.places["output"].tokens
         assert len(out) == 2
         assert out[0].payload["k"] == out[1].payload["k"]
-
-        legacy_net = build(BindingPolicy.LEGACY)
-        legacy_net.run(deadline=time.monotonic() + 0.3)
-        assert len(legacy_net.places["output"].tokens) == 0
 
 
 class TestSearchLimitExhaustion:

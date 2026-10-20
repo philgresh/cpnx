@@ -25,7 +25,6 @@ from datetime import datetime as DatetimeClass
 import pytest
 
 from cpnx import InputArc, OutputArc, Token, Transition, linting
-from cpnx import transitions as transitions_mod
 from cpnx.linting import (
     DATABASE,
     NETWORK,
@@ -282,8 +281,7 @@ def test_lint_warning_points_at_the_caller(trigger):
     frame that reports as ``<string>`` and names no user code at all — so both are pinned
     here by file; the exact line is pinned by ``test_guard_finding_names_the_exact_line`` and
     ``test_guard_reassignment_names_the_exact_line``, which call inline (here the innermost
-    user frame is the parametrised lambda). See ``_assignment_stacklevel`` in
-    ``cpnx.transitions``.
+    user frame is the parametrised lambda). See ``_assignment_stacklevel`` in ``cpnx.linting``.
     """
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -322,15 +320,51 @@ def test_guard_reassignment_names_the_exact_line():
     assert (hit.filename, hit.lineno) == (__file__, expected_lineno)
 
 
+def test_warning_reaches_synthetic_caller_frames():
+    """User code with no real file — a REPL, a notebook cell, ``exec`` — still gets a line.
+
+    ``_is_internal_frame`` steps over the ``@dataclass``-generated ``__init__``, whose filename
+    is synthetic (``<string>``) too. Rejecting *every* synthetic frame overshot the whole stack
+    and made ``warnings`` report ``sys:1`` — no file and no line at all — for anyone driving a
+    net from ``python -c``, a REPL or a notebook. Only the generated ``__init__`` is skipped,
+    told apart by ``co_name``.
+
+    This arrived with the `BindingPolicy.LEGACY` deprecation warning and was pinned through it;
+    it is re-pinned here against a lint finding, because `LEGACY` was removed in 0.7.0 and
+    `lint_and_warn` is now the only caller of `_assignment_stacklevel`.
+    """
+    source = "Transition(name='t', inputs=[InputArc('in')], outputs=[OutputArc('out')], action=a, guard=g)"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        exec(  # noqa: S102 - exercising attribution for exec'd user code is the point
+            compile(source, "<string>", "exec"),
+            {
+                "Transition": Transition,
+                "InputArc": InputArc,
+                "OutputArc": OutputArc,
+                "a": _action,
+                "g": guard_random,
+            },
+        )
+
+    hits = [w for w in caught if issubclass(w.category, CpnxLintWarning)]
+    assert hits, "expected a lint finding"
+    assert hits[0].filename == "<string>"  # the caller's synthetic frame, not `sys`
+    assert hits[0].lineno == 1
+
+
 def test_clean_construction_never_walks_the_stack(monkeypatch):
     """Resolving `stacklevel` is deferred until a warning is actually emitted.
 
     The depth is found by walking frames, which is pure waste when there is nothing to report
     — and *every* guard, key, filter and condition assignment went through it while the
-    `stacklevel` was computed eagerly at the call site. `lint_and_warn` and
-    `_warn_deprecated_policy` now resolve it themselves, after their early returns, so a clean
-    net pays nothing. Pinned because a call site re-adding an eager `stacklevel=` argument
-    would silently undo it.
+    `stacklevel` was computed eagerly at the call site. `lint_and_warn` now resolves it
+    itself, after its early returns, so a clean net pays nothing. Pinned because a call site
+    re-adding an eager `stacklevel=` argument would silently undo it.
+
+    Only the `linting` namespace is patched: `cpnx.transitions` used to bind the name at
+    import for the `BindingPolicy.LEGACY` deprecation notice, which went away with `LEGACY`
+    in 0.7.0, so `lint_and_warn` is now the only caller.
     """
     calls = []
     real = linting._assignment_stacklevel
@@ -339,9 +373,7 @@ def test_clean_construction_never_walks_the_stack(monkeypatch):
         calls.append(1)
         return real()
 
-    # `cpnx.transitions` bound the name at import, so both namespaces need patching.
     monkeypatch.setattr(linting, "_assignment_stacklevel", counting)
-    monkeypatch.setattr(transitions_mod, "_assignment_stacklevel", counting)
 
     Transition(
         name="t",

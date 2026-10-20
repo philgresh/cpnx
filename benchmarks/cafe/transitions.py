@@ -274,9 +274,10 @@ def t_rework_dose(*, work_secs: float = 0.0, dose_low: float, dose_high: float) 
         default flip the completeness is unconditional: a bad dose anywhere in the line
         is reworked on the next check. That is strictly more work per enabling check
         (bounded by `binding_search_limit`) for a strictly earlier rework, and it is the
-        one place in the fixture where the flip is observable. Pinning
-        `binding_policy=BindingPolicy.LEGACY` here would restore the old behaviour for
-        one more release; the fixture deliberately takes the new default instead.
+        one place in the fixture where the flip is observable. The old behaviour is no
+        longer reachable — `LEGACY` was removed in 0.7.0 — and `binding_search_limit=1`
+        is the nearest thing, though it is net-wide and signals
+        `on_binding_search_exhausted` whenever the head fails.
 
     Args:
         work_secs: Physical seconds the station occupies a worker.

@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, Literal
 
 from cpnx.analysis import coerce_color_domain
 from cpnx.certification import is_inline_safe
-from cpnx.linting import _assignment_stacklevel, lint_and_warn
+from cpnx.linting import lint_and_warn
 from cpnx.retries import RetryPolicy
 from cpnx.sandbox import verify_callable_purity
 from cpnx.tokens import Token
@@ -28,38 +28,52 @@ class CpnxDeprecationWarning(UserWarning):
         This deliberately subclasses `UserWarning`, **not** `DeprecationWarning`, so it is
         **visible by default**. Python's default filters ignore `DeprecationWarning` outside
         `__main__`, which would hide it from exactly the library users a deprecation is meant
-        to reach. cpnx has been bitten by a silent deprecation once already: `LEGACY` was
-        announced as deprecated in the 0.5.0 docs with no runtime signal whatsoever, so a net
-        relying on it had nothing to notice short of reading the changelog.
+        to reach. cpnx has been bitten by a silent deprecation once already:
+        `BindingPolicy.LEGACY` was announced as deprecated in the 0.5.0 docs with no runtime
+        signal whatsoever, so a net relying on it had nothing to notice short of reading the
+        changelog. It gained this warning in 0.6.0 and was removed in 0.7.0.
+
+    Note:
+        No cpnx API currently emits this. It is retained as the project's deprecation
+        category — the contract above (its own filterable category, visible by default) is
+        public API that the next deprecation inherits, and removing it would break the
+        `filterwarnings` entries users were told to add.
     """
 
 
-def _warn_deprecated_policy(policy: "BindingPolicy", *, source: str) -> None:
-    """Emit the removal notice when a deprecated [`BindingPolicy`][cpnx.BindingPolicy] is selected.
+def _reject_non_binding_policy(value, *, name: str, allow_none: bool) -> None:
+    """Reject a `binding_policy` that is not a [`BindingPolicy`][cpnx.BindingPolicy].
 
-    Called from every entry point that can put a policy into force — `Transition.__setattr__`,
-    `PetriNet.__init__` and the `PetriNet.binding_policy` setter — so the warning fires wherever
-    `LEGACY` enters the system rather than only at one of them. A no-op for every other policy,
-    so the healthy path really does pay just one identity comparison: the `stacklevel` walk
-    happens *after* that check, never before it.
+    Checked at assignment because a wrong value is otherwise *silently* degrading rather than
+    loud. Nothing downstream re-validates it: `_effective_policy` returns whatever it holds,
+    and `PetriNet._is_head_only` tests `policy is BindingPolicy.FIRST`, which simply comes back
+    `False` for anything else. So a typo'd string or a `None` net default drops every
+    guard-free transition in the net off the O(1) head resolution *and* ADR 0005's
+    `consume_all` count-only fast path, re-routing them through a full binding search that can
+    fire `on_binding_search_exhausted` on a deep place — a large, puzzling slowdown with no
+    error to trace it to.
+
+    `None` is legal on a `Transition` (it means "inherit the net default") but not on a
+    `PetriNet`, which *is* the default and so must name a real policy. That asymmetry is the
+    reason for `allow_none`: `PetriNet(binding_policy=None)` reads as "inherit" by analogy with
+    `Transition(binding_policy=None)` and `PetriNet(retry_policy=None)`, but there is nothing
+    above a net to inherit from.
 
     Args:
-        policy: The policy being selected; only `BindingPolicy.LEGACY` warns.
-        source: How it was selected, named in the message so a net with several transitions
-            says which one (e.g. `"Transition(name='t')"`).
+        value: The value being assigned.
+        name: Field name, used in the error message.
+        allow_none: Whether `None` is a legal value here.
     """
-    if policy is not BindingPolicy.LEGACY:
+    if value is None and allow_none:
         return
-    warnings.warn(
-        f"{source}: BindingPolicy.LEGACY is deprecated and will be removed in 0.7.0. It is no "
-        "longer the default — that is now BindingPolicy.FIRST, with LEGACY kept selectable for "
-        "one release as the opt-out. FIRST is a strict superset (identical head "
-        "selection whenever the head satisfies the guard, plus the head-of-line fix when it "
-        "does not, and no search cost without a guard), so migrate by dropping the argument to "
-        "inherit the FIRST default, or passing binding_policy=BindingPolicy.FIRST explicitly.",
-        CpnxDeprecationWarning,
-        stacklevel=_assignment_stacklevel(),
+    if isinstance(value, BindingPolicy):
+        return
+    hint = (
+        " Pass a BindingPolicy member (e.g. BindingPolicy.FIRST), or None to inherit the net default."
+        if allow_none
+        else " Pass a BindingPolicy member (e.g. BindingPolicy.FIRST); a net has no default to inherit."
     )
+    raise TypeError(f"{name} must be a BindingPolicy, got {type(value).__name__}: {value!r}.{hint}")
 
 
 def _reject_non_callable_priority_key(value) -> None:
@@ -184,21 +198,6 @@ class BindingPolicy(enum.Enum):
             This is the default. When the transition has no guard, the first
             candidate is the head and trivially satisfies, so resolution reduces to the
             O(1) head selection and incurs no search cost.
-        LEGACY: Test only the first `count` tokens of each input place (FIFO, or the
-            leading tokens of the [`InputArc.key`][cpnx.InputArc] ordering) and evaluate
-            the guard once against that single candidate set. Reproducible, but subject to
-            head-of-line blocking.
-
-            **Deprecated — selecting it warns at run time
-            ([`CpnxDeprecationWarning`][cpnx.CpnxDeprecationWarning]) and it will be
-            removed in 0.7.0.** It was the default through 0.5.0; the default is now
-            `FIRST`, with `LEGACY` kept selectable for one release as the opt-out, so a net
-            that relied on head-only resolution has a cycle in which to migrate (ADR 0001
-            Phases 3–4). `FIRST` is a strict superset — identical head selection whenever
-            the head already satisfies the guard, plus the head-of-line fix when it doesn't,
-            and no search cost at all without a guard — so there is no remaining reason to
-            choose `LEGACY`. Migrate by deleting the argument to inherit the `FIRST` default,
-            or passing `binding_policy=BindingPolicy.FIRST` explicitly.
         RANDOM: Enumerate the satisfying combinations and select one **uniformly at
             random**. Reproducible when the owning [`PetriNet`][cpnx.PetriNet] is
             constructed with a `seed` (and `max_workers=1`); otherwise it varies run to
@@ -222,9 +221,8 @@ class BindingPolicy(enum.Enum):
           permutations. List resource arcs **before** data arcs in `Transition.inputs` so the
           data dimension (the one that actually changes the guard result) varies first, and/or
           raise `binding_search_limit`.
-        - For `FIRST` the first binding yielded is exactly `LEGACY`'s head selection, so
-          `FIRST` is a strict superset of `LEGACY` and a guard the head already satisfies
-          costs no search at all.
+        - For `FIRST` the first binding yielded is the head selection, so a guard the head
+          already satisfies costs no search at all.
         - `RANDOM`/`PRIORITY` must scan the whole (bounded) candidate set, so they do not
           short-circuit and are typically costlier than `FIRST`. If the candidate space
           exceeds `binding_search_limit`, they select over the first `limit` candidates only
@@ -234,7 +232,6 @@ class BindingPolicy(enum.Enum):
     """
 
     FIRST = "first"
-    LEGACY = "legacy"
     RANDOM = "random"
     PRIORITY = "priority"
 
@@ -569,9 +566,7 @@ class Transition:
                resolves head-only for a guard-free transition and searches only when a guard
                is present. Set `BindingPolicy.RANDOM` or `BindingPolicy.PRIORITY` to select
                *among* the satisfying bindings rather than taking the first, for this
-               transition only. Setting the deprecated `BindingPolicy.LEGACY` warns
-               ([`CpnxDeprecationWarning`][cpnx.CpnxDeprecationWarning]) and stops working in
-               0.7.0.
+               transition only.
         binding_priority_key: Sort key used only under `BindingPolicy.PRIORITY`. A pure
                `Callable[[list[Token]], object]` (must be callable or `None` — string
                expressions are not supported and raise `TypeError` at assignment) mapping a
@@ -651,13 +646,8 @@ class Transition:
             _reject_non_callable_priority_key(value)
             verify_callable_purity(value)
             lint_and_warn(value, "binding_priority_key")
-        elif name == "binding_policy" and value is not None:
-            # Warns only for a deprecated policy, and from both paths into this method: the
-            # generated dataclass ``__init__`` as well as post-construction reassignment.
-            # ``name`` is declared before ``binding_policy`` so it is already assigned, but
-            # read it defensively so a field reorder degrades the message rather than raising.
-            owner = getattr(self, "name", "<unnamed>")
-            _warn_deprecated_policy(value, source=f"Transition(name={owner!r})")
+        elif name == "binding_policy":
+            _reject_non_binding_policy(value, name="Transition.binding_policy", allow_none=True)
         elif name == "retry_policy":
             _reject_non_retry_policy(value)
         elif name == "impacts_colors":
