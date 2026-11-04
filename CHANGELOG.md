@@ -67,6 +67,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the new features assessed and declined:
   [`docs/python-version-support.md`](https://github.com/philgresh/cpnx/blob/main/docs/python-version-support.md).
 
+### Fixed
+
+- **A backlog of matured timed tokens no longer makes every logical-clock advance O(backlog).**
+  `_TokenStore` kept a timed token in its cooling heap after it matured, so
+  [`Place.earliest_available_boundary`][cpnx.Place.earliest_available_boundary], which
+  `drive_to_quiescence` calls for every place on every clock advance, popped and re-pushed each
+  matured-but-unconsumed token to reach the first future one, and every FIFO read over the place
+  did the same. A net whose timed work waits on a scarce resource, the normal shape of a
+  discrete-event simulation, therefore drained in O(N²). Matured entries now migrate once into a
+  second heap as a finite read time passes them, and reads walk ready, matured, then cooling,
+  which keeps the `(available_at, seq)` order. A `t_limit = inf` probe (`is_quiescent`) never
+  migrates, a past-dated deposit lands with the matured entries, and a read on a clock behind the
+  migration point, such as a wall-clock read before a switch to logical time, falls back to a
+  scan. Measured with the new `benchmarks/bench_timed_backlog.py`: a boundary query holds at
+  0.3–0.4 µs from 1 000 to 16 000 matured tokens (was 345 → 7 795 µs), and the timed drive drops
+  from 4 034 to 1 529 µs/step at 4 000 arrivals. That drive still plateaus above its untimed
+  control, because the FIFO pool read peeks `binding_search_limit + 1` tokens per evaluation
+  whatever the head-only cap; that is cause B of
+  [#59](https://github.com/philgresh/cpnx/issues/59) and is not fixed here.
+
 ## [0.7.0] — 2026-10-20
 
 ### Removed

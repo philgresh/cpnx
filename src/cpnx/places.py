@@ -15,6 +15,7 @@ shorthands for a place whose colour set is ``{"resource"}`` with a pre-filled in
 
 import heapq
 import itertools
+import math
 import threading
 import time
 from collections import OrderedDict, deque
@@ -145,16 +146,21 @@ class _TokenStore:
 
     Tokens whose ``available_at == AVAILABLE_NOW`` (always available — the overwhelming
     common case) live in `_ready`, an `OrderedDict` keyed by a monotonic insertion
-    sequence number so iteration order is insertion order. Future-dated ("cooling")
-    tokens live in a `heapq` min-heap of ``(available_at, seq)`` (`_cooling`), lazily
-    deleted: a heap entry is stale once its ``seq`` is no longer in `_cooling_by_seq`
-    (the authoritative membership for cooling tokens). `_seq_of` maps ``id(token)`` to
-    its seq for O(1) removal by object identity.
+    sequence number so iteration order is insertion order. Timed tokens live in two
+    `heapq` min-heaps of ``(available_at, seq)`` split at `_migrated_to`: `_matured`
+    holds entries at or before it and `_cooling` holds entries after it. Reads migrate
+    entries from `_cooling` to `_matured` as a finite read time moves past them, so a
+    matured backlog is never re-walked to find the next future boundary. Both heaps are
+    lazily deleted: an entry is stale once its ``seq`` is no longer in `_cooling_by_seq`
+    (the authoritative membership for every timed token, matured or not). `_seq_of` maps
+    ``id(token)`` to its seq for O(1) removal by object identity.
 
     **Ordering contract:** every read yields available tokens in ``(available_at, seq)``
     order. Because `AVAILABLE_NOW` (`0.0`) sorts below any real timestamp, a store
     holding only ready tokens yields pure insertion order — identical to the FIFO
-    deque semantics this replaces.
+    deque semantics this replaces. Reads walk `_ready`, then `_matured`, then `_cooling`;
+    the `_migrated_to` split keeps every `_matured` entry below every `_cooling` entry, so
+    the concatenation is still in order.
 
     Not internally synchronized: callers must hold the owning place's lock.
     """
@@ -162,6 +168,8 @@ class _TokenStore:
     def __init__(self) -> None:
         self._ready: OrderedDict[int, Token] = OrderedDict()
         self._cooling: list[tuple[float, int]] = []
+        self._matured: list[tuple[float, int]] = []
+        self._migrated_to: float = -math.inf
         self._cooling_by_seq: dict[int, Token] = {}
         self._seq_of: dict[int, int] = {}
         self._next_seq: int = 0
@@ -210,27 +218,59 @@ class _TokenStore:
             for index in self._key_indexes.values():
                 index.add(seq, token)
         else:
-            heapq.heappush(self._cooling, (token.available_at, seq))
+            self._push_timed((token.available_at, seq))
             self._cooling_by_seq[seq] = token
 
     def __len__(self) -> int:
         return len(self._ready) + len(self._cooling_by_seq)
 
-    def _pop_matured_cooling(self, t_limit: float, limit: int) -> list[tuple[float, int]]:
-        """Pop up to *limit* live, matured ``(available_at, seq)`` entries off the heap,
-        discarding stale entries permanently along the way. Does NOT restore anything —
-        callers that need a non-destructive read must push matured entries back themselves.
+    def _push_timed(self, entry: tuple[float, int]) -> None:
+        """Push a timed ``(available_at, seq)`` entry onto whichever heap its time belongs to.
+
+        An entry at or before `_migrated_to` goes to `_matured` even when it is new, such as a
+        past-dated deposit, because every `_cooling` entry must stay after `_migrated_to`.
         """
+        heapq.heappush(self._matured if entry[0] <= self._migrated_to else self._cooling, entry)
+
+    def _push_timed_all(self, entries: Iterable[tuple[float, int]]) -> None:
+        """Restore entries popped by a non-destructive read; see `_push_timed`."""
+        for entry in entries:
+            self._push_timed(entry)
+
+    def _migrate(self, t_limit: float) -> None:
+        """Move `_cooling` entries at or before *t_limit* to `_matured`, if time moved forward.
+
+        Each entry migrates at most once, so the cost is amortized O(log n) per token. A
+        non-finite *t_limit* never migrates: `is_quiescent` probes with `t_limit = inf` to ask
+        whether anything could *ever* fire, and migrating on it would file every future token as
+        matured. Stale entries met on the way are discarded.
+        """
+        if not t_limit > self._migrated_to or t_limit == math.inf:
+            return
+        while self._cooling and self._cooling[0][0] <= t_limit:
+            entry = heapq.heappop(self._cooling)
+            if entry[1] in self._cooling_by_seq:
+                heapq.heappush(self._matured, entry)
+        self._migrated_to = t_limit
+
+    def _pop_matured_cooling(self, t_limit: float, limit: int) -> list[tuple[float, int]]:
+        """Pop up to *limit* live timed ``(available_at, seq)`` entries due by *t_limit*.
+
+        Walks `_matured` then `_cooling` in ascending order, discarding stale entries
+        permanently along the way. Does NOT restore anything — callers that need a
+        non-destructive read must hand the result to `_push_timed_all`.
+        """
+        self._migrate(t_limit)
         matured: list[tuple[float, int]] = []
-        while self._cooling and len(matured) < limit:
-            avail_at, seq = self._cooling[0]
-            if seq not in self._cooling_by_seq:
-                heapq.heappop(self._cooling)  # stale — discard for good
-                continue
-            if avail_at > t_limit:
-                break
-            heapq.heappop(self._cooling)
-            matured.append((avail_at, seq))
+        for heap in (self._matured, self._cooling):
+            while heap and len(matured) < limit:
+                avail_at, seq = heap[0]
+                if seq not in self._cooling_by_seq:
+                    heapq.heappop(heap)
+                    continue
+                if avail_at > t_limit:
+                    break
+                matured.append(heapq.heappop(heap))
         return matured
 
     def has_available(self, t_limit: float, need: int) -> bool:
@@ -246,8 +286,7 @@ class _TokenStore:
             return True
         shortfall = need - len(self._ready)
         matured = self._pop_matured_cooling(t_limit, shortfall)
-        for item in matured:
-            heapq.heappush(self._cooling, item)
+        self._push_timed_all(matured)
         return len(matured) >= shortfall
 
     def count_available(self, t_limit: float) -> int:
@@ -259,8 +298,7 @@ class _TokenStore:
         count = len(self._ready)
         matured = self._pop_matured_cooling(t_limit, len(self._cooling_by_seq))
         count += len(matured)
-        for item in matured:
-            heapq.heappush(self._cooling, item)
+        self._push_timed_all(matured)
         return count
 
     def peek_available(self, k: int, t_limit: float) -> list[Token]:
@@ -273,8 +311,7 @@ class _TokenStore:
             return result
         matured = self._pop_matured_cooling(t_limit, remaining)
         result.extend(self._cooling_by_seq[seq] for _, seq in matured)
-        for item in matured:
-            heapq.heappush(self._cooling, item)
+        self._push_timed_all(matured)
         return result
 
     def peek_by_key(
@@ -287,8 +324,8 @@ class _TokenStore:
 
         - no index is registered for *index_id*, or it disabled itself (see `_KeyIndex`);
         - **the place holds cooling tokens.** A key index covers `_ready` only, and a
-          cooling token never migrates into `_ready` even after it matures — it is served
-          straight off the cooling heap — so any timed token in this place puts available
+          timed token never migrates into `_ready` even after it matures — it is served
+          off the timed heaps — so any timed token in this place puts available
           tokens outside the index's view. Rather than return a silently incomplete
           ordering, defer to the caller's per-firing scan. This is the timed×key residual:
           a keyed place that also holds timed tokens keeps PR 1's cost.
@@ -341,27 +378,42 @@ class _TokenStore:
         return set(ids) - self._seq_of.keys()
 
     def earliest_cooling_after(self, now: float) -> float | None:
-        """Smallest cooling ``available_at`` strictly greater than *now*, or ``None``.
+        """Smallest timed ``available_at`` strictly greater than *now*, or ``None``.
 
-        O(1) when nothing is cooling (the untimed common case — the heap is empty).
-        Otherwise skips stale heap entries permanently and buffers/restores any
-        matured-but-still-present entries, leaving the heap intact.
+        O(1) when nothing is timed (the untimed common case — both heaps are empty). When
+        *now* is at or past `_migrated_to`, matured entries are migrated out of the way and the
+        answer is the live head of `_cooling`: amortized O(log n) however deep the matured
+        backlog is. When *now* is behind `_migrated_to` (a read on another clock, such as the
+        wall clock before a net switches to logical time), `_matured` may hold entries after
+        *now*, so both heaps are scanned, buffering and restoring the entries walked past.
         """
-        if not self._cooling:
+        if (not self._cooling and not self._matured) or now == math.inf:
             return None
+        if now >= self._migrated_to:
+            self._migrate(now)
+            return self._first_live_after(self._cooling, now)
+        candidates = [self._first_live_after(heap, now) for heap in (self._matured, self._cooling)]
+        return min((c for c in candidates if c is not None), default=None)
+
+    def _first_live_after(self, heap: list[tuple[float, int]], now: float) -> float | None:
+        """Return the first live ``available_at`` after *now* in *heap*, leaving *heap* intact.
+
+        Stale entries are discarded for good; live entries at or before *now* are buffered and
+        pushed back.
+        """
         buffered: list[tuple[float, int]] = []
         result: float | None = None
-        while self._cooling:
-            avail_at, seq = self._cooling[0]
+        while heap:
+            avail_at, seq = heap[0]
             if seq not in self._cooling_by_seq:
-                heapq.heappop(self._cooling)  # stale — discard for good
+                heapq.heappop(heap)
                 continue
             if avail_at > now:
                 result = avail_at
                 break
-            buffered.append(heapq.heappop(self._cooling))  # matured but present — restore after
-        for item in buffered:
-            heapq.heappush(self._cooling, item)
+            buffered.append(heapq.heappop(heap))
+        for entry in buffered:
+            heapq.heappush(heap, entry)
         return result
 
     def iter_insertion_order(self) -> Iterable[Token]:
@@ -719,8 +771,10 @@ class Place:
         """Smallest future ``available_at`` (strictly greater than *now*) held here, or ``None``.
 
         Backs the engine's logical-clock advance. O(1) for an untimed place (nothing is
-        cooling), and O(log n) amortized otherwise — via the store's cooling heap — so the
-        clock advance no longer scans the whole marking of every place on every tick.
+        cooling), and O(log n) amortized otherwise, however many matured tokens are waiting
+        here to be consumed, so the clock advance does not scan the marking on every tick.
+        A *now* earlier than a previous read's time (for example a wall-clock read followed
+        by a switch to a small logical time) falls back to a scan of the matured tokens.
         """
         with self._lock:
             return self._store.earliest_cooling_after(now)

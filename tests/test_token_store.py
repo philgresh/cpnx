@@ -10,10 +10,19 @@ Covers:
 - The lazily-deleted heap (`_cooling`) does not accumulate unbounded stale
   entries across many interleaved deposit/remove cycles — old entries are
   discarded as they're encountered rather than kept forever.
+- Matured timed tokens migrate out of `_cooling` into `_matured`, so finding the next
+  future boundary no longer re-walks a matured backlog (#59), while reads keep the
+  `(available_at, seq)` contract across ready, matured and cooling tokens, past-dated
+  deposits, `t_limit = inf` probes and reads on a clock behind the migration point.
 """
 
+import math
+import random
+
+import pytest
+
 from cpnx.places import Place, _TokenStore
-from cpnx.tokens import Token
+from cpnx.tokens import AVAILABLE_NOW, Token
 
 
 class TestArbitraryRemovalCorrectness:
@@ -166,3 +175,128 @@ class TestLazyHeapCleanup:
         all_available = store.take_available(len(kept), t_limit=10_000.0)
         assert len(all_available) == len(kept)
         assert [t.payload["i"] for t in all_available] == sorted((t.payload["i"] for t in kept), key=lambda i: 300 - i)
+
+
+def _timed(store: _TokenStore, *times: float) -> list[Token]:
+    tokens = [Token(payload={"t": t}, available_at=t) for t in times]
+    for token in tokens:
+        store.append(token)
+    return tokens
+
+
+class TestMaturedMigration:
+    """Matured timed tokens leave `_cooling` once a finite read time passes them (#59)."""
+
+    def test_boundary_search_does_not_rewalk_a_matured_backlog(self):
+        store = _TokenStore()
+        _timed(store, *(float(i) for i in range(1, 2001)))
+        _timed(store, 5000.0)
+
+        assert store.earliest_cooling_after(2500.0) == 5000.0
+        assert len(store._matured) == 2000
+        assert len(store._cooling) == 1
+        assert store.earliest_cooling_after(2600.0) == 5000.0
+        assert len(store._cooling) == 1
+
+    def test_reads_span_ready_matured_and_cooling_in_order(self):
+        store = _TokenStore()
+        ready = Token(payload={"t": "ready"})
+        _timed(store, 30.0, 10.0, 20.0)
+        store.append(ready)
+        _timed(store, 40.0)
+
+        assert store.peek_available(10, t_limit=25.0) == [ready, *_by_time(store, 10.0, 20.0)]
+        assert [t.available_at for t in store.peek_available(10, t_limit=40.0)[1:]] == [10.0, 20.0, 30.0, 40.0]
+
+    def test_past_dated_deposit_after_migration_keeps_order(self):
+        store = _TokenStore()
+        _timed(store, 60.0, 80.0, 200.0)
+        assert store.earliest_cooling_after(100.0) == 200.0
+
+        _timed(store, 50.0)
+
+        assert [t.available_at for t in store.peek_available(10, t_limit=100.0)] == [50.0, 60.0, 80.0]
+        assert store.earliest_cooling_after(100.0) == 200.0
+
+    def test_infinite_probe_does_not_migrate(self):
+        store = _TokenStore()
+        _timed(store, 10.0, 20.0)
+
+        assert store.has_available(t_limit=math.inf, need=2)
+        assert store._migrated_to == -math.inf
+        assert store.peek_available(10, t_limit=5.0) == []
+        assert store.earliest_cooling_after(5.0) == 10.0
+        assert store.earliest_cooling_after(math.inf) is None
+
+    def test_read_behind_the_migration_point_still_sees_matured_future_tokens(self):
+        store = _TokenStore()
+        _timed(store, 5.0, 15.0, 2000.0)
+        assert store.earliest_cooling_after(1000.0) == 2000.0
+
+        assert store.earliest_cooling_after(10.0) == 15.0
+        assert [t.available_at for t in store.peek_available(10, t_limit=10.0)] == [5.0]
+        assert not store.has_available(t_limit=10.0, need=2)
+        assert [t.available_at for t in store.take_available(10, t_limit=10.0)] == [5.0]
+        assert len(store) == 2
+
+
+def _by_time(store: _TokenStore, *times: float) -> list[Token]:
+    by_time = {t.available_at: t for t in store.iter_insertion_order()}
+    return [by_time[t] for t in times]
+
+
+class _ReferenceStore:
+    """Naive model of the `_TokenStore` read contract: ready tokens first, then timed by time."""
+
+    def __init__(self) -> None:
+        self.live: dict[int, tuple[int, Token]] = {}
+        self.seq = 0
+
+    def append(self, token: Token) -> None:
+        self.live[id(token)] = (self.seq, token)
+        self.seq += 1
+
+    def available(self, t_limit: float) -> list[Token]:
+        ready = [(s, t) for s, t in self.live.values() if t.available_at == AVAILABLE_NOW]
+        timed = [(t.available_at, s, t) for s, t in self.live.values() if 0.0 < t.available_at <= t_limit]
+        return [t for _, t in sorted(ready, key=lambda e: e[0])] + [t for *_, t in sorted(timed, key=lambda e: e[:2])]
+
+    def earliest_after(self, now: float) -> float | None:
+        later = [
+            t.available_at for _, t in self.live.values() if t.available_at != AVAILABLE_NOW and t.available_at > now
+        ]
+        return min(later, default=None)
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_store_matches_reference_under_random_non_monotonic_reads(seed):
+    rng = random.Random(seed)
+    store, ref = _TokenStore(), _ReferenceStore()
+    times = [AVAILABLE_NOW] + [float(t) for t in range(1, 40)]
+    reads = [float(t) for t in range(0, 45)] + [math.inf]
+
+    for _ in range(600):
+        op = rng.random()
+        if op < 0.35:
+            token = Token(available_at=rng.choice(times))
+            store.append(token)
+            ref.append(token)
+        elif op < 0.45 and ref.live:
+            _, victim = rng.choice(list(ref.live.values()))
+            store.remove_identity([victim])
+            del ref.live[id(victim)]
+        else:
+            t = rng.choice(reads)
+            expected = ref.available(t)
+            assert store.earliest_cooling_after(t) == ref.earliest_after(t)
+            assert store.peek_available(5, t_limit=t) == expected[:5]
+            assert store.has_available(t_limit=t, need=len(expected)) and not store.has_available(
+                t_limit=t, need=len(expected) + 1
+            )
+            assert store.count_available(t) == len(expected)
+            if op > 0.95:
+                taken = store.take_available(2, t_limit=t)
+                assert taken == expected[:2]
+                for token in taken:
+                    del ref.live[id(token)]
+        assert len(store) == len(ref.live)
