@@ -16,11 +16,13 @@ Covers:
   deposits, `t_limit = inf` probes and reads on a clock behind the migration point.
 """
 
+import heapq
 import math
 import random
 
 import pytest
 
+from cpnx import InputArc, OutputArc, PetriNet, Transition
 from cpnx.places import Place, _TokenStore
 from cpnx.tokens import AVAILABLE_NOW, Token
 
@@ -184,19 +186,52 @@ def _timed(store: _TokenStore, *times: float) -> list[Token]:
     return tokens
 
 
+class _CountingHeapq:
+    """Stand-in for `cpnx.places.heapq` that counts heap operations."""
+
+    def __init__(self) -> None:
+        self.ops = 0
+
+    def heappush(self, heap: list, item: object) -> None:
+        self.ops += 1
+        heapq.heappush(heap, item)
+
+    def heappop(self, heap: list) -> object:
+        self.ops += 1
+        return heapq.heappop(heap)
+
+    def heapify(self, heap: list) -> None:
+        self.ops += len(heap)
+        heapq.heapify(heap)
+
+
+@pytest.fixture
+def heap_ops(monkeypatch: pytest.MonkeyPatch) -> _CountingHeapq:
+    counter = _CountingHeapq()
+    monkeypatch.setattr("cpnx.places.heapq", counter)
+    return counter
+
+
+def _deep_backlog_place(depth: int = 2000) -> Place:
+    place = Place("p")
+    for i in range(depth):
+        place.deposit(Token(available_at=1.0 + i), model_time=0.0)
+    place.deposit(Token(available_at=5000.0), model_time=0.0)
+    return place
+
+
+def _assert_fast_boundary(place: Place, heap_ops: _CountingHeapq) -> None:
+    assert place.earliest_available_boundary(2500.0) == 5000.0
+    heap_ops.ops = 0
+    assert place.earliest_available_boundary(2600.0) == 5000.0
+    assert heap_ops.ops <= 2
+
+
 class TestMaturedMigration:
     """Matured timed tokens leave `_cooling` once a finite read time passes them (#59)."""
 
-    def test_boundary_search_does_not_rewalk_a_matured_backlog(self):
-        store = _TokenStore()
-        _timed(store, *(float(i) for i in range(1, 2001)))
-        _timed(store, 5000.0)
-
-        assert store.earliest_cooling_after(2500.0) == 5000.0
-        assert len(store._matured) == 2000
-        assert len(store._cooling) == 1
-        assert store.earliest_cooling_after(2600.0) == 5000.0
-        assert len(store._cooling) == 1
+    def test_boundary_search_does_not_rewalk_a_matured_backlog(self, heap_ops):
+        _assert_fast_boundary(_deep_backlog_place(), heap_ops)
 
     def test_reads_span_ready_matured_and_cooling_in_order(self):
         store = _TokenStore()
@@ -240,6 +275,69 @@ class TestMaturedMigration:
         assert len(store) == 2
 
 
+class TestSplitCannotBePinned:
+    """A read on one clock must not leave later reads on another clock on the slow path (#59)."""
+
+    def test_wall_clock_read_on_an_empty_place_does_not_pin_the_split(self, heap_ops):
+        place = Place("p")
+        assert not place.can_retrieve(1)
+        for i in range(2000):
+            place.deposit(Token(available_at=1.0 + i), model_time=0.0)
+        place.deposit(Token(available_at=5000.0), model_time=0.0)
+
+        _assert_fast_boundary(place, heap_ops)
+
+    def test_boundary_query_behind_the_split_resplits_once(self, heap_ops):
+        place = _deep_backlog_place()
+        assert place.can_retrieve(1)
+        assert place._store._migrated_to > 5000.0
+
+        _assert_fast_boundary(place, heap_ops)
+        assert place._store._migrated_to == 2600.0
+
+    def test_wall_clock_step_then_logical_time_stays_on_the_fast_path(self, heap_ops):
+        net = PetriNet(seed=0)
+        for name in ("inbox", "gate", "out"):
+            net.add_place(Place(name))
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[InputArc("inbox"), InputArc("gate")],
+                outputs=[OutputArc("out")],
+                action=lambda tokens: tokens[:1],
+            )
+        )
+        net.deposit("inbox", Token(available_at=0.5))
+        net.step()
+        net.advance_time(1.0)
+        for i in range(2000):
+            net.deposit("inbox", Token(available_at=1.0 + i))
+        net.deposit("inbox", Token(available_at=5000.0))
+
+        _assert_fast_boundary(net.places["inbox"], heap_ops)
+
+    def test_non_finite_reads_never_move_the_split(self):
+        store = _TokenStore()
+        _timed(store, 10.0, 100.0)
+        assert store.earliest_cooling_after(50.0) == 100.0
+
+        for t in (math.nan, math.inf, -math.inf):
+            store.has_available(t_limit=t, need=1)
+            store.earliest_cooling_after(t)
+        assert store._migrated_to == 50.0
+        assert [t.available_at for t in store.peek_available(5, t_limit=60.0)] == [10.0]
+
+    def test_store_with_no_timed_token_resets_the_split(self):
+        store = _TokenStore()
+        (token,) = _timed(store, 10.0)
+        assert store.earliest_cooling_after(50.0) is None
+        store.remove_identity([token])
+
+        assert not store.has_available(t_limit=100.0, need=1)
+        assert store._migrated_to == -math.inf
+        assert store._matured == [] and store._cooling == []
+
+
 def _by_time(store: _TokenStore, *times: float) -> list[Token]:
     by_time = {t.available_at: t for t in store.iter_insertion_order()}
     return [by_time[t] for t in times]
@@ -268,17 +366,34 @@ class _ReferenceStore:
         return min(later, default=None)
 
 
+def _live(store: _TokenStore, heap: list[tuple[float, int]]) -> int:
+    return sum(1 for _, seq in heap if seq in store._cooling_by_seq)
+
+
+def _check_read(store: _TokenStore, ref: _ReferenceStore, t: float, rng: random.Random) -> None:
+    expected = ref.available(t)
+    boundary_first = rng.random() < 0.5
+    if boundary_first:
+        assert store.earliest_cooling_after(t) == ref.earliest_after(t)
+    assert store.peek_available(5, t_limit=t) == expected[:5]
+    assert store.has_available(t_limit=t, need=len(expected))
+    assert not store.has_available(t_limit=t, need=len(expected) + 1)
+    assert store.count_available(t) == len(expected)
+    if not boundary_first:
+        assert store.earliest_cooling_after(t) == ref.earliest_after(t)
+
+
 @pytest.mark.parametrize("seed", range(12))
-def test_store_matches_reference_under_random_non_monotonic_reads(seed):
+def test_store_matches_reference_under_a_moving_clock(seed):
     rng = random.Random(seed)
     store, ref = _TokenStore(), _ReferenceStore()
-    times = [AVAILABLE_NOW] + [float(t) for t in range(1, 40)]
-    reads = [float(t) for t in range(0, 45)] + [math.inf]
+    clock = 10.0
+    reads = reads_with_both_heaps_live = 0
 
-    for _ in range(600):
+    for _ in range(800):
         op = rng.random()
         if op < 0.35:
-            token = Token(available_at=rng.choice(times))
+            token = Token(available_at=AVAILABLE_NOW if rng.random() < 0.1 else clock + rng.randint(-5, 20))
             store.append(token)
             ref.append(token)
         elif op < 0.45 and ref.live:
@@ -286,17 +401,23 @@ def test_store_matches_reference_under_random_non_monotonic_reads(seed):
             store.remove_identity([victim])
             del ref.live[id(victim)]
         else:
-            t = rng.choice(reads)
-            expected = ref.available(t)
-            assert store.earliest_cooling_after(t) == ref.earliest_after(t)
-            assert store.peek_available(5, t_limit=t) == expected[:5]
-            assert store.has_available(t_limit=t, need=len(expected)) and not store.has_available(
-                t_limit=t, need=len(expected) + 1
-            )
-            assert store.count_available(t) == len(expected)
+            direction = rng.random()
+            if direction < 0.8:
+                clock += rng.randint(0, 3)
+                t = clock
+            elif direction < 0.95:
+                t = clock - rng.randint(1, 30)
+            else:
+                t = math.inf
+            reads += 1
+            reads_with_both_heaps_live += bool(_live(store, store._matured) and _live(store, store._cooling))
+            _check_read(store, ref, t, rng)
             if op > 0.95:
+                expected = ref.available(t)
                 taken = store.take_available(2, t_limit=t)
                 assert taken == expected[:2]
                 for token in taken:
                     del ref.live[id(token)]
         assert len(store) == len(ref.live)
+
+    assert reads_with_both_heaps_live >= 0.75 * reads

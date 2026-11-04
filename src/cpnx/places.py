@@ -150,7 +150,9 @@ class _TokenStore:
     `heapq` min-heaps of ``(available_at, seq)`` split at `_migrated_to`: `_matured`
     holds entries at or before it and `_cooling` holds entries after it. Reads migrate
     entries from `_cooling` to `_matured` as a finite read time moves past them, so a
-    matured backlog is never re-walked to find the next future boundary. Both heaps are
+    matured backlog is never re-walked to find the next future boundary. The split moves back
+    only when a boundary query arrives behind it (`_resplit`), and resets to ``-inf`` whenever
+    the store holds no timed token, so a read on one clock cannot pin it. Both heaps are
     lazily deleted: an entry is stale once its ``seq`` is no longer in `_cooling_by_seq`
     (the authoritative membership for every timed token, matured or not). `_seq_of` maps
     ``id(token)`` to its seq for O(1) removal by object identity.
@@ -244,14 +246,42 @@ class _TokenStore:
         non-finite *t_limit* never migrates: `is_quiescent` probes with `t_limit = inf` to ask
         whether anything could *ever* fire, and migrating on it would file every future token as
         matured. Stale entries met on the way are discarded.
+
+        A store holding no timed token resets both heaps and `_migrated_to` instead, so a read on
+        one clock (such as a wall-clock `can_retrieve` on an empty place) cannot pin the split
+        ahead of tokens later deposited on another.
         """
-        if not t_limit > self._migrated_to or t_limit == math.inf:
+        if not self._cooling_by_seq:
+            self._cooling.clear()
+            self._matured.clear()
+            self._migrated_to = -math.inf
+            return
+        if not math.isfinite(t_limit) or t_limit <= self._migrated_to:
             return
         while self._cooling and self._cooling[0][0] <= t_limit:
             entry = heapq.heappop(self._cooling)
             if entry[1] in self._cooling_by_seq:
                 heapq.heappush(self._matured, entry)
         self._migrated_to = t_limit
+
+    def _resplit(self, now: float) -> None:
+        """Move live `_matured` entries after *now* back to `_cooling` and lower the split to *now*.
+
+        O(n) once, then forward reads from *now* are back on the fast path. Called only from
+        `earliest_cooling_after`, whose pre-split cost was already O(n) per call, so a caller
+        alternating between two clocks is never slower than that. Drops stale entries.
+        """
+        keep: list[tuple[float, int]] = []
+        later: list[tuple[float, int]] = []
+        for entry in self._matured:
+            if entry[1] in self._cooling_by_seq:
+                (later if entry[0] > now else keep).append(entry)
+        heapq.heapify(keep)
+        self._matured = keep
+        if later:
+            self._cooling.extend(later)
+            heapq.heapify(self._cooling)
+        self._migrated_to = now
 
     def _pop_matured_cooling(self, t_limit: float, limit: int) -> list[tuple[float, int]]:
         """Pop up to *limit* live timed ``(available_at, seq)`` entries due by *t_limit*.
@@ -380,20 +410,23 @@ class _TokenStore:
     def earliest_cooling_after(self, now: float) -> float | None:
         """Smallest timed ``available_at`` strictly greater than *now*, or ``None``.
 
-        O(1) when nothing is timed (the untimed common case — both heaps are empty). When
-        *now* is at or past `_migrated_to`, matured entries are migrated out of the way and the
-        answer is the live head of `_cooling`: amortized O(log n) however deep the matured
-        backlog is. When *now* is behind `_migrated_to` (a read on another clock, such as the
-        wall clock before a net switches to logical time), `_matured` may hold entries after
-        *now*, so both heaps are scanned, buffering and restoring the entries walked past.
+        O(1) when nothing is timed (the untimed common case — both heaps are empty). Otherwise
+        matured entries are moved out of the way and the answer is the live head of `_cooling`:
+        amortized O(log n) however deep the matured backlog is. A *now* behind `_migrated_to`
+        (a read on another clock, such as the wall clock before a net switches to logical time)
+        first re-splits the heaps at *now*, an O(n) step paid once per move backwards. A NaN or
+        `-inf` *now* scans both heaps, as before the split existed.
         """
         if (not self._cooling and not self._matured) or now == math.inf:
             return None
-        if now >= self._migrated_to:
+        if not math.isfinite(now):
+            candidates = [self._first_live_after(heap, now) for heap in (self._matured, self._cooling)]
+            return min((c for c in candidates if c is not None), default=None)
+        if now < self._migrated_to:
+            self._resplit(now)
+        else:
             self._migrate(now)
-            return self._first_live_after(self._cooling, now)
-        candidates = [self._first_live_after(heap, now) for heap in (self._matured, self._cooling)]
-        return min((c for c in candidates if c is not None), default=None)
+        return self._first_live_after(self._cooling, now)
 
     def _first_live_after(self, heap: list[tuple[float, int]], now: float) -> float | None:
         """Return the first live ``available_at`` after *now* in *heap*, leaving *heap* intact.
@@ -774,7 +807,8 @@ class Place:
         cooling), and O(log n) amortized otherwise, however many matured tokens are waiting
         here to be consumed, so the clock advance does not scan the marking on every tick.
         A *now* earlier than a previous read's time (for example a wall-clock read followed
-        by a switch to a small logical time) falls back to a scan of the matured tokens.
+        by a switch to a small logical time) pays one O(n) re-split, after which queries from
+        that time on are back to O(log n).
         """
         with self._lock:
             return self._store.earliest_cooling_after(now)
