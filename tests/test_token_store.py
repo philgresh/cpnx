@@ -19,6 +19,7 @@ Covers:
 import heapq
 import math
 import random
+import time
 
 import pytest
 
@@ -275,27 +276,37 @@ class TestMaturedMigration:
         assert len(store) == 2
 
 
+#: Where the wall-clock reads below land. `time.monotonic()` is seconds since boot, which is
+#: days on a workstation but under two minutes on a fresh CI runner, so it is pinned.
+_WALL_CLOCK = 1_000_000.0
+
+
 class TestSplitCannotBePinned:
     """A read on one clock must not leave later reads on another clock on the slow path (#59)."""
 
-    def test_wall_clock_read_on_an_empty_place_does_not_pin_the_split(self, heap_ops):
+    def test_wall_clock_read_on_an_empty_place_does_not_pin_the_split(self, heap_ops, monkeypatch):
         place = Place("p")
-        assert not place.can_retrieve(1)
+        with monkeypatch.context() as m:
+            m.setattr(time, "monotonic", lambda: _WALL_CLOCK)
+            assert not place.can_retrieve(1)
+        assert place._store._migrated_to == -math.inf
         for i in range(2000):
             place.deposit(Token(available_at=1.0 + i), model_time=0.0)
         place.deposit(Token(available_at=5000.0), model_time=0.0)
 
         _assert_fast_boundary(place, heap_ops)
 
-    def test_boundary_query_behind_the_split_resplits_once(self, heap_ops):
+    def test_boundary_query_behind_the_split_resplits_once(self, heap_ops, monkeypatch):
         place = _deep_backlog_place()
-        assert place.can_retrieve(1)
-        assert place._store._migrated_to > 5000.0
+        with monkeypatch.context() as m:
+            m.setattr(time, "monotonic", lambda: _WALL_CLOCK)
+            assert place.can_retrieve(1)
+        assert place._store._migrated_to == _WALL_CLOCK
 
         _assert_fast_boundary(place, heap_ops)
         assert place._store._migrated_to == 2600.0
 
-    def test_wall_clock_step_then_logical_time_stays_on_the_fast_path(self, heap_ops):
+    def test_wall_clock_step_then_logical_time_stays_on_the_fast_path(self, heap_ops, monkeypatch):
         net = PetriNet(seed=0)
         for name in ("inbox", "gate", "out"):
             net.add_place(Place(name))
@@ -308,7 +319,10 @@ class TestSplitCannotBePinned:
             )
         )
         net.deposit("inbox", Token(available_at=0.5))
-        net.step()
+        with monkeypatch.context() as m:
+            m.setattr(time, "monotonic", lambda: _WALL_CLOCK)
+            net.step()
+        assert net.places["inbox"]._store._migrated_to == _WALL_CLOCK
         net.advance_time(1.0)
         for i in range(2000):
             net.deposit("inbox", Token(available_at=1.0 + i))
