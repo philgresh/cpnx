@@ -75,8 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tower pours each batch as it matures and advances the clock only a few dozen times.
   `bench_cafe_throughput.py` adds a "mobile-order rush" regime at 500 / 2 000 / 8 000 orders that
   runs each size twice with identical work, once timed and once with the orders deposited
-  `AVAILABLE_NOW`, and prints the ratio. At 8 000 orders the timed rail costs 13× its untimed
-  control before the matured-heap fix below and 6.7× after; the rest is cause B of
+  `AVAILABLE_NOW`, and prints the ratio. At 8 000 orders the timed rail costs 13.2× its untimed
+  control before the matured-heap fix below and 6.5× after; the rest is cause B of
   [#59](https://github.com/philgresh/cpnx/issues/59), the FIFO pool read peeking
   `binding_search_limit + 1` tokens per evaluation.
 
@@ -94,8 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migrates, a past-dated deposit lands with the matured entries, a store holding no timed token
   resets the split, and a boundary query behind the migration point, such as one on the wall clock
   before a switch to logical time, re-splits the heaps once rather than staying on a slow path.
-  Measured with the new `benchmarks/bench_timed_backlog.py`: a boundary query holds at 0.3–0.4 µs from 1 000 to 16 000 matured tokens (was 345 → 7 795 µs), and the timed drive drops
-  from 4 034 to 1 529 µs/step at 4 000 arrivals. That drive still plateaus above its untimed
+  Measured with the new `benchmarks/bench_timed_backlog.py`: a boundary query holds at about
+  0.32 µs from 1 000 to 16 000 matured tokens (was 346 → 7 754 µs), and the timed drive drops
+  from 3 964 to 1 484 µs/step at 4 000 arrivals. That drive still plateaus above its untimed
   control, because the FIFO pool read peeks `binding_search_limit + 1` tokens per evaluation
   whatever the head-only cap; that is cause B of
   [#59](https://github.com/philgresh/cpnx/issues/59) and is not fixed here.
