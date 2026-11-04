@@ -1826,8 +1826,9 @@ class PetriNet:
             ignore_timing: When `True`, treat cooling-down/not-yet-settled tokens as available
                 (used by [`is_quiescent`][cpnx.PetriNet.is_quiescent]).
             cap: How many ordered tokens the caller can actually consume (see
-                `_gather_arc_pools`). Only an upper bound on what a *key-index* read
-                materializes; `None` disables the index path entirely.
+                `_gather_arc_pools`). An upper bound on what a bounded FIFO peek or a
+                *key-index* read materializes; `None` disables the index path entirely and
+                leaves the FIFO peek at `binding_search_limit + 1`.
 
         Returns:
             The eligible tokens — FIFO, or ascending-key when served from the index — or
@@ -1851,7 +1852,9 @@ class PetriNet:
            one token in FIFO order and the search consumes only the first
            `binding_search_limit + 1` of them (see `_iter_candidate_bindings`), so peeking
            that many yields the identical candidate set while turning an O(marking-depth)
-           scan into an O(limit) one.
+           scan into an O(limit) one. A head-only transition consumes only the first
+           `count`, so `cap` (see `_gather_arc_pools`) narrows the peek further; on a place
+           holding timed tokens each token peeked costs a heap pop and push.
         2. **Key-index read.** A keyed arc is not position-FIFO, so route 1's bound does not
            apply — but a *certified* key is served from the place's persistent key-index,
            which yields the same ascending-key prefix without materializing or sorting the
@@ -1865,7 +1868,8 @@ class PetriNet:
         falling through is always safe.
         """
         if arc.key is None and arc.filter is None and not arc.consume_all and arc.count == 1:
-            return place.peek(self.binding_search_limit + 1, model_time=t_limit)
+            k = self.binding_search_limit + 1
+            return place.peek(k if cap is None else min(cap, k), model_time=t_limit)
         if cap is not None and not arc.consume_all and self._ensure_key_index(arc, place):
             ordered = place.peek_by_key(id(arc), cap, arc.filter)
             if ordered is not None:
