@@ -74,6 +74,7 @@ because there is an engine cost path the base net never touches:
 | `eighty_six` | 🚫 86 board | Certified `key` + **uncertified** `filter` |
 | `cupping` | 🥄 Cupping table | `count > 1` and the candidate space |
 | `pastry_case` | 🥐 Pastry case | The only `SubstitutionTransition` |
+| `mobile_orders` | 📱 Mobile-order rush | A deep **matured** timed backlog, one clock advance per drink ([#59]) |
 
 Two knobs on `build_cafe` are not stations but are newly sweepable:
 `binding_search_limit` (previously fixed at the engine default) and
@@ -571,6 +572,7 @@ the subnet's clock *value* (the parent's time never crosses the boundary) while 
 
 [#18]: https://github.com/philgresh/cpnx/issues/18
 [#25]: https://github.com/philgresh/cpnx/issues/25
+[#59]: https://github.com/philgresh/cpnx/issues/59
 
 ## Scope
 

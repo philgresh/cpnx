@@ -96,6 +96,10 @@ comparable. Each exists because there is some engine cost path the base net neve
 
 ::: cafe.stations.pastry_case
 
+### 📱 The mobile-order rush — a deep matured backlog
+
+::: cafe.stations.mobile_orders
+
 ## ⚠️ Decidability hazards — deliberate anti-patterns
 
 Every station above is deterministic, so the base cafe is **lint-clean**: the best-effort

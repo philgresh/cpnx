@@ -67,6 +67,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the new features assessed and declined:
   [`docs/python-version-support.md`](https://github.com/philgresh/cpnx/blob/main/docs/python-version-support.md).
 
+- **The Concurrency Cafe gains a 📱 mobile-order rush station, `build_cafe(mobile_orders=True)`.**
+  App orders land on `P_Mobile_Rail` with a due time and a single barista, a capacity-1
+  [`PacedResourcePlace`][cpnx.PacedResourcePlace] with `mobile_make_secs` (default 30) per drink,
+  works through them. When a rush comes due at once the rail holds a deep backlog of *matured*
+  tokens while the clock advances once per drink, a shape no other station builds: the cold-brew
+  tower pours each batch as it matures and advances the clock only a few dozen times.
+  `bench_cafe_throughput.py` adds a "mobile-order rush" regime at 500 / 2 000 / 8 000 orders that
+  runs each size twice with identical work, once timed and once with the orders deposited
+  `AVAILABLE_NOW`, and prints the ratio. At 8 000 orders the timed rail costs 13× its untimed
+  control before the matured-heap fix below and 6.7× after; the rest is cause B of
+  [#59](https://github.com/philgresh/cpnx/issues/59), the FIFO pool read peeking
+  `binding_search_limit + 1` tokens per evaluation.
+
 ### Fixed
 
 - **A backlog of matured timed tokens no longer makes every logical-clock advance O(backlog).**

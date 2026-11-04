@@ -22,6 +22,7 @@ from cafe.stations import decaf as _decaf
 from cafe.stations import decidability_hazards as _hazards
 from cafe.stations import eighty_six as _eighty_six
 from cafe.stations import knock_box as _knock_box
+from cafe.stations import mobile_orders as _mobile_orders
 from cafe.stations import pastry_case as _pastry_case
 from cafe.stations import specials_board as _specials_board
 from cafe.support import dose_band
@@ -53,6 +54,8 @@ def build_cafe(
     cupping: bool = False,
     cupping_count: int = 4,
     pastry_case: bool = False,
+    mobile_orders: bool = False,
+    mobile_make_secs: float = 30.0,
     hazards: bool = False,
 ) -> PetriNet:
     """Wire up the Concurrency Cafe topology and return the (unstarted) [`PetriNet`][cpnx.PetriNet].
@@ -146,6 +149,12 @@ def build_cafe(
             [`SubstitutionTransition`][cpnx.SubstitutionTransition], driving a nested
             kitchen subnet to quiescence per firing. See
             [`cafe.stations.pastry_case`][cafe.stations.pastry_case].
+        mobile_orders: Add the 📱 mobile-order rush — a deep *matured* timed backlog behind a
+            one-barista [`PacedResourcePlace`][cpnx.PacedResourcePlace], so the clock advances once
+            per drink while the rail stays deep. See
+            [`cafe.stations.mobile_orders`][cafe.stations.mobile_orders].
+        mobile_make_secs: Logical seconds the mobile-order barista needs per drink. Only
+            meaningful with `mobile_orders=True`.
         hazards: Add the ⚠️ decidability hazards — a gallery of **deliberate
             anti-patterns** that smuggle network/database/clock/randomness reads into
             enabling logic, so the best-effort linter ([`cpnx.linting`][cpnx.lint_callable])
@@ -227,6 +236,10 @@ def build_cafe(
     if pastry_case:
         net_places += _pastry_case.places()
         net_transitions += _pastry_case.transitions(work_secs=work_secs)
+
+    if mobile_orders:
+        net_places += _mobile_orders.places(make_secs=mobile_make_secs)
+        net_transitions += _mobile_orders.transitions(work_secs=work_secs)
 
     if hazards:
         net_places += _hazards.places()

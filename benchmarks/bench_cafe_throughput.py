@@ -40,6 +40,14 @@ isolated single-station workloads (they deposit straight into the new place, byp
 new code path, uncontaminated by the rest of the topology. See ``concurrency_cafe.py``'s module
 docstring for why these two shapes were otherwise absent from the net.
 
+One more, ``mobile-order rush``, exercises ``build_cafe(mobile_orders=True)``: N app orders all
+come due at one instant and a single barista with a make-time cooldown works through them, so a
+deep backlog of *matured* tokens sits on the rail while the clock advances once per drink (#59).
+It runs twice per N with identical work, once with timed orders and once with the same orders
+deposited ``AVAILABLE_NOW``, and reports the ratio, so the comparison does not depend on run-to-run
+noise. Its ladder stops at 8000: on a store that re-walks the matured backlog every clock advance,
+the timed arm costs O(N²).
+
 Run it on ``main`` and on a candidate branch and compare the reported ``us/order`` (report the
 ratio, not the raw microseconds — see benchmarks/README.md). Native stdlib only.
 
@@ -57,7 +65,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _driver import drive_to_quiescence  # noqa: E402
 from concurrency_cafe import build_cafe  # noqa: E402
 
-from cpnx import Token  # noqa: E402
+from cpnx import AVAILABLE_NOW, Token  # noqa: E402
 
 # 2000 deliberately exceeds the engine's binding_search_limit (default 1000): once the ticket
 # line is deeper than that cap, the per-firing PRIORITY candidate scan saturates instead of
@@ -144,6 +152,12 @@ _STEEP_SPREAD_SECS = 8 * 3600
 #: instead of one jump per token.
 _STEEP_BUCKETS = 40
 
+MOBILE_ORDER_COUNTS = (500, 2000, 8000)
+
+#: Logical seconds from deposit until the whole rush comes due, so every order is still timed
+#: (not yet available) when it lands on the rail.
+_MOBILE_DUE_SECS = 60.0
+
 
 def _cold_brew_tokens(n_orders: int, base_time: float) -> list[Token]:
     """`n_orders` cold-brew tokens, staggered across `_STEEP_BUCKETS` distinct future times.
@@ -188,6 +202,35 @@ def _run_cold_brew(n_orders: int) -> None:
             f"ticks={result.ticks:<5}  "
             f"{result.wall_secs * 1e3:9.2f} ms  ({us_per_order:8.1f} us/order)"
         )
+
+
+def _drive_mobile_rush(n_orders: int, *, timed: bool) -> tuple[int, int, float]:
+    """Drain `n_orders` app orders due at one instant; return (served, ticks, wall seconds).
+
+    `timed=False` deposits the same orders `AVAILABLE_NOW`, which is the untimed control arm.
+    """
+    with build_cafe(mobile_orders=True, seed=NET_SEED, max_workers=1) as net:
+        due = time.monotonic() + _MOBILE_DUE_SECS
+        for i in range(n_orders):
+            net.deposit(
+                "P_Mobile_Rail",
+                Token(color="mobile", payload={"order": i}, available_at=due if timed else AVAILABLE_NOW),
+            )
+        result = drive_to_quiescence(net)
+        return net.places["P_Served"].stats()["absorbed"], result.ticks, result.wall_secs
+
+
+def _run_mobile_rush(n_orders: int) -> None:
+    """Run the timed arm and its untimed control at `n_orders` and print both with their ratio."""
+    served, ticks, timed_secs = _drive_mobile_rush(n_orders, timed=True)
+    control_served, _, control_secs = _drive_mobile_rush(n_orders, timed=False)
+    assert served == control_served == n_orders
+    timed_us = timed_secs / n_orders * 1e6
+    control_us = control_secs / n_orders * 1e6
+    print(
+        f"  orders={n_orders:<5} served={served:<5} peak_due_backlog={n_orders:<5} ticks={ticks:<5}  "
+        f"timed {timed_us:8.1f} us/order  untimed {control_us:7.1f} us/order  ratio {timed_us / control_us:5.1f}x"
+    )
 
 
 def _run_batch_triage(n_orders: int) -> None:
@@ -259,6 +302,11 @@ def main() -> None:
     print("Concurrency Cafe throughput — batch-triage (key-ordered) (logical clock, workers=1):")
     for n in DEEP_ORDER_COUNTS:
         _run_batch_triage(n)
+    print()
+
+    print("Concurrency Cafe throughput — mobile-order rush, all due at once (logical clock, workers=1):")
+    for n in MOBILE_ORDER_COUNTS:
+        _run_mobile_rush(n)
     print()
 
 
