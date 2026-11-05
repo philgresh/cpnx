@@ -137,6 +137,11 @@ independent O(depth) terms were involved, all now removed:
    engine's clock advance (`_earliest_cooldown_boundary`) now reads that heap per place
    instead of scanning `place.tokens` on every tick.
 
+   That earliest-available read was O(1) only while matured tokens were consumed as they
+   matured. A backlog of matured tokens waiting on a scarce resource made it O(backlog)
+   per clock advance until [#59](https://github.com/philgresh/cpnx/issues/59)'s
+   matured heap; `bench_timed_backlog.py` measures that shape.
+
 Guard-free FIFO µs/step, same machine, before vs after (read the **shape** — flat is the
 goal):
 

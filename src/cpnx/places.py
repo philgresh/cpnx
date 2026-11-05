@@ -810,9 +810,10 @@ class Place:
         Backs the engine's logical-clock advance. O(1) for an untimed place (nothing is
         cooling), and O(log n) amortized otherwise, however many matured tokens are waiting
         here to be consumed, so the clock advance does not scan the marking on every tick.
-        A *now* earlier than a previous read's time (for example a wall-clock read followed
-        by a switch to a small logical time) pays one O(n) re-split, after which queries from
-        that time on are back to O(log n).
+        A *now* earlier than the previous boundary query's (for example the engine's wall-clock
+        query followed by a switch to a small logical time) pays one O(n) re-split, after which
+        queries from that time on are back to O(log n). Reads such as `peek` and
+        `can_retrieve` do not affect this, whichever clock they use.
         """
         with self._lock:
             return self._store.earliest_cooling_after(now)
