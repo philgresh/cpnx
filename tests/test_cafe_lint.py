@@ -39,6 +39,7 @@ _ALL_LEGIT_STATIONS = dict(
     eighty_six=True,
     cupping=True,
     pastry_case=True,
+    mobile_orders=True,
 )
 
 

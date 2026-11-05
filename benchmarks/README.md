@@ -30,6 +30,7 @@ Two tiers:
 | `bench_enablement.py` | micro | Cost of one `_is_transition_enabled` check (and `_resolve_binding` across binding policies), for a **string** guard and a **callable** guard computing the identical predicate — the per-transition, per-`step()` hot path, and the dispatch gap between the two flavours. |
 | `bench_consume_all_drain.py` | micro | Per-probe cost of `_is_transition_enabled` for a `consume_all` transition over a place of growing depth `N`, contrasting the **count-only fast path** (guard-free) against the **eager full-pool peek** (an always-true guard forces the pre-fix path). Fast holds `O(1)`, eager climbs `O(N)` — the per-probe half of the `O(N)`-vs-`O(N²)` accumulate-then-drain gap. |
 | `bench_transition_scan.py` | micro + macro | Per-step cost as the **transition count** `T` grows (the axis nothing else here sweeps). Before [ADR 0006](../docs/adr/0006-incremental-enablement.md), `_select_transition_to_fire` re-resolved *every* transition each step (one scan `O(T)`, a `K`-firing run `O(K·T)`, drive wall time `O(T²)`). The incremental per-place dirty-set scheduler collapsed that to `O(K)`; this benchmark is the regression guard, and both the scan-probe and drive per-step columns now stay ~flat as `T` doubles (growth ~1.0). |
+| `bench_timed_backlog.py` | micro + macro | Logical-clock cost when matured timed tokens back up in a place ([#59](https://github.com/philgresh/cpnx/issues/59)). **boundary**: per-call `Place.earliest_available_boundary` over `N` matured tokens, which must stay flat as `N` doubles. **drive**: `drive_to_quiescence` of `N` timed arrivals through one busy worker, against an untimed control. |
 | `bench_cafe_throughput.py` | macro | End-to-end throughput (`us/order`, `us/step`) of the cafe net processing N orders, swept over `N` and the binding regime. Reveals how per-step engine cost scales with marking depth. Single-worker by construction. |
 | `bench_cafe_concurrency.py` | macro | Wall-clock **makespan** against `max_workers`, swept over queue depth and guard regime. The only script here that says anything about parallelism. |
 | `bench_station_costs.py` | macro | µs/order against queue depth for each opt-in station's selection shape (certified vs. uncertified `key`, filter-only, timed×key), plus the arc-ordering and `binding_search_limit` search-budget sweeps. Answers the "Unmeasured combinations" audit below. |
@@ -73,6 +74,7 @@ because there is an engine cost path the base net never touches:
 | `eighty_six` | 🚫 86 board | Certified `key` + **uncertified** `filter` |
 | `cupping` | 🥄 Cupping table | `count > 1` and the candidate space |
 | `pastry_case` | 🥐 Pastry case | The only `SubstitutionTransition` |
+| `mobile_orders` | 📱 Mobile-order rush | A deep **matured** timed backlog, one clock advance per drink ([#59]) |
 
 Two knobs on `build_cafe` are not stations but are newly sweepable:
 `binding_search_limit` (previously fixed at the engine default) and
@@ -134,6 +136,11 @@ independent O(depth) terms were involved, all now removed:
    cooling ones) gives O(1) arbitrary removal and O(1) earliest-available, and the
    engine's clock advance (`_earliest_cooldown_boundary`) now reads that heap per place
    instead of scanning `place.tokens` on every tick.
+
+   That earliest-available read was O(1) only while matured tokens were consumed as they
+   matured. A backlog of matured tokens waiting on a scarce resource made it O(backlog)
+   per clock advance until [#59](https://github.com/philgresh/cpnx/issues/59)'s
+   matured heap; `bench_timed_backlog.py` measures that shape.
 
 Guard-free FIFO µs/step, same machine, before vs after (read the **shape** — flat is the
 goal):
@@ -570,6 +577,7 @@ the subnet's clock *value* (the parent's time never crosses the boundary) while 
 
 [#18]: https://github.com/philgresh/cpnx/issues/18
 [#25]: https://github.com/philgresh/cpnx/issues/25
+[#59]: https://github.com/philgresh/cpnx/issues/59
 
 ## Scope
 

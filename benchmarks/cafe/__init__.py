@@ -85,6 +85,7 @@ no flags is exactly the table above. See [`cafe.stations`][cafe.stations] for th
 | `cold_brew` | 🧊 Cold-brew tower | A deep **timed** place |
 | `cold_brew_key` | ↳ with a keyed arc | The timed×key residual (#25) |
 | `batch_triage` | 📋 Rush-hour triage | A certified [`InputArc.key`][cpnx.InputArc] at depth |
+| `mobile_orders` | 📱 Mobile-order rush | A deep *matured* timed backlog behind one paced barista |
 
 Run it directly:
 

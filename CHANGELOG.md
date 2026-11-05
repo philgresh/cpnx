@@ -67,6 +67,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the new features assessed and declined:
   [`docs/python-version-support.md`](https://github.com/philgresh/cpnx/blob/main/docs/python-version-support.md).
 
+- **The Concurrency Cafe gains a 📱 mobile-order rush station, `build_cafe(mobile_orders=True)`.**
+  App orders land on `P_Mobile_Rail` with a due time and a single barista, a capacity-1
+  [`PacedResourcePlace`][cpnx.PacedResourcePlace] with `mobile_make_secs` (default 30) per drink,
+  works through them. When a rush comes due at once the rail holds a deep backlog of *matured*
+  tokens while the clock advances once per drink, a shape no other station builds: the cold-brew
+  tower pours each batch as it matures and advances the clock only a few dozen times.
+  `bench_cafe_throughput.py` adds a "mobile-order rush" regime at 500 / 2 000 / 8 000 orders that
+  runs each size twice with identical work, once timed and once with the orders deposited
+  `AVAILABLE_NOW`, and prints the ratio. At 8 000 orders the timed rail costs 13.2× its untimed
+  control before the matured-heap fix below and 6.5× after; the rest is cause B of
+  [#59](https://github.com/philgresh/cpnx/issues/59), the FIFO pool read peeking
+  `binding_search_limit + 1` tokens per evaluation.
+
+### Fixed
+
+- **A backlog of matured timed tokens no longer makes every logical-clock advance O(backlog).**
+  `_TokenStore` kept a timed token in its cooling heap after it matured, so
+  [`Place.earliest_available_boundary`][cpnx.Place.earliest_available_boundary], which
+  `drive_to_quiescence` calls for every place on every clock advance, popped and re-pushed each
+  matured-but-unconsumed token to reach the first future one, and every FIFO read over the place
+  did the same. A net whose timed work waits on a scarce resource, the normal shape of a
+  discrete-event simulation, therefore drained in O(N²). Matured entries now migrate once into a
+  second heap when a boundary query's finite time passes them, and reads walk ready, matured, then
+  cooling, which keeps the `(available_at, seq)` order. Only the boundary query moves the split
+  between the two heaps: a FIFO read on the wall clock (`peek`, `can_retrieve` or `retrieve`
+  without `model_time`) never does, so it cannot push the next logical-time query onto a slow path.
+  A non-finite time never migrates, a past-dated deposit lands with the matured entries, removing
+  the last timed token resets the split, and a boundary query behind the split, such as the
+  engine's wall-clock query before a switch to logical time, re-splits the heaps once rather than
+  staying on a slow path.
+  Measured with the new `benchmarks/bench_timed_backlog.py`: a boundary query holds at about
+  0.32 µs from 1 000 to 16 000 matured tokens (was 346 → 7 754 µs), and the timed drive drops
+  from 3 964 to 1 484 µs/step at 4 000 arrivals. That drive still plateaus above its untimed
+  control, because the FIFO pool read peeks `binding_search_limit + 1` tokens per evaluation
+  whatever the head-only cap; that is cause B of
+  [#59](https://github.com/philgresh/cpnx/issues/59) and is not fixed here.
+
 ## [0.7.0] — 2026-10-20
 
 ### Removed
