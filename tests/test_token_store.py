@@ -23,7 +23,7 @@ import time
 
 import pytest
 
-from cpnx import InputArc, OutputArc, PetriNet, Transition
+from cpnx import InputArc, OutputArc, PacedResourcePlace, PetriNet, Transition
 from cpnx.places import Place, _TokenStore
 from cpnx.tokens import AVAILABLE_NOW, Token
 
@@ -284,51 +284,68 @@ _WALL_CLOCK = 1_000_000.0
 class TestSplitCannotBePinned:
     """A read on one clock must not leave later reads on another clock on the slow path (#59)."""
 
-    def test_wall_clock_read_on_an_empty_place_does_not_pin_the_split(self, heap_ops, monkeypatch):
-        place = Place("p")
-        with monkeypatch.context() as m:
-            m.setattr(time, "monotonic", lambda: _WALL_CLOCK)
-            assert not place.can_retrieve(1)
-        assert place._store._migrated_to == -math.inf
-        for i in range(2000):
-            place.deposit(Token(available_at=1.0 + i), model_time=0.0)
-        place.deposit(Token(available_at=5000.0), model_time=0.0)
-
-        _assert_fast_boundary(place, heap_ops)
-
-    def test_boundary_query_behind_the_split_resplits_once(self, heap_ops, monkeypatch):
+    def test_wall_clock_fifo_read_does_not_move_the_split(self, heap_ops, monkeypatch):
         place = _deep_backlog_place()
+        assert place.earliest_available_boundary(100.0) == 101.0
         with monkeypatch.context() as m:
             m.setattr(time, "monotonic", lambda: _WALL_CLOCK)
+            assert place.peek() is not None
             assert place.can_retrieve(1)
+        assert place._store._migrated_to == 100.0
+
+        heap_ops.ops = 0
+        assert place.earliest_available_boundary(100.0) == 101.0
+        assert heap_ops.ops <= 2
+
+    def test_boundary_query_behind_the_split_resplits_once(self, heap_ops):
+        place = _deep_backlog_place()
+        assert place.earliest_available_boundary(_WALL_CLOCK) is None
         assert place._store._migrated_to == _WALL_CLOCK
 
         _assert_fast_boundary(place, heap_ops)
         assert place._store._migrated_to == 2600.0
 
-    def test_wall_clock_step_then_logical_time_stays_on_the_fast_path(self, heap_ops, monkeypatch):
+    def test_wall_clock_step_then_logical_drive_stays_on_the_fast_path(self, heap_ops, monkeypatch):
         net = PetriNet(seed=0)
-        for name in ("inbox", "gate", "out"):
+        for name in ("inbox", "out"):
             net.add_place(Place(name))
+        net.add_place(PacedResourcePlace("gate", capacity=1, pacing_secs=3.0))
         net.add_transition(
             Transition(
                 name="t",
                 inputs=[InputArc("inbox"), InputArc("gate")],
                 outputs=[OutputArc("out")],
-                action=lambda tokens: tokens[:1],
+                action=lambda tokens: [t for t in tokens if not t.is_resource],
             )
         )
-        net.deposit("inbox", Token(available_at=0.5))
+        # Due after the wall-clock step, so nothing fires on a worker thread while it is patched.
+        net.deposit("inbox", Token(available_at=2 * _WALL_CLOCK))
         with monkeypatch.context() as m:
             m.setattr(time, "monotonic", lambda: _WALL_CLOCK)
             net.step()
-        assert net.places["inbox"]._store._migrated_to == _WALL_CLOCK
         net.advance_time(1.0)
-        for i in range(2000):
+        for i in range(1000):
             net.deposit("inbox", Token(available_at=1.0 + i))
-        net.deposit("inbox", Token(available_at=5000.0))
 
-        _assert_fast_boundary(net.places["inbox"], heap_ops)
+        inbox = net.places["inbox"]
+        boundary = inbox.earliest_available_boundary
+        calls = ops = 0
+
+        def counted(now: float) -> float | None:
+            nonlocal calls, ops
+            before = heap_ops.ops
+            try:
+                return boundary(now)
+            finally:
+                calls += 1
+                ops += heap_ops.ops - before
+
+        monkeypatch.setattr(inbox, "earliest_available_boundary", counted)
+        result = net.drive_to_quiescence()
+
+        assert len(net.marking["out"]) == 1001
+        assert calls >= result.ticks > 1000
+        assert ops <= 2 * calls
 
     def test_non_finite_reads_never_move_the_split(self):
         store = _TokenStore()
@@ -337,19 +354,28 @@ class TestSplitCannotBePinned:
 
         for t in (math.nan, math.inf, -math.inf):
             store.has_available(t_limit=t, need=1)
-            store.earliest_cooling_after(t)
+        assert store.earliest_cooling_after(-math.inf) == 10.0
+        assert store.earliest_cooling_after(math.nan) is None
+        assert store.earliest_cooling_after(math.inf) is None
         assert store._migrated_to == 50.0
         assert [t.available_at for t in store.peek_available(5, t_limit=60.0)] == [10.0]
 
-    def test_store_with_no_timed_token_resets_the_split(self):
+    @pytest.mark.parametrize("empty", ["remove_identity", "take_available"])
+    def test_removing_the_last_timed_token_resets_the_split(self, empty):
         store = _TokenStore()
-        (token,) = _timed(store, 10.0)
+        tokens = _timed(store, 10.0, 20.0)
         assert store.earliest_cooling_after(50.0) is None
-        store.remove_identity([token])
+        assert store._migrated_to == 50.0
 
-        assert not store.has_available(t_limit=100.0, need=1)
+        if empty == "remove_identity":
+            store.remove_identity(tokens)
+        else:
+            assert len(store.take_available(10, t_limit=50.0)) == 2
+
         assert store._migrated_to == -math.inf
         assert store._matured == [] and store._cooling == []
+        _timed(store, 30.0)
+        assert store._cooling and not store._matured
 
 
 def _by_time(store: _TokenStore, *times: float) -> list[Token]:

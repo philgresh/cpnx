@@ -162,10 +162,10 @@ class TestStationsFire:
             assert len(net.marking["P_Mobile_Rail"]) == 1, "an order was made before it was due"
 
     def test_mobile_rush_is_made_one_drink_per_make_time_in_due_order(self):
-        """A burst of due orders must drain oldest-first, one drink per `make_secs` of logical
-        time: that one-advance-per-drink cadence is what makes the rail a matured backlog."""
+        """A burst of due orders must drain oldest-first, one drink per `mobile_make_secs` of
+        logical time: that one-advance-per-drink cadence is what makes the rail a matured backlog."""
         made: list[tuple[int, float]] = []
-        with build_cafe(mobile_orders=True, mobile_make_secs=30.0, seed=1, max_workers=1) as net:
+        with build_cafe(mobile_orders=True, mobile_make_secs=45.0, seed=1, max_workers=1) as net:
 
             def record(place: str, token: Token) -> None:
                 if place == "P_Served":
@@ -179,9 +179,9 @@ class TestStationsFire:
 
         assert [order for order, _ in made] == [0, 1, 2, 3, 4]
         gaps = [later - earlier for (_, earlier), (_, later) in zip(made, made[1:], strict=False)]
-        # Not `>= 30.0`: `t + 30.0` rounds down by one ulp when it crosses a power of two, which
+        # Not `>= 45.0`: `t + 45.0` rounds down by one ulp when it crosses a power of two, which
         # happens at the small monotonic readings of a freshly booted CI runner.
-        assert gaps == pytest.approx([30.0] * 4)
+        assert gaps == pytest.approx([45.0] * 4)
         assert result.ticks >= 5
 
     def test_keyed_cold_brew_builds_and_still_defers(self):

@@ -41,6 +41,7 @@ _ALL_LEGIT = dict(
     eighty_six=True,
     cupping=True,
     pastry_case=True,
+    mobile_orders=True,
 )
 
 

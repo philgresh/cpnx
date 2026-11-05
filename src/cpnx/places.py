@@ -148,11 +148,13 @@ class _TokenStore:
     common case) live in `_ready`, an `OrderedDict` keyed by a monotonic insertion
     sequence number so iteration order is insertion order. Timed tokens live in two
     `heapq` min-heaps of ``(available_at, seq)`` split at `_migrated_to`: `_matured`
-    holds entries at or before it and `_cooling` holds entries after it. Reads migrate
-    entries from `_cooling` to `_matured` as a finite read time moves past them, so a
-    matured backlog is never re-walked to find the next future boundary. The split moves back
-    only when a boundary query arrives behind it (`_resplit`), and resets to ``-inf`` whenever
-    the store holds no timed token, so a read on one clock cannot pin it. Both heaps are
+    holds entries at or before it and `_cooling` holds entries after it. Only the boundary
+    query, `earliest_cooling_after`, moves the split: it migrates entries from `_cooling` to
+    `_matured` as its finite time moves past them, so a matured backlog is never re-walked to
+    find the next future boundary, and it re-splits the heaps (`_resplit`) when it arrives
+    behind the split, which is what keeps a query on one clock from pinning the split for
+    another. FIFO reads only walk `_matured` then `_cooling` and never move it. Removing the
+    last timed token resets both heaps and the split to ``-inf``. Both heaps are
     lazily deleted: an entry is stale once its ``seq`` is no longer in `_cooling_by_seq`
     (the authoritative membership for every timed token, matured or not). `_seq_of` maps
     ``id(token)`` to its seq for O(1) removal by object identity.
@@ -243,19 +245,10 @@ class _TokenStore:
         """Move `_cooling` entries at or before *t_limit* to `_matured`, if time moved forward.
 
         Each entry migrates at most once, so the cost is amortized O(log n) per token. A
-        non-finite *t_limit* never migrates: `is_quiescent` probes with `t_limit = inf` to ask
-        whether anything could *ever* fire, and migrating on it would file every future token as
-        matured. Stale entries met on the way are discarded.
-
-        A store holding no timed token resets both heaps and `_migrated_to` instead, so a read on
-        one clock (such as a wall-clock `can_retrieve` on an empty place) cannot pin the split
-        ahead of tokens later deposited on another.
+        non-finite *t_limit* never migrates, so NaN or ``inf`` can never become the split; an
+        ``inf`` split would file every future token as matured. Stale entries met on the way
+        are discarded.
         """
-        if not self._cooling_by_seq:
-            self._cooling.clear()
-            self._matured.clear()
-            self._migrated_to = -math.inf
-            return
         if not math.isfinite(t_limit) or t_limit <= self._migrated_to:
             return
         while self._cooling and self._cooling[0][0] <= t_limit:
@@ -289,8 +282,11 @@ class _TokenStore:
         Walks `_matured` then `_cooling` in ascending order, discarding stale entries
         permanently along the way. Does NOT restore anything — callers that need a
         non-destructive read must hand the result to `_push_timed_all`.
+
+        Does not migrate: a FIFO read on the wall clock would otherwise file every token
+        dated before it as matured, and the next logical-time boundary query would re-split
+        them all back.
         """
-        self._migrate(t_limit)
         matured: list[tuple[float, int]] = []
         for heap in (self._matured, self._cooling):
             while heap and len(matured) < limit:
@@ -387,14 +383,22 @@ class _TokenStore:
                 token = self._cooling_by_seq.pop(seq)
                 del self._seq_of[id(token)]
                 taken.append(token)
+            self._reset_if_untimed()
         return taken
 
     def drop(self, seq: int) -> None:
         """Remove the token at *seq* from whichever set holds it (heap entry left lazily stale)."""
         if seq in self._ready:
             del self._ready[seq]
-        else:
-            self._cooling_by_seq.pop(seq, None)
+        elif self._cooling_by_seq.pop(seq, None) is not None:
+            self._reset_if_untimed()
+
+    def _reset_if_untimed(self) -> None:
+        """Empty both timed heaps and reset the split once the store holds no timed token."""
+        if not self._cooling_by_seq:
+            self._cooling.clear()
+            self._matured.clear()
+            self._migrated_to = -math.inf
 
     def remove_identity(self, tokens: Iterable[Token]) -> None:
         """Remove each of *tokens* by object identity. Callers must validate presence first."""
