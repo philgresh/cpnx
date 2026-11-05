@@ -112,11 +112,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the backlog until it hit the limit. The peek is now bounded by the arc's `count` for a
   head-only transition. Searching transitions (a guard, `RANDOM` or `PRIORITY`) still read
   `binding_search_limit + 1` candidates, so which tokens fire, and the seeded RNG stream, are
-  unchanged. Measured on the `cold_brew` row of `bench_station_costs.py`, per-order cost
-  across a 250 → 2 000 depth ladder now grows 1.05× (was 2.1×), and is 2.6× lower at 2 000;
-  the `cold-brew` regime of `bench_cafe_throughput.py` is 1.7× faster at 20 000 orders. Both
-  were measured before the matured-heap fix above. Part of
-  [#59](https://github.com/philgresh/cpnx/issues/59) (cause B).
+  unchanged. With the matured-heap fix above in place, a timed backlog now costs about what
+  its untimed control does: at 8 000 orders the mobile-order rush's timed rail runs 1.0× its
+  control (was 5.2×), and `bench_timed_backlog.py`'s timed drive at 4 000 arrivals runs
+  1.0–1.1× (was 7.2×), 9–10× faster per step. The `cold_brew` row of
+  `bench_station_costs.py` is flat across its 250 → 2 000 depth ladder (was 2.2× growth) and
+  2.7× lower at 2 000, and the `cold-brew` regime of `bench_cafe_throughput.py` is 1.7× faster
+  at 20 000 orders. Part of [#59](https://github.com/philgresh/cpnx/issues/59) (cause B).
 
 ## [0.7.0] — 2026-10-20
 
