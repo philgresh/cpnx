@@ -117,6 +117,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2.7× lower at 2 000, and the `cold-brew` regime of `bench_cafe_throughput.py` is 1.7× faster
   at 20 000 orders. Part of [#59](https://github.com/philgresh/cpnx/issues/59) (cause B).
 
+- **A guarded `FIRST` transition over plain single-token arcs now pays for the candidates it
+  inspects, not for the depth of its input places.** The search built every arc's capped
+  candidate list, and peeked up to
+  `binding_search_limit + 1` tokens per arc, before trying the first combination. So even when
+  the head combination satisfied the guard, each enabling check and firing cost O(min(depth,
+  limit)) per arc, and draining a guard join over a deep place was O(N²). `FIRST` and the
+  RNG-free enabling probe now enumerate the same lexicographic product lazily, reading each
+  arc's candidates at most twice as far as the enumeration has reached. A deep pool on an arc
+  with `count == 1` and no `key`, `filter` or `consume_all` is peeked in doubling chunks, so
+  for such an arc `FIRST` reads a constant multiple of the tokens it inspects. This supersedes the
+  entry above's note that searching transitions still read `binding_search_limit + 1`
+  candidates, but only for those arcs. Other shapes still read their pool up front: a
+  certified `key` reads up to `binding_search_limit + count` tokens from its index, and a
+  `filter`, an uncertified `key`, `count >= 2` or `consume_all` reads the whole place, so a
+  join over those stays O(depth) per check. A transition with more than 32 input arcs keeps
+  the eager product.
+  `RANDOM` and `PRIORITY` scan the whole bounded product anyway and keep the eager path, so
+  chosen bindings and the seeded RNG stream are unchanged for every policy. Measured with the
+  new `benchmarks/bench_guard_join.py` (N jobs joined to 8 workers on a `wid` guard): one
+  resolution with a satisfying head holds at about 6.7 µs from 1 000 to 16 000 jobs (was
+  76 → 1 207 µs), and the drive runs 106 → 133 µs/step from 500 to 8 000 jobs (was
+  120 → 628). With no satisfying binding `FIRST` still walks the whole capped product, now
+  1–4% slower than before; avoiding that walk needs an index on the join key. Part of
+  [#59](https://github.com/philgresh/cpnx/issues/59) (cause C).
+
 ## [0.7.0] — 2026-10-20
 
 ### Removed
