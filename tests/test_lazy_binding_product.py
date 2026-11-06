@@ -48,6 +48,12 @@ def test_lazy_product_reads_options_in_proportion_to_what_it_yields(take):
     assert sum(s.pulled for s in streams) <= 2 * take + len(streams)
 
 
+@pytest.mark.parametrize("width", [32, 33, 40])
+def test_lazy_product_order_holds_on_both_sides_of_the_width_cap(width):
+    lists = [[0, 1, 2] if i in (0, width - 1) else [i] for i in range(width)]
+    assert list(_lazy_product([iter(xs) for xs in lists])) == list(itertools.product(*lists))
+
+
 def test_lazy_product_stops_at_an_empty_stream_after_one_pull_from_each():
     streams = [_CountingStream(range(1_000)), _CountingStream([]), _CountingStream(range(1_000))]
     assert list(_lazy_product(streams)) == []
@@ -82,48 +88,128 @@ def test_every_arc_selection_runs_when_an_earlier_arc_is_empty():
     assert sorted(keyed) == [2, 3]
 
 
-def _eager_first(net, transition, m_time, ignore_timing):
-    """`FIRST` as `main` ran it: `(binding, exhausted)` from the full capped product, eager pools."""
-    pools = net._gather_arc_pools(transition, m_time, ignore_timing)
-    if pools is None:
-        return None, False
-    cap = net.binding_search_limit + 1
-    option_lists = [list(itertools.islice(net._arc_options(arc, pool), cap)) for arc, pool in pools]
-    for examined, combo in enumerate(itertools.product(*option_lists), start=1):
-        if examined > net.binding_search_limit:
-            return None, True
-        if net._check_transition_guard(transition, [t for group in combo for t in group]):
-            return [list(group) for group in combo], False
-    return None, False
-
-
 NOW = 10.0
+
+
+def _oracle_options(net, arc, t_limit):
+    """One arc's candidate groups, built from public `Place` reads and `itertools` only."""
+    place = net.places[arc.place]
+    if not place.can_retrieve(arc.count, model_time=t_limit):
+        return None
+    pool = place.peek(len(place), model_time=t_limit)
+    if arc.consume_all:
+        return [pool]
+    if arc.filter is not None:
+        pool = [t for t in pool if arc.filter(t)]
+    if arc.key is not None:
+        pool = sorted(pool, key=arc.key)
+    return [list(group) for group in itertools.combinations(pool, arc.count)]
+
+
+def _oracle_search(net, transition, t_limit, *, probe, rng_state):
+    """`(binding, guard_calls, exhausted)` as ADR 0001 specifies the search, independent of the engine.
+
+    Candidates are the product of each arc's groups in lexicographic order, examined up to
+    `binding_search_limit`. `FIRST` and the probe take the first satisfying one, `PRIORITY` the
+    first-encountered minimum key, and `RANDOM` reservoir-samples with the net's RNG.
+    """
+    lists = []
+    for arc in transition.inputs:
+        options = _oracle_options(net, arc, t_limit)
+        if options is None:
+            return None, [], False
+        lists.append(options)
+    policy = transition.binding_policy or net.binding_policy
+    stop_at_first = probe or policy is BindingPolicy.FIRST
+    calls, satisfying, exhausted = [], [], False
+    for examined, combo in enumerate(itertools.product(*lists), start=1):
+        if examined > net.binding_search_limit:
+            exhausted = True
+            break
+        flat = [t for group in combo for t in group]
+        calls.append(tuple(t.id for t in flat))
+        if transition.guard(flat):
+            satisfying.append(([list(group) for group in combo], flat))
+            if stop_at_first:
+                break
+    if not satisfying:
+        return None, calls, exhausted
+    if stop_at_first:
+        return satisfying[0][0], calls, exhausted
+    if policy is BindingPolicy.PRIORITY:
+        best = min(range(len(satisfying)), key=lambda i: (transition.binding_priority_key(satisfying[i][1]), i))
+        return satisfying[best][0], calls, exhausted
+    rng = random.Random()
+    rng.setstate(rng_state)
+    chosen = None
+    for seen, (binding, _flat) in enumerate(satisfying, start=1):
+        if rng.random() < 1.0 / seen:
+            chosen = binding
+    return chosen, calls, exhausted
+
+
+ARC_SHAPES = ("plain", "plain", "pair", "keyed", "filtered", "drain")
+
+
+def _descending_v(token):
+    return -token.payload["v"]
+
+
+def _not_three(token):
+    return token.payload["v"] != 3
+
+
+def _priority(tokens):
+    return (sum(t.payload["i"] for t in tokens) * 7) % 5
+
+
+def _sum_guard(modulus, residue):
+    return lambda toks: sum(t.payload["v"] for t in toks) % modulus == residue
+
+
+GUARDS = [_sum_guard(m, r) for m in range(2, 8) for r in range(m)]
+
+
+def _arc(name, shape):
+    if shape == "pair":
+        return InputArc(name, count=2)
+    if shape == "keyed":
+        return InputArc(name, key=_descending_v)
+    if shape == "filtered":
+        return InputArc(name, filter=_not_three)
+    if shape == "drain":
+        return InputArc(name, consume_all=True)
+    return InputArc(name)
+
+
+def _first_token(tokens):
+    return tokens[:1]
 
 
 def _random_net(rng):
     limit = rng.choice([3, 7, 50, 1_000])
+    policy = rng.choice([None, BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY])
     net = PetriNet(seed=rng.randrange(1_000), binding_search_limit=limit)
     net.advance_time(NOW)
     arcs = []
     for p in range(rng.randint(1, 3)):
         name = f"bin{p}"
         net.add_place(Place(name))
-        count = rng.choice([1, 1, 2])
-        keyed = rng.random() < 0.3
-        arcs.append(InputArc(name, count=count, key=(lambda t: -t.payload["v"]) if keyed else None))
+        arcs.append(_arc(name, rng.choice(ARC_SHAPES)))
         timed_share = rng.choice([0.0, 0.0, 0.3, 0.8])
         for i in range(rng.choice([rng.randint(0, 12), rng.randint(9, 40)])):
             at = rng.uniform(0.0, 2 * NOW) if rng.random() < timed_share else 0.0
             net.deposit(name, Token(payload={"v": rng.randrange(6), "i": i}, available_at=at))
     net.add_place(Place("out"))
-    modulus, residue = rng.randint(2, 7), rng.randrange(7)
     net.add_transition(
         Transition(
             name="pick",
             inputs=arcs,
             outputs=[OutputArc("out")],
-            guard=lambda toks: sum(t.payload["v"] for t in toks) % modulus == residue % modulus,
-            action=lambda toks: toks[:1],
+            guard=rng.choice(GUARDS),
+            action=_first_token,
+            binding_policy=policy,
+            binding_priority_key=_priority,
         )
     )
     return net
@@ -147,37 +233,125 @@ def _record_search(monkeypatch, net):
     return calls
 
 
+def _guard_calls(calls):
+    return [ids for kind, ids in calls if kind == "guard"]
+
+
 @pytest.mark.parametrize("ignore_timing", [False, True], ids=["at-model-time", "ignoring-timing"])
-def test_first_runs_the_same_search_as_the_eager_product(monkeypatch, ignore_timing):
-    """Same binding, same guard evaluations in the same order, same exhaustion, timed tokens included."""
+def test_every_policy_runs_the_same_search_as_an_independent_oracle(monkeypatch, ignore_timing):
+    """Same binding, same guard evaluations in order, same exhaustion: resolution and probe, every policy."""
     rng = random.Random(1959)
     found = exhausted = streamed = 0
-    for _ in range(600):
+    policies = set()
+    for _ in range(300):
         net = _random_net(rng)
         transition = net.transitions["pick"]
         m_time = float("inf") if ignore_timing else NOW
         calls = _record_search(monkeypatch, net)
 
-        expected, expected_exhausted = _eager_first(net, transition, m_time, ignore_timing)
-        eager_calls = list(calls)
-        calls.clear()
+        rng_state = net._rng.getstate()
+        expected, oracle_calls, oracle_exhausted = _oracle_search(
+            net, transition, m_time, probe=False, rng_state=rng_state
+        )
         binding = net._resolve_binding(transition, m_time, ignore_timing=ignore_timing)
         got = None if binding is None else [tokens for _arc, tokens in binding]
         assert got == expected
-        assert [c for c in calls if c[0] == "guard"] == eager_calls
-        assert (("exhausted", ()) in calls) is expected_exhausted
+        assert _guard_calls(calls) == oracle_calls
+        assert (("exhausted", ()) in calls) is oracle_exhausted
 
         calls.clear()
-        assert net._binding_exists(transition, m_time, ignore_timing=ignore_timing) is (expected is not None)
-        assert [c for c in calls if c[0] == "guard"] == [c for c in eager_calls if c[0] == "guard"]
+        exists, probe_calls, probe_exhausted = _oracle_search(net, transition, m_time, probe=True, rng_state=None)
+        assert net._binding_exists(transition, m_time, ignore_timing=ignore_timing) is (exists is not None)
+        assert _guard_calls(calls) == probe_calls
+        assert (("exhausted", ()) in calls) is probe_exhausted
 
-        pools = net._gather_arc_pools(transition, m_time, ignore_timing, lazy=True) or []
+        head_only, lazy = net._search_mode(transition, net._effective_policy(transition), probe=True)
+        pools = net._gather_arc_pools(transition, m_time, ignore_timing, head_only=head_only, lazy=lazy) or []
         streamed += any(isinstance(pool, _PeekStream) for _arc, pool in pools)
         found += expected is not None
-        exhausted += expected_exhausted
-    assert 100 < found < 500, found
-    assert exhausted > 20, exhausted
-    assert streamed > 50, streamed
+        exhausted += oracle_exhausted
+        policies.add(net._effective_policy(transition))
+    assert policies == set(BindingPolicy)
+    assert 50 < found < 270, found
+    assert exhausted > 10, exhausted
+    assert streamed > 15, streamed
+
+
+@pytest.mark.parametrize(
+    ("shape", "limit", "policy", "streams"),
+    [
+        ("plain", 1_000, None, True),
+        ("plain", 7, None, False),
+        ("pair", 1_000, None, False),
+        ("keyed", 1_000, None, False),
+        ("filtered", 1_000, None, False),
+        ("drain", 1_000, None, False),
+        ("plain", 1_000, BindingPolicy.RANDOM, False),
+        ("plain", 1_000, BindingPolicy.PRIORITY, False),
+    ],
+)
+def test_only_a_deep_plain_single_token_arc_searched_lazily_streams(shape, limit, policy, streams):
+    net = PetriNet(binding_search_limit=limit)
+    net.add_place(Place("bin"))
+    for i in range(40):
+        net.deposit("bin", Token(payload={"v": i % 6, "i": i}))
+    transition = Transition(
+        name="pick",
+        inputs=[_arc("bin", shape)],
+        outputs=[],
+        guard=lambda toks: True,
+        action=lambda toks: toks,
+        binding_policy=policy,
+    )
+    head_only, lazy = net._search_mode(transition, net._effective_policy(transition), probe=False)
+    pools = net._gather_arc_pools(transition, net.model_time, False, head_only=head_only, lazy=lazy)
+    assert isinstance(pools[0][1], _PeekStream) is streams
+    assert isinstance(pools[0][1], list) is not streams
+
+
+def test_a_head_only_transition_always_gets_lists():
+    net = PetriNet(binding_search_limit=1_000)
+    net.add_place(Place("bin"))
+    for i in range(40):
+        net.deposit("bin", Token(payload={"i": i}))
+    transition = Transition(name="pick", inputs=[InputArc("bin")], outputs=[], action=lambda toks: toks)
+    for probe in (False, True):
+        head_only, lazy = net._search_mode(transition, net._effective_policy(transition), probe=probe)
+        assert (head_only, lazy) == (True, False)
+        pools = net._gather_arc_pools(transition, net.model_time, False, head_only=head_only, lazy=lazy)
+        assert isinstance(pools[0][1], list)
+
+
+class _GuardDroppingPlace(Place):
+    """Clears its transition's guard during the pool read, standing in for another thread."""
+
+    transition = None
+
+    def can_retrieve(self, count=1, model_time=None):
+        if self.transition is not None:
+            self.transition.guard, self.transition = None, None
+        return super().can_retrieve(count, model_time=model_time)
+
+
+def test_reassigning_the_guard_mid_resolution_keeps_pools_and_path_consistent():
+    net = PetriNet(binding_search_limit=1_000)
+    place = _GuardDroppingPlace("bin")
+    net.add_place(place)
+    net.add_place(Place("out"))
+    for i in range(40):
+        net.deposit("bin", Token(payload={"i": i}))
+    net.add_transition(
+        Transition(
+            name="pick",
+            inputs=[InputArc("bin")],
+            outputs=[OutputArc("out")],
+            guard=lambda toks: False,
+            action=lambda t: t,
+        )
+    )
+    place.transition = net.transitions["pick"]
+    binding = net._resolve_binding(net.transitions["pick"], net.model_time)
+    assert binding is not None and binding[0][1][0].payload["i"] == 0
 
 
 WORKERS = 8
@@ -257,11 +431,16 @@ def _spy_peek(monkeypatch, place):
 
 
 @pytest.mark.parametrize("first_match", [0, 3, 40])
-def test_first_peeks_the_deep_pool_in_proportion_to_what_it_inspects(monkeypatch, first_match):
+@pytest.mark.parametrize("probe", [False, True], ids=["resolve", "exists"])
+def test_first_peeks_the_deep_pool_in_proportion_to_what_it_inspects(monkeypatch, first_match, probe):
     net = _join_net(5_000, first_match)
     reads = _spy_peek(monkeypatch, net.places["waiting"])
-    binding = net._resolve_binding(net.transitions["match"], net.model_time)
-    assert binding[0][1][0].payload["job"] == first_match
+    transition = net.transitions["match"]
+    if probe:
+        assert net._binding_exists(transition, net.model_time)
+    else:
+        binding = net._resolve_binding(transition, net.model_time)
+        assert binding[0][1][0].payload["job"] == first_match
     assert sum(reads) < 4 * (first_match + 1) + 8, reads
 
 
@@ -286,3 +465,50 @@ def test_peek_stream_offers_each_token_once_if_the_place_changes_between_chunks(
     assert len(seen) == len({id(t) for t in seen})
     assert seen[:8] == tokens[:8]
     assert set(map(id, seen)) <= set(map(id, tokens))
+
+
+def test_peek_stream_offers_a_token_deposited_inside_the_read_prefix_between_chunks():
+    place = Place("jobs")
+    ready = [Token(payload={"i": i}) for i in range(4)]
+    matured = [Token(payload={"i": 100 + i}, available_at=1.0 + 0.01 * i) for i in range(30)]
+    for token in [*ready, *matured]:
+        place.deposit(token, model_time=0.0)
+    late = Token(payload={"i": -1})
+    seen = []
+    for token in _PeekStream(place, NOW, 40):
+        seen.append(token)
+        if len(seen) == 8:
+            place.retrieve_specific([ready[0]], model_time=NOW)
+            place.deposit(late, model_time=NOW)
+    assert seen[:8] == [*ready, *matured[:4]]
+    assert len(seen) == len({id(t) for t in seen})
+    assert any(t is late for t in seen)
+    assert {id(t) for t in seen} == {id(t) for t in [*ready, *matured, late]}
+
+
+@pytest.mark.parametrize(
+    ("guard", "policy"),
+    [(lambda toks: True, None), (None, BindingPolicy.RANDOM), (None, BindingPolicy.PRIORITY)],
+    ids=["guarded-first", "guard-free-random", "guard-free-priority"],
+)
+def test_a_transition_with_a_thousand_input_arcs_still_resolves(guard, policy):
+    width = 1_100
+    net = PetriNet(seed=5)
+    names = [f"slot{i}" for i in range(width)]
+    for name in [*names, "out"]:
+        net.add_place(Place(name))
+    for name in names:
+        net.deposit(name, Token(payload={"slot": name}))
+    net.add_transition(
+        Transition(
+            name="gather",
+            inputs=[InputArc(name) for name in names],
+            outputs=[OutputArc("out")],
+            guard=guard,
+            action=lambda toks: toks[:1],
+            binding_policy=policy,
+        )
+    )
+    assert net.is_dead() is False
+    assert net.is_quiescent() is False
+    assert net.step() is True
