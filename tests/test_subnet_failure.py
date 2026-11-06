@@ -12,6 +12,7 @@ must survive every purge), and lands in `Ready`.
 
 import functools
 import gc
+import itertools
 import math
 import threading
 import time
@@ -1397,7 +1398,9 @@ def test_logical_drive_stops_new_work_two_levels_down():
             )
         ],
     )
-    front.drive_to_quiescence = functools.partial(front.drive_to_quiescence, max_spins=2000)
+    first_drive = itertools.count()
+    drive_front = front.drive_to_quiescence
+    front.drive_to_quiescence = lambda: drive_front(max_spins=2000 if next(first_drive) == 0 else 10_000_000)
     parent = PetriNet(
         places=[Place("Queue"), Place("Served")],
         transitions=[
@@ -1544,6 +1547,8 @@ def test_queued_work_does_not_start_while_the_drive_is_judged():
 
     def slow_verdict() -> bool:
         verdict = judged()
+        if not subnet._closing:
+            return verdict
         release.set()
         deadline = time.monotonic() + 5.0
         while subnet._running_count and time.monotonic() < deadline:
@@ -1886,6 +1891,24 @@ def test_replacing_a_kitchen_by_name_releases_its_subnet():
     del second.transitions["Kitchen"]
     third = PetriNet(places=[Place("Queue"), Place("Served")], transitions=[station])
     assert kitchen._parent_net() is third
+    kitchen._pending_restore = (kitchen._checkpoint_marking(), [])
+    assert second.is_quiescent() and not third.is_quiescent()
+    kitchen._pending_restore = None
+
+
+def test_a_wrapped_subnet_cannot_be_swapped():
+    kitchen = PetriNet(places=[Place("Queue"), Place("Served")])
+    station = SubstitutionTransition(
+        name="Kitchen",
+        inputs=[InputArc("Queue")],
+        outputs=[OutputArc("Served")],
+        action=lambda tokens: tokens,
+        subnet=kitchen,
+        port_socket_map={"Queue": "Queue", "Served": "Served"},
+    )
+    with pytest.raises(AttributeError, match="cannot be reassigned"):
+        station.subnet = PetriNet(places=[Place("Queue"), Place("Served")])
+    assert station.subnet is kitchen
 
 
 @pytest.mark.parametrize("logical", [True, False], ids=["logical", "wall"])
@@ -2048,10 +2071,11 @@ def test_deadline_must_be_positive_or_none(deadline, error):
     assert subnet not in SubstitutionTransition._mapped_subnets
 
 
+@pytest.mark.parametrize("deadline", [None, 5.0], ids=["unbounded", "bounded"])
 @pytest.mark.parametrize("logical", [True, False], ids=["logical", "wall"])
-def test_unbounded_deadline_serves_a_subnet_held_by_back_pressure(logical):
+def test_a_subnet_held_by_back_pressure_is_served_without_waiting_out_its_deadline(logical, deadline):
     """The kitchen's tray is full, so `Jam` stays enabled but can never fire: the kitchen is
-    finished without ever being quiescent. An unbounded drive must still return."""
+    finished without ever being quiescent. The drive must return once it has finished."""
     kitchen = PetriNet(
         places=[
             Place("Orders"),
@@ -2074,7 +2098,7 @@ def test_unbounded_deadline_serves_a_subnet_held_by_back_pressure(logical):
                 action=lambda tokens: tokens,
                 subnet=kitchen,
                 port_socket_map={"Orders": "Queue", "Ready": "Served"},
-                subnet_deadline_secs=None,
+                subnet_deadline_secs=deadline,
             )
         ],
     )
@@ -2089,7 +2113,34 @@ def test_unbounded_deadline_serves_a_subnet_held_by_back_pressure(logical):
             done.set()
 
     threading.Thread(target=drive, daemon=True).start()
-    assert done.wait(10.0)
+    assert done.wait(2.5)
+    assert _served(parent) == [1]
+
+
+@pytest.mark.parametrize("deadline", [None, math.inf], ids=["none", "inf"])
+def test_unbounded_drive_steps_a_subnet_with_no_cooldown_interval(deadline):
+    kitchen = PetriNet(
+        places=[Place("Orders"), Place("Ready")],
+        cooldown_interval=0.0,
+        transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], lambda tokens: tokens)],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        transitions=[
+            SubstitutionTransition(
+                name="Cafe",
+                inputs=[InputArc("Queue")],
+                outputs=[OutputArc("Served")],
+                action=lambda tokens: tokens,
+                subnet=kitchen,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                subnet_deadline_secs=deadline,
+            )
+        ],
+    )
+    with parent:
+        parent.deposit("Queue", Token(payload={"order": 1}))
+        parent.run(deadline=time.monotonic() + 5.0)
     assert _served(parent) == [1]
 
 
@@ -2151,7 +2202,7 @@ def test_firing_cut_short_by_an_enclosing_failure_still_cools_its_permit():
 def test_a_permit_cooling_down_during_the_finished_check_keeps_the_net_unfinished():
     """`_is_finished` reads deadness and the next availability time separately. A permit whose
     cooldown ends between the two reads must not make a net that can fire look finished."""
-    oven = PacedResourcePlace("Oven", capacity=1, pacing_secs=0.05)
+    oven = PacedResourcePlace("Oven", capacity=1, pacing_secs=1.0)
     net = PetriNet(
         places=[Place("Orders"), Place("Ready"), oven],
         transitions=[Transition("Bake", [InputArc("Orders"), InputArc("Oven")], [OutputArc("Ready")], lambda t: t)],
@@ -2160,7 +2211,9 @@ def test_a_permit_cooling_down_during_the_finished_check_keeps_the_net_unfinishe
 
     def dead_then_wait() -> bool:
         dead = is_dead()
-        time.sleep(0.1)
+        (permit,) = oven.tokens
+        while time.monotonic() <= permit.available_at:
+            time.sleep(0.01)
         return dead
 
     with net:
@@ -2187,8 +2240,9 @@ def test_deadline_is_checked_on_assignment_and_stored_as_a_float():
     assert cafe.subnet_deadline_secs == 0.5
     cafe.subnet_deadline_secs = 10**400
     assert cafe.subnet_deadline_secs == math.inf
-    with pytest.raises(ValueError, match="positive number or None"):
-        cafe.subnet_deadline_secs = float("nan")
+    for bad in (float("nan"), -(10**400)):
+        with pytest.raises(ValueError, match="positive number or None"):
+            cafe.subnet_deadline_secs = bad
     assert cafe.subnet_deadline_secs == math.inf
 
 

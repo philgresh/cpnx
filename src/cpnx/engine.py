@@ -109,6 +109,7 @@ _EXHAUSTED = object()
 #: Widest product `_lazy_product` enumerates lazily. Its recursion is one generator frame per
 #: stream, so a transition with hundreds of input arcs would hit `RecursionError`.
 _LAZY_PRODUCT_MAX_STREAMS = 32
+_MIN_SUBNET_SLICE_SECS = 0.05
 
 
 def _lazy_product(streams: list[Iterator[_T]]) -> Iterator[tuple[_T, ...]]:
@@ -3141,7 +3142,11 @@ class PetriNet:
                     self._mark_dirty(src, token)
 
     def _aborted(self) -> bool:
-        """Whether this net, or a net enclosing it, has a failed firing still to settle."""
+        """Whether this net, or a net enclosing it, has a failed firing still to settle.
+
+        Also true while `_drive_subnet` judges a subnet's drive, including one that then commits:
+        no new work may start in that window.
+        """
         net: PetriNet | None = self
         while net is not None:
             if net._closing or net._pending_restore is not None:
@@ -3247,7 +3252,7 @@ class PetriNet:
 
     def _has_unsettled_subnet(self) -> bool:
         """Whether a subnet of this net still has a failed firing to settle."""
-        return any(subnet._pending_restore is not None for subnet in self._subnets)
+        return any(subnet._pending_restore is not None and subnet._parent_net() is self for subnet in self._subnets)
 
     def _roll_back_nested(self, journal: list["_NestedUndo"]) -> None:
         """Undo the substitution firings this net committed during a firing that failed.
@@ -3272,6 +3277,7 @@ class PetriNet:
         with self._lock:
             if self._running_count or self._has_unsettled_subnet():
                 return False
+        # Boundary first: a cooldown ending between the two reads must not read as finished.
         return self._next_availability_boundary() is None and self.is_dead()
 
     def _checkpoint_marking(self) -> dict[str, tuple[Token, ...]]:
@@ -3597,13 +3603,16 @@ class PetriNet:
         return self._retrieve_subnet_outputs(subnet, transition.port_socket_map, parent_outputs)
 
     def _run_subnet(self, subnet: "PetriNet", bound: float | None) -> None:
-        """Run *subnet* on the wall clock for up to *bound* seconds, or until it has finished."""
-        if bound is not None and math.isfinite(bound):
-            subnet.run(deadline=time.monotonic() + bound)
-            return
-        # `run()` returns only once quiescent, which a back-pressured subnet never is.
+        """Run *subnet* on the wall clock until it has finished, for at most *bound* seconds."""
+        end = math.inf if bound is None else time.monotonic() + bound
+        # `run()` returns only once quiescent, which a back-pressured subnet never is. A slice
+        # shorter than `run()`'s own setup would end before its first step.
+        slice_secs = max(subnet.cooldown_interval, _MIN_SUBNET_SLICE_SECS)
         while not subnet._is_finished() and not self._aborted():
-            subnet.run(deadline=time.monotonic() + subnet.cooldown_interval)
+            now = time.monotonic()
+            if now >= end:
+                return
+            subnet.run(deadline=min(end, now + slice_secs))
 
     def _drive_subnet(self, transition: SubstitutionTransition) -> None:
         """Drive the subnet to quiescence in the parent's clock regime, raising if it gets stuck."""

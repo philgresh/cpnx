@@ -673,7 +673,7 @@ def _check_subnet_deadline(name: str, deadline: object) -> float | None:
     try:
         secs = float(deadline)
     except OverflowError:
-        secs = math.inf
+        secs = math.inf if deadline > 0 else -math.inf
     if not secs > 0:
         raise ValueError(message)
     return secs
@@ -728,9 +728,9 @@ class SubstitutionTransition(Transition):
 
     A subnet instance may only be wrapped by one `SubstitutionTransition` at a
     time; this is tracked process-wide via a weak set. Attempting to wrap the same subnet
-    twice raises `ValueError`. Constructing with a non-dict `port_socket_map`, or with
-    non-string port/socket names, raises `TypeError`. Referencing a port place that does not
-    exist in the subnet raises `ValueError`.
+    twice raises `ValueError`, and reassigning `subnet` raises `AttributeError`. Constructing
+    with a non-dict `port_socket_map`, or with non-string port/socket names, raises `TypeError`.
+    Referencing a port place that does not exist in the subnet raises `ValueError`.
 
     Attributes:
         subnet: The nested `PetriNet` this transition wraps and fires as a unit.
@@ -783,6 +783,11 @@ class SubstitutionTransition(Transition):
         SubstitutionTransition._mapped_subnets.add(self.subnet)
 
     def __setattr__(self, name, value):
+        if name == "subnet" and "subnet" in self.__dict__:
+            raise AttributeError(
+                f"SubstitutionTransition '{self.name}': subnet cannot be reassigned; wrap the new subnet in a "
+                "new SubstitutionTransition."
+            )
         if name == "subnet_deadline_secs":
             value = _check_subnet_deadline(self.name, value)
         super().__setattr__(name, value)

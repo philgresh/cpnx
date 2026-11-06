@@ -39,7 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **A substitution transition cannot wrap the net it is in, or a net enclosing it, and one
     `SubstitutionTransition` cannot be in two nets at once.** `add_transition` raises
     `ValueError`. A substitution transition replaced by name in `add_transition` can then be
-    added to another net.
+    added to another net. Reassigning a `SubstitutionTransition`'s `subnet` raises
+    `AttributeError`; the engine used to pick the new subnet up at the next firing.
 
 - **A certified callable may no longer close over a `frozenset` whose members are not themselves
   immutable.** `cpnx.certification` decides what a callable can close over and still earn the
@@ -123,8 +124,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quiescing in time, or the parent being unable to commit the outputs. Resource permits are left
   to the firings that borrowed them, so a pool the subnet owns keeps its capacity and any
   cooldown the failed firing started (a `ResourcePlace` mapped as a port still gains the parent's
-  permit copy on each failed firing, as in earlier releases, and a permit one transition moves
-  into another pool for a later one to return stays there if the firing fails in between). An
+  permit copy on each failed firing; one that times out used to drain it, and now leaves it there
+  too. A permit one transition moves into another pool for a later one to return stays there if
+  the firing fails in between). An
   action of the failed firing still running when the subnet gives up finishes through its own
   arcs first: the restore waits until the subnet has settled, so nothing in use (a permit, a
   recipe card, a one-token machine) is ever put back twice, and work the failed firing had

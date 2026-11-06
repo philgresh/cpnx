@@ -121,6 +121,7 @@ def test_substitution_transition_no_parent_mutation():
     )
 
     assert not hasattr(child, "_parent_transition"), "Subnet must not carry a back-reference to its parent transition"
+    assert child._parent_net() is None
 
 
 def test_subnet_holds_only_a_weak_link_to_its_parent():
