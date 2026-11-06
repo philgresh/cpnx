@@ -110,8 +110,10 @@ A guarded transition searches for a binding instead of taking the head. Under `F
 search used to build every input arc's candidate list, up to `binding_search_limit + 1`
 entries deep, before testing the first combination, so a guard join over a deep place cost
 `O(depth)` per check even when the head matched. The search now reads each arc's candidates
-lazily, in the same order, and stops at the first combination the guard accepts, so the cost
-tracks how far into the candidates the match sits. In `bench_guard_join.py`, resolving a join
+lazily, in the same order, and stops at the first combination the guard accepts. When the
+join's arcs are plain single-token arcs (no `key`, `filter` or `consume_all`), the place read
+is lazy too, so the cost tracks how far into the candidates the match sits. Arcs with a
+selection or `count >= 2` still read their pool up front on every check. In `bench_guard_join.py`, resolving a join
 whose head matches holds at about 6.7 µs from 1 000 to 16 000 waiting jobs (it grew from 76
 to 1 207 µs), and draining 8 000 jobs runs 4.7× faster per step. A join with **no** match
 still inspects every candidate, so keep `binding_search_limit` in mind for places that can

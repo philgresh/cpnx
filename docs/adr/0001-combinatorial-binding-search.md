@@ -74,12 +74,14 @@ same marking).
   no search. This is the common case and stays O(1).
 - **Short-circuit.** Enumerate the product of the per-arc candidate streams in
   lexicographic order (arc order, last arc varying fastest) and stop at the first
-  satisfying binding. For `first` and the existence probe the product is **lazy**: an arc's
-  next candidate is read only when the enumeration first reaches it, and a deep FIFO pool is
-  peeked in doubling chunks, so the work tracks the position of the first satisfying binding
-  rather than the depth of the places. `random` and `priority` scan the whole bounded
-  product anyway and use `itertools.product` over fully built lists. Both enumerations yield
-  the identical sequence. *(The lazy path was added in
+  satisfying binding. For `first` and the existence probe the product is **lazy**: each
+  arc's candidates are read at most twice as far as the enumeration has reached. A deep pool
+  on a plain single-token arc (no `key`, `filter` or `consume_all`) is also peeked in
+  doubling chunks, so for those arcs the work tracks the position of the first satisfying
+  binding rather than the depth of the places. Other arc shapes still read their pool up
+  front, and a transition with more than 32 input arcs uses the eager product. `random` and
+  `priority` scan the whole bounded product anyway and use `itertools.product` over fully
+  built lists. Both enumerations yield the identical sequence. *(The lazy path was added in
   [#59](https://github.com/philgresh/cpnx/issues/59)'s cause C; before it, `first` built
   every arc's capped list before trying the first combination, so each evaluation cost
   O(min(depth, limit)) per arc.)*
