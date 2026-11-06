@@ -706,6 +706,21 @@ class Place:
             t_limit = model_time if model_time is not None else time.monotonic()
             return self._store.take_available(len(self._store), t_limit)
 
+    def _restore_tokens(self, tokens: tuple[Token, ...]) -> bool:
+        """Replace the contents with exactly *tokens*, bypassing colour, schema and pacing.
+
+        Used to roll a subnet back after a failed substitution firing; *tokens* is an earlier
+        `tokens` snapshot of this same place. Returns whether the contents changed.
+        """
+        with self._lock:
+            current = self._store.iter_insertion_order()
+            if len(current) == len(tokens) and all(a is b for a, b in zip(current, tokens, strict=True)):
+                return False
+            self._store.remove_identity(current)
+            for token in tokens:
+                self._store.append(token)
+            return True
+
     def peek(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Return up to *count* available tokens from the head without removing them.
 

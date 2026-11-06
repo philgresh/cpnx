@@ -81,6 +81,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing no longer leaves
+  tokens inside its subnet** ([#38](https://github.com/philgresh/cpnx/issues/38)). The parent
+  rolled back its own consumed tokens, but the copies deposited into the subnet's ports, and
+  anything half-processed, stayed in the reused subnet. The next firing then brewed the stale
+  order as well and returned it in place of its own. Now, if the firing fails for any reason,
+  every subnet place except resource pools and sinks is restored to its marking from before the
+  firing. The reasons are a port rejecting a deposit, the subnet raising, the subnet not
+  quiescing in time, or the parent being unable to commit the outputs. Resource permits are left
+  to the firings that borrowed them, so a pool keeps its capacity and any cooldown the failed
+  firing started. An action still running when the subnet gives up hands its permits back when
+  it finishes, and its other outputs are dropped.
+
+  Three behavior changes come with this:
+
+  - **A subnet that does not reach quiescence now fails the firing.** That covers a wall-clock
+    subnet still busy at `subnet_deadline_secs` (`TimeoutError`) and a logical-clock subnet that
+    hits `drive_to_quiescence`'s `max_ticks` (`RuntimeError`). Before, the parent took whatever
+    had reached the output ports. If that was enough to commit, the leftover work came out in a
+    later firing. The parent's `on_error` now reports why, where it used to get a "returned 0
+    non-resource token(s)" error.
+  - **Firings of one `SubstitutionTransition` now run one at a time.** With `max_workers > 1`,
+    concurrent firings shared the subnet's ports, so a firing could collect another's output.
+    The surplus was dropped and the starved firing retried, so some orders were served twice and
+    others never. A purge would also have erased a concurrent firing's tokens.
+  - **A rolled-back firing no longer keeps its effect on subnet-owned state.** A subnet that
+    updates its own tokens, such as a stamp card, used to keep the update when the parent could
+    not commit, and applied it again on every retry.
+
 - **A backlog of matured timed tokens no longer makes every logical-clock advance O(backlog).**
   `_TokenStore` kept a timed token in its cooling heap after it matured, so
   [`Place.earliest_available_boundary`][cpnx.Place.earliest_available_boundary], which

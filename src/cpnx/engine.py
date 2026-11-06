@@ -37,6 +37,10 @@ from cpnx.visualization import snapshot, to_dot
 _DepositFn: TypeAlias = Callable[[str, Token], bool | None]
 """Callable that deposits a token into a named place. Must be invoked under the engine lock."""
 
+_FiringOutcome: TypeAlias = tuple[bool, float, BaseException | None, list[Token], list[Token], list[tuple[str, Token]]]
+"""`_invoke_transition_callbacks` arguments, in order: success, duration, error, data tokens,
+dead-lettered data tokens, deposits."""
+
 
 class _DrainAll:
     """Sentinel standing in for a `consume_all` arc's tokens in a resolved binding.
@@ -525,6 +529,7 @@ class PetriNet:
         self.places: dict[str, Place] = {}
         self.transitions: dict[str, Transition] = {}
         self._running_count = 0
+        self._marking_epoch = 0
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._action_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cpnx-action")
         self._expr_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cpnx-expr")
@@ -1245,7 +1250,9 @@ class PetriNet:
 
                     self._running_count += 1
                     try:
-                        self._executor.submit(self._execute_transition, transition, consumed_tokens, token_sources)
+                        self._executor.submit(
+                            self._execute_transition, transition, consumed_tokens, token_sources, self._marking_epoch
+                        )
                     except Exception:
                         # submit() failed (e.g. executor shut down) — undo the increment so
                         # is_quiescent() doesn't permanently block.
@@ -2798,19 +2805,23 @@ class PetriNet:
         transition: Transition,
         consumed_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
+        epoch: int | None = None,
     ) -> None:
         start_time = time.monotonic()
         try:
-            success, output_tokens, error = self._execute_transition_action(transition, consumed_tokens, token_sources)
-            with self._lock:
-                duration = time.monotonic() - start_time
-                success, error, data_tokens, dl_data, deposited = self._commit_or_rollback_transition(
-                    transition, success, consumed_tokens, output_tokens, token_sources, error
+            if isinstance(transition, SubstitutionTransition):
+                outcome = self._fire_substitution_atomically(
+                    transition, consumed_tokens, token_sources, start_time, epoch
                 )
+            else:
+                outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, epoch)
+            if outcome is None:
+                return
 
             # --- OUTSIDE THE LOCK ---
-            self._invoke_transition_callbacks(transition, success, duration, error, data_tokens, dl_data, deposited)
+            self._invoke_transition_callbacks(transition, *outcome)
 
+            error = outcome[2]
             if error is not None and not isinstance(error, Exception):
                 raise error
 
@@ -2819,6 +2830,89 @@ class PetriNet:
             with self._lock:
                 self._running_count -= 1
             self._work_available.set()
+
+    def _fire_and_commit(
+        self,
+        transition: Transition,
+        consumed_tokens: list[Token],
+        token_sources: list[tuple[str, Token]],
+        start_time: float,
+        epoch: int | None,
+    ) -> "_FiringOutcome | None":
+        """Run the action and commit or roll back; `None` if a purge orphaned this firing."""
+        success, output_tokens, error = self._execute_transition_action(transition, consumed_tokens, token_sources)
+        with self._lock:
+            if epoch is not None and epoch != self._marking_epoch:
+                deposited = self._return_orphaned_permits(token_sources)
+            else:
+                duration = time.monotonic() - start_time
+                success, error, data_tokens, dl_data, deposited = self._commit_or_rollback_transition(
+                    transition, success, consumed_tokens, output_tokens, token_sources, error
+                )
+                return success, duration, error, data_tokens, dl_data, deposited
+        self._dispatch_deposits(deposited)
+        return None
+
+    def _return_orphaned_permits(self, token_sources: list[tuple[str, Token]]) -> list[tuple[str, Token]]:
+        """Settle a firing that a purge overtook: hand back its permits and drop everything else.
+
+        A purge never restores a resource pool, so whatever this firing took from one is still
+        owed to it. Everything else it took was restored from the checkpoint (or belonged to the
+        purged firing), so committing its outputs or rolling its inputs back would duplicate it.
+        Caller holds `self._lock`.
+        """
+        returned = [(src, t) for src, t in token_sources if isinstance(self.places.get(src), ResourcePlace)]
+        for src, t in returned:
+            self._deposit_under_lock(src, t)
+        return returned
+
+    def _fire_substitution_atomically(
+        self,
+        transition: SubstitutionTransition,
+        consumed_tokens: list[Token],
+        token_sources: list[tuple[str, Token]],
+        start_time: float,
+        epoch: int | None,
+    ) -> "_FiringOutcome | None":
+        """Fire a substitution transition so that a failed firing leaves its subnet untouched.
+
+        One firing at a time owns the subnet, from the checkpoint to the parent's commit, so a
+        firing only ever collects its own outputs and a purge can never reach another firing's
+        tokens. If the parent does not commit, the subnet is restored to the checkpoint.
+        """
+        subnet = transition.subnet
+        with transition._firing_lock:
+            checkpoint = subnet._checkpoint_marking()
+            outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, epoch)
+            if outcome is None or not outcome[0]:
+                subnet._restore_marking(checkpoint)
+        return outcome
+
+    def _checkpoint_marking(self) -> dict[str, tuple[Token, ...]]:
+        """Snapshot the places a purge restores: every place except resource pools and sinks."""
+        with self._lock:
+            return {
+                name: place.tokens
+                for name, place in self.places.items()
+                if not isinstance(place, (ResourcePlace, SinkPlace))
+            }
+
+    def _restore_marking(self, checkpoint: dict[str, tuple[Token, ...]]) -> None:
+        """Put each checkpointed place back to its checkpointed tokens and orphan in-flight firings.
+
+        Resource pools and sinks are left as they are: permits are conserved by the firings that
+        borrow them (orphaned ones included), and a sink cannot enable anything. The clock is
+        not moved; checkpointed tokens were available then and the clock has only advanced.
+        """
+        with self._lock:
+            self._marking_epoch += 1
+            for name, tokens in checkpoint.items():
+                if not self.places[name]._restore_tokens(tokens):
+                    continue
+                self._mark_dirty(name)
+                for token in tokens:
+                    self._mark_dirty(name, token)
+        self._work_available.set()
 
     def _try_commit_transition(
         self,
@@ -3112,6 +3206,14 @@ class PetriNet:
         socket_to_ports = self._map_sockets_to_ports(transition.port_socket_map)
         self._verify_port_socket_boundaries(token_sources, socket_to_ports)
         self._deposit_into_subnet(subnet, token_sources, socket_to_ports)
+        self._drive_subnet(transition)
+
+        parent_outputs = [arc.place for arc in transition.outputs]
+        return self._retrieve_subnet_outputs(subnet, transition.port_socket_map, parent_outputs)
+
+    def _drive_subnet(self, transition: SubstitutionTransition) -> None:
+        """Drive the subnet to quiescence in the parent's clock regime, raising if it gets stuck."""
+        subnet = transition.subnet
 
         # Fire the subnet in the parent's clock *regime*, but on the subnet's OWN clock. The
         # subnet's clock is isolated — the parent's logical time is never pushed onto it (doing so
@@ -3129,14 +3231,22 @@ class PetriNet:
         #     real cooldowns are genuinely waited out — the correct production semantics.
         #
         # `subnet_deadline_secs` bounds only the wall-clock path; a logically-driven subnet is
-        # bounded by `drive_to_quiescence`'s own `max_ticks`/`max_spins`. See `tests/test_subnet.py`
-        # and `benchmarks/bench_subnet.py`.
+        # bounded by `drive_to_quiescence`'s own `max_ticks`/`max_spins`. A subnet left short of
+        # quiescence by either bound fails the firing. See `tests/test_subnet.py`,
+        # `tests/test_subnet_failure.py` and `benchmarks/bench_subnet.py`.
         with self._lock:
             parent_on_logical_clock = self._model_time is not None
         if parent_on_logical_clock:
-            subnet.drive_to_quiescence()
+            ticks = subnet.drive_to_quiescence().ticks
+            if not subnet.is_quiescent():
+                raise RuntimeError(
+                    f"SubstitutionTransition '{transition.name}': subnet did not reach quiescence "
+                    f"on the logical clock after {ticks} clock advance(s)."
+                )
         else:
             subnet.run(deadline=time.monotonic() + transition.subnet_deadline_secs)
-
-        parent_outputs = [arc.place for arc in transition.outputs]
-        return self._retrieve_subnet_outputs(subnet, transition.port_socket_map, parent_outputs)
+            if not subnet.is_quiescent():
+                raise TimeoutError(
+                    f"SubstitutionTransition '{transition.name}': subnet did not reach quiescence "
+                    f"within subnet_deadline_secs={transition.subnet_deadline_secs}."
+                )

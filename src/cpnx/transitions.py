@@ -1,4 +1,5 @@
 import enum
+import threading
 import typing
 import warnings
 import weakref
@@ -670,6 +671,19 @@ class SubstitutionTransition(Transition):
     it carries no reference to its parent. Communication occurs strictly through the
     `port_socket_map`.
 
+    A firing is all-or-nothing as far as the subnet is concerned. Firings of one
+    `SubstitutionTransition` run one at a time, so each collects only its own outputs. The
+    firing fails if a port rejects a deposited token, the subnet raises, the subnet has not
+    reached quiescence by its bound (`subnet_deadline_secs` on the wall clock,
+    [`drive_to_quiescence`][cpnx.PetriNet.drive_to_quiescence]'s `max_ticks` on the logical
+    clock), or the parent cannot commit the outputs. The parent's consumed tokens are then
+    rolled back as for any transition, and every subnet place except resource pools and
+    [`SinkPlace`][cpnx.SinkPlace]s is restored to its marking from before the firing.
+    Resource permits are not restored. The firings that borrowed them return them, so each
+    pool keeps its capacity and any cooldown the failed firing started. An action still
+    running when the subnet gives up cannot be stopped: when it finishes, it returns its
+    permits and its other outputs are discarded.
+
     A subnet instance may only be wrapped by one `SubstitutionTransition` at a
     time; this is tracked process-wide via a weak set. Attempting to wrap the same subnet
     twice raises `ValueError`. Constructing with a non-dict `port_socket_map`, or with
@@ -682,7 +696,8 @@ class SubstitutionTransition(Transition):
                          (in the parent net). Every key must name a place that already
                          exists in `subnet`. Defaults to an empty dict.
         subnet_deadline_secs: Maximum wall-clock seconds allowed for the subnet to reach
-                         quiescence when this transition fires. Defaults to `30.0`.
+                         quiescence when this transition fires. A subnet still short of
+                         quiescence at the deadline fails the firing. Defaults to `30.0`.
     """
 
     _mapped_subnets: ClassVar[weakref.WeakSet] = weakref.WeakSet()
@@ -715,3 +730,4 @@ class SubstitutionTransition(Transition):
                 f"SubstitutionTransition '{self.name}': child subnet is already mapped to another transition."
             )
         SubstitutionTransition._mapped_subnets.add(self.subnet)
+        self._firing_lock = threading.Lock()
