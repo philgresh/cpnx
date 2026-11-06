@@ -11,7 +11,7 @@ import random
 
 import pytest
 
-from cpnx.engine import PetriNet, _lazy_product, _PeekStream
+from cpnx.engine import _LAZY_PRODUCT_MAX_STREAMS, PetriNet, _lazy_product, _PeekStream
 from cpnx.places import Place
 from cpnx.tokens import Token
 from cpnx.transitions import BindingPolicy, InputArc, OutputArc, Transition
@@ -442,6 +442,41 @@ def test_first_peeks_the_deep_pool_in_proportion_to_what_it_inspects(monkeypatch
         binding = net._resolve_binding(transition, net.model_time)
         assert binding[0][1][0].payload["job"] == first_match
     assert sum(reads) < 4 * (first_match + 1) + 8, reads
+
+
+@pytest.mark.parametrize("first_match", [0, 40])
+@pytest.mark.parametrize("policy", [BindingPolicy.RANDOM, BindingPolicy.PRIORITY])
+def test_the_probe_peeks_the_deep_pool_lazily_under_full_scan_policies(monkeypatch, policy, first_match):
+    net = _join_net(5_000, first_match, policy=policy)
+    reads = _spy_peek(monkeypatch, net.places["waiting"])
+    assert net._binding_exists(net.transitions["match"], net.model_time)
+    assert sum(reads) < 4 * (first_match + 1) + 8, reads
+
+
+@pytest.mark.parametrize("probe", [False, True], ids=["resolve", "exists"])
+def test_a_transition_wider_than_the_lazy_cap_peeks_each_place_once(monkeypatch, probe):
+    width = _LAZY_PRODUCT_MAX_STREAMS + 1
+    net = PetriNet(binding_search_limit=1_000)
+    names = [f"slot{i}" for i in range(width)]
+    for name in names:
+        net.add_place(Place(name))
+        for i in range(40):
+            net.deposit(name, Token(payload={"i": i}))
+    transition = Transition(
+        name="gather",
+        inputs=[InputArc(name) for name in names],
+        outputs=[],
+        guard=lambda toks: True,
+        action=lambda toks: [],
+    )
+    net.add_transition(transition)
+    assert net._search_mode(transition, net._effective_policy(transition), probe=probe) == (False, False)
+    reads = [_spy_peek(monkeypatch, net.places[name]) for name in names]
+    if probe:
+        assert net._binding_exists(transition, net.model_time)
+    else:
+        assert net._resolve_binding(transition, net.model_time) is not None
+    assert reads == [[40]] * width
 
 
 @pytest.mark.parametrize("policy", [BindingPolicy.RANDOM, BindingPolicy.PRIORITY])

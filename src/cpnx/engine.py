@@ -2079,10 +2079,14 @@ class PetriNet:
         reassigned after construction: pools gathered for one path must not reach the other.
         `lazy` holds when the caller stops at the first satisfying binding, which is `FIRST`
         resolution and the existence `probe` under any policy. `RANDOM` and `PRIORITY`
-        resolution scan the whole bounded product, which the eager path does faster.
+        resolution scan the whole bounded product, which the eager path does faster. So does a
+        transition wider than `_LAZY_PRODUCT_MAX_STREAMS`, whose product `_lazy_product`
+        would build eagerly anyway: streamed pools would only re-peek each place in chunks.
         """
         head_only = self._is_head_only(transition, policy)
-        return head_only, not head_only and (probe or policy is BindingPolicy.FIRST)
+        if head_only or len(transition.inputs) > _LAZY_PRODUCT_MAX_STREAMS:
+            return head_only, False
+        return False, probe or policy is BindingPolicy.FIRST
 
     @staticmethod
     def _is_head_only(transition: Transition, policy: BindingPolicy) -> bool:
