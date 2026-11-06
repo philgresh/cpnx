@@ -139,7 +139,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolution with a satisfying head holds at about 6.7 µs from 1 000 to 16 000 jobs (was
   76 → 1 207 µs), and the drive runs 106 → 133 µs/step from 500 to 8 000 jobs (was
   120 → 628). With no satisfying binding `FIRST` still walks the whole capped product, now
-  1–3% slower than before; avoiding that walk needs an index on the join key. Part of
+  1–4% slower than before; avoiding that walk needs an index on the join key. Part of
   [#59](https://github.com/philgresh/cpnx/issues/59) (cause C).
 
 ## [0.7.0] — 2026-10-20
