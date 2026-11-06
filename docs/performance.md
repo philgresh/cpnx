@@ -85,6 +85,25 @@ per-probe cost holds constant as depth grows, turning the accumulate-then-drain 
 `O(N²)` back into `O(N)`. See
 [ADR 0005](https://github.com/philgresh/cpnx/blob/main/docs/adr/0005-consume-all-count-only-fast-path.md).
 
+## Depth: timed backlogs drain like untimed ones
+
+A net used as a discrete-event simulation builds a different kind of deep place: timed work
+that has *matured* (its `available_at` has passed) but waits for a scarce resource. Two costs
+used to scale with that backlog. Every clock advance asked each place for its next future
+boundary, and the store walked past every matured token to answer, so each advance cost
+`O(backlog)`. And every firing of a guard-free FIFO transition peeked
+`binding_search_limit + 1` tokens to use one, which on a timed place is a heap pop and push
+per token.
+
+Matured tokens now move once into their own heap, so the boundary query skips them
+([#60](https://github.com/philgresh/cpnx/pull/60)), and a head-only transition reads only the
+tokens it will consume ([#61](https://github.com/philgresh/cpnx/pull/61)). A timed backlog
+now costs about what the same work costs untimed. In the cafe's mobile-order rush at 8 000
+orders the timed rail runs 1.0× its untimed control (5.1–5.3× with only the first fix), and
+in `bench_timed_backlog.py` the timed drive at 4 000 arrivals runs 1.02–1.14× its control
+(7.1–7.25×). Both causes are tracked in
+[#59](https://github.com/philgresh/cpnx/issues/59).
+
 ## What this means for you
 
 You do not have to opt into either optimization or structure your net around them — they are
@@ -112,6 +131,11 @@ python benchmarks/bench_transition_scan.py
 ```bash
 # Depth: per-probe consume_all enablement cost as place depth N grows (O(N²)→O(N)).
 python benchmarks/bench_consume_all_drain.py
+```
+
+```bash
+# Depth: timed backlog — boundary query cost and a timed drive vs its untimed control.
+python benchmarks/bench_timed_backlog.py
 ```
 
 ```bash
