@@ -38,6 +38,11 @@ from cpnx.visualization import snapshot, to_dot
 _DepositFn: TypeAlias = Callable[[str, Token], bool | None]
 """Callable that deposits a token into a named place. Must be invoked under the engine lock."""
 
+
+class _EnclosingFiringFailed(Exception):
+    """A nested drive was cut short because a firing enclosing it failed; nothing to report."""
+
+
 _FiringOutcome: TypeAlias = tuple[bool, float, BaseException | None, list[Token], list[Token], list[tuple[str, Token]]]
 """`_invoke_transition_callbacks` arguments, in order: success, duration, error, data tokens,
 dead-lettered data tokens, deposits."""
@@ -655,7 +660,6 @@ class PetriNet:
         self._closing = False
         self._parent: weakref.ref[PetriNet] | None = None
         self._subnets: list[PetriNet] = []
-        self._busy_substitutions: set[str] = set()
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._action_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cpnx-action")
         self._expr_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cpnx-expr")
@@ -1032,6 +1036,7 @@ class PetriNet:
             self._validate_new_transition(transition)
             self.transitions[transition.name] = transition
             if isinstance(transition, SubstitutionTransition):
+                self._reject_subnet_cycle(transition)
                 self._subnets.append(transition.subnet)
                 transition.subnet._parent = weakref.ref(self)
             if any(arc.settle_secs > 0.0 for arc in transition.inputs):
@@ -1043,6 +1048,16 @@ class PetriNet:
             self._scheduler_ready = False
             # …and its resource borrows may need a synthesized return arc.
             self._resource_returns_synthesized = False
+
+    def _reject_subnet_cycle(self, transition: SubstitutionTransition) -> None:
+        """Raise if *transition*'s subnet is this net or encloses it."""
+        net: PetriNet | None = self
+        while net is not None:
+            if net is transition.subnet:
+                raise ValueError(
+                    f"SubstitutionTransition '{transition.name}': its subnet is this net or one enclosing it."
+                )
+            net = net._parent() if net._parent is not None else None
 
     def deposit(self, place_name: str, token: Token) -> None:
         """Deposit `token` into `place_name`, auto-creating a bare place if it does not exist.
@@ -1103,11 +1118,7 @@ class PetriNet:
     def _select_transition_to_fire(self) -> tuple[Transition, _Binding] | None:
         if self._incremental_eligible:
             return self._select_incremental()
-        enabled = self._enabled_transition_bindings()
-        if self._busy_substitutions:
-            idle = [(t, b) for t, b in enabled if t.name not in self._busy_substitutions]
-            enabled = idle or enabled
-        candidates = self._filter_highest_priority(enabled)
+        candidates = self._filter_highest_priority(self._enabled_transition_bindings())
         return self._rng.choice(candidates) if candidates else None
 
     # ------------------------------------------------------------------
@@ -1294,27 +1305,9 @@ class PetriNet:
         self._reconcile_dirty()
         if not self._enabled_bindings:
             return None
-        if self._busy_substitutions:
-            picked = self._select_incremental_skipping_busy()
-            if picked is not None:
-                return picked
         min_priority = min(p for p, bucket in self._priority_buckets.items() if bucket)
         name = self._rng.choice(self._priority_buckets[min_priority])
         return self.transitions[name], self._enabled_bindings[name]
-
-    def _select_incremental_skipping_busy(self) -> tuple[Transition, _Binding] | None:
-        """`_select_incremental` while a substitution transition is mid-firing: skip it if possible.
-
-        Selecting it again parks a worker on its `_firing_lock`, so the highest priority among
-        the other enabled transitions fires instead. With nothing else enabled, `None` lets the
-        caller queue the next firing behind the current one, which keeps a backlog pipelined.
-        """
-        for priority in sorted(p for p, bucket in self._priority_buckets.items() if bucket):
-            names = [n for n in self._priority_buckets[priority] if n not in self._busy_substitutions]
-            if names:
-                name = self._rng.choice(names)
-                return self.transitions[name], self._enabled_bindings[name]
-        return None
 
     def _consume_binding(self, binding: _Binding, m_time: float | None) -> tuple[list[Token], list[tuple[str, Token]]]:
         """Remove the exact tokens named by `binding` from their source places.
@@ -1400,15 +1393,12 @@ class PetriNet:
                     consumed_tokens, token_sources = self._consume_binding(binding, m_time)
 
                     self._running_count += 1
-                    if isinstance(transition, SubstitutionTransition):
-                        self._busy_substitutions.add(transition.name)
                     try:
                         self._executor.submit(self._execute_transition, transition, consumed_tokens, token_sources)
                     except Exception:
                         # submit() failed (e.g. executor shut down) — undo the increment so
                         # is_quiescent() doesn't permanently block.
                         self._running_count -= 1
-                        self._busy_substitutions.discard(transition.name)
                         # Return consumed tokens back to their source places
                         for src_name, t in token_sources:
                             self._deposit_under_lock(src_name, t)
@@ -1632,7 +1622,8 @@ class PetriNet:
         Args:
             max_ticks: Safety cap on logical-clock advances, so a pathological net cannot loop
                 forever.
-            max_spins: Safety cap on the per-firing barrier that awaits each in-flight action. The
+            max_spins: Safety cap on the per-firing barrier that awaits each in-flight action, and
+                on the wait for a subnet to settle after a failed substitution firing. The
                 default suits the fast (~microsecond) actions this driver is built for; raise it for
                 nets whose actions legitimately block for longer, so a slow-but-healthy action is
                 not mistaken for a hung one.
@@ -1641,7 +1632,8 @@ class PetriNet:
             A [`DriveResult`][cpnx.DriveResult] with the number of firings and clock advances.
 
         Raises:
-            RuntimeError: If an in-flight action does not complete within `max_spins` barrier spins.
+            RuntimeError: If an in-flight action does not complete, or a subnet does not settle,
+                within `max_spins` barrier spins.
         """
         # Anchor onto the logical clock the first time only. `math.nextafter` (not `+ 1e-9`)
         # guarantees a strictly-greater value: at monotonic-clock magnitudes one ULP is ~2e-9, so a
@@ -3058,7 +3050,6 @@ class PetriNet:
             # Decrement running count and signal work available under lock
             with self._lock:
                 self._running_count -= 1
-                self._busy_substitutions.discard(transition.name)
                 idle = self._running_count == 0
             self._work_available.set()
             if idle:
@@ -3078,13 +3069,16 @@ class PetriNet:
         failed firing to settle: it belongs to that failed firing, so it hands its tokens back
         without acting, retrying, dead-lettering or calling back, and the restore resets the net.
         """
-        if action_error is None and self._aborted():
+        if self._aborted():
             self._return_unstarted(token_sources)
             return None
         if action_error is None:
             success, output_tokens, error = self._execute_transition_action(transition, consumed_tokens, token_sources)
         else:
             success, output_tokens, error = False, [], action_error
+        if isinstance(error, _EnclosingFiringFailed):
+            self._return_unstarted(token_sources)
+            return None
         with self._lock:
             duration = time.monotonic() - start_time
             success, error, data_tokens, dl_data, deposited = self._commit_or_rollback_transition(
@@ -3132,7 +3126,7 @@ class PetriNet:
             if self._aborted():
                 self._return_unstarted(token_sources)
                 return None
-            if not subnet._await_settled(time.monotonic() + transition.subnet_deadline_secs):
+            if not subnet._await_settled(time.monotonic() + transition.subnet_deadline_secs, self._aborted):
                 error = RuntimeError(
                     f"SubstitutionTransition '{transition.name}': subnet is still running an action of a "
                     f"failed firing after subnet_deadline_secs={transition.subnet_deadline_secs}."
@@ -3192,10 +3186,10 @@ class PetriNet:
             parent._work_available.set()
             parent._try_settle()
 
-    def _await_settled(self, deadline: float) -> bool:
-        """Wait until no restore is pending on this subnet; `False` if *deadline* passes first."""
+    def _await_settled(self, deadline: float, abandon: Callable[[], bool]) -> bool:
+        """Wait until no restore is pending on this subnet; `False` if *deadline* passes or *abandon*."""
         while self._pending_restore is not None:
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= deadline or abandon():
                 return False
             time.sleep(0.001)
         return True
@@ -3207,17 +3201,13 @@ class PetriNet:
     def _roll_back_nested(self, journal: list["_NestedUndo"]) -> None:
         """Undo the substitution firings this net committed during a firing that failed.
 
-        Newest first per transition, each restores its subnet and then its own nested firings.
-        Only called once this net and every subnet under it have settled, so nothing can be
-        firing in a subnet being restored.
+        Newest first, each restores its subnet and then its own nested firings. Only called once
+        this net and every subnet under it have settled, so nothing can be firing in a subnet
+        being restored.
         """
-        by_transition: dict[int, list[_NestedUndo]] = {}
-        for entry in journal:
-            by_transition.setdefault(id(entry[0]), []).append(entry)
-        for entries in by_transition.values():
-            for transition, checkpoint, nested in reversed(entries):
-                transition.subnet._restore_marking(checkpoint)
-                transition.subnet._roll_back_nested(nested)
+        for transition, checkpoint, nested in reversed(journal):
+            transition.subnet._restore_marking(checkpoint)
+            transition.subnet._roll_back_nested(nested)
 
     def _is_finished(self) -> bool:
         """Return whether no transition can fire at the current time or any finite later time.
@@ -3241,8 +3231,10 @@ class PetriNet:
     def _restore_marking(self, checkpoint: dict[str, tuple[Token, ...]]) -> None:
         """Put each checkpointed place back to its checkpointed tokens.
 
-        Resource pools and sinks are left as they are: every borrowed permit has already come
-        back through its firing's arcs, and a sink cannot enable anything. The clock is not
+        Resource pools and sinks are left as they are: a permit borrowed and returned by one
+        transition has already come back through that firing's arcs, and a sink cannot enable
+        anything. A permit one transition moves into another pool for a later transition to
+        return stays where the failed firing left it. The clock is not
         moved; checkpointed tokens were available then and the clock has only advanced.
         """
         with self._lock:
@@ -3591,5 +3583,7 @@ class PetriNet:
         # Closed before the check: work still queued must not start while the verdict is out.
         subnet._closing = True
         if not subnet._is_finished():
+            if self._aborted():
+                raise _EnclosingFiringFailed(transition.name)
             raise error
         subnet._closing = False

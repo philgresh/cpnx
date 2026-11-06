@@ -672,9 +672,8 @@ class SubstitutionTransition(Transition):
     settled. Tokens move strictly through the `port_socket_map`.
 
     A firing is all-or-nothing as far as the subnet is concerned. Firings of one
-    `SubstitutionTransition` run one at a time, so each collects only its own outputs; while
-    one is in progress, any other enabled transition is selected ahead of it, so a queued
-    firing does not hold a worker that other work could use. The
+    `SubstitutionTransition` run one at a time, so each collects only its own outputs. A firing
+    selected while another is in progress waits for it on a worker thread. The
     firing fails if a port rejects a deposited token, the subnet raises, the subnet has not
     finished by its bound (`subnet_deadline_secs` on the wall clock,
     [`drive_to_quiescence`][cpnx.PetriNet.drive_to_quiescence]'s `max_ticks` on the logical
@@ -686,9 +685,10 @@ class SubstitutionTransition(Transition):
     rollback reaches nested subnets: a `SubstitutionTransition` inside the subnet that
     committed during the failed firing has its own subnet restored too.
     Resource permits are not restored. The firings that borrowed them return them, so each
-    pool the subnet owns keeps its capacity and any cooldown the failed firing started (a
-    `ResourcePlace` mapped as a port still gains the parent's permit copy on each failed
-    firing). A firing that commits
+    pool the subnet owns keeps its capacity and any cooldown the failed firing started. Two
+    exceptions: a `ResourcePlace` mapped as a port still gains the parent's permit copy on each
+    failed firing, and a permit one transition moves into another pool, for a later transition
+    to return, stays there if the firing fails in between. A firing that commits
     leaves the subnet as it reached it, so a subnet may keep state across firings.
 
     The restore happens only once the subnet has settled. An action of the failed firing

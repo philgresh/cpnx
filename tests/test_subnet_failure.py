@@ -1446,14 +1446,16 @@ def test_two_settle_attempts_restore_only_once():
 
 def test_queued_work_does_not_start_while_the_drive_is_judged():
     """The first brew outlives the deadline; the second is queued behind it on one worker. The
-    check that decides the drive failed is slowed down, so the first brew finishes and the
-    worker picks up the second before the verdict is in. It must still not start."""
+    first brew is released only once the check that judges the drive has begun, and the check
+    waits for the second brew to be decided, so the second brew always starts inside the window.
+    It must still not run."""
     calls: list[int] = []
+    release = threading.Event()
 
     def brew(tokens: list[Token]) -> list[Token]:
         calls.append(tokens[0].payload["order"])
         if tokens[0].payload["order"] == 1:
-            time.sleep(0.3)
+            release.wait(5.0)
         return tokens
 
     subnet = PetriNet(
@@ -1465,7 +1467,10 @@ def test_queued_work_does_not_start_while_the_drive_is_judged():
 
     def slow_verdict() -> bool:
         verdict = judged()
-        time.sleep(0.25)
+        release.set()
+        deadline = time.monotonic() + 5.0
+        while subnet._running_count and time.monotonic() < deadline:
+            time.sleep(0.005)
         return verdict
 
     subnet._is_finished = slow_verdict
@@ -1485,10 +1490,13 @@ def test_queued_work_does_not_start_while_the_drive_is_judged():
             )
         ],
     )
-    with parent:
-        parent.deposit("Queue", Token(payload={"order": 1}))
-        parent.deposit("Queue", Token(payload={"order": 2}))
-        parent.run(deadline=time.monotonic() + 5.0)
+    try:
+        with parent:
+            parent.deposit("Queue", Token(payload={"order": 1}))
+            parent.deposit("Queue", Token(payload={"order": 2}))
+            parent.run(deadline=time.monotonic() + 5.0)
+    finally:
+        release.set()
     _await_settled(subnet)
     assert calls == [1]
 
@@ -1590,23 +1598,20 @@ def test_logical_drive_returns_only_once_its_subnet_has_settled():
 
 
 @pytest.mark.parametrize("incremental", [True, False], ids=["incremental", "full-scan"])
-def test_busy_subnet_does_not_hold_up_an_unrelated_transition(incremental):
-    """Four orders queue for a slow kitchen on a two-worker parent. Firings of one substitution
-    transition run one at a time; the second worker must stay free for the greeter instead of
-    waiting its turn at the kitchen."""
-    greeted: list[float] = []
-
-    def cook(tokens: list[Token]) -> list[Token]:
-        time.sleep(0.3)
-        return tokens
-
+@pytest.mark.parametrize("logical", [True, False], ids=["logical", "wall"])
+def test_priority_decides_between_a_busy_subnet_and_a_competing_consumer(logical, incremental):
+    """The kitchen (priority 1) and the overflow counter (priority 10) both take from the queue.
+    A kitchen firing in progress must not hand the next orders to the lower-priority overflow."""
     subnet = PetriNet(
         places=[Place("Orders"), Place("Ready")],
-        transitions=[Transition("Cook", [InputArc("Orders")], [OutputArc("Ready")], cook)],
+        max_workers=1,
+        seed=7,
+        transitions=[Transition("Cook", [InputArc("Orders")], [OutputArc("Ready")], lambda tokens: tokens)],
     )
     parent = PetriNet(
-        places=[Place("Queue"), Place("Served"), Place("Door"), Place("Greeted")],
-        max_workers=2,
+        places=[Place("Queue"), Place("Served"), Place("Overflow")],
+        max_workers=1,
+        seed=7,
         transitions=[
             SubstitutionTransition(
                 name="Kitchen",
@@ -1618,11 +1623,7 @@ def test_busy_subnet_does_not_hold_up_an_unrelated_transition(incremental):
                 priority=1,
             ),
             Transition(
-                "Greet",
-                [InputArc("Door")],
-                [OutputArc("Greeted")],
-                lambda tokens: (greeted.append(time.monotonic()), tokens)[1],
-                priority=5,
+                "SendToOverflow", [InputArc("Queue")], [OutputArc("Overflow")], lambda tokens: tokens, priority=10
             ),
         ],
     )
@@ -1630,10 +1631,126 @@ def test_busy_subnet_does_not_hold_up_an_unrelated_transition(incremental):
         parent.add_place(PacedResourcePlace("Bell", capacity=1, pacing_secs=0.0))
     assert parent._incremental_eligible is incremental
     with parent:
-        for order in range(4):
+        for order in range(50):
             parent.deposit("Queue", Token(payload={"order": order}))
-        parent.deposit("Door", Token())
-        started = time.monotonic()
-        parent.run(deadline=time.monotonic() + 5.0)
-    assert sorted(_served(parent)) == [0, 1, 2, 3]
-    assert greeted and greeted[0] - started < 0.2, "the greeter waited behind queued kitchen firings"
+        _drive(parent, logical)
+    assert len(parent.marking["Served"]) == 50
+    assert parent.marking["Overflow"] == ()
+
+
+def _three_level_cafe(stage, *, outer_deadline: float, inner_deadline: float, middle_workers: int = 1, orders: int = 1):
+    """Front of house (outer) -> kitchen (middle, with a sink for dead letters) -> station (inner)."""
+    station = PetriNet(
+        places=[Place("Orders"), Place("Ready")],
+        transitions=[Transition("Stage", [InputArc("Orders")], [OutputArc("Ready")], stage)],
+    )
+    kitchen = PetriNet(
+        places=[Place("Orders"), Place("Ready"), SinkPlace("Spoiled", keep_last=10)],
+        error_place="Spoiled",
+        max_workers=middle_workers,
+        transitions=[
+            SubstitutionTransition(
+                name="Station",
+                inputs=[InputArc("Orders")],
+                outputs=[OutputArc("Ready")],
+                action=lambda tokens: tokens,
+                subnet=station,
+                port_socket_map={"Orders": "Orders", "Ready": "Ready"},
+                subnet_deadline_secs=inner_deadline,
+                max_retries=0,
+            )
+        ],
+    )
+    front = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Kitchen",
+                inputs=[InputArc("Queue", count=orders)],
+                outputs=[OutputArc("Served", count=orders)],
+                action=lambda tokens: tokens,
+                subnet=kitchen,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                subnet_deadline_secs=outer_deadline,
+                max_retries=0,
+            )
+        ],
+    )
+    return front, kitchen, station
+
+
+def test_nested_firing_cut_short_by_an_enclosing_failure_reports_nothing():
+    """The front of house gives up at 0.2 s while the kitchen's station is still on its first
+    stage, under its own 2 s deadline. The station's firing is cut short because of the outer
+    failure, not its own, so the kitchen must not report a timeout or dead-letter the order."""
+    slow = threading.Event()
+
+    def stage(tokens: list[Token]) -> list[Token]:
+        if not slow.is_set():
+            slow.set()
+            time.sleep(0.5)
+        return tokens
+
+    front, kitchen, station = _three_level_cafe(stage, outer_deadline=0.2, inner_deadline=2.0)
+    kitchen_errors = _collect_errors(kitchen)
+    dead_letters: list[Token] = []
+    kitchen.on_token_dead_lettered = lambda _name, token: dead_letters.append(token)
+    with front:
+        front.deposit("Queue", Token(payload={"order": 1}))
+        front.run(deadline=time.monotonic() + 5.0)
+    _await_settled(kitchen)
+    _await_settled(station)
+    assert [t.payload["order"] for t in front.marking["failed"]] == [1]
+    assert kitchen_errors == [] and dead_letters == []
+    assert kitchen.places["Spoiled"].stats()["absorbed"] == 0
+
+
+def test_firing_waiting_to_settle_reports_nothing_once_its_net_is_aborted():
+    """The kitchen's first station firing has a straggler, so its second waits for the station
+    to settle. The front of house fails meanwhile; the waiting firing belongs to that failure
+    and must not later report its own timeout."""
+    slow = threading.Event()
+
+    def stage(tokens: list[Token]) -> list[Token]:
+        if not slow.is_set():
+            slow.set()
+            time.sleep(1.0)
+        return tokens
+
+    front, kitchen, station = _three_level_cafe(
+        stage, outer_deadline=0.3, inner_deadline=0.2, middle_workers=2, orders=2
+    )
+    kitchen_errors = _collect_errors(kitchen)
+    with front:
+        front.deposit("Queue", Token(payload={"order": "a"}))
+        front.deposit("Queue", Token(payload={"order": "b"}))
+        front.run(deadline=time.monotonic() + 5.0)
+    _await_settled(kitchen)
+    _await_settled(station)
+    assert [type(e) for e in kitchen_errors] == [TimeoutError], "only the station's own timeout is real"
+    assert kitchen.places["Spoiled"].stats()["absorbed"] == 1
+
+
+def test_a_subnet_cannot_enclose_its_own_parent():
+    front = PetriNet(places=[Place("Queue"), Place("Served")])
+    kitchen = PetriNet(places=[Place("Queue"), Place("Served")])
+
+    def wrap(outer: PetriNet, inner: PetriNet, name: str) -> None:
+        outer.add_transition(
+            SubstitutionTransition(
+                name=name,
+                inputs=[InputArc("Queue")],
+                outputs=[OutputArc("Served")],
+                action=lambda tokens: tokens,
+                subnet=inner,
+                port_socket_map={"Queue": "Queue", "Served": "Served"},
+            )
+        )
+
+    wrap(front, kitchen, "Kitchen")
+    with pytest.raises(ValueError, match="enclosing it"):
+        wrap(kitchen, front, "Front")
+    lonely = PetriNet(places=[Place("Queue"), Place("Served")])
+    with pytest.raises(ValueError, match="this net"):
+        wrap(lonely, lonely, "Self")
