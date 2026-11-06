@@ -721,11 +721,6 @@ class Place:
             t_limit = model_time if model_time is not None else time.monotonic()
             return self._store.take_available(len(self._store), t_limit)
 
-    def _holds(self, token: Token) -> bool:
-        """Whether this place currently stores *token* itself, compared by identity."""
-        with self._lock:
-            return not self._store.missing_identities({id(token)})
-
     def _restore_tokens(self, tokens: tuple[Token, ...]) -> bool:
         """Replace the contents with exactly *tokens*, bypassing colour, schema and pacing.
 

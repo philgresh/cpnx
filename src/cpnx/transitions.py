@@ -684,15 +684,16 @@ class SubstitutionTransition(Transition):
     rollback reaches nested subnets: a `SubstitutionTransition` inside the subnet that
     committed during the failed firing has its own subnet restored too.
     Resource permits are not restored. The firings that borrowed them return them, so each
-    pool keeps its capacity and any cooldown the failed firing started. An action still
-    running when the subnet gives up cannot be stopped. What it holds from before the firing
-    (a permit, or a subnet-owned token such as a recipe card or a one-token machine) is not
-    restored while it holds it; it hands it back when it finishes, and its other outputs are
-    discarded. It no longer counts as the subnet's work, so later firings don't wait for it.
-    A later firing that needs what it holds fails rather than waits: a firing whose subnet
-    finishes with any token the firing deposited still in an input port fails. A firing does
-    not start while such actions occupy every subnet worker; it waits up to
-    `subnet_deadline_secs` for one, then fails.
+    pool keeps its capacity and any cooldown the failed firing started. A firing that commits
+    leaves the subnet as it reached it, so a subnet may keep state across firings.
+
+    The restore happens only once the subnet has settled. An action of the failed firing
+    still running cannot be stopped: it finishes and commits through its own arcs inside the
+    subnet, and only then is the subnet restored, so nothing it holds (a permit, a recipe
+    card, a one-token machine) is ever put back while in use. Work the failed firing had
+    queued in the subnet is not started. Until the subnet settles, the parent is not
+    quiescent, and the next firing waits up to `subnet_deadline_secs` for it, then fails
+    without depositing anything.
 
     A subnet instance may only be wrapped by one `SubstitutionTransition` at a
     time; this is tracked process-wide via a weak set. Attempting to wrap the same subnet
@@ -707,7 +708,9 @@ class SubstitutionTransition(Transition):
                          exists in `subnet`. Defaults to an empty dict.
         subnet_deadline_secs: Maximum wall-clock seconds allowed for the subnet to reach
                          quiescence when this transition fires. A subnet still short of
-                         quiescence at the deadline fails the firing. Defaults to `30.0`.
+                         quiescence at the deadline fails the firing. A firing first waits up
+                         to the same bound for the subnet to settle from an earlier failed
+                         firing, on either clock. Defaults to `30.0`.
     """
 
     _mapped_subnets: ClassVar[weakref.WeakSet] = weakref.WeakSet()

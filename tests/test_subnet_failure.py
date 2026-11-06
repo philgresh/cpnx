@@ -28,6 +28,7 @@ from cpnx import (
     RetryPolicy,
     SinkPlace,
     SubstitutionTransition,
+    ThresholdPlace,
     Token,
     Transition,
 )
@@ -94,11 +95,11 @@ def _cafe(
     return parent, subnet, recipe
 
 
-def _await_orphans(net: PetriNet, timeout: float = 5.0) -> None:
+def _await_settled(net: PetriNet, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
-    while net._running_count and time.monotonic() < deadline:
+    while (net._pending_restore is not None or net._running_count) and time.monotonic() < deadline:
         time.sleep(0.005)
-    assert net._running_count == 0, "an orphaned firing never finished"
+    assert net._pending_restore is None and net._running_count == 0, "the subnet never settled"
 
 
 def _collect_errors(net: PetriNet) -> list[Exception]:
@@ -326,42 +327,6 @@ def test_concurrent_firings_of_one_subnet_keep_their_own_orders():
     assert served == Counter(range(n))
 
 
-def test_brew_still_running_at_the_deadline_returns_only_its_permit():
-    """An action still brewing when the deadline passes finishes after the purge. It hands back
-    what it holds from before the firing: its permit (still cooling down, since the pool is never
-    restored) and the recipe card (which the purge withheld rather than duplicate). Its order
-    belongs to the rolled-back firing and is dropped."""
-    release = threading.Event()
-
-    def stuck_brew(tokens: list[Token]) -> list[Token]:
-        release.wait(5.0)
-        return [tokens[0].evolve({"brewed": True}), tokens[1]]
-
-    barista = PacedResourcePlace("Barista", capacity=2, pacing_secs=60.0)
-    parent, subnet, recipe = _cafe(_Grinder(), deadline=0.2, barista=barista)
-    subnet.transitions["Brew"].action = stuck_brew
-    errors = _collect_errors(parent)
-    with parent:
-        parent.deposit("Queue", Token(payload={"order": 1}))
-        parent.run(deadline=time.monotonic() + 5.0)
-        assert [t.payload["order"] for t in parent.marking["failed"]] == [1]
-        assert [type(e) for e in errors] == [TimeoutError], "a busy subnet must not count as finished"
-        assert subnet.marking["Recipe"] == (), "the purge restored a card the straggler still holds"
-        release.set()
-        _await_orphans(subnet)
-        permits = subnet.marking["Barista"]
-        assert len(permits) == 2, "the purge duplicated or destroyed a permit"
-        assert len({t.id for t in permits}) == 2
-        cooling = [t for t in permits if t.available_at > time.monotonic()]
-        assert len(cooling) == 1, "the permit the stuck brew used should still be cooling down"
-        assert subnet.marking["Ready"] == (), "the late brew's output leaked into the subnet"
-        assert subnet.marking["Recipe"] == (recipe,)
-
-        parent.deposit("Queue", Token(payload={"order": 2}))
-        parent.run(deadline=time.monotonic() + 5.0)
-        assert _served(parent) == [2]
-
-
 @pytest.mark.parametrize("logical", [True, False], ids=["logical", "wall"])
 def test_token_parked_at_infinity_does_not_fail_the_firing(logical):
     """A token at `available_at = inf` never enables anything, so the subnet is in a timed dead
@@ -428,38 +393,6 @@ def _counter_cafe(brew, *, baristas: int, deadline: float, max_retries: int = 0)
         ],
     )
     return parent, subnet
-
-
-def test_straggler_does_not_fail_later_firings_that_finish():
-    """A brew still running after its firing was purged no longer counts as the subnet's work, so
-    a later order that brews on the other barista completes instead of waiting out the deadline
-    behind the straggler."""
-    release = threading.Event()
-    deadline = 1.0
-
-    def brew(tokens: list[Token]) -> list[Token]:
-        if tokens[0].payload["order"] == 1:
-            release.wait(5.0)
-        return [tokens[0].evolve({"brewed": True})]
-
-    parent, subnet = _counter_cafe(brew, baristas=2, deadline=deadline)
-    try:
-        with parent:
-            parent.deposit("Queue", Token(payload={"order": 1}))
-            parent.run(deadline=time.monotonic() + 5.0)
-            assert [t.payload["order"] for t in parent.marking["failed"]] == [1]
-
-            started = time.monotonic()
-            parent.deposit("Queue", Token(payload={"order": 2}))
-            parent.run(deadline=time.monotonic() + 5.0)
-            assert _served(parent) == [2]
-            assert [t.payload["order"] for t in parent.marking["failed"]] == [1]
-            assert time.monotonic() - started < deadline / 4, "order 2 waited out the deadline behind the straggler"
-    finally:
-        release.set()
-    _await_orphans(subnet)
-    assert len(subnet.marking["Barista"]) == 2
-    assert subnet.marking["Ready"] == ()
 
 
 def test_place_holding_one_token_object_twice_is_restored_exactly():
@@ -677,327 +610,6 @@ def test_restored_token_alone_re_enables_its_transition():
     assert _served(parent) == [2]
 
 
-def test_firing_blocked_by_a_straggler_fails_instead_of_committing_nothing():
-    """The straggler holds the only barista, so the next order cannot start. Its subnet is done
-    at once with the order still in the port. With only conditional outputs the parent could
-    commit zero tokens, so the firing must fail on the unconsumed order instead."""
-    release = threading.Event()
-    brewed: list[int] = []
-
-    def brew(tokens: list[Token]) -> list[Token]:
-        if tokens[0].payload["order"] == 1:
-            release.wait(5.0)
-        brewed.append(tokens[0].payload["order"])
-        return [tokens[0].evolve({"brewed": True})]
-
-    parent, subnet = _counter_cafe(brew, baristas=1, deadline=0.2)
-    cafe = parent.transitions["Cafe"]
-    parent.add_place(Place("Rejected"))
-    cafe.outputs = [OutputArc.on_color(Token().color, "Served"), OutputArc.on_color("error", "Rejected")]
-    errors = _collect_errors(parent)
-    try:
-        with parent:
-            parent.deposit("Queue", Token(payload={"order": 1}))
-            parent.run(deadline=time.monotonic() + 5.0)
-            parent.deposit("Queue", Token(payload={"order": 2}))
-            parent.run(deadline=time.monotonic() + 5.0)
-            assert [t.payload["order"] for t in parent.marking["failed"]] == [1, 2]
-            assert subnet.marking["Orders"] == ()
-            assert type(errors[-1]) is RuntimeError
-            assert "without consuming" in str(errors[-1])
-
-            release.set()
-            _await_orphans(subnet)
-            parent.deposit("Queue", Token(payload={"order": 3}))
-            parent.run(deadline=time.monotonic() + 5.0)
-    finally:
-        release.set()
-    assert _served(parent) == [3]
-    assert brewed == [1, 3]
-
-
-def test_purge_never_hands_a_held_machine_to_the_next_firing():
-    """`Place(initial_marking=[machine])` is the CPN form of a one-permit pool. While a straggler
-    holds the machine, the purge must not put it back, or two orders brew on one machine."""
-    release = threading.Event()
-    active = peak = 0
-    lock = threading.Lock()
-
-    def brew(tokens: list[Token]) -> list[Token]:
-        nonlocal active, peak
-        with lock:
-            active += 1
-            peak = max(peak, active)
-        try:
-            if tokens[0].payload["order"] == 1:
-                release.wait(5.0)
-        finally:
-            with lock:
-                active -= 1
-        return [tokens[0].evolve({"brewed": True}), tokens[1]]
-
-    machine = Token(color="machine")
-    subnet = PetriNet(
-        places=[Place("Orders"), Place("Ready"), Place("Machine", color_set={"machine"}, initial_marking=[machine])],
-        transitions=[
-            Transition(
-                "Brew", [InputArc("Orders"), InputArc("Machine")], [OutputArc("Ready"), OutputArc("Machine")], brew
-            )
-        ],
-    )
-    parent = PetriNet(
-        places=[Place("Queue"), Place("Served")],
-        max_workers=1,
-        transitions=[
-            SubstitutionTransition(
-                name="Cafe",
-                inputs=[InputArc("Queue")],
-                outputs=[OutputArc("Served")],
-                action=lambda tokens: tokens,
-                subnet=subnet,
-                port_socket_map={"Orders": "Queue", "Ready": "Served"},
-                subnet_deadline_secs=0.2,
-                max_retries=0,
-            )
-        ],
-    )
-    try:
-        with parent:
-            parent.deposit("Queue", Token(payload={"order": 1}))
-            parent.run(deadline=time.monotonic() + 5.0)
-            assert subnet.marking["Machine"] == ()
-            parent.deposit("Queue", Token(payload={"order": 2}))
-            parent.run(deadline=time.monotonic() + 5.0)
-            assert [t.payload["order"] for t in parent.marking["failed"]] == [1, 2]
-    finally:
-        release.set()
-    _await_orphans(subnet)
-    assert peak == 1
-    assert subnet.marking["Machine"] == (machine,)
-
-
-def test_card_handed_back_during_a_later_firing_survives_that_firings_purge():
-    """The straggler hands the recipe card back while order 2's firing is in progress, after its
-    checkpoint was taken. Order 2 then fails too, and its purge must keep the returned card."""
-    release = threading.Event()
-    recipe = Token(payload={"recipe": "flat white"})
-
-    def grind(tokens: list[Token]) -> list[Token]:
-        if tokens[0].payload["order"] == 2:
-            threading.Timer(0.05, release.set).start()
-            time.sleep(0.3)
-        return [tokens[0].evolve({"ground": True})]
-
-    def brew(tokens: list[Token]) -> list[Token]:
-        order, card = tokens
-        if order.payload["order"] == 1:
-            release.wait(5.0)
-        return [order.evolve(color="latte" if order.payload["order"] == 1 else "mocha"), card]
-
-    subnet = PetriNet(
-        places=[Place("Orders"), Place("Ground"), Place("Ready"), Place("Recipe", initial_marking=[recipe])],
-        transitions=[
-            Transition("Grind", [InputArc("Orders")], [OutputArc("Ground")], grind),
-            Transition(
-                "Brew", [InputArc("Ground"), InputArc("Recipe")], [OutputArc("Ready"), OutputArc("Recipe")], brew
-            ),
-        ],
-    )
-    parent = PetriNet(
-        places=[Place("Queue"), Place("Counter", color_set={"latte"})],
-        max_workers=1,
-        transitions=[
-            SubstitutionTransition(
-                name="Cafe",
-                inputs=[InputArc("Queue")],
-                outputs=[OutputArc("Counter")],
-                action=lambda tokens: tokens,
-                subnet=subnet,
-                port_socket_map={"Orders": "Queue", "Ready": "Counter"},
-                subnet_deadline_secs=1.0,
-                max_retries=0,
-            )
-        ],
-    )
-    subnet.transitions["Brew"].action = brew
-    try:
-        with parent:
-            parent.deposit("Queue", Token(payload={"order": 1}))
-            parent.run(deadline=time.monotonic() + 5.0)
-            assert subnet.marking["Recipe"] == ()
-            parent.deposit("Queue", Token(payload={"order": 2}))
-            parent.run(deadline=time.monotonic() + 5.0)
-    finally:
-        release.set()
-    _await_orphans(subnet)
-    assert [t.payload["order"] for t in parent.marking["failed"]] == [1, 2]
-    assert subnet.marking["Recipe"] == (recipe,)
-
-
-def test_one_slow_brew_does_not_cascade_through_a_one_worker_subnet():
-    """With one worker, a firing started while the straggler runs used to spend its deadline
-    queued behind it, miss, and orphan the next firing in turn. It now waits for the worker."""
-    calls: list[int] = []
-    spiked = threading.Event()
-
-    def brew(tokens: list[Token]) -> list[Token]:
-        calls.append(tokens[0].payload["order"])
-        if tokens[0].payload["order"] == 1 and not spiked.is_set():
-            spiked.set()
-            time.sleep(0.8)
-        else:
-            time.sleep(0.25)
-        return tokens
-
-    subnet = PetriNet(
-        places=[Place("Orders"), Place("Ready")],
-        max_workers=1,
-        transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], brew)],
-    )
-    parent = PetriNet(
-        places=[Place("Queue"), Place("Served")],
-        max_workers=1,
-        transitions=[
-            SubstitutionTransition(
-                name="Cafe",
-                inputs=[InputArc("Queue")],
-                outputs=[OutputArc("Served")],
-                action=lambda tokens: tokens,
-                subnet=subnet,
-                port_socket_map={"Orders": "Queue", "Ready": "Served"},
-                subnet_deadline_secs=0.5,
-                max_retries=5,
-                retry_policy=RetryPolicy(delay=0.0),
-            )
-        ],
-    )
-    errors = _collect_errors(parent)
-    with parent:
-        parent.deposit("Queue", Token(payload={"order": 1}))
-        parent.deposit("Queue", Token(payload={"order": 2}))
-        parent.run(deadline=time.monotonic() + 10.0)
-    _await_orphans(subnet)
-    assert sorted(_served(parent)) == [1, 2]
-    assert len(errors) == 1
-    assert sorted(calls) == [1, 1, 2]
-
-
-def test_firing_fails_when_orphans_hold_every_worker_past_the_deadline():
-    release = threading.Event()
-
-    def brew(tokens: list[Token]) -> list[Token]:
-        if tokens[0].payload["order"] == 1:
-            release.wait(5.0)
-        return tokens
-
-    subnet = PetriNet(
-        places=[Place("Orders"), Place("Ready")],
-        max_workers=1,
-        transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], brew)],
-    )
-    parent = PetriNet(
-        places=[Place("Queue"), Place("Served")],
-        max_workers=1,
-        transitions=[
-            SubstitutionTransition(
-                name="Cafe",
-                inputs=[InputArc("Queue")],
-                outputs=[OutputArc("Served")],
-                action=lambda tokens: tokens,
-                subnet=subnet,
-                port_socket_map={"Orders": "Queue", "Ready": "Served"},
-                subnet_deadline_secs=0.2,
-                max_retries=0,
-            )
-        ],
-    )
-    errors = _collect_errors(parent)
-    try:
-        with parent:
-            for order in (1, 2):
-                parent.deposit("Queue", Token(payload={"order": order}))
-                parent.run(deadline=time.monotonic() + 5.0)
-    finally:
-        release.set()
-    _await_orphans(subnet)
-    assert [type(e) for e in errors] == [TimeoutError, RuntimeError]
-    assert "every subnet worker" in str(errors[1])
-    assert subnet.marking["Orders"] == ()
-
-
-def test_work_queued_behind_a_straggler_never_runs_once_orphaned():
-    """Both of a firing's orders queue on a one-worker subnet. When the firing is purged, the
-    queued brew is orphaned before it starts and must not run its action."""
-    release = threading.Event()
-    calls: list[int] = []
-
-    def brew(tokens: list[Token]) -> list[Token]:
-        calls.append(tokens[0].payload["order"])
-        release.wait(5.0)
-        return tokens
-
-    subnet = PetriNet(
-        places=[Place("Orders"), Place("Ready")],
-        max_workers=1,
-        transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], brew)],
-    )
-    parent = PetriNet(
-        places=[Place("Queue"), Place("Served")],
-        max_workers=1,
-        transitions=[
-            SubstitutionTransition(
-                name="Cafe",
-                inputs=[InputArc("Queue", count=2)],
-                outputs=[OutputArc("Served", count=2)],
-                action=lambda tokens: tokens,
-                subnet=subnet,
-                port_socket_map={"Orders": "Queue", "Ready": "Served"},
-                subnet_deadline_secs=0.2,
-                max_retries=0,
-            )
-        ],
-    )
-    try:
-        with parent:
-            parent.deposit("Queue", Token(payload={"order": 1}))
-            parent.deposit("Queue", Token(payload={"order": 2}))
-            parent.run(deadline=time.monotonic() + 5.0)
-    finally:
-        release.set()
-    _await_orphans(subnet)
-    assert len(calls) == 1
-    assert subnet.marking["Orders"] == () and subnet.marking["Ready"] == ()
-
-
-def test_repeated_purges_leave_no_firing_counted():
-    """Two purges while stragglers run, then a clean order: the counts must return to zero, or a
-    later firing would read live work as finished (or wait forever)."""
-    release = threading.Event()
-
-    def brew(tokens: list[Token]) -> list[Token]:
-        if tokens[0].payload["order"] < 3:
-            release.wait(5.0)
-        return [tokens[0].evolve({"brewed": True})]
-
-    parent, subnet = _counter_cafe(brew, baristas=3, deadline=0.2)
-    try:
-        with parent:
-            for order in (1, 2):
-                parent.deposit("Queue", Token(payload={"order": order}))
-                parent.run(deadline=time.monotonic() + 5.0)
-            assert subnet._running_count == 2
-            assert subnet._live_count == 0
-            release.set()
-            _await_orphans(subnet)
-            assert subnet._live_count == 0 and subnet._firings == set()
-            parent.deposit("Queue", Token(payload={"order": 3}))
-            parent.run(deadline=time.monotonic() + 5.0)
-    finally:
-        release.set()
-    assert _served(parent) == [3]
-    assert len(subnet.marking["Barista"]) == 3
-
-
 def test_rollback_undoes_every_nested_firing_newest_first():
     """Two orders reach the kitchen in one outer firing, so it stamps twice. Rolling back must
     restore the oldest checkpoint last, leaving the card unstamped."""
@@ -1060,3 +672,610 @@ def test_rollback_reaches_three_levels():
         parent.drive_to_quiescence()
     assert [t.payload["order"] for t in parent.marking["failed"]] == [1]
     assert [t.payload["stamps"] for t in pantry.marking["StampCard"]] == [0]
+
+
+def _release_after(event: threading.Event, secs: float) -> None:
+    timer = threading.Timer(secs, event.set)
+    timer.daemon = True
+    timer.start()
+
+
+def test_straggler_finishes_through_its_arcs_before_the_restore():
+    """A brew still running at the deadline is not cut short. Until it finishes the subnet is
+    unsettled, and the parent is not quiescent. Once it finishes, its permit is back in the
+    pool through its own arc (still cooling down) and the restore puts the subnet back: no
+    brewed order in `Ready`, the recipe card exactly once."""
+    release = threading.Event()
+
+    def stuck_brew(tokens: list[Token]) -> list[Token]:
+        release.wait(5.0)
+        return [tokens[0].evolve({"brewed": True}), tokens[1]]
+
+    barista = PacedResourcePlace("Barista", capacity=2, pacing_secs=60.0)
+    parent, subnet, recipe = _cafe(_Grinder(), deadline=0.2, barista=barista)
+    subnet.transitions["Brew"].action = stuck_brew
+    errors = _collect_errors(parent)
+    try:
+        with parent:
+            parent.deposit("Queue", Token(payload={"order": 1}))
+            parent.run(deadline=time.monotonic() + 0.6)
+            assert [t.payload["order"] for t in parent.marking["failed"]] == [1]
+            assert [type(e) for e in errors] == [TimeoutError], "a busy subnet must not count as finished"
+            assert subnet._pending_restore is not None
+            assert not parent.is_quiescent(), "the parent reported quiescent while its subnet was still running"
+            release.set()
+            _await_settled(subnet)
+            assert parent.is_quiescent()
+            permits = subnet.marking["Barista"]
+            assert len(permits) == 2 and len({t.id for t in permits}) == 2
+            assert len([t for t in permits if t.available_at > time.monotonic()]) == 1
+            assert subnet.marking["Ready"] == ()
+            assert subnet.marking["Recipe"] == (recipe,)
+
+            parent.deposit("Queue", Token(payload={"order": 2}))
+            parent.run(deadline=time.monotonic() + 5.0)
+    finally:
+        release.set()
+    assert _served(parent) == [2]
+
+
+def test_next_firing_waits_for_the_subnet_to_settle_then_runs_clean():
+    release = threading.Event()
+    brewed: list[int] = []
+
+    def brew(tokens: list[Token]) -> list[Token]:
+        if tokens[0].payload["order"] == 1:
+            release.wait(5.0)
+        brewed.append(tokens[0].payload["order"])
+        return [tokens[0].evolve({"brewed": True})]
+
+    parent, subnet = _counter_cafe(brew, baristas=2, deadline=1.0)
+    try:
+        with parent:
+            parent.deposit("Queue", Token(payload={"order": 1}))
+            parent.run(deadline=time.monotonic() + 1.3)
+            started = time.monotonic()
+            _release_after(release, 0.3)
+            parent.deposit("Queue", Token(payload={"order": 2}))
+            parent.run(deadline=time.monotonic() + 5.0)
+            waited = time.monotonic() - started
+    finally:
+        release.set()
+    assert [t.payload["order"] for t in parent.marking["failed"]] == [1]
+    assert _served(parent) == [2]
+    assert brewed == [1, 2]
+    assert waited >= 0.25, "order 2 started before the straggler finished"
+    assert len(subnet.marking["Barista"]) == 2 and subnet.marking["Ready"] == ()
+
+
+def test_firing_that_cannot_wait_out_a_straggler_fails_without_depositing():
+    """With only conditional parent outputs, a firing that ran beside the straggler could have
+    committed nothing and left its order behind. It now fails before depositing anything."""
+    release = threading.Event()
+    brewed: list[int] = []
+
+    def brew(tokens: list[Token]) -> list[Token]:
+        if tokens[0].payload["order"] == 1:
+            release.wait(5.0)
+        brewed.append(tokens[0].payload["order"])
+        return [tokens[0].evolve({"brewed": True})]
+
+    parent, subnet = _counter_cafe(brew, baristas=1, deadline=0.2)
+    parent.add_place(Place("Rejected"))
+    parent.transitions["Cafe"].outputs = [
+        OutputArc.on_color(Token().color, "Served"),
+        OutputArc.on_color("error", "Rejected"),
+    ]
+    errors = _collect_errors(parent)
+    try:
+        with parent:
+            for order in (1, 2):
+                parent.deposit("Queue", Token(payload={"order": order}))
+                parent.run(deadline=time.monotonic() + 0.6)
+            assert [t.payload["order"] for t in parent.marking["failed"]] == [1, 2]
+            assert [type(e) for e in errors] == [TimeoutError, RuntimeError]
+            assert "still running an action of a failed firing" in str(errors[1])
+            assert subnet.marking["Orders"] == ()
+            release.set()
+            _await_settled(subnet)
+            parent.deposit("Queue", Token(payload={"order": 3}))
+            parent.run(deadline=time.monotonic() + 5.0)
+    finally:
+        release.set()
+    assert _served(parent) == [3]
+    assert brewed == [1, 3]
+
+
+def test_two_stage_subnet_never_strands_an_order():
+    """Prep moves each order to `Mid`, where Bake waits for the one oven. Order 0's bake outlives
+    the deadline; order 1 must not leave its prepped order behind for order 2 to deliver."""
+    release = threading.Event()
+
+    def bake(tokens: list[Token]) -> list[Token]:
+        order = next(t for t in tokens if not t.is_resource)
+        if order.payload["order"] == 0:
+            release.wait(5.0)
+        return [Token(color="pizza", payload=dict(order.payload))]
+
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Mid"), Place("Ready"), ResourcePlace("Oven", capacity=1)],
+        transitions=[
+            Transition("Prep", [InputArc("Orders")], [OutputArc("Mid")], lambda tokens: tokens),
+            Transition("Bake", [InputArc("Mid"), InputArc("Oven")], [OutputArc("Ready"), OutputArc("Oven")], bake),
+        ],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Kitchen",
+                inputs=[InputArc("Queue")],
+                outputs=[OutputArc.on_color("pizza", "Served")],
+                action=lambda tokens: tokens,
+                subnet=subnet,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                subnet_deadline_secs=0.2,
+                max_retries=0,
+            )
+        ],
+    )
+    try:
+        with parent:
+            parent.deposit("Queue", Token(payload={"order": 0}))
+            parent.run(deadline=time.monotonic() + 0.5)
+            _release_after(release, 0.1)
+            for order in (1, 2):
+                parent.deposit("Queue", Token(payload={"order": order}))
+                parent.run(deadline=time.monotonic() + 5.0)
+    finally:
+        release.set()
+    assert [t.payload["order"] for t in parent.marking["failed"]] == [0]
+    assert [t.payload["order"] for t in parent.marking["Served"]] == [1, 2]
+    assert all(subnet.marking[name] == () for name in ("Orders", "Mid", "Ready"))
+
+
+def test_batching_port_keeps_what_committed_firings_left():
+    """A committed firing keeps the state it reached, so a port that gathers two tickets per
+    tray still batches across firings."""
+    subnet = PetriNet(
+        places=[ThresholdPlace("Tickets", threshold=2), Place("Trays")],
+        transitions=[
+            Transition(
+                "Bake",
+                [InputArc("Tickets", count=2)],
+                [OutputArc("Trays")],
+                lambda tokens: [Token(payload={"batch": [t.payload["order"] for t in tokens]})],
+            )
+        ],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Out")],
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Oven",
+                inputs=[InputArc("Queue")],
+                outputs=[OutputArc.on_color(Token().color, "Out")],
+                action=lambda tokens: tokens,
+                subnet=subnet,
+                port_socket_map={"Tickets": "Queue", "Trays": "Out"},
+                max_retries=0,
+            )
+        ],
+    )
+    with parent:
+        for order in (1, 2, 3, 4):
+            parent.deposit("Queue", Token(payload={"order": order}))
+            parent.drive_to_quiescence()
+    assert [t.payload["batch"] for t in parent.marking["Out"]] == [(1, 2), (3, 4)]
+    assert parent.marking["failed"] == ()
+
+
+def test_purge_never_hands_a_held_machine_to_the_next_firing():
+    """`Place(initial_marking=[machine])` is the CPN form of a one-permit pool. The next order
+    waits for the straggler to give the machine back, so no two orders brew on it at once."""
+    release = threading.Event()
+    active = peak = 0
+    lock = threading.Lock()
+
+    def brew(tokens: list[Token]) -> list[Token]:
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            if tokens[0].payload["order"] == 1:
+                release.wait(5.0)
+        finally:
+            with lock:
+                active -= 1
+        return [tokens[0].evolve({"brewed": True}), tokens[1]]
+
+    machine = Token(color="machine")
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Ready"), Place("Machine", color_set={"machine"}, initial_marking=[machine])],
+        transitions=[
+            Transition(
+                "Brew", [InputArc("Orders"), InputArc("Machine")], [OutputArc("Ready"), OutputArc("Machine")], brew
+            )
+        ],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Cafe",
+                inputs=[InputArc("Queue")],
+                outputs=[OutputArc("Served")],
+                action=lambda tokens: tokens,
+                subnet=subnet,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                subnet_deadline_secs=1.0,
+                max_retries=0,
+            )
+        ],
+    )
+    try:
+        with parent:
+            parent.deposit("Queue", Token(payload={"order": 1}))
+            parent.run(deadline=time.monotonic() + 1.3)
+            _release_after(release, 0.2)
+            parent.deposit("Queue", Token(payload={"order": 2}))
+            parent.run(deadline=time.monotonic() + 5.0)
+    finally:
+        release.set()
+    _await_settled(subnet)
+    assert peak == 1
+    assert _served(parent) == [2]
+    assert subnet.marking["Machine"] == (machine,)
+
+
+def test_nested_straggler_leaves_one_machine():
+    """The kitchen's slow brew outlives the front of house's deadline. When everything has
+    settled, the kitchen holds exactly one machine, in its state from before the failed firing."""
+
+    def brew(tokens: list[Token]) -> list[Token]:
+        order, machine = tokens
+        time.sleep(0.6 if order.payload["order"] == 2 else 0.01)
+        return [order.evolve({"brewed": True}), machine.evolve({"uses": machine.payload["uses"] + 1})]
+
+    kitchen = PetriNet(
+        places=[
+            Place("Tickets"),
+            Place("Plated"),
+            Place("Machine", color_set={"machine"}, initial_marking=[Token(color="machine", payload={"uses": 0})]),
+        ],
+        transitions=[
+            Transition(
+                "Brew", [InputArc("Tickets"), InputArc("Machine")], [OutputArc("Plated"), OutputArc("Machine")], brew
+            )
+        ],
+    )
+    front = PetriNet(
+        places=[Place("Orders"), Place("Ready")],
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Kitchen",
+                inputs=[InputArc("Orders")],
+                outputs=[OutputArc("Ready")],
+                action=lambda tokens: tokens,
+                subnet=kitchen,
+                port_socket_map={"Tickets": "Orders", "Plated": "Ready"},
+                subnet_deadline_secs=1.0,
+                max_retries=0,
+            )
+        ],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Cafe",
+                inputs=[InputArc("Queue", count=2)],
+                outputs=[OutputArc("Served", count=2)],
+                action=lambda tokens: tokens,
+                subnet=front,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                subnet_deadline_secs=0.2,
+                max_retries=0,
+            )
+        ],
+    )
+    with parent:
+        parent.deposit("Queue", Token(payload={"order": 1}))
+        parent.deposit("Queue", Token(payload={"order": 2}))
+        parent.run(deadline=time.monotonic() + 5.0)
+    _await_settled(front)
+    _await_settled(kitchen)
+    assert len(parent.marking["failed"]) == 2
+    assert [t.payload for t in kitchen.marking["Machine"]] == [{"uses": 0}]
+    assert all(kitchen.marking[name] == () for name in ("Tickets", "Plated"))
+
+
+def test_rollback_does_not_store_a_returned_machine_twice():
+    """The kitchen's straggler gives its machine back after the kitchen's own purge, while the
+    front of house is still waiting on another station. The front's rollback must leave one
+    machine, not replay the hand-back onto a checkpoint that already has it."""
+    machine = Token(color="machine")
+
+    def brew(tokens: list[Token]) -> list[Token]:
+        order, held = tokens
+        time.sleep(0.5 if order.payload["order"] == 2 else 0.01)
+        return [order.evolve({"brewed": True}), held]
+
+    kitchen = PetriNet(
+        places=[Place("Tickets"), Place("Plated"), Place("Machine", color_set={"machine"}, initial_marking=[machine])],
+        transitions=[
+            Transition(
+                "Brew", [InputArc("Tickets"), InputArc("Machine")], [OutputArc("Plated"), OutputArc("Machine")], brew
+            )
+        ],
+    )
+    front = PetriNet(
+        places=[Place("Orders"), Place("Ready"), Place("Timer"), Place("Rang")],
+        max_workers=2,
+        transitions=[
+            SubstitutionTransition(
+                name="Kitchen",
+                inputs=[InputArc("Orders")],
+                outputs=[OutputArc("Ready")],
+                action=lambda tokens: tokens,
+                subnet=kitchen,
+                port_socket_map={"Tickets": "Orders", "Plated": "Ready"},
+                subnet_deadline_secs=0.2,
+                max_retries=0,
+            ),
+            Transition("Wait", [InputArc("Timer")], [OutputArc("Rang")], lambda tokens: (time.sleep(0.8), tokens)[1]),
+        ],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Timer"), Place("Served")],
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Cafe",
+                inputs=[InputArc("Queue", count=2), InputArc("Timer")],
+                outputs=[OutputArc("Served", count=2)],
+                action=lambda tokens: tokens,
+                subnet=front,
+                port_socket_map={"Orders": "Queue", "Ready": "Served", "Timer": "Timer"},
+                subnet_deadline_secs=2.0,
+                max_retries=0,
+            )
+        ],
+    )
+    with parent:
+        parent.deposit("Queue", Token(payload={"order": 1}))
+        parent.deposit("Queue", Token(payload={"order": 2}))
+        parent.deposit("Timer", Token(payload={"order": 0}))
+        parent.run(deadline=time.monotonic() + 5.0)
+    _await_settled(front)
+    _await_settled(kitchen)
+    assert kitchen.marking["Machine"] == (machine,)
+
+
+def test_one_slow_brew_does_not_cascade_through_a_one_worker_subnet():
+    """With one worker, a firing that started while the straggler ran would spend its deadline
+    queued behind it, miss, and fail the next firing in turn. It waits for the subnet instead."""
+    calls: list[int] = []
+    spiked = threading.Event()
+
+    def brew(tokens: list[Token]) -> list[Token]:
+        calls.append(tokens[0].payload["order"])
+        if tokens[0].payload["order"] == 1 and not spiked.is_set():
+            spiked.set()
+            time.sleep(1.2)
+        else:
+            time.sleep(0.05)
+        return tokens
+
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Ready")],
+        max_workers=1,
+        transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], brew)],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Cafe",
+                inputs=[InputArc("Queue")],
+                outputs=[OutputArc("Served")],
+                action=lambda tokens: tokens,
+                subnet=subnet,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                subnet_deadline_secs=1.0,
+                max_retries=5,
+                retry_policy=RetryPolicy(delay=0.0),
+            )
+        ],
+    )
+    errors = _collect_errors(parent)
+    with parent:
+        parent.deposit("Queue", Token(payload={"order": 1}))
+        parent.deposit("Queue", Token(payload={"order": 2}))
+        parent.run(deadline=time.monotonic() + 10.0)
+    assert sorted(_served(parent)) == [1, 2]
+    assert len(errors) == 1
+    assert sorted(calls) == [1, 1, 2]
+
+
+def test_work_queued_by_a_failed_firing_never_runs():
+    """Both of a firing's orders queue on a one-worker subnet. When the firing fails, the brew
+    still queued belongs to it and must not act once it gets the worker."""
+    release = threading.Event()
+    calls: list[int] = []
+
+    def brew(tokens: list[Token]) -> list[Token]:
+        calls.append(tokens[0].payload["order"])
+        release.wait(5.0)
+        return tokens
+
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Ready")],
+        max_workers=1,
+        transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], brew)],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Cafe",
+                inputs=[InputArc("Queue", count=2)],
+                outputs=[OutputArc("Served", count=2)],
+                action=lambda tokens: tokens,
+                subnet=subnet,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                subnet_deadline_secs=0.2,
+                max_retries=0,
+            )
+        ],
+    )
+    try:
+        with parent:
+            parent.deposit("Queue", Token(payload={"order": 1}))
+            parent.deposit("Queue", Token(payload={"order": 2}))
+            parent.run(deadline=time.monotonic() + 0.5)
+    finally:
+        release.set()
+    _await_settled(subnet)
+    assert len(calls) == 1
+    assert subnet.marking["Orders"] == () and subnet.marking["Ready"] == ()
+
+
+def test_subnet_with_unbounded_workers_fires():
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Ready")],
+        max_workers=None,
+        transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], lambda tokens: tokens)],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        transitions=[
+            SubstitutionTransition(
+                name="Cafe",
+                inputs=[InputArc("Queue")],
+                outputs=[OutputArc("Served")],
+                action=lambda tokens: tokens,
+                subnet=subnet,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+            )
+        ],
+    )
+    with parent:
+        parent.deposit("Queue", Token(payload={"order": 1}))
+        parent.run(deadline=time.monotonic() + 5.0)
+    assert _served(parent) == [1]
+
+
+def _stamping_front(
+    brew, *, kitchen_deadline: float, front_deadline: float, orders: int
+) -> tuple[PetriNet, PetriNet, PetriNet]:
+    """A parent whose front of house hands orders to a kitchen subnet with a stamp card."""
+    kitchen = PetriNet(
+        places=[Place("Tickets"), Place("Plated"), Place("StampCard", initial_marking=[Token(payload={"stamps": 0})])],
+        transitions=[
+            Transition(
+                "Brew",
+                [InputArc("Tickets"), InputArc("StampCard")],
+                [OutputArc("Plated"), OutputArc("StampCard")],
+                brew,
+            )
+        ],
+    )
+    front = PetriNet(
+        places=[Place("Orders"), Place("Ready")],
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Kitchen",
+                inputs=[InputArc("Orders")],
+                outputs=[OutputArc("Ready")],
+                action=lambda tokens: tokens,
+                subnet=kitchen,
+                port_socket_map={"Tickets": "Orders", "Plated": "Ready"},
+                subnet_deadline_secs=kitchen_deadline,
+                max_retries=0,
+            )
+        ],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Counter", color_set={"latte"})],
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Cafe",
+                inputs=[InputArc("Queue", count=orders)],
+                outputs=[OutputArc("Counter", count=orders)],
+                action=lambda tokens: tokens,
+                subnet=front,
+                port_socket_map={"Orders": "Queue", "Ready": "Counter"},
+                subnet_deadline_secs=front_deadline,
+                max_retries=0,
+            )
+        ],
+    )
+    return parent, front, kitchen
+
+
+def _stamp(tokens: list[Token]) -> list[Token]:
+    order, card = tokens
+    return [order.evolve({"brewed": True}), card.evolve({"stamps": card.payload["stamps"] + 1})]
+
+
+def test_nested_firing_that_commits_after_the_outer_failure_is_undone():
+    """The kitchen's only brew outlives the front of house's deadline but not its own, so it
+    commits a stamp after the outer firing has failed. The outer restore must undo it."""
+
+    def brew(tokens: list[Token]) -> list[Token]:
+        time.sleep(0.5)
+        return _stamp(tokens)
+
+    parent, front, kitchen = _stamping_front(brew, kitchen_deadline=2.0, front_deadline=0.2, orders=1)
+    with parent:
+        parent.deposit("Queue", Token(payload={"order": 1}))
+        parent.run(deadline=time.monotonic() + 5.0)
+    _await_settled(front)
+    assert [t.payload["order"] for t in parent.marking["failed"]] == [1]
+    assert [t.payload["stamps"] for t in kitchen.marking["StampCard"]] == [0]
+
+
+def test_outer_restore_waits_for_a_nested_subnet_to_settle():
+    """Order 1's brew commits a stamp; order 2's brew is still holding the card when both the
+    kitchen and the front of house fail. The front's rollback to before order 1 must come after
+    the kitchen's own restore, or the kitchen's restore would bring order 1's stamp back."""
+    release = threading.Event()
+
+    def brew(tokens: list[Token]) -> list[Token]:
+        if tokens[0].payload["order"] == 2:
+            release.wait(5.0)
+        return _stamp(tokens)
+
+    parent, front, kitchen = _stamping_front(brew, kitchen_deadline=0.2, front_deadline=0.5, orders=2)
+    try:
+        with parent:
+            parent.deposit("Queue", Token(payload={"order": 1}))
+            parent.deposit("Queue", Token(payload={"order": 2}))
+            parent.run(deadline=time.monotonic() + 0.8)
+            assert front._pending_restore is not None and kitchen._pending_restore is not None
+            release.set()
+            _await_settled(kitchen)
+            _await_settled(front)
+    finally:
+        release.set()
+    assert len(parent.marking["failed"]) == 2
+    assert [t.payload["stamps"] for t in kitchen.marking["StampCard"]] == [0]
+
+
+def test_net_with_an_unsettled_subnet_is_not_finished():
+    _, front, kitchen = _stamping_front(_stamp, kitchen_deadline=1.0, front_deadline=1.0, orders=1)
+    assert front._is_finished()
+    kitchen._pending_restore = (kitchen._checkpoint_marking(), [])
+    assert not front._is_finished()
+    kitchen._pending_restore = None

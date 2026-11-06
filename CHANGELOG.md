@@ -90,13 +90,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   firing. The reasons are a port rejecting a deposit, the subnet raising, the subnet not
   quiescing in time, or the parent being unable to commit the outputs. Resource permits are left
   to the firings that borrowed them, so a pool keeps its capacity and any cooldown the failed
-  firing started. An action still running when the subnet gives up keeps what it took from
-  before the firing (a permit, a recipe card, a one-token machine) out of the restored subnet,
-  hands it back when it finishes, and its other outputs are dropped; later firings do not wait
-  for it, and one that needs what it holds fails. The rollback reaches nested subnets, and a
-  place that holds the same `Token` object more than once is restored with exactly that many.
+  firing started. An action of the failed firing still running when the subnet gives up
+  finishes through its own arcs first: the restore waits until the subnet has settled, so
+  nothing in use (a permit, a recipe card, a one-token machine) is ever put back twice, and work
+  the failed firing had queued is not started. The rollback reaches nested subnets, and a place
+  that holds the same `Token` object more than once is restored with exactly that many. A
+  committed firing still leaves the subnet as it reached it, so subnets that keep state across
+  firings, such as a batching port, are unaffected. `docs/cpn-invariants.json` now records the
+  theory this rests on, with page references: the CPN occurrence, compound-place, timed and
+  place-invariant rules (`CPN-*`), zero-safe nets' stable markings and transactions (`ZS-*`),
+  and closed nested transactions (`NESTED-TX*`).
 
-  Three behavior changes come with this:
+  Four behavior changes come with this:
 
   - **A subnet that does not reach quiescence now fails the firing.** That covers a wall-clock
     subnet still busy at `subnet_deadline_secs` (`TimeoutError`) and a logical-clock subnet that
@@ -105,8 +110,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     later firing. The parent's `on_error` now reports why, where it used to get a "returned 0
     non-resource token(s)" error. A subnet left holding only tokens parked at
     `available_at = inf` has finished: nothing can ever fire, so the firing completes as before.
-    A subnet that finishes with any token the firing deposited still in an input port also
-    fails the firing (`RuntimeError`), where it used to commit whatever outputs there were.
+  - **While a failed firing's action is still running, its subnet is not settled.** The parent
+    is not quiescent until it settles, so `run()` without a deadline waits for it, as it would
+    for any running action in a flat net. The next firing of the transition waits up to
+    `subnet_deadline_secs` for it, then fails with `RuntimeError` without depositing anything.
   - **Firings of one `SubstitutionTransition` now run one at a time.** With `max_workers > 1`,
     concurrent firings shared the subnet's ports, so a firing could collect another's output.
     The surplus was dropped and the starved firing retried, so some orders were served twice and
