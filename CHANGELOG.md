@@ -28,7 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     it, then fails with `RuntimeError` without depositing anything, and that failure counts
     toward `max_retries`. To bound a subnet action that may hang, set `action_timeout_secs` on
     it. `subnet_deadline_secs=None` removes both bounds, so a hung subnet action then holds the
-    transition and the parent's shutdown indefinitely; any other value must be positive.
+    transition and the parent's shutdown indefinitely. Any other value must be a positive real
+    number (`TypeError` for a non-number, `ValueError` otherwise), is checked on assignment too,
+    and is stored as a float.
   - **Firings of one `SubstitutionTransition` now run one at a time.** A firing selected while
     another is in progress waits for it on a worker thread. With `max_workers > 1`, concurrent
     firings shared the subnet's ports, so a firing could collect another's output. The surplus
@@ -36,7 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     never.
   - **A substitution transition cannot wrap the net it is in, or a net enclosing it, and one
     `SubstitutionTransition` cannot be in two nets at once.** `add_transition` raises
-    `ValueError`. Replacing a substitution transition by name releases its subnet.
+    `ValueError`. A substitution transition replaced by name in `add_transition` can then be
+    added to another net.
 
 - **A certified callable may no longer close over a `frozenset` whose members are not themselves
   immutable.** `cpnx.certification` decides what a callable can close over and still earn the
@@ -120,11 +123,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quiescing in time, or the parent being unable to commit the outputs. Resource permits are left
   to the firings that borrowed them, so a pool the subnet owns keeps its capacity and any
   cooldown the failed firing started (a `ResourcePlace` mapped as a port still gains the parent's
-  permit copy on each failed firing, as in earlier releases, and a permit one transition moves into
-  another pool for a later one to return stays there if the firing fails in between). An action of the failed firing still running when the subnet gives up
-  finishes through its own arcs first: the restore waits until the subnet has settled, so
-  nothing in use (a permit, a recipe card, a one-token machine) is ever put back twice, and work
-  the failed firing had queued, at any depth, is not started and reports nothing. The rollback reaches nested subnets, and a place
+  permit copy on each failed firing, as in earlier releases, and a permit one transition moves
+  into another pool for a later one to return stays there if the firing fails in between). An
+  action of the failed firing still running when the subnet gives up finishes through its own
+  arcs first: the restore waits until the subnet has settled, so nothing in use (a permit, a
+  recipe card, a one-token machine) is ever put back twice, and work the failed firing had
+  queued, at any depth, is not started and reports nothing. A token deposited into a restored
+  subnet place during the failed firing is discarded with it, even one deposited from outside
+  the subnet. The rollback reaches nested subnets, and a place
   that holds the same `Token` object more than once is restored with exactly that many. A
   committed firing still leaves the subnet as it reached it, so subnets that keep state across
   firings, such as a batching port, are unaffected. `docs/cpn-invariants.json` now records the

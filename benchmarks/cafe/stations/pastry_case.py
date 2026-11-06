@@ -18,8 +18,8 @@ Demonstrates:
     place in the corpus where engine cost is not proportional to a single action.
 
     **Isolation, precisely.** The child subnet holds one weak reference to its parent, used to
-    stop its work when an enclosing firing fails and to signal when a failed firing has settled.
-    Otherwise
+    stop its work when an enclosing firing fails, to signal when a failed firing has settled,
+    and to reject a subnet that would enclose its parent or belong to two nets. Otherwise
     it is constructed, run, and drained as a wholly separate [`PetriNet`][cpnx.PetriNet] with its own
     lock, its own clock, its own thread pools. Communication crosses the boundary
     *only* through `port_socket_map`: a port place inside the subnet (`P_Pastry_In`,

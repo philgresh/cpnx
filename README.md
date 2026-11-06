@@ -212,7 +212,7 @@ The **marking** is the complete distribution of tokens across all places at a gi
 ```python
 m = net.marking           # dict[str, list[Token]]
 dead = net.is_dead()      # True if no transition can fire in this marking
-quiet = net.is_quiescent()  # True if dead AND no in-flight transitions
+quiet = net.is_quiescent()  # True if no work is running, unsettled or pending
 ```
 
 ---
@@ -349,7 +349,7 @@ class PetriNet:
     @property
     def marking(self) -> dict[str, list[Token]]: ...  # current CPN marking
     def is_dead(self) -> bool: ...                # no transition enabled in current marking
-    def is_quiescent(self) -> bool: ...           # dead AND no in-flight transitions
+    def is_quiescent(self) -> bool: ...           # nothing running, unsettled or able to fire later
     def advance_time(self, t: float) -> None: ... # advance timed CPN model clock
     def snapshot(self) -> dict: ...               # JSON-serialisable marking snapshot
     def to_dot(self) -> str: ...                  # Graphviz DOT representation
@@ -432,7 +432,7 @@ cpnx's execution model is aligned with **Coloured Petri Nets (CPNs)** as formali
 |---|---|
 | `PacedResourcePlace`, `settle_secs` | Pragmatic concurrency extensions; no CPN equivalent |
 | `expr_timeout_secs`, certification (`cpnx.certification`) | Pragmatic purity-checking / certification of callable expressions; no CPN equivalent |
-| `is_quiescent()` | Dead marking AND no in-flight threads; no single CPN term |
+| `is_quiescent()` | No in-flight actions, no subnet still settling a failed firing, and nothing that could fire once a cooldown ends; no single CPN term |
 | `ResourcePlace`, `ThresholdPlace` | CPN patterns expressed as typed place shorthands |
 | `Place.bound` | Standard CPN: k-bounded place |
 | `Token.color`, `Place.color_set` | Standard CPN: colours and colour sets |

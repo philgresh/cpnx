@@ -1,4 +1,6 @@
 import enum
+import math
+import numbers
 import threading
 import typing
 import warnings
@@ -659,15 +661,22 @@ class Transition:
         super().__setattr__(name, value)
 
 
-def _check_subnet_deadline(name: str, deadline: object) -> None:
-    """Raise unless *deadline* is a positive number or `None`."""
+def _check_subnet_deadline(name: str, deadline: object) -> float | None:
+    """Return *deadline* as a float, raising unless it is a positive real number or `None`."""
     if deadline is None:
-        return
-    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not deadline > 0:
-        raise ValueError(
-            f"SubstitutionTransition '{name}': subnet_deadline_secs must be a positive number or None, "
-            f"not {deadline!r}."
-        )
+        return None
+    message = (
+        f"SubstitutionTransition '{name}': subnet_deadline_secs must be a positive number or None, not {deadline!r}."
+    )
+    if isinstance(deadline, bool) or not isinstance(deadline, numbers.Real):
+        raise TypeError(message)
+    try:
+        secs = float(deadline)
+    except OverflowError:
+        secs = math.inf
+    if not secs > 0:
+        raise ValueError(message)
+    return secs
 
 
 @dataclass
@@ -736,8 +745,9 @@ class SubstitutionTransition(Transition):
                          `run()`, which waits for a failed firing's still-running action;
                          set `action_timeout_secs` on subnet actions that may hang. `None`
                          removes both bounds, so a hung subnet action then holds this
-                         transition, and the parent's shutdown, indefinitely. Must be
-                         positive or `None`. Defaults to `30.0`.
+                         transition, and the parent's shutdown, indefinitely. Must be a
+                         positive number or `None`, checked on assignment too, and is stored
+                         as a float. Defaults to `30.0`.
     """
 
     _mapped_subnets: ClassVar[weakref.WeakSet] = weakref.WeakSet()
@@ -745,6 +755,7 @@ class SubstitutionTransition(Transition):
     subnet: "PetriNet" = field(default=None)  # type: ignore[assignment]
     port_socket_map: dict[str, str] = field(default_factory=dict)
     subnet_deadline_secs: float | None = 30.0
+    _firing_lock: "threading.Lock" = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         # Guard purity/inline-safety is handled by Transition.__setattr__ during field
@@ -758,8 +769,6 @@ class SubstitutionTransition(Transition):
             if not isinstance(port, str) or not isinstance(socket, str):
                 raise TypeError("Port and socket mapping names must be strings.")
 
-        _check_subnet_deadline(self.name, self.subnet_deadline_secs)
-
         missing = [p for p in self.port_socket_map if p not in self.subnet.places]
         if missing:
             raise ValueError(
@@ -772,4 +781,8 @@ class SubstitutionTransition(Transition):
                 f"SubstitutionTransition '{self.name}': child subnet is already mapped to another transition."
             )
         SubstitutionTransition._mapped_subnets.add(self.subnet)
-        self._firing_lock = threading.Lock()
+
+    def __setattr__(self, name, value):
+        if name == "subnet_deadline_secs":
+            value = _check_subnet_deadline(self.name, value)
+        super().__setattr__(name, value)

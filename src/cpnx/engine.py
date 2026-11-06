@@ -1063,7 +1063,14 @@ class PetriNet:
                 )
             net = net._parent_net()
         parent = transition.subnet._parent_net()
-        if parent is not None and parent is not self and transition.subnet in parent._subnets:
+        if (
+            parent is not None
+            and parent is not self
+            and any(
+                isinstance(other, SubstitutionTransition) and other.subnet is transition.subnet
+                for other in parent.transitions.values()
+            )
+        ):
             raise ValueError(f"SubstitutionTransition '{transition.name}': its subnet already belongs to another net.")
 
     def _unlink_replaced(self, replaced: Transition | None) -> None:
@@ -1644,7 +1651,8 @@ class PetriNet:
                 on the wait for a subnet to settle after a failed substitution firing. The
                 default suits the fast (~microsecond) actions this driver is built for; raise it for
                 nets whose actions legitimately block for longer, so a slow-but-healthy action is
-                not mistaken for a hung one.
+                not mistaken for a hung one. It counts spins, so how long it lasts depends on the
+                machine; it is not a time bound.
 
         Returns:
             A [`DriveResult`][cpnx.DriveResult] with the number of firings and clock advances.
@@ -1708,8 +1716,8 @@ class PetriNet:
         not-yet-settled tokens become available. Unlike [`is_dead`][cpnx.PetriNet.is_dead],
         which is a pure snapshot of the current marking, `is_quiescent` also accounts for
         in-flight transitions (including those still running in a subnet whose firing failed,
-        until it has settled and been restored) and treats time-gated tokens (cooldowns, settle windows) as if
-        they were already present — so the net is not considered quiescent merely because
+        until it has settled and been restored) and treats time-gated tokens (cooldowns, settle
+        windows) as if they were already present — so the net is not considered quiescent merely because
         work is temporarily blocked by timing. This is the condition [`run`][cpnx.PetriNet.run]
         loops until.
 
@@ -1779,7 +1787,9 @@ class PetriNet:
         Returns:
             Dict with `"places"` (mapping place name to a list of token dicts with
             keys `id`, `payload`, `created_at`, `is_resource`) and
-            `"running_count"` (number of transitions currently executing).
+            `"running_count"` (number of transitions currently executing in this net; a
+            subnet still settling a failed firing is not counted, so `0` does not mean
+            quiescent).
 
         Example:
             ```python
@@ -3083,9 +3093,10 @@ class PetriNet:
     ) -> "_FiringOutcome | None":
         """Run the action and commit or roll back; *action_error* fails the firing without it.
 
-        Returns `None` for a firing that starts after this net, or a net enclosing it, has a
-        failed firing to settle: it belongs to that failed firing, so it hands its tokens back
-        without acting, retrying, dead-lettering or calling back, and the restore resets the net.
+        Returns `None` for a firing that belongs to a failed firing of this net or a net enclosing
+        it: one that starts after that failure, or whose subnet drive the failure cuts short. It
+        hands its tokens back without retrying, dead-lettering or calling back, and the restore
+        resets the net.
         """
         if self._aborted():
             self._return_unstarted(token_sources)
@@ -3095,7 +3106,7 @@ class PetriNet:
         else:
             success, output_tokens, error = False, [], action_error
         if isinstance(error, _EnclosingFiringFailed):
-            self._return_unstarted(token_sources)
+            self._return_interrupted(token_sources)
             return None
         with self._lock:
             duration = time.monotonic() - start_time
@@ -3114,6 +3125,20 @@ class PetriNet:
             for src, token in token_sources:
                 self.places[src]._return_token(token)
                 self._mark_dirty(src, token)
+
+    def _return_interrupted(self, token_sources: list[tuple[str, Token]]) -> None:
+        """Hand back the tokens of a firing whose subnet drive an enclosing failure cut short.
+
+        Data tokens go back unchanged, with no retry counted. Resource tokens go back through
+        `deposit`, as a rollback returns them, so a paced permit starts its cooldown.
+        """
+        with self._lock:
+            for src, token in token_sources:
+                if token.is_resource:
+                    self._deposit_under_lock(src, token)
+                else:
+                    self.places[src]._return_token(token)
+                    self._mark_dirty(src, token)
 
     def _aborted(self) -> bool:
         """Whether this net, or a net enclosing it, has a failed firing still to settle."""
@@ -3247,7 +3272,7 @@ class PetriNet:
         with self._lock:
             if self._running_count or self._has_unsettled_subnet():
                 return False
-        return self.is_dead() and self._next_availability_boundary() is None
+        return self._next_availability_boundary() is None and self.is_dead()
 
     def _checkpoint_marking(self) -> dict[str, tuple[Token, ...]]:
         """Snapshot the places a purge restores: every place except resource pools and sinks."""
@@ -3257,11 +3282,13 @@ class PetriNet:
     def _restore_marking(self, checkpoint: dict[str, tuple[Token, ...]]) -> None:
         """Put each checkpointed place back to its checkpointed tokens.
 
+        A token deposited into a restored place since the checkpoint is discarded, even one
+        deposited from outside the subnet, so a subnet should take input only through its ports.
         Resource pools and sinks are left as they are: a permit borrowed and returned by one
         transition has already come back through that firing's arcs, and a sink cannot enable
         anything. A permit one transition moves into another pool for a later transition to
-        return stays where the failed firing left it. The clock is not
-        moved; checkpointed tokens were available then and the clock has only advanced.
+        return stays where the failed firing left it. The clock is not moved; checkpointed
+        tokens were available then and the clock has only advanced.
         """
         with self._lock:
             for name, tokens in checkpoint.items():
@@ -3569,6 +3596,15 @@ class PetriNet:
         parent_outputs = [arc.place for arc in transition.outputs]
         return self._retrieve_subnet_outputs(subnet, transition.port_socket_map, parent_outputs)
 
+    def _run_subnet(self, subnet: "PetriNet", bound: float | None) -> None:
+        """Run *subnet* on the wall clock for up to *bound* seconds, or until it has finished."""
+        if bound is not None and math.isfinite(bound):
+            subnet.run(deadline=time.monotonic() + bound)
+            return
+        # `run()` returns only once quiescent, which a back-pressured subnet never is.
+        while not subnet._is_finished() and not self._aborted():
+            subnet.run(deadline=time.monotonic() + subnet.cooldown_interval)
+
     def _drive_subnet(self, transition: SubstitutionTransition) -> None:
         """Drive the subnet to quiescence in the parent's clock regime, raising if it gets stuck."""
         subnet = transition.subnet
@@ -3598,8 +3634,7 @@ class PetriNet:
             if parent_on_logical_clock:
                 ticks = subnet.drive_to_quiescence().ticks
             else:
-                bound = transition.subnet_deadline_secs
-                subnet.run(deadline=None if bound is None else time.monotonic() + bound)
+                self._run_subnet(subnet, transition.subnet_deadline_secs)
         except Exception:
             if self._aborted():
                 raise _EnclosingFiringFailed(transition.name) from None
