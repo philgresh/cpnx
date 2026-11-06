@@ -1912,9 +1912,9 @@ class PetriNet:
         """Collect the eligible-token pool for every input arc, or `None` if any is unmet.
 
         Derives how many ordered tokens each arc could actually consume and passes it as the
-        key-index read cap. Reading only that many is what keeps a keyed drain proportional
-        to what the search will look at rather than to the depth of the place — the whole
-        point of the index. The two cases:
+        read cap for both the bounded FIFO peek and the key-index read. Reading only that many
+        keeps a drain proportional to what the search will look at rather than to the depth of
+        the place. The two cases:
 
         - **head-only** (per `_is_head_only`): `_resolve_input_tokens` takes the leading
           `count`, so `count` tokens is exactly enough.
