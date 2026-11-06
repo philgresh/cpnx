@@ -15,9 +15,8 @@ Two views:
 - **drive** -- `drive_to_quiescence` on N timed arrivals spaced 0.01 apart, served by one
   worker that is busy for 1.0 after each firing, so the matured backlog grows to about N.
   `untimed` is the identical net with the arrivals deposited `AVAILABLE_NOW`, as a control.
-  The timed arm still pays the route-1 FIFO peek of `binding_search_limit + 1` tokens per
-  evaluation (#59 cause B), so it plateaus rather than matching the control until that is
-  fixed too.
+  With the matured heap and the head-only FIFO peek (#59 causes A and B) the timed arm
+  tracks the control.
 
 Report the *shape* (flat vs linear growth per doubling) and the ratio, not raw microseconds.
 Native stdlib only.
@@ -108,6 +107,8 @@ def main() -> None:
     print()
     print("   Expected: 'us/call' holds ~flat (O(log n) amortized per boundary query). Before the")
     print("   matured heap it ~doubled per doubling of N, which made each clock advance O(backlog).")
+    print("   'timed us/step' tracks 'untimed us/step' and grows only slowly with N. Before #59's")
+    print("   fixes it grew roughly linearly with N, far above the untimed control.")
 
 
 if __name__ == "__main__":

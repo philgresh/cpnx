@@ -19,11 +19,12 @@ Demonstrates:
     answer pays O(backlog) per drink and O(N²) for the rush. That is cause A of
     [#59](https://github.com/philgresh/cpnx/issues/59).
 
-    `T_Make_Mobile_Order` is a plain guard-free FIFO, so after A the remaining per-drink cost
-    is the FIFO pool read itself, which peeks up to `binding_search_limit + 1` tokens per
-    evaluation (cause B of #59). Deposit the same orders as `AVAILABLE_NOW` instead of timed
-    and the run does identical work with an untimed rail, which is the control arm the
-    throughput benchmark reports alongside it.
+    `T_Make_Mobile_Order` is a plain guard-free FIFO, so it also exercises the head-only pool
+    read, which used to peek up to `binding_search_limit + 1` tokens per evaluation (cause B
+    of #59). With A and B fixed, the timed rush costs about what its untimed control does.
+    Deposit the same orders as `AVAILABLE_NOW` instead of timed and the run does identical
+    work with an untimed rail, which is the control arm the throughput benchmark reports
+    alongside it.
 
     Like every station, nothing here deposits: the benchmark decides when orders come due.
 """

@@ -76,9 +76,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bench_cafe_throughput.py` adds a "mobile-order rush" regime at 500 / 2 000 / 8 000 orders that
   runs each size twice with identical work, once timed and once with the orders deposited
   `AVAILABLE_NOW`, and prints the ratio. At 8 000 orders the timed rail costs 13.2× its untimed
-  control before the matured-heap fix below and 6.5× after; the rest is cause B of
-  [#59](https://github.com/philgresh/cpnx/issues/59), the FIFO pool read peeking
-  `binding_search_limit + 1` tokens per evaluation.
+  control before the matured-heap fix below, 6.5× after it, and about 1.0× with the FIFO peek
+  fix below as well.
 
 ### Fixed
 
@@ -99,10 +98,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   staying on a slow path.
   Measured with the new `benchmarks/bench_timed_backlog.py`: a boundary query holds at about
   0.32 µs from 1 000 to 16 000 matured tokens (was 346 → 7 754 µs), and the timed drive drops
-  from 3 964 to 1 484 µs/step at 4 000 arrivals. That drive still plateaus above its untimed
-  control, because the FIFO pool read peeks `binding_search_limit + 1` tokens per evaluation
-  whatever the head-only cap; that is cause B of
-  [#59](https://github.com/philgresh/cpnx/issues/59) and is not fixed here.
+  from 3 964 to 1 484 µs/step at 4 000 arrivals. The rest of the gap to its untimed control
+  was the FIFO pool read, fixed in the entry below.
+
+- **A guard-free FIFO transition now reads only the tokens it will consume.** For a
+  head-only transition (`FIRST` with no guard) on a plain single-token arc, the engine peeked
+  `binding_search_limit + 1` tokens (1 001 by default) on every enabling check and every
+  firing, then used only the first. On an untimed place that cost an `islice`; on a place
+  holding timed tokens every token read is a heap pop and push, so the per-firing cost grew
+  with the backlog until it hit the limit. The peek is now bounded by the arc's `count` for a
+  head-only transition. Searching transitions (a guard, `RANDOM` or `PRIORITY`) still read
+  `binding_search_limit + 1` candidates, so which tokens fire, and the seeded RNG stream, are
+  unchanged. With the matured-heap fix above in place, a timed backlog now costs about what
+  its untimed control does: at 8 000 orders the mobile-order rush's timed rail runs 1.0× its
+  control (was 5.2×), and `bench_timed_backlog.py`'s timed drive at 4 000 arrivals runs
+  1.0–1.1× (was 7.2×), 9–10× faster per step. The `cold_brew` row of
+  `bench_station_costs.py` is flat across its 250 → 2 000 depth ladder (was 2.2× growth) and
+  2.7× lower at 2 000, and the `cold-brew` regime of `bench_cafe_throughput.py` is 1.7× faster
+  at 20 000 orders. Part of [#59](https://github.com/philgresh/cpnx/issues/59) (cause B).
 
 ## [0.7.0] — 2026-10-20
 
