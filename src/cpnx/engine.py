@@ -99,21 +99,21 @@ def _lazy_product(streams: list[Iterator[_T]]) -> Iterator[tuple[_T, ...]]:
     """Yield the Cartesian product of `streams` in `itertools.product`'s order, reading lazily.
 
     `itertools.product` consumes every input iterable in full before yielding anything. This
-    reads an option from a stream only when the lexicographic order first needs it, so reading
-    the first `k` tuples touches about `k + len(streams)` options however long the streams are.
+    reads a stream only as far as the lexicographic order has reached into it (at most twice as
+    far, see `_lazy_product_from`), so reading the first `k` tuples touches O(`k`) options
+    plus one per stream, however long the streams are.
     The output order is identical (lexicographic in stream index, last stream varying fastest),
     and an empty stream yields nothing, as with `product`.
 
-    Every stream is asked for its first option before anything is yielded, even once one has
-    come back empty. The engine's streams run each arc's `filter` and `key` on that first
+    Every stream is asked for its first option when this is called, even once one has come back
+    empty. The engine's streams run each arc's `filter` and `key` on that first
     pull, and `product` ran them for every arc, so skipping the later arcs would drop their
     fault signals.
     """
     firsts = [next(stream, _EXHAUSTED) for stream in streams]
     if any(first is _EXHAUSTED for first in firsts):
-        return
-    seen = [[cast("_T", first)] for first in firsts]
-    yield from _lazy_product_from(streams, seen, 0)
+        return iter(())
+    return _lazy_product_from(streams, [[cast("_T", first)] for first in firsts], 0)
 
 
 def _lazy_product_from(streams: list[Iterator[_T]], seen: list[list[_T]], i: int) -> Iterator[tuple[_T, ...]]:
@@ -121,7 +121,9 @@ def _lazy_product_from(streams: list[Iterator[_T]], seen: list[list[_T]], i: int
 
     The first pass, under `seen[i][0]`, recurses and so stays lazy. It returns only after every
     deeper stream is exhausted, at which point `seen[i + 1:]` holds their complete option
-    lists and each later option of stream `i` pairs with them through `itertools.product`.
+    lists. Later options of stream `i` are then read in doubling batches and paired with them
+    through `itertools.product`, which keeps a full scan close to `product`'s speed while
+    reading at most twice as far into stream `i` as the consumer gets.
     """
     if i == len(streams):
         yield ()
@@ -130,9 +132,11 @@ def _lazy_product_from(streams: list[Iterator[_T]], seen: list[list[_T]], i: int
     for rest in _lazy_product_from(streams, seen, i + 1):
         yield (head, *rest)
     deeper = seen[i + 1 :]
-    for option in streams[i]:
-        seen[i].append(option)
-        yield from itertools.product((option,), *deeper)
+    batch_size = 1
+    while batch := list(itertools.islice(streams[i], batch_size)):
+        seen[i].extend(batch)
+        yield from itertools.product(batch, *deeper)
+        batch_size *= 2
 
 
 class _PeekStream:
