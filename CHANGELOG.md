@@ -89,11 +89,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every subnet place except resource pools and sinks is restored to its marking from before the
   firing. The reasons are a port rejecting a deposit, the subnet raising, the subnet not
   quiescing in time, or the parent being unable to commit the outputs. Resource permits are left
-  to the firings that borrowed them, so a pool keeps its capacity and any cooldown the failed
-  firing started. An action of the failed firing still running when the subnet gives up
+  to the firings that borrowed them, so a pool the subnet owns keeps its capacity and any
+  cooldown the failed firing started (a `ResourcePlace` mapped as a port still gains the parent's
+  permit copy on each failed firing, as on `main`). An action of the failed firing still running when the subnet gives up
   finishes through its own arcs first: the restore waits until the subnet has settled, so
   nothing in use (a permit, a recipe card, a one-token machine) is ever put back twice, and work
-  the failed firing had queued is not started. The rollback reaches nested subnets, and a place
+  the failed firing had queued, at any depth, is not started and reports nothing. The rollback reaches nested subnets, and a place
   that holds the same `Token` object more than once is restored with exactly that many. A
   committed firing still leaves the subnet as it reached it, so subnets that keep state across
   firings, such as a batching port, are unaffected. `docs/cpn-invariants.json` now records the

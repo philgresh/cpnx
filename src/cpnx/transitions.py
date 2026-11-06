@@ -668,8 +668,8 @@ class SubstitutionTransition(Transition):
     `subnet`): named port places inside the subnet are bound to named socket places in the
     parent net via `port_socket_map`, and `subnet_deadline_secs` bounds how long the subnet
     is given to reach quiescence. The child subnet is fully insulated from the parent net —
-    it carries no reference to its parent. Communication occurs strictly through the
-    `port_socket_map`.
+    it holds only a weak reference to its parent, used to tell it when a failed firing has
+    settled. Tokens move strictly through the `port_socket_map`.
 
     A firing is all-or-nothing as far as the subnet is concerned. Firings of one
     `SubstitutionTransition` run one at a time, so each collects only its own outputs. The
@@ -684,14 +684,17 @@ class SubstitutionTransition(Transition):
     rollback reaches nested subnets: a `SubstitutionTransition` inside the subnet that
     committed during the failed firing has its own subnet restored too.
     Resource permits are not restored. The firings that borrowed them return them, so each
-    pool keeps its capacity and any cooldown the failed firing started. A firing that commits
+    pool the subnet owns keeps its capacity and any cooldown the failed firing started (a
+    `ResourcePlace` mapped as a port still gains the parent's permit copy on each failed
+    firing). A firing that commits
     leaves the subnet as it reached it, so a subnet may keep state across firings.
 
     The restore happens only once the subnet has settled. An action of the failed firing
     still running cannot be stopped: it finishes and commits through its own arcs inside the
     subnet, and only then is the subnet restored, so nothing it holds (a permit, a recipe
     card, a one-token machine) is ever put back while in use. Work the failed firing had
-    queued in the subnet is not started. Until the subnet settles, the parent is not
+    queued, in the subnet or in any subnet below it, is not started: it hands its tokens back
+    without retrying, dead-lettering or reporting an error. Until the subnet settles, the parent is not
     quiescent, and the next firing waits up to `subnet_deadline_secs` for it, then fails
     without depositing anything.
 

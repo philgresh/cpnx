@@ -8,6 +8,7 @@ import operator
 import random
 import threading
 import time
+import weakref
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
@@ -651,7 +652,8 @@ class PetriNet:
         self._nested_undo: list[_NestedUndo] | None = None
         self._pending_restore: tuple[dict[str, tuple[Token, ...]], list[_NestedUndo]] | None = None
         self._settle_lock = threading.Lock()
-        self._parent: PetriNet | None = None
+        self._closing = False
+        self._parent: weakref.ref[PetriNet] | None = None
         self._subnets: list[PetriNet] = []
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._action_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cpnx-action")
@@ -1030,7 +1032,7 @@ class PetriNet:
             self.transitions[transition.name] = transition
             if isinstance(transition, SubstitutionTransition):
                 self._subnets.append(transition.subnet)
-                transition.subnet._parent = self
+                transition.subnet._parent = weakref.ref(self)
             if any(arc.settle_secs > 0.0 for arc in transition.inputs):
                 self._has_timed_features = True
             if self._effective_policy(transition) in (BindingPolicy.RANDOM, BindingPolicy.PRIORITY):
@@ -1576,7 +1578,7 @@ class PetriNet:
         """
         self.validate()
         while not self.is_quiescent():
-            if self._should_stop_run(deadline, stop_event):
+            if self._should_stop_run(deadline, stop_event) or self._aborted():
                 break
             self._work_available.clear()
             if not self.step():
@@ -1630,11 +1632,11 @@ class PetriNet:
             # most one action is ever in flight. This keeps the drive single-threaded (determinism)
             # and ensures each completed action's outputs are committed before the next enablement
             # check (instant accounting).
-            while self.step():
+            while not self._aborted() and self.step():
                 steps += 1
                 self._await_inflight(max_spins=max_spins)
             # Nothing fires right now. Done, or just waiting out a cooldown/settle window?
-            if self.is_quiescent():
+            if self.is_quiescent() or self._aborted():
                 break
             boundary = self._next_availability_boundary()
             if boundary is None or boundary <= self._model_time:
@@ -2994,9 +2996,11 @@ class PetriNet:
         start_time = time.monotonic()
         try:
             if isinstance(transition, SubstitutionTransition):
-                outcome = self._fire_substitution_atomically(transition, consumed_tokens, token_sources)
+                outcome = self._fire_substitution_atomically(transition, consumed_tokens, token_sources, start_time)
             else:
                 outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time)
+            if outcome is None:
+                return
 
             # --- OUTSIDE THE LOCK ---
             self._invoke_transition_callbacks(transition, *outcome)
@@ -3021,15 +3025,16 @@ class PetriNet:
         token_sources: list[tuple[str, Token]],
         start_time: float,
         action_error: BaseException | None = None,
-    ) -> _FiringOutcome:
+    ) -> "_FiringOutcome | None":
         """Run the action and commit or roll back; *action_error* fails the firing without it.
 
-        A firing that starts while this net awaits a restore belongs to the failed firing being
-        undone, so it is failed without acting: its consumed tokens roll back through the normal
-        path, and the restore resets the net once it settles.
+        Returns `None` for a firing that starts after this net, or a net enclosing it, has a
+        failed firing to settle: it belongs to that failed firing, so it hands its tokens back
+        without acting, retrying, dead-lettering or calling back, and the restore resets the net.
         """
-        if action_error is None and self._pending_restore is not None:
-            action_error = RuntimeError(f"Transition '{transition.name}': its subnet's firing failed; not started.")
+        if action_error is None and self._aborted():
+            self._return_unstarted(token_sources)
+            return None
         if action_error is None:
             success, output_tokens, error = self._execute_transition_action(transition, consumed_tokens, token_sources)
         else:
@@ -3041,12 +3046,28 @@ class PetriNet:
             )
         return success, duration, error, data_tokens, dl_data, deposited
 
+    def _return_unstarted(self, token_sources: list[tuple[str, Token]]) -> None:
+        """Put a firing's consumed tokens back where they came from, as if it never fired."""
+        with self._lock:
+            for src, token in token_sources:
+                self._deposit_under_lock(src, token)
+
+    def _aborted(self) -> bool:
+        """Whether this net, or a net enclosing it, has a failed firing still to settle."""
+        net: PetriNet | None = self
+        while net is not None:
+            if net._closing or net._pending_restore is not None:
+                return True
+            net = net._parent() if net._parent is not None else None
+        return False
+
     def _fire_substitution_atomically(
         self,
         transition: SubstitutionTransition,
         consumed_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
-    ) -> _FiringOutcome:
+        start_time: float,
+    ) -> "_FiringOutcome | None":
         """Fire a substitution transition as one transaction on its subnet.
 
         Firings of one transition run one at a time, and each starts only once the subnet has
@@ -3057,8 +3078,10 @@ class PetriNet:
         """
         subnet = transition.subnet
         with transition._firing_lock:
-            start_time = time.monotonic()
-            if not subnet._await_settled(start_time + transition.subnet_deadline_secs):
+            if self._aborted():
+                self._return_unstarted(token_sources)
+                return None
+            if not subnet._await_settled(time.monotonic() + transition.subnet_deadline_secs):
                 error = RuntimeError(
                     f"SubstitutionTransition '{transition.name}': subnet is still running an action of a "
                     f"failed firing after subnet_deadline_secs={transition.subnet_deadline_secs}."
@@ -3066,8 +3089,12 @@ class PetriNet:
                 return self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, error)
             checkpoint = subnet._checkpoint_marking()
             subnet._nested_undo = nested = []
-            outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, time.monotonic())
-            if outcome[0]:
+            try:
+                outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time)
+            except BaseException:
+                subnet._request_restore(checkpoint, nested)
+                raise
+            if outcome is not None and outcome[0]:
                 subnet._nested_undo = None
                 with self._lock:
                     if self._nested_undo is not None:
@@ -3107,8 +3134,9 @@ class PetriNet:
             with self._lock:
                 self._nested_undo = None
                 self._pending_restore = None
+                self._closing = False
         self._work_available.set()
-        parent = self._parent
+        parent = self._parent() if self._parent is not None else None
         if parent is not None:
             parent._work_available.set()
             parent._try_settle()
@@ -3499,15 +3527,18 @@ class PetriNet:
             parent_on_logical_clock = self._model_time is not None
         if parent_on_logical_clock:
             ticks = subnet.drive_to_quiescence().ticks
-            if not subnet._is_finished():
-                raise RuntimeError(
-                    f"SubstitutionTransition '{transition.name}': subnet did not reach quiescence "
-                    f"on the logical clock after {ticks} clock advance(s)."
-                )
+            error: Exception = RuntimeError(
+                f"SubstitutionTransition '{transition.name}': subnet did not reach quiescence "
+                f"on the logical clock after {ticks} clock advance(s)."
+            )
         else:
             subnet.run(deadline=time.monotonic() + transition.subnet_deadline_secs)
-            if not subnet._is_finished():
-                raise TimeoutError(
-                    f"SubstitutionTransition '{transition.name}': subnet did not reach quiescence "
-                    f"within subnet_deadline_secs={transition.subnet_deadline_secs}."
-                )
+            error = TimeoutError(
+                f"SubstitutionTransition '{transition.name}': subnet did not reach quiescence "
+                f"within subnet_deadline_secs={transition.subnet_deadline_secs}."
+            )
+        # Closed before the check: work still queued must not start while the verdict is out.
+        subnet._closing = True
+        if not subnet._is_finished():
+            raise error
+        subnet._closing = False
