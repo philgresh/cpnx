@@ -117,6 +117,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2.7× lower at 2 000, and the `cold-brew` regime of `bench_cafe_throughput.py` is 1.7× faster
   at 20 000 orders. Part of [#59](https://github.com/philgresh/cpnx/issues/59) (cause B).
 
+- **A guarded `FIRST` transition now pays for the candidates it inspects, not for the depth of
+  its input places.** The search built every arc's capped candidate list, and peeked up to
+  `binding_search_limit + 1` tokens per arc, before trying the first combination. So even when
+  the head combination satisfied the guard, each enabling check and firing cost O(min(depth,
+  limit)) per arc, and draining a guard join over a deep place was O(N²). `FIRST` and the
+  RNG-free enabling probe now enumerate the same lexicographic product lazily, reading an arc's
+  next candidate only when the enumeration reaches it, and a deep FIFO pool is peeked in
+  doubling chunks. This supersedes the entry above's note that searching transitions still read
+  `binding_search_limit + 1` candidates: `FIRST` now reads within twice what it inspects.
+  `RANDOM` and `PRIORITY` scan the whole bounded product anyway and keep the eager path, so
+  chosen bindings and the seeded RNG stream are unchanged for every policy. Measured with the
+  new `benchmarks/bench_guard_join.py` (N jobs joined to 8 workers on a `wid` guard): one
+  resolution with a satisfying head holds at about 6.7 µs from 1 000 to 16 000 jobs (was
+  76 → 1 207 µs), and the drive runs 106 → 133 µs/step from 500 to 8 000 jobs (was
+  120 → 628). With no satisfying binding `FIRST` still walks the whole capped product, now
+  1–3% slower than before; avoiding that walk needs an index on the join key. Part of
+  [#59](https://github.com/philgresh/cpnx/issues/59) (cause C).
+
 ## [0.7.0] — 2026-10-20
 
 ### Removed

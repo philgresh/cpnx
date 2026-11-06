@@ -104,6 +104,20 @@ in `bench_timed_backlog.py` the timed drive at 4 000 arrivals runs 1.02–1.14×
 (7.1–7.25×). Both causes are tracked in
 [#59](https://github.com/philgresh/cpnx/issues/59).
 
+## Depth: a guard join stops where the match is
+
+A guarded transition searches for a binding instead of taking the head. Under `FIRST` that
+search used to build every input arc's candidate list, up to `binding_search_limit + 1`
+entries deep, before testing the first combination, so a guard join over a deep place cost
+`O(depth)` per check even when the head matched. The search now reads each arc's candidates
+lazily, in the same order, and stops at the first combination the guard accepts, so the cost
+tracks how far into the candidates the match sits. In `bench_guard_join.py`, resolving a join
+whose head matches holds at about 6.7 µs from 1 000 to 16 000 waiting jobs (it grew from 76
+to 1 207 µs), and draining 8 000 jobs runs 4.7× faster per step. A join with **no** match
+still inspects every candidate, so keep `binding_search_limit` in mind for places that can
+hold many tokens nobody will accept. Tracked in
+[#59](https://github.com/philgresh/cpnx/issues/59).
+
 ## What this means for you
 
 You do not have to opt into either optimization or structure your net around them — they are
@@ -136,6 +150,11 @@ python benchmarks/bench_consume_all_drain.py
 ```bash
 # Depth: timed backlog — boundary query cost and a timed drive vs its untimed control.
 python benchmarks/bench_timed_backlog.py
+```
+
+```bash
+# Depth: guard join — one resolution with a matching head, a non-matching scan, and a drive.
+python benchmarks/bench_guard_join.py
 ```
 
 ```bash
