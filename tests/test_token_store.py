@@ -461,3 +461,24 @@ def test_store_matches_reference_under_a_moving_clock(seed):
         assert len(store) == len(ref.live)
 
     assert reads_with_both_heaps_live >= 0.75 * reads
+
+
+def test_restore_drops_tokens_absent_from_the_snapshot():
+    a, b = Token(payload={"order": "a"}), Token(payload={"order": "b"})
+    place = Place("Orders", initial_marking=[a, b])
+    assert place._restore_tokens((a,))
+    assert place.tokens == (a,)
+    with pytest.raises(ValueError):
+        place.retrieve_specific([b])
+
+
+def test_restore_resets_key_index_entries():
+    place = Place("Backlog", initial_marking=[Token(payload={"prio": i}) for i in range(100)])
+    place._store.register_key_index(1, lambda t: t.payload["prio"])
+    for _ in range(20):
+        snapshot = place.tokens
+        place.retrieve(1)
+        place._restore_tokens(snapshot)
+    index = place._store.key_index(1)
+    assert len(index._heap) == len(place)
+    assert [t.payload["prio"] for t in index.peek_ordered(place._store._ready, 3)] == [0, 1, 2]

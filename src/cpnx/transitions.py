@@ -685,10 +685,14 @@ class SubstitutionTransition(Transition):
     committed during the failed firing has its own subnet restored too.
     Resource permits are not restored. The firings that borrowed them return them, so each
     pool keeps its capacity and any cooldown the failed firing started. An action still
-    running when the subnet gives up cannot be stopped: when it finishes, it returns its
-    permits and its other outputs are discarded. It no longer counts as the subnet's work, so
-    later firings finish without waiting for it, but until it does its permits are out of
-    the pool and a firing that needs one fails rather than waits.
+    running when the subnet gives up cannot be stopped. What it holds from before the firing
+    (a permit, or a subnet-owned token such as a recipe card or a one-token machine) is not
+    restored while it holds it; it hands it back when it finishes, and its other outputs are
+    discarded. It no longer counts as the subnet's work, so later firings don't wait for it.
+    A later firing that needs what it holds fails rather than waits: a firing whose subnet
+    finishes with any token the firing deposited still in an input port fails. A firing does
+    not start while such actions occupy every subnet worker; it waits up to
+    `subnet_deadline_secs` for one, then fails.
 
     A subnet instance may only be wrapped by one `SubstitutionTransition` at a
     time; this is tracked process-wide via a weak set. Attempting to wrap the same subnet

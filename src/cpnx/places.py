@@ -62,6 +62,10 @@ class _KeyIndex:
         self.disabled = False
         self._last_build: int = 0
 
+    def clear(self) -> None:
+        """Discard every entry, for a store that has just dropped all of its tokens."""
+        self._heap.clear()
+
     def add(self, seq: int, token: Token) -> bool:
         """Index *token* under *seq*. Returns ``False`` (and disables) if it cannot be keyed."""
         if self.disabled:
@@ -408,10 +412,12 @@ class _TokenStore:
                 self.drop(seq)
 
     def drop_all(self) -> None:
-        """Remove every stored token, keeping key-index registrations (their entries go stale)."""
+        """Remove every stored token, keeping key-index registrations but not their entries."""
         for seq in [*self._ready, *self._cooling_by_seq]:
             self.drop(seq)
         self._seq_of.clear()
+        for index in self._key_indexes.values():
+            index.clear()
 
     def missing_identities(self, ids: set[int]) -> set[int]:
         """Return the subset of `id(token)` values in *ids* that are not currently stored."""
@@ -714,6 +720,11 @@ class Place:
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
             return self._store.take_available(len(self._store), t_limit)
+
+    def _holds(self, token: Token) -> bool:
+        """Whether this place currently stores *token* itself, compared by identity."""
+        with self._lock:
+            return not self._store.missing_identities({id(token)})
 
     def _restore_tokens(self, tokens: tuple[Token, ...]) -> bool:
         """Replace the contents with exactly *tokens*, bypassing colour, schema and pacing.

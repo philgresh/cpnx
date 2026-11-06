@@ -11,7 +11,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Callable, Iterator, TypeAlias, TypeVar, cast
 
 from cpnx.analysis import ImpactMap, risk_report, trace_impact
@@ -41,9 +41,62 @@ _FiringOutcome: TypeAlias = tuple[bool, float, BaseException | None, list[Token]
 """`_invoke_transition_callbacks` arguments, in order: success, duration, error, data tokens,
 dead-lettered data tokens, deposits."""
 
-_NestedUndo: TypeAlias = "tuple[SubstitutionTransition, dict[str, tuple[Token, ...]], list[_NestedUndo]]"
+
+@dataclass(eq=False)
+class _Firing:
+    """A submitted firing: the marking epoch it was submitted in and the tokens it took.
+
+    `owed` holds indexes into `token_sources`, filled by the purge that orphans the firing: the
+    tokens the firing must hand back when it finishes.
+    """
+
+    epoch: int
+    token_sources: list[tuple[str, Token]]
+    owed: set[int] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class _Checkpoint:
+    """A subnet's restorable marking, and the hand-back log position when it was taken."""
+
+    seq: int
+    marking: dict[str, tuple[Token, ...]]
+
+
+_NestedUndo: TypeAlias = "tuple[SubstitutionTransition, _Checkpoint, list[_NestedUndo]]"
 """A committed substitution firing inside a subnet: the transition, its subnet's checkpoint from
 before the firing, and the same record for every substitution firing it committed in turn."""
+
+
+def _restore_target(
+    checkpoint: _Checkpoint, late_returns: list[tuple[int, str, Token]], firings: set[_Firing]
+) -> dict[str, list[Token]]:
+    """The marking a purge restores, marking on each in-flight firing what it then owes.
+
+    That is the checkpoint, plus tokens handed back since it was taken, minus tokens an
+    in-flight firing still holds. A held token from a place the checkpoint does not cover (a
+    resource pool) is always owed.
+    """
+    target = {name: list(tokens) for name, tokens in checkpoint.marking.items()}
+    for seq, name, token in late_returns:
+        if seq > checkpoint.seq and name in target:
+            target[name].append(token)
+    for firing in firings:
+        for index, (src, token) in enumerate(firing.token_sources):
+            if _withhold(target.get(src), token):
+                firing.owed.add(index)
+    return target
+
+
+def _withhold(tokens: list[Token] | None, token: Token) -> bool:
+    """Remove one occurrence of *token* from *tokens* by identity; `None` means a pool's token."""
+    if tokens is None:
+        return True
+    for i, held in enumerate(tokens):
+        if held is token:
+            del tokens[i]
+            return True
+    return False
 
 
 class _DrainAll:
@@ -648,8 +701,12 @@ class PetriNet:
         self.transitions: dict[str, Transition] = {}
         self._running_count = 0
         self._marking_epoch = 0
-        self._orphaned_count = 0
+        self._live_count = 0
+        self._firings: set[_Firing] = set()
         self._nested_undo: list[_NestedUndo] | None = None
+        self._late_returns: list[tuple[int, str, Token]] = []
+        self._return_seq = 0
+        self._max_workers = max_workers
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._action_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cpnx-action")
         self._expr_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cpnx-expr")
@@ -1368,15 +1425,15 @@ class PetriNet:
                     m_time = self._get_model_time_under_lock()
                     consumed_tokens, token_sources = self._consume_binding(binding, m_time)
 
-                    self._running_count += 1
+                    firing = self._begin_firing(token_sources)
                     try:
                         self._executor.submit(
-                            self._execute_transition, transition, consumed_tokens, token_sources, self._marking_epoch
+                            self._execute_transition, transition, consumed_tokens, token_sources, firing
                         )
                     except Exception:
                         # submit() failed (e.g. executor shut down) — undo the increment so
                         # is_quiescent() doesn't permanently block.
-                        self._running_count -= 1
+                        self._end_firing(firing)
                         # Return consumed tokens back to their source places
                         for src_name, t in token_sources:
                             self._deposit_under_lock(src_name, t)
@@ -1658,7 +1715,7 @@ class PetriNet:
             elapses).
         """
         with self._lock:
-            if self._running_count > self._orphaned_count:
+            if self._live_count > 0:
                 result = False
             elif self._incremental_eligible:
                 self._reconcile_dirty()
@@ -2917,10 +2974,11 @@ class PetriNet:
     def _await_inflight(self, *, max_spins: int = 10_000_000) -> None:
         """Block until no transition action is mid-flight (barrier for `drive_to_quiescence`).
 
-        Spins on `_running_count` with `time.sleep(0)` (yields the GIL to worker threads without a
-        real sleep). Safe as a barrier: `_execute_transition` decrements `_running_count` *after*
-        committing its output deposits, so observing zero implies every completed action's outputs
-        are visible.
+        Spins on `_live_count` with `time.sleep(0)` (yields the GIL to worker threads without a
+        real sleep). Safe as a barrier: `_execute_transition` decrements `_live_count` *after*
+        committing its output deposits, so observing zero implies every completed live action's
+        outputs are visible. Firings orphaned by a purge are not waited for: their outputs are
+        discarded, and what they owe is handed back whenever they finish.
 
         Args:
             max_spins: Safety cap. Actions are expected to complete promptly; a hung action would
@@ -2930,11 +2988,11 @@ class PetriNet:
             RuntimeError: If `max_spins` is exceeded while an action is still in flight.
         """
         spins = 0
-        while self._running_count > self._orphaned_count:
+        while self._live_count > 0:
             if spins >= max_spins:
                 raise RuntimeError(
                     f"_await_inflight exceeded max_spins={max_spins} with "
-                    f"{self._running_count} action(s) still in flight — hung action?"
+                    f"{self._live_count} action(s) still in flight — hung action?"
                 )
             spins += 1
             time.sleep(0)
@@ -2981,21 +3039,33 @@ class PetriNet:
             )
         return success, error, data_tokens, dl_data, deposited
 
+    def _begin_firing(self, token_sources: list[tuple[str, Token]]) -> "_Firing":
+        """Register a firing that has taken *token_sources*. Caller holds `self._lock`."""
+        firing = _Firing(self._marking_epoch, token_sources)
+        self._firings.add(firing)
+        self._running_count += 1
+        self._live_count += 1
+        return firing
+
+    def _end_firing(self, firing: "_Firing") -> None:
+        """Deregister a finished firing. Caller holds `self._lock`."""
+        self._firings.discard(firing)
+        self._running_count -= 1
+        if firing.epoch == self._marking_epoch:
+            self._live_count -= 1
+
     def _execute_transition(
         self,
         transition: Transition,
         consumed_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
-        epoch: int | None = None,
+        firing: "_Firing",
     ) -> None:
-        start_time = time.monotonic()
         try:
             if isinstance(transition, SubstitutionTransition):
-                outcome = self._fire_substitution_atomically(
-                    transition, consumed_tokens, token_sources, start_time, epoch
-                )
+                outcome = self._fire_substitution_atomically(transition, consumed_tokens, token_sources, firing)
             else:
-                outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, epoch)
+                outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, time.monotonic(), firing)
             if outcome is None:
                 return
 
@@ -3007,11 +3077,8 @@ class PetriNet:
                 raise error
 
         finally:
-            # Decrement running count and signal work available under lock
             with self._lock:
-                self._running_count -= 1
-                if epoch is not None and epoch != self._marking_epoch:
-                    self._orphaned_count -= 1
+                self._end_firing(firing)
             self._work_available.set()
 
     def _fire_and_commit(
@@ -3020,33 +3087,51 @@ class PetriNet:
         consumed_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
         start_time: float,
-        epoch: int | None,
+        firing: "_Firing",
+        undo: "_NestedUndo | None" = None,
     ) -> "_FiringOutcome | None":
-        """Run the action and commit or roll back; `None` if a purge orphaned this firing."""
-        success, output_tokens, error = self._execute_transition_action(transition, consumed_tokens, token_sources)
+        """Run the action and commit or roll back; `None` if a purge orphaned this firing.
+
+        The epoch is checked before the action as well as after it, so a firing that a purge
+        overtook while it was still queued hands back what it owes without acting at all.
+        """
         with self._lock:
-            if epoch is not None and epoch != self._marking_epoch:
-                deposited = self._return_orphaned_permits(token_sources)
-            else:
-                duration = time.monotonic() - start_time
-                success, error, data_tokens, dl_data, deposited = self._commit_or_rollback_transition(
-                    transition, success, consumed_tokens, output_tokens, token_sources, error
-                )
-                return success, duration, error, data_tokens, dl_data, deposited
-        self._dispatch_deposits(deposited)
+            settled = self._settle_if_orphaned(firing)
+        if settled is None:
+            success, output_tokens, error = self._execute_transition_action(transition, consumed_tokens, token_sources)
+            with self._lock:
+                settled = self._settle_if_orphaned(firing)
+                if settled is None:
+                    duration = time.monotonic() - start_time
+                    success, error, data_tokens, dl_data, deposited = self._commit_or_rollback_transition(
+                        transition, success, consumed_tokens, output_tokens, token_sources, error
+                    )
+                    self._firings.discard(firing)
+                    if success and undo is not None and self._nested_undo is not None:
+                        self._nested_undo.append(undo)
+                    return success, duration, error, data_tokens, dl_data, deposited
+        self._dispatch_deposits(settled)
         return None
 
-    def _return_orphaned_permits(self, token_sources: list[tuple[str, Token]]) -> list[tuple[str, Token]]:
-        """Settle a firing that a purge overtook: hand back its permits and drop everything else.
+    def _settle_if_orphaned(self, firing: "_Firing") -> list[tuple[str, Token]] | None:
+        """Hand back what an orphaned firing owes and drop the rest; `None` if it is not orphaned.
 
-        A purge never restores a resource pool, so whatever this firing took from one is still
-        owed to it. Everything else it took was restored from the checkpoint (or belonged to the
-        purged firing), so committing its outputs or rolling its inputs back would duplicate it.
-        Caller holds `self._lock`.
+        `_restore_marking` decided what the firing owes: everything it took from a place a purge
+        never restores, and every token the purge withheld because this firing held it. The
+        rest it took belongs to the purged firing, so committing or rolling it back would
+        duplicate tokens the purge restored. A token handed back to a restorable place is logged
+        so that restoring a checkpoint taken before the hand-back keeps it. Caller holds
+        `self._lock`.
         """
-        returned = [(src, t) for src, t in token_sources if isinstance(self.places.get(src), ResourcePlace)]
-        for src, t in returned:
-            self._deposit_under_lock(src, t)
+        if firing.epoch == self._marking_epoch:
+            return None
+        self._firings.discard(firing)
+        returned = [firing.token_sources[i] for i in sorted(firing.owed)]
+        for src, token in returned:
+            self._deposit_under_lock(src, token)
+            if self.places[src]._restorable:
+                self._return_seq += 1
+                self._late_returns.append((self._return_seq, src, token))
         return returned
 
     def _fire_substitution_atomically(
@@ -3054,8 +3139,7 @@ class PetriNet:
         transition: SubstitutionTransition,
         consumed_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
-        start_time: float,
-        epoch: int | None,
+        firing: "_Firing",
     ) -> "_FiringOutcome | None":
         """Fire a substitution transition so that a failed firing leaves its subnet untouched.
 
@@ -3065,33 +3149,56 @@ class PetriNet:
         """
         subnet = transition.subnet
         with transition._firing_lock:
-            checkpoint = subnet._checkpoint_marking()
+            with self._lock:
+                settled = self._settle_if_orphaned(firing)
+                oldest_open = self._oldest_open_checkpoint(transition)
+            if settled is not None:
+                self._dispatch_deposits(settled)
+                return None
+            checkpoint = subnet._checkpoint_marking(oldest_open)
             subnet._nested_undo = nested = []
             try:
-                outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, epoch)
+                outcome = self._fire_and_commit(
+                    transition,
+                    consumed_tokens,
+                    token_sources,
+                    time.monotonic(),
+                    firing,
+                    (transition, checkpoint, nested),
+                )
                 if outcome is None or not outcome[0]:
                     subnet._restore_marking(checkpoint)
                     subnet._roll_back_nested(nested)
-                elif self._nested_undo is not None:
-                    self._nested_undo.append((transition, checkpoint, nested))
             finally:
                 subnet._nested_undo = None
         return outcome
 
-    def _roll_back_nested(self, journal: list[_NestedUndo]) -> None:
+    def _oldest_open_checkpoint(self, transition: SubstitutionTransition) -> "_Checkpoint | None":
+        """The oldest checkpoint of *transition*'s subnet that a pending rollback may still restore.
+
+        Caller holds `self._lock`.
+        """
+        open_checkpoints = [entry[1] for entry in self._nested_undo or () if entry[0] is transition]
+        return min(open_checkpoints, key=lambda checkpoint: checkpoint.seq, default=None)
+
+    def _roll_back_nested(self, journal: list["_NestedUndo"]) -> None:
         """Undo the substitution firings this net committed during a firing that is being purged.
 
-        Newest first, each restores its subnet and then its own nested firings. Each transition's
-        `_firing_lock` is taken first, so a firing still running (one the purge orphaned) has
-        restored its own subnet before this restores it to the earlier checkpoint.
+        Newest first per transition, each restores its subnet and then its own nested firings.
+        That transition's `_firing_lock` is taken first, so a firing of it still running (one the
+        purge orphaned) has restored its own subnet before this restores it to an earlier
+        checkpoint. The journal is complete: commits append to it under `self._lock`, and the
+        purge that called this already bumped the epoch, so no later commit can.
         """
-        for transition in self.transitions.values():
-            if not isinstance(transition, SubstitutionTransition):
-                continue
+        by_transition: dict[int, list[_NestedUndo]] = {}
+        for entry in journal:
+            by_transition.setdefault(id(entry[0]), []).append(entry)
+        for entries in by_transition.values():
+            transition = entries[0][0]
             with transition._firing_lock:
-                for fired, checkpoint, nested in reversed([entry for entry in journal if entry[0] is transition]):
-                    fired.subnet._restore_marking(checkpoint)
-                    fired.subnet._roll_back_nested(nested)
+                for _, checkpoint, nested in reversed(entries):
+                    transition.subnet._restore_marking(checkpoint)
+                    transition.subnet._roll_back_nested(nested)
 
     def _is_finished(self) -> bool:
         """Return whether no transition can fire at the current time or any finite later time.
@@ -3103,28 +3210,69 @@ class PetriNet:
         if self.is_quiescent():
             return True
         with self._lock:
-            if self._running_count > self._orphaned_count:
+            if self._live_count:
                 return False
         return self.is_dead() and self._next_availability_boundary() is None
 
-    def _checkpoint_marking(self) -> dict[str, tuple[Token, ...]]:
-        """Snapshot the places a purge restores: every place except resource pools and sinks."""
-        with self._lock:
-            return {name: place.tokens for name, place in self.places.items() if place._restorable}
+    def _await_unorphaned_worker(self, deadline: float) -> bool:
+        """Wait until orphaned firings leave a worker free; `False` if *deadline* passes first.
 
-    def _restore_marking(self, checkpoint: dict[str, tuple[Token, ...]]) -> None:
+        A firing that starts while orphans hold every worker spends its deadline queued behind
+        them, misses it, and is orphaned in turn, so one slow action would fail every firing
+        after it.
+        """
+        while True:
+            with self._lock:
+                if self._running_count - self._live_count < self._max_workers:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.001)
+
+    def _raise_if_unconsumed(self, transition_name: str, deposited: list[tuple[str, Token]]) -> None:
+        """Fail a firing whose subnet finished without taking every token the firing deposited.
+
+        A token left in an input port is unprocessed work. Committing would carry it into the
+        next firing, which is the contamination a purge exists to prevent. Pools are skipped: a
+        permit the subnet borrowed and returned is meant to stay.
+        """
+        left = sorted(
+            {port for port, token in deposited if self.places[port]._restorable and self.places[port]._holds(token)}
+        )
+        if left:
+            raise RuntimeError(
+                f"SubstitutionTransition '{transition_name}': subnet finished without consuming the "
+                f"token(s) this firing deposited into port(s) {left}."
+            )
+
+    def _checkpoint_marking(self, oldest_open: "_Checkpoint | None" = None) -> "_Checkpoint":
+        """Snapshot the places a purge restores: every place except resource pools and sinks.
+
+        Hand-backs logged at or before *oldest_open*, the oldest checkpoint a pending rollback
+        may still restore, can no longer matter and are pruned.
+        """
+        with self._lock:
+            if self._late_returns:
+                keep_after = oldest_open.seq if oldest_open is not None else self._return_seq
+                self._late_returns = [entry for entry in self._late_returns if entry[0] > keep_after]
+            marking = {name: place.tokens for name, place in self.places.items() if place._restorable}
+            return _Checkpoint(self._return_seq, marking)
+
+    def _restore_marking(self, checkpoint: "_Checkpoint") -> None:
         """Put each checkpointed place back to its checkpointed tokens and orphan in-flight firings.
 
-        Resource pools and sinks are left as they are: permits are conserved by the firings that
-        borrow them (orphaned ones included), and a sink cannot enable anything. The clock is
-        not moved; checkpointed tokens were available then and the clock has only advanced.
+        Resource pools and sinks are left as they are, and the clock is not moved. A token an
+        in-flight firing still holds is withheld from the restore and owed by that firing, which
+        hands it back when it finishes, so the restore never duplicates a token, permit or
+        mutex in use. A token handed back after the checkpoint was taken is restored with it.
         Every firing still running is orphaned and stops counting as in flight.
         """
         with self._lock:
             self._marking_epoch += 1
-            self._orphaned_count = self._running_count
-            for name, tokens in checkpoint.items():
-                if not self.places[name]._restore_tokens(tokens):
+            self._live_count = 0
+            target = _restore_target(checkpoint, self._late_returns, self._firings)
+            for name, tokens in target.items():
+                if not self.places[name]._restore_tokens(tuple(tokens)):
                     continue
                 self._mark_dirty(name)
                 for token in tokens:
@@ -3393,10 +3541,14 @@ class PetriNet:
     @staticmethod
     def _deposit_into_subnet(
         subnet: "PetriNet", token_sources: list[tuple[str, Token]], socket_to_ports: dict[str, list[str]]
-    ) -> None:
+    ) -> list[tuple[str, Token]]:
+        deposited = []
         for socket_name, token in token_sources:
             for port_name in socket_to_ports[socket_name]:
-                subnet.deposit(port_name, token.evolve())
+                copy = token.evolve()
+                subnet.deposit(port_name, copy)
+                deposited.append((port_name, copy))
+        return deposited
 
     def _retrieve_subnet_outputs(
         self, subnet: "PetriNet", port_socket_map: dict[str, str], parent_outputs: list[str]
@@ -3422,10 +3574,17 @@ class PetriNet:
 
         socket_to_ports = self._map_sockets_to_ports(transition.port_socket_map)
         self._verify_port_socket_boundaries(token_sources, socket_to_ports)
-        self._deposit_into_subnet(subnet, token_sources, socket_to_ports)
+        if not subnet._await_unorphaned_worker(time.monotonic() + transition.subnet_deadline_secs):
+            raise RuntimeError(
+                f"SubstitutionTransition '{transition.name}': every subnet worker is still running an "
+                f"action from a purged firing after subnet_deadline_secs={transition.subnet_deadline_secs}."
+            )
+        deposited = self._deposit_into_subnet(subnet, token_sources, socket_to_ports)
         self._drive_subnet(transition)
 
         parent_outputs = [arc.place for arc in transition.outputs]
+        output_ports = {port for port, socket in transition.port_socket_map.items() if socket in parent_outputs}
+        subnet._raise_if_unconsumed(transition.name, [(port, t) for port, t in deposited if port not in output_ports])
         return self._retrieve_subnet_outputs(subnet, transition.port_socket_map, parent_outputs)
 
     def _drive_subnet(self, transition: SubstitutionTransition) -> None:

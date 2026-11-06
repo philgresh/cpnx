@@ -210,9 +210,9 @@ def test_execute_transition_rolls_back_on_unexpected_commit_error():
         raise RuntimeError("unexpected deposit error")
 
     net._plan_and_validate_deposits = blow_up
-    net._running_count = 1  # prevent underflow in finally
+    firing = net._begin_firing(token_sources)
 
-    net._execute_transition(transition, consumed_tokens, token_sources)
+    net._execute_transition(transition, consumed_tokens, token_sources, firing)
 
     # Token must have been rolled back to p_src (retry path)
     assert len(p_src) == 1
