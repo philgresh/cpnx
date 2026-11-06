@@ -672,7 +672,9 @@ class SubstitutionTransition(Transition):
     settled. Tokens move strictly through the `port_socket_map`.
 
     A firing is all-or-nothing as far as the subnet is concerned. Firings of one
-    `SubstitutionTransition` run one at a time, so each collects only its own outputs. The
+    `SubstitutionTransition` run one at a time, so each collects only its own outputs; while
+    one is in progress, any other enabled transition is selected ahead of it, so a queued
+    firing does not hold a worker that other work could use. The
     firing fails if a port rejects a deposited token, the subnet raises, the subnet has not
     finished by its bound (`subnet_deadline_secs` on the wall clock,
     [`drive_to_quiescence`][cpnx.PetriNet.drive_to_quiescence]'s `max_ticks` on the logical

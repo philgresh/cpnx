@@ -721,6 +721,11 @@ class Place:
             t_limit = model_time if model_time is not None else time.monotonic()
             return self._store.take_available(len(self._store), t_limit)
 
+    def _return_token(self, token: Token) -> None:
+        """Put back a token this place gave up, unchanged and without re-applying any deposit rule."""
+        with self._lock:
+            self._store.append(token)
+
     def _restore_tokens(self, tokens: tuple[Token, ...]) -> bool:
         """Replace the contents with exactly *tokens*, bypassing colour, schema and pacing.
 

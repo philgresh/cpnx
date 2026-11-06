@@ -1491,3 +1491,149 @@ def test_queued_work_does_not_start_while_the_drive_is_judged():
         parent.run(deadline=time.monotonic() + 5.0)
     _await_settled(subnet)
     assert calls == [1]
+
+
+def test_unstarted_brew_does_not_burn_a_paced_permit():
+    """Each order splits into two jobs on a 3-barista paced pool. Order 1's first job outlives the
+    deadline, so its second job never starts. That job must not leave a barista cooling down, or
+    order 2 finds one barista where it needs two."""
+    calls: list[tuple[int, int]] = []
+
+    def split(tokens: list[Token]) -> list[Token]:
+        order = tokens[0].payload["order"]
+        return [Token(payload={"order": order, "job": 1}), Token(payload={"order": order, "job": 2})]
+
+    def brew(tokens: list[Token]) -> list[Token]:
+        job = next(t for t in tokens if not t.is_resource)
+        calls.append((job.payload["order"], job.payload["job"]))
+        time.sleep(0.8 if job.payload == {"order": 1, "job": 1} else 0.01)
+        return [job]
+
+    baristas = PacedResourcePlace("Barista", capacity=3, pacing_secs=5.0)
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Jobs"), Place("Done"), Place("Ready"), baristas],
+        max_workers=1,
+        transitions=[
+            Transition("Split", [InputArc("Orders")], [OutputArc("Jobs", count=2)], split),
+            Transition(
+                "Brew", [InputArc("Jobs"), InputArc("Barista")], [OutputArc("Done"), OutputArc("Barista")], brew
+            ),
+            Transition(
+                "Join",
+                [InputArc("Done", count=2)],
+                [OutputArc("Ready")],
+                lambda tokens: [Token(payload={"order": tokens[0].payload["order"]})],
+            ),
+        ],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Cafe",
+                inputs=[InputArc("Queue")],
+                outputs=[OutputArc("Served")],
+                action=lambda tokens: tokens,
+                subnet=subnet,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                subnet_deadline_secs=0.5,
+                max_retries=0,
+            )
+        ],
+    )
+    with parent:
+        parent.deposit("Queue", Token(payload={"order": 1}))
+        parent.run(deadline=time.monotonic() + 3.0)
+        now = time.monotonic()
+        assert calls == [(1, 1)]
+        assert sum(1 for t in baristas.tokens if t.available_at > now) == 1
+        parent.deposit("Queue", Token(payload={"order": 2}))
+        parent.run(deadline=time.monotonic() + 3.0)
+    assert _served(parent) == [2]
+
+
+def test_logical_drive_returns_only_once_its_subnet_has_settled():
+    """The subnet's own drive gives up on a slow brew, so the firing fails with the brew still
+    running. The parent's drive must not return until that brew has finished and the subnet is
+    restored."""
+
+    def slow(tokens: list[Token]) -> list[Token]:
+        time.sleep(0.4)
+        return tokens
+
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Ready")],
+        transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], slow)],
+    )
+    subnet.drive_to_quiescence = functools.partial(subnet.drive_to_quiescence, max_spins=2000)
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        transitions=[
+            SubstitutionTransition(
+                name="Cafe",
+                inputs=[InputArc("Queue")],
+                outputs=[OutputArc("Served")],
+                action=lambda tokens: tokens,
+                subnet=subnet,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                max_retries=0,
+            )
+        ],
+    )
+    parent.deposit("Queue", Token(payload={"order": 1}))
+    parent.drive_to_quiescence()
+    assert subnet._pending_restore is None
+    assert parent.is_quiescent()
+    assert [t.payload["order"] for t in parent.marking["failed"]] == [1]
+    assert all(tokens == () for tokens in subnet.marking.values())
+
+
+@pytest.mark.parametrize("incremental", [True, False], ids=["incremental", "full-scan"])
+def test_busy_subnet_does_not_hold_up_an_unrelated_transition(incremental):
+    """Four orders queue for a slow kitchen on a two-worker parent. Firings of one substitution
+    transition run one at a time; the second worker must stay free for the greeter instead of
+    waiting its turn at the kitchen."""
+    greeted: list[float] = []
+
+    def cook(tokens: list[Token]) -> list[Token]:
+        time.sleep(0.3)
+        return tokens
+
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Ready")],
+        transitions=[Transition("Cook", [InputArc("Orders")], [OutputArc("Ready")], cook)],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served"), Place("Door"), Place("Greeted")],
+        max_workers=2,
+        transitions=[
+            SubstitutionTransition(
+                name="Kitchen",
+                inputs=[InputArc("Queue")],
+                outputs=[OutputArc("Served")],
+                action=lambda tokens: tokens,
+                subnet=subnet,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                priority=1,
+            ),
+            Transition(
+                "Greet",
+                [InputArc("Door")],
+                [OutputArc("Greeted")],
+                lambda tokens: (greeted.append(time.monotonic()), tokens)[1],
+                priority=5,
+            ),
+        ],
+    )
+    if not incremental:
+        parent.add_place(PacedResourcePlace("Bell", capacity=1, pacing_secs=0.0))
+    assert parent._incremental_eligible is incremental
+    with parent:
+        for order in range(4):
+            parent.deposit("Queue", Token(payload={"order": order}))
+        parent.deposit("Door", Token())
+        started = time.monotonic()
+        parent.run(deadline=time.monotonic() + 5.0)
+    assert sorted(_served(parent)) == [0, 1, 2, 3]
+    assert greeted and greeted[0] - started < 0.2, "the greeter waited behind queued kitchen firings"

@@ -115,8 +115,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     is not quiescent until it settles, so `run()` without a deadline waits for it, as it would
     for any running action in a flat net. The next firing of the transition waits up to
     `subnet_deadline_secs` for it, then fails with `RuntimeError` without depositing anything.
-  - **Firings of one `SubstitutionTransition` now run one at a time.** With `max_workers > 1`,
-    concurrent firings shared the subnet's ports, so a firing could collect another's output.
+  - **Firings of one `SubstitutionTransition` now run one at a time.** While one is in progress,
+    any other enabled transition is selected ahead of it, so a queued firing does not hold a
+    worker that other work could use. With `max_workers > 1`, concurrent firings shared the subnet's ports, so a
+    firing could collect another's output.
     The surplus was dropped and the starved firing retried, so some orders were served twice and
     others never. A purge would also have erased a concurrent firing's tokens.
   - **A rolled-back firing no longer keeps its effect on subnet-owned state.** A subnet that

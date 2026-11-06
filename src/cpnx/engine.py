@@ -655,6 +655,7 @@ class PetriNet:
         self._closing = False
         self._parent: weakref.ref[PetriNet] | None = None
         self._subnets: list[PetriNet] = []
+        self._busy_substitutions: set[str] = set()
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._action_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cpnx-action")
         self._expr_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cpnx-expr")
@@ -1102,7 +1103,11 @@ class PetriNet:
     def _select_transition_to_fire(self) -> tuple[Transition, _Binding] | None:
         if self._incremental_eligible:
             return self._select_incremental()
-        candidates = self._filter_highest_priority(self._enabled_transition_bindings())
+        enabled = self._enabled_transition_bindings()
+        if self._busy_substitutions:
+            idle = [(t, b) for t, b in enabled if t.name not in self._busy_substitutions]
+            enabled = idle or enabled
+        candidates = self._filter_highest_priority(enabled)
         return self._rng.choice(candidates) if candidates else None
 
     # ------------------------------------------------------------------
@@ -1289,9 +1294,27 @@ class PetriNet:
         self._reconcile_dirty()
         if not self._enabled_bindings:
             return None
+        if self._busy_substitutions:
+            picked = self._select_incremental_skipping_busy()
+            if picked is not None:
+                return picked
         min_priority = min(p for p, bucket in self._priority_buckets.items() if bucket)
         name = self._rng.choice(self._priority_buckets[min_priority])
         return self.transitions[name], self._enabled_bindings[name]
+
+    def _select_incremental_skipping_busy(self) -> tuple[Transition, _Binding] | None:
+        """`_select_incremental` while a substitution transition is mid-firing: skip it if possible.
+
+        Selecting it again parks a worker on its `_firing_lock`, so the highest priority among
+        the other enabled transitions fires instead. With nothing else enabled, `None` lets the
+        caller queue the next firing behind the current one, which keeps a backlog pipelined.
+        """
+        for priority in sorted(p for p, bucket in self._priority_buckets.items() if bucket):
+            names = [n for n in self._priority_buckets[priority] if n not in self._busy_substitutions]
+            if names:
+                name = self._rng.choice(names)
+                return self.transitions[name], self._enabled_bindings[name]
+        return None
 
     def _consume_binding(self, binding: _Binding, m_time: float | None) -> tuple[list[Token], list[tuple[str, Token]]]:
         """Remove the exact tokens named by `binding` from their source places.
@@ -1377,12 +1400,15 @@ class PetriNet:
                     consumed_tokens, token_sources = self._consume_binding(binding, m_time)
 
                     self._running_count += 1
+                    if isinstance(transition, SubstitutionTransition):
+                        self._busy_substitutions.add(transition.name)
                     try:
                         self._executor.submit(self._execute_transition, transition, consumed_tokens, token_sources)
                     except Exception:
                         # submit() failed (e.g. executor shut down) — undo the increment so
                         # is_quiescent() doesn't permanently block.
                         self._running_count -= 1
+                        self._busy_substitutions.discard(transition.name)
                         # Return consumed tokens back to their source places
                         for src_name, t in token_sources:
                             self._deposit_under_lock(src_name, t)
@@ -1640,10 +1666,29 @@ class PetriNet:
                 break
             boundary = self._next_availability_boundary()
             if boundary is None or boundary <= self._model_time:
+                if self._has_unsettled_subnet():
+                    self._await_subnets_settled(max_spins=max_spins)
+                    continue
                 break
             self.advance_time(boundary)
             ticks += 1
         return DriveResult(steps=steps, ticks=ticks)
+
+    def _await_subnets_settled(self, *, max_spins: int) -> None:
+        """Block until no subnet of this net has a failed firing left to settle.
+
+        Raises:
+            RuntimeError: If `max_spins` is exceeded while a subnet is still settling.
+        """
+        spins = 0
+        while self._has_unsettled_subnet():
+            if spins >= max_spins:
+                raise RuntimeError(
+                    f"drive_to_quiescence: a subnet is still settling a failed firing after max_spins={max_spins} "
+                    "— hung action?"
+                )
+            spins += 1
+            time.sleep(0)
 
     def is_quiescent(self) -> bool:
         """Return `True` if there is no in-flight work and nothing could become enabled soon.
@@ -3013,6 +3058,7 @@ class PetriNet:
             # Decrement running count and signal work available under lock
             with self._lock:
                 self._running_count -= 1
+                self._busy_substitutions.discard(transition.name)
                 idle = self._running_count == 0
             self._work_available.set()
             if idle:
@@ -3047,10 +3093,15 @@ class PetriNet:
         return success, duration, error, data_tokens, dl_data, deposited
 
     def _return_unstarted(self, token_sources: list[tuple[str, Token]]) -> None:
-        """Put a firing's consumed tokens back where they came from, as if it never fired."""
+        """Put a firing's consumed tokens back where they came from, as if it never fired.
+
+        Each token goes back as it was taken, not through `deposit`, so a paced permit keeps
+        its availability instead of starting a cooldown for work that never ran.
+        """
         with self._lock:
             for src, token in token_sources:
-                self._deposit_under_lock(src, token)
+                self.places[src]._return_token(token)
+                self._mark_dirty(src, token)
 
     def _aborted(self) -> bool:
         """Whether this net, or a net enclosing it, has a failed firing still to settle."""
