@@ -61,9 +61,6 @@ _DRAIN = _DrainAll()
 #: which means "qualified, but not currently enabled".
 _NO_FAST_PATH = object()
 
-_Pool: TypeAlias = "list[Token] | _PeekStream"
-"""An arc's eligible tokens: a list, or a `_PeekStream` on the lazy searching path."""
-
 _Binding: TypeAlias = list[tuple[InputArc, "list[Token] | _DrainAll"]]
 """A resolved binding: each input arc paired with the exact tokens it will consume, or the
 [`_DRAIN`][] sentinel for a `consume_all` arc resolved lazily (drained at consume time)."""
@@ -180,6 +177,10 @@ class _PeekStream:
             return chunk[n:]
         ids = {id(token) for token in yielded}
         return [token for token in chunk if id(token) not in ids]
+
+
+_Pool: TypeAlias = list[Token] | _PeekStream
+"""An arc's eligible tokens: a list, or a `_PeekStream` on the lazy searching path."""
 
 
 _first = operator.itemgetter(0)
