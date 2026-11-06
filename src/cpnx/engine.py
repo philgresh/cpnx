@@ -157,8 +157,9 @@ class _PeekStream:
     Each chunk is checked for that, by identity, before its tail is used. If something mutated
     the place without the engine lock, the check fails and the chunk is filtered by identity
     instead. Then no token is offered twice, and every token offered was in the place when its
-    chunk was read, but the stream is no longer a single snapshot. Consumption re-validates
-    each token, so the cost of such a race is at most a wasted guard evaluation.
+    chunk was read, but the stream is no longer a single snapshot. As with any stale
+    snapshot, a chosen token that is gone by consume time makes `retrieve_specific` raise, and
+    `_consume_binding` rolls back what it took and re-raises out of `step()`.
     """
 
     __slots__ = ("_place", "_t_limit", "_limit")
