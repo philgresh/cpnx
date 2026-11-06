@@ -41,6 +41,10 @@ _FiringOutcome: TypeAlias = tuple[bool, float, BaseException | None, list[Token]
 """`_invoke_transition_callbacks` arguments, in order: success, duration, error, data tokens,
 dead-lettered data tokens, deposits."""
 
+_NestedUndo: TypeAlias = "tuple[SubstitutionTransition, dict[str, tuple[Token, ...]], list[_NestedUndo]]"
+"""A committed substitution firing inside a subnet: the transition, its subnet's checkpoint from
+before the firing, and the same record for every substitution firing it committed in turn."""
+
 
 class _DrainAll:
     """Sentinel standing in for a `consume_all` arc's tokens in a resolved binding.
@@ -644,6 +648,8 @@ class PetriNet:
         self.transitions: dict[str, Transition] = {}
         self._running_count = 0
         self._marking_epoch = 0
+        self._orphaned_count = 0
+        self._nested_undo: list[_NestedUndo] | None = None
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._action_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cpnx-action")
         self._expr_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cpnx-expr")
@@ -1640,7 +1646,8 @@ class PetriNet:
         action) *and* no transition could possibly fire even once currently-cooling-down or
         not-yet-settled tokens become available. Unlike [`is_dead`][cpnx.PetriNet.is_dead],
         which is a pure snapshot of the current marking, `is_quiescent` also accounts for
-        in-flight transitions and treats time-gated tokens (cooldowns, settle windows) as if
+        in-flight transitions (except those orphaned by a failed substitution firing, whose
+        outputs are discarded) and treats time-gated tokens (cooldowns, settle windows) as if
         they were already present — so the net is not considered quiescent merely because
         work is temporarily blocked by timing. This is the condition [`run`][cpnx.PetriNet.run]
         loops until.
@@ -1651,7 +1658,7 @@ class PetriNet:
             elapses).
         """
         with self._lock:
-            if self._running_count > 0:
+            if self._running_count > self._orphaned_count:
                 result = False
             elif self._incremental_eligible:
                 self._reconcile_dirty()
@@ -2923,7 +2930,7 @@ class PetriNet:
             RuntimeError: If `max_spins` is exceeded while an action is still in flight.
         """
         spins = 0
-        while self._running_count > 0:
+        while self._running_count > self._orphaned_count:
             if spins >= max_spins:
                 raise RuntimeError(
                     f"_await_inflight exceeded max_spins={max_spins} with "
@@ -3003,6 +3010,8 @@ class PetriNet:
             # Decrement running count and signal work available under lock
             with self._lock:
                 self._running_count -= 1
+                if epoch is not None and epoch != self._marking_epoch:
+                    self._orphaned_count -= 1
             self._work_available.set()
 
     def _fire_and_commit(
@@ -3057,10 +3066,32 @@ class PetriNet:
         subnet = transition.subnet
         with transition._firing_lock:
             checkpoint = subnet._checkpoint_marking()
-            outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, epoch)
-            if outcome is None or not outcome[0]:
-                subnet._restore_marking(checkpoint)
+            subnet._nested_undo = nested = []
+            try:
+                outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, epoch)
+                if outcome is None or not outcome[0]:
+                    subnet._restore_marking(checkpoint)
+                    subnet._roll_back_nested(nested)
+                elif self._nested_undo is not None:
+                    self._nested_undo.append((transition, checkpoint, nested))
+            finally:
+                subnet._nested_undo = None
         return outcome
+
+    def _roll_back_nested(self, journal: list[_NestedUndo]) -> None:
+        """Undo the substitution firings this net committed during a firing that is being purged.
+
+        Newest first, each restores its subnet and then its own nested firings. Each transition's
+        `_firing_lock` is taken first, so a firing still running (one the purge orphaned) has
+        restored its own subnet before this restores it to the earlier checkpoint.
+        """
+        for transition in self.transitions.values():
+            if not isinstance(transition, SubstitutionTransition):
+                continue
+            with transition._firing_lock:
+                for fired, checkpoint, nested in reversed([entry for entry in journal if entry[0] is transition]):
+                    fired.subnet._restore_marking(checkpoint)
+                    fired.subnet._roll_back_nested(nested)
 
     def _is_finished(self) -> bool:
         """Return whether no transition can fire at the current time or any finite later time.
@@ -3072,18 +3103,14 @@ class PetriNet:
         if self.is_quiescent():
             return True
         with self._lock:
-            if self._running_count:
+            if self._running_count > self._orphaned_count:
                 return False
         return self.is_dead() and self._next_availability_boundary() is None
 
     def _checkpoint_marking(self) -> dict[str, tuple[Token, ...]]:
         """Snapshot the places a purge restores: every place except resource pools and sinks."""
         with self._lock:
-            return {
-                name: place.tokens
-                for name, place in self.places.items()
-                if not isinstance(place, (ResourcePlace, SinkPlace))
-            }
+            return {name: place.tokens for name, place in self.places.items() if place._restorable}
 
     def _restore_marking(self, checkpoint: dict[str, tuple[Token, ...]]) -> None:
         """Put each checkpointed place back to its checkpointed tokens and orphan in-flight firings.
@@ -3091,9 +3118,11 @@ class PetriNet:
         Resource pools and sinks are left as they are: permits are conserved by the firings that
         borrow them (orphaned ones included), and a sink cannot enable anything. The clock is
         not moved; checkpointed tokens were available then and the clock has only advanced.
+        Every firing still running is orphaned and stops counting as in flight.
         """
         with self._lock:
             self._marking_epoch += 1
+            self._orphaned_count = self._running_count
             for name, tokens in checkpoint.items():
                 if not self.places[name]._restore_tokens(tokens):
                     continue

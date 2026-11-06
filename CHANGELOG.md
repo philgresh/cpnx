@@ -91,7 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quiescing in time, or the parent being unable to commit the outputs. Resource permits are left
   to the firings that borrowed them, so a pool keeps its capacity and any cooldown the failed
   firing started. An action still running when the subnet gives up hands its permits back when
-  it finishes, and its other outputs are dropped.
+  it finishes, and its other outputs are dropped; later firings do not wait for it. The rollback
+  reaches nested subnets, and a place that holds the same `Token` object more than once is
+  restored with exactly that many.
 
   Three behavior changes come with this:
 

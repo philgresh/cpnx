@@ -20,7 +20,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any
+from typing import Any, ClassVar
 
 from cpnx.tokens import AVAILABLE_NOW, Token
 
@@ -407,6 +407,12 @@ class _TokenStore:
             if seq is not None:
                 self.drop(seq)
 
+    def drop_all(self) -> None:
+        """Remove every stored token, keeping key-index registrations (their entries go stale)."""
+        for seq in [*self._ready, *self._cooling_by_seq]:
+            self.drop(seq)
+        self._seq_of.clear()
+
     def missing_identities(self, ids: set[int]) -> set[int]:
         """Return the subset of `id(token)` values in *ids* that are not currently stored."""
         return set(ids) - self._seq_of.keys()
@@ -475,6 +481,9 @@ class Place:
 
     All operations are thread-safe via an internal `threading.Lock`.
     """
+
+    _restorable: ClassVar[bool] = True
+    """Whether a failed substitution firing restores this place from its checkpoint."""
 
     def __init__(
         self,
@@ -712,11 +721,13 @@ class Place:
         Used to roll a subnet back after a failed substitution firing; *tokens* is an earlier
         `tokens` snapshot of this same place. Returns whether the contents changed.
         """
+        if not self._restorable:
+            raise TypeError(f"{type(self).__name__} '{self.name}' is never restored from a checkpoint")
         with self._lock:
             current = self._store.iter_insertion_order()
             if len(current) == len(tokens) and all(a is b for a, b in zip(current, tokens, strict=True)):
                 return False
-            self._store.remove_identity(current)
+            self._store.drop_all()
             for token in tokens:
                 self._store.append(token)
             return True
@@ -910,6 +921,8 @@ class ResourcePlace(Place):
         gpu_pool = ResourcePlace("gpu_slots", capacity=4)
         ```
     """
+
+    _restorable: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -1214,6 +1227,8 @@ class SinkPlace(Place):
         colour will raise a `TypeError` inside the locked transition failure branch,
         causing the token to be lost rather than successfully dead-lettered.
     """
+
+    _restorable: ClassVar[bool] = False
 
     def __init__(
         self,

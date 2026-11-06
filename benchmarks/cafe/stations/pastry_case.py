@@ -219,8 +219,8 @@ def transitions(
         **Firing a [`SubstitutionTransition`][cpnx.SubstitutionTransition]**: `port_socket_map` binds the kitchen's
         `P_Pastry_In` to this net's `P_Food_Order` socket, and its `P_Pastry_Out` to
         `P_Served`. Each firing drives `build_kitchen_subnet()`'s three internal
-        transitions to quiescence (or to `subnet_deadline_secs`, whichever comes
-        first) before this transition can be said to have completed — see the module
+        transitions to quiescence before this transition can be said to have completed;
+        a kitchen still busy at `subnet_deadline_secs` fails the firing — see the module
         docstring for the performance questions that per-firing cost raises.
 
     Warning:

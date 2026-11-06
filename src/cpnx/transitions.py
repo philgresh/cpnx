@@ -680,11 +680,15 @@ class SubstitutionTransition(Transition):
     quiescent, or once nothing can fire at the current time or any finite later time (a
     token parked at `available_at = inf` never becomes available). The parent's consumed tokens are then
     rolled back as for any transition, and every subnet place except resource pools and
-    [`SinkPlace`][cpnx.SinkPlace]s is restored to its marking from before the firing.
+    [`SinkPlace`][cpnx.SinkPlace]s is restored to its marking from before the firing. The
+    rollback reaches nested subnets: a `SubstitutionTransition` inside the subnet that
+    committed during the failed firing has its own subnet restored too.
     Resource permits are not restored. The firings that borrowed them return them, so each
     pool keeps its capacity and any cooldown the failed firing started. An action still
     running when the subnet gives up cannot be stopped: when it finishes, it returns its
-    permits and its other outputs are discarded.
+    permits and its other outputs are discarded. It no longer counts as the subnet's work, so
+    later firings finish without waiting for it, but until it does its permits are out of
+    the pool and a firing that needs one fails rather than waits.
 
     A subnet instance may only be wrapped by one `SubstitutionTransition` at a
     time; this is tracked process-wide via a weak set. Attempting to wrap the same subnet
