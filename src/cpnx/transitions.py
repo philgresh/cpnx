@@ -715,7 +715,10 @@ class SubstitutionTransition(Transition):
                          quiescence when this transition fires. A subnet still short of
                          quiescence at the deadline fails the firing. A firing first waits up
                          to the same bound for the subnet to settle from an earlier failed
-                         firing, on either clock. Defaults to `30.0`.
+                         firing, on either clock. It bounds the firing, not the parent's
+                         `run()`, which waits for a failed firing's still-running action;
+                         set `action_timeout_secs` on subnet actions that may hang.
+                         Defaults to `30.0`.
     """
 
     _mapped_subnets: ClassVar[weakref.WeakSet] = weakref.WeakSet()

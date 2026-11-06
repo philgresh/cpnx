@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing now fails loudly, runs one
+  at a time, and keeps its parent busy until a failed firing has settled**
+  ([#38](https://github.com/philgresh/cpnx/issues/38)). These come with the subnet restore
+  under **Fixed** below:
+
+  - **A subnet that does not reach quiescence now fails the firing.** That covers a wall-clock
+    subnet still busy at `subnet_deadline_secs` (`TimeoutError`) and a logical-clock subnet that
+    hits `drive_to_quiescence`'s `max_ticks` (`RuntimeError`). Before, the parent took whatever
+    had reached the output ports. If that was enough to commit, the leftover work came out in a
+    later firing. The parent's `on_error` now reports why, where it used to get a "returned 0
+    non-resource token(s)" error. A subnet left holding only tokens parked at
+    `available_at = inf` has finished: nothing can ever fire, so the firing completes as before.
+  - **While a failed firing's action is still running, its subnet is not settled.** The parent
+    is not quiescent until it settles, so `run()` without a deadline waits for it, as it would
+    for any running action in a flat net; `subnet_deadline_secs` bounds the firing, not the
+    parent's `run()`. The next firing of the transition waits up to `subnet_deadline_secs` for
+    it, then fails with `RuntimeError` without depositing anything, and that failure counts
+    toward `max_retries`. To bound a subnet action that may hang, set `action_timeout_secs` on
+    it.
+  - **Firings of one `SubstitutionTransition` now run one at a time.** A firing selected while
+    another is in progress waits for it on a worker thread. With `max_workers > 1`, concurrent
+    firings shared the subnet's ports, so a firing could collect another's output. The surplus
+    was dropped and the starved firing retried, so some orders were served twice and others
+    never.
+  - **A substitution transition cannot wrap the net it is in, or a net enclosing it, and one
+    `SubstitutionTransition` cannot be added to two nets.** `add_transition` raises `ValueError`.
+
 - **A certified callable may no longer close over a `frozenset` whose members are not themselves
   immutable.** `cpnx.certification` decides what a callable can close over and still earn the
   **inline** execution path — run directly under the engine lock, with no timeout — so that
@@ -103,27 +130,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   place-invariant rules (`CPN-*`), zero-safe nets' stable markings and transactions (`ZS-*`),
   and closed nested transactions (`NESTED-TX*`).
 
-  Four behavior changes come with this:
-
-  - **A subnet that does not reach quiescence now fails the firing.** That covers a wall-clock
-    subnet still busy at `subnet_deadline_secs` (`TimeoutError`) and a logical-clock subnet that
-    hits `drive_to_quiescence`'s `max_ticks` (`RuntimeError`). Before, the parent took whatever
-    had reached the output ports. If that was enough to commit, the leftover work came out in a
-    later firing. The parent's `on_error` now reports why, where it used to get a "returned 0
-    non-resource token(s)" error. A subnet left holding only tokens parked at
-    `available_at = inf` has finished: nothing can ever fire, so the firing completes as before.
-  - **While a failed firing's action is still running, its subnet is not settled.** The parent
-    is not quiescent until it settles, so `run()` without a deadline waits for it, as it would
-    for any running action in a flat net. The next firing of the transition waits up to
-    `subnet_deadline_secs` for it, then fails with `RuntimeError` without depositing anything.
-  - **Firings of one `SubstitutionTransition` now run one at a time.** A firing selected while
-    another is in progress waits for it on a worker thread. With `max_workers > 1`, concurrent firings shared the subnet's ports, so a
-    firing could collect another's output.
-    The surplus was dropped and the starved firing retried, so some orders were served twice and
-    others never. A purge would also have erased a concurrent firing's tokens.
-  - **A rolled-back firing no longer keeps its effect on subnet-owned state.** A subnet that
-    updates its own tokens, such as a stamp card, used to keep the update when the parent could
-    not commit, and applied it again on every retry.
+  A rolled-back firing also no longer keeps its effect on subnet-owned state: a subnet that
+  updates its own tokens, such as a stamp card, used to keep the update when the parent could
+  not commit, and applied it again on every retry. The behavior changes that come with this fix
+  are under **Changed** above.
 
 - **A backlog of matured timed tokens no longer makes every logical-clock advance O(backlog).**
   `_TokenStore` kept a timed token in its cooling heap after it matured, so

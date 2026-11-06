@@ -107,7 +107,7 @@ def test_substitution_transition_requires_predeclared_ports():
 
 
 def test_substitution_transition_no_parent_mutation():
-    """Subnet must remain unaware of its parent — no _parent_transition attribute written."""
+    """Constructing a SubstitutionTransition writes no strong or transition back-reference into the subnet."""
     child = PetriNet()
     child.add_place(Place("child_port_in"))
 

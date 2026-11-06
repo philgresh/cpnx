@@ -1028,15 +1028,18 @@ class PetriNet:
                 [`SubstitutionTransition`][cpnx.SubstitutionTransition]) to register.
 
         Raises:
-            ValueError: If `transition.name` is already registered as a place name.
+            ValueError: If `transition.name` is already registered as a place name, or if
+                `transition` is a [`SubstitutionTransition`][cpnx.SubstitutionTransition] whose
+                subnet is this net, encloses it, or is already wrapped in another net.
             TypeError: If one of the transition's arcs targets another transition's name
                 instead of a place.
         """
         with self._lock:
             self._validate_new_transition(transition)
+            if isinstance(transition, SubstitutionTransition):
+                self._reject_subnet_link(transition)
             self.transitions[transition.name] = transition
             if isinstance(transition, SubstitutionTransition):
-                self._reject_subnet_cycle(transition)
                 self._subnets.append(transition.subnet)
                 transition.subnet._parent = weakref.ref(self)
             if any(arc.settle_secs > 0.0 for arc in transition.inputs):
@@ -1049,15 +1052,22 @@ class PetriNet:
             # …and its resource borrows may need a synthesized return arc.
             self._resource_returns_synthesized = False
 
-    def _reject_subnet_cycle(self, transition: SubstitutionTransition) -> None:
-        """Raise if *transition*'s subnet is this net or encloses it."""
+    def _reject_subnet_link(self, transition: SubstitutionTransition) -> None:
+        """Raise if *transition*'s subnet is this net, encloses it, or already has another parent."""
         net: PetriNet | None = self
         while net is not None:
             if net is transition.subnet:
                 raise ValueError(
                     f"SubstitutionTransition '{transition.name}': its subnet is this net or one enclosing it."
                 )
-            net = net._parent() if net._parent is not None else None
+            net = net._parent_net()
+        parent = transition.subnet._parent_net()
+        if parent is not None and parent is not self:
+            raise ValueError(f"SubstitutionTransition '{transition.name}': its subnet already belongs to another net.")
+
+    def _parent_net(self) -> "PetriNet | None":
+        """The net whose substitution transition wraps this one, if it is still alive."""
+        return self._parent() if self._parent is not None else None
 
     def deposit(self, place_name: str, token: Token) -> None:
         """Deposit `token` into `place_name`, auto-creating a bare place if it does not exist.
@@ -3033,7 +3043,7 @@ class PetriNet:
         start_time = time.monotonic()
         try:
             if isinstance(transition, SubstitutionTransition):
-                outcome = self._fire_substitution_atomically(transition, consumed_tokens, token_sources, start_time)
+                outcome = self._fire_substitution_atomically(transition, consumed_tokens, token_sources)
             else:
                 outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time)
             if outcome is None:
@@ -3103,7 +3113,7 @@ class PetriNet:
         while net is not None:
             if net._closing or net._pending_restore is not None:
                 return True
-            net = net._parent() if net._parent is not None else None
+            net = net._parent_net()
         return False
 
     def _fire_substitution_atomically(
@@ -3111,7 +3121,6 @@ class PetriNet:
         transition: SubstitutionTransition,
         consumed_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
-        start_time: float,
     ) -> "_FiringOutcome | None":
         """Fire a substitution transition as one transaction on its subnet.
 
@@ -3123,16 +3132,23 @@ class PetriNet:
         """
         subnet = transition.subnet
         with transition._firing_lock:
+            start_time = time.monotonic()
             if self._aborted():
                 self._return_unstarted(token_sources)
                 return None
-            if not subnet._await_settled(time.monotonic() + transition.subnet_deadline_secs, self._aborted):
+            try:
+                bound = transition.subnet_deadline_secs
+                deadline = math.inf if bound is None else start_time + bound
+                settled = subnet._await_settled(deadline, self._aborted)
+                checkpoint = subnet._checkpoint_marking() if settled else {}
+            except BaseException as exc:
+                return self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, exc)
+            if not settled:
                 error = RuntimeError(
                     f"SubstitutionTransition '{transition.name}': subnet is still running an action of a "
                     f"failed firing after subnet_deadline_secs={transition.subnet_deadline_secs}."
                 )
                 return self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, error)
-            checkpoint = subnet._checkpoint_marking()
             subnet._nested_undo = nested = []
             try:
                 outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time)
@@ -3181,7 +3197,7 @@ class PetriNet:
                 self._pending_restore = None
                 self._closing = False
         self._work_available.set()
-        parent = self._parent() if self._parent is not None else None
+        parent = self._parent_net()
         if parent is not None:
             parent._work_available.set()
             parent._try_settle()
@@ -3570,20 +3586,21 @@ class PetriNet:
             parent_on_logical_clock = self._model_time is not None
         if parent_on_logical_clock:
             ticks = subnet.drive_to_quiescence().ticks
-            error: Exception = RuntimeError(
+        else:
+            subnet.run(deadline=time.monotonic() + transition.subnet_deadline_secs)
+        # Closed before the check: work still queued must not start while the verdict is out.
+        subnet._closing = True
+        if subnet._is_finished():
+            subnet._closing = False
+            return
+        if self._aborted():
+            raise _EnclosingFiringFailed(transition.name)
+        if parent_on_logical_clock:
+            raise RuntimeError(
                 f"SubstitutionTransition '{transition.name}': subnet did not reach quiescence "
                 f"on the logical clock after {ticks} clock advance(s)."
             )
-        else:
-            subnet.run(deadline=time.monotonic() + transition.subnet_deadline_secs)
-            error = TimeoutError(
-                f"SubstitutionTransition '{transition.name}': subnet did not reach quiescence "
-                f"within subnet_deadline_secs={transition.subnet_deadline_secs}."
-            )
-        # Closed before the check: work still queued must not start while the verdict is out.
-        subnet._closing = True
-        if not subnet._is_finished():
-            if self._aborted():
-                raise _EnclosingFiringFailed(transition.name)
-            raise error
-        subnet._closing = False
+        raise TimeoutError(
+            f"SubstitutionTransition '{transition.name}': subnet did not reach quiescence "
+            f"within subnet_deadline_secs={transition.subnet_deadline_secs}."
+        )
