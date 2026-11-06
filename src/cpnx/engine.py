@@ -12,7 +12,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, replace
-from typing import Callable, Iterator, TypeAlias, cast
+from typing import Callable, Iterator, TypeAlias, TypeVar, cast
 
 from cpnx.analysis import ImpactMap, risk_report, trace_impact
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace
@@ -90,6 +90,120 @@ def _flatten_binding(binding: _Binding) -> list[Token]:
         assert not isinstance(tokens, _DrainAll), "a drain binding must never be flattened"
         flat.extend(tokens)
     return flat
+
+
+_T = TypeVar("_T")
+_EXHAUSTED = object()
+
+#: Widest product `_lazy_product` enumerates lazily. Its recursion is one generator frame per
+#: stream, so a transition with hundreds of input arcs would hit `RecursionError`.
+_LAZY_PRODUCT_MAX_STREAMS = 32
+
+
+def _lazy_product(streams: list[Iterator[_T]]) -> Iterator[tuple[_T, ...]]:
+    """Yield the Cartesian product of `streams` in `itertools.product`'s order, reading lazily.
+
+    `itertools.product` consumes every input iterable in full before yielding anything. This
+    reads a stream at most twice as far as the lexicographic order has reached into it (see
+    `_lazy_product_from`), so reading the first `k` tuples touches O(`k`) options plus one per
+    stream, however long the streams are. The output order is identical (lexicographic in
+    stream index, last stream varying fastest), and an empty stream yields nothing, as with
+    `product`.
+
+    Every stream is asked for its first option when this is called, even once one has come back
+    empty. The engine's streams run each arc's `filter` and `key` on that first pull, and
+    `product` ran them for every arc, so skipping the later arcs would drop their fault signals.
+
+    More than `_LAZY_PRODUCT_MAX_STREAMS` streams are handed to `itertools.product` instead,
+    which reads them all up front. The saving here comes from deep streams, not many of them.
+    """
+    if len(streams) > _LAZY_PRODUCT_MAX_STREAMS:
+        return itertools.product(*(list(stream) for stream in streams))
+    firsts = [next(stream, _EXHAUSTED) for stream in streams]
+    if any(first is _EXHAUSTED for first in firsts):
+        return iter(())
+    return _lazy_product_from(streams, [[cast("_T", first)] for first in firsts], 0)
+
+
+def _lazy_product_from(streams: list[Iterator[_T]], seen: list[list[_T]], i: int) -> Iterator[tuple[_T, ...]]:
+    """Yield the product of `streams[i:]`, appending every option read to `seen`.
+
+    The first pass, under `seen[i][0]`, recurses and so stays lazy. It returns only after every
+    deeper stream is exhausted, at which point `seen[i + 1:]` holds their complete option
+    lists. Later options of stream `i` are then read in doubling batches and paired with them
+    through `itertools.product`, which keeps a full scan close to `product`'s speed while
+    reading at most twice as far into stream `i` as the consumer gets.
+    """
+    if i == len(streams):
+        yield ()
+        return
+    head = seen[i][0]
+    for rest in _lazy_product_from(streams, seen, i + 1):
+        yield (head, *rest)
+    deeper = seen[i + 1 :]
+    batch_size = 1
+    while batch := list(itertools.islice(streams[i], batch_size)):
+        seen[i].extend(batch)
+        yield from itertools.product(batch, *deeper)
+        batch_size *= 2
+
+
+class _PeekStream:
+    """A place's first `limit` available tokens in FIFO order, peeked in doubling chunks.
+
+    The searching path's FIFO pool (route 1 of `PetriNet._materialize_pool`) may be up to
+    `binding_search_limit + 1` tokens deep, while a lazy search usually stops after a few. Each
+    chunk re-peeks from the head and yields only the tokens past the previous chunk. Chunks
+    double, so reading `m` tokens copies fewer than `4m` (plus the first chunk). Within one
+    locked resolution the marking and the model time are fixed, so each chunk starts with
+    exactly the tokens already yielded and the stream equals one `peek(limit)`.
+
+    Each chunk is checked for that, by identity, before its tail is used. If something mutated
+    the place without the engine lock, the check fails and the chunk is filtered by identity
+    instead. Then no token is offered twice, and every token offered was in the place when its
+    chunk was read, but the stream is no longer a single snapshot. As with any stale
+    snapshot, a chosen token that is gone by consume time makes `retrieve_specific` raise, and
+    `_consume_binding` rolls back what it took and re-raises out of `step()`.
+    """
+
+    __slots__ = ("_place", "_t_limit", "_limit")
+
+    _FIRST_CHUNK = 8
+
+    def __init__(self, place: Place, t_limit: float | None, limit: int) -> None:
+        self._place = place
+        self._t_limit = t_limit
+        self._limit = limit
+
+    def __iter__(self) -> Iterator[Token]:
+        yielded: list[Token] = []
+        size = min(self._FIRST_CHUNK, self._limit)
+        while True:
+            chunk = self._place.peek(size, model_time=self._t_limit)
+            fresh = self._past(chunk, yielded)
+            yielded.extend(fresh)
+            yield from fresh
+            if len(chunk) < size or size >= self._limit:
+                return
+            size = min(2 * size, self._limit)
+
+    @staticmethod
+    def _past(chunk: list[Token], yielded: list[Token]) -> list[Token]:
+        """The tokens of `chunk` not yet yielded, in `chunk`'s order."""
+        n = len(yielded)
+        if len(chunk) >= n and all(map(operator.is_, chunk, yielded)):
+            return chunk[n:]
+        ids = {id(token) for token in yielded}
+        return [token for token in chunk if id(token) not in ids]
+
+
+_Pool: TypeAlias = list[Token] | _PeekStream
+"""An arc's eligible tokens: a list, or a `_PeekStream` on the lazy searching path."""
+
+
+def _as_list(pool: _Pool) -> list[Token]:
+    """`pool` as a list, reading a `_PeekStream` in full."""
+    return pool if isinstance(pool, list) else list(pool)
 
 
 _first = operator.itemgetter(0)
@@ -1818,8 +1932,15 @@ class PetriNet:
         return self.binding_policy if transition.binding_policy is None else transition.binding_policy
 
     def _arc_available(
-        self, arc: InputArc, place: Place | None, m_time: float | None, ignore_timing: bool, cap: int | None = None
-    ) -> list[Token] | None:
+        self,
+        arc: InputArc,
+        place: Place | None,
+        m_time: float | None,
+        ignore_timing: bool,
+        cap: int | None = None,
+        *,
+        lazy: bool = False,
+    ) -> _Pool | None:
         """Return the tokens eligible to satisfy one input `arc`, or `None` if it cannot be met.
 
         Eligibility accounts for token count and — unless `ignore_timing` is set — cooldowns
@@ -1836,6 +1957,8 @@ class PetriNet:
                 `_gather_arc_pools`). An upper bound on what a bounded FIFO peek or a
                 *key-index* read materializes; `None` disables the index path entirely and
                 leaves the FIFO peek at `binding_search_limit + 1`.
+            lazy: Whether a deep bounded FIFO peek may be returned as a `_PeekStream`
+                (see `_materialize_pool`).
 
         Returns:
             The eligible tokens — FIFO, or ascending-key when served from the index — or
@@ -1848,9 +1971,11 @@ class PetriNet:
             return None
         if not ignore_timing and not self._is_settle_time_met(place, arc):
             return None
-        return self._materialize_pool(arc, place, t_limit, cap)
+        return self._materialize_pool(arc, place, t_limit, cap, lazy=lazy)
 
-    def _materialize_pool(self, arc: InputArc, place: Place, t_limit: float | None, cap: int | None) -> list[Token]:
+    def _materialize_pool(
+        self, arc: InputArc, place: Place, t_limit: float | None, cap: int | None, *, lazy: bool = False
+    ) -> _Pool:
         """Read the arc's candidate pool, as narrowly as the arc's shape allows.
 
         Three routes, cheapest first:
@@ -1861,7 +1986,9 @@ class PetriNet:
            that many yields the identical candidate set while turning an O(marking-depth)
            scan into an O(limit) one. A head-only transition consumes only the first
            `count`, so `cap` (see `_gather_arc_pools`) narrows the peek further; on a place
-           holding timed tokens each token peeked costs a heap pop and push.
+           holding timed tokens each token peeked costs a heap pop and push. With `lazy`,
+           a peek deeper than one chunk comes back as a `_PeekStream`, so a search that stops
+           early reads a small multiple of what it inspected rather than the whole bound.
         2. **Key-index read.** A keyed arc is not position-FIFO, so route 1's bound does not
            apply — but a *certified* key is served from the place's persistent key-index,
            which yields the same ascending-key prefix without materializing or sorting the
@@ -1875,13 +2002,20 @@ class PetriNet:
         falling through is always safe.
         """
         if arc.key is None and arc.filter is None and not arc.consume_all and arc.count == 1:
-            k = self.binding_search_limit + 1
-            return place.peek(k if cap is None else min(cap, k), model_time=t_limit)
+            return self._fifo_pool(place, t_limit, cap, lazy=lazy)
         if cap is not None and not arc.consume_all and self._ensure_key_index(arc, place):
             ordered = place.peek_by_key(id(arc), cap, arc.filter)
             if ordered is not None:
                 return ordered
         return place.peek(len(place), model_time=t_limit)
+
+    def _fifo_pool(self, place: Place, t_limit: float | None, cap: int | None, *, lazy: bool) -> _Pool:
+        """Route 1 of `_materialize_pool`: the first `min(cap, binding_search_limit + 1)` tokens."""
+        k = self.binding_search_limit + 1
+        k = k if cap is None else min(cap, k)
+        if lazy and k > _PeekStream._FIRST_CHUNK:
+            return _PeekStream(place, t_limit, k)
+        return place.peek(k, model_time=t_limit)
 
     def _ensure_key_index(self, arc: InputArc, place: Place) -> bool:
         """Whether `arc` may be served from a key-index on `place`, registering one if so.
@@ -1914,8 +2048,8 @@ class PetriNet:
         return True
 
     def _gather_arc_pools(
-        self, transition: Transition, m_time: float | None, ignore_timing: bool
-    ) -> list[tuple[InputArc, list[Token]]] | None:
+        self, transition: Transition, m_time: float | None, ignore_timing: bool, *, head_only: bool, lazy: bool = False
+    ) -> list[tuple[InputArc, _Pool]] | None:
         """Collect the eligible-token pool for every input arc, or `None` if any is unmet.
 
         Derives how many ordered tokens each arc could actually consume and passes it as the
@@ -1931,16 +2065,35 @@ class PetriNet:
           indices up to `limit + count - 1`. So the cap is `binding_search_limit + count`,
           collapsing to the familiar `limit + 1` at `count == 1`. Reading short here would
           silently truncate the candidate set, not merely cost time.
+
+        `head_only` and `lazy` come from `_search_mode`, read once per resolution, so the pools
+        always match the path that consumes them. `lazy` lets a deep FIFO pool come back as a
+        `_PeekStream`.
         """
-        pools: list[tuple[InputArc, list[Token]]] = []
-        head_only = self._is_head_only(transition, self._effective_policy(transition))
+        pools: list[tuple[InputArc, _Pool]] = []
         for arc in transition.inputs:
             cap = arc.count if head_only else self.binding_search_limit + arc.count
-            available = self._arc_available(arc, self.places.get(arc.place), m_time, ignore_timing, cap)
+            available = self._arc_available(arc, self.places.get(arc.place), m_time, ignore_timing, cap, lazy=lazy)
             if available is None:
                 return None
             pools.append((arc, available))
         return pools
+
+    def _search_mode(self, transition: Transition, policy: BindingPolicy, *, probe: bool) -> tuple[bool, bool]:
+        """Return `(head_only, lazy)` for one resolution of `transition` under `policy`.
+
+        Read once per resolution and passed down, because `guard` and `binding_policy` may be
+        reassigned after construction: pools gathered for one path must not reach the other.
+        `lazy` holds when the caller stops at the first satisfying binding, which is `FIRST`
+        resolution and the existence `probe` under any policy. `RANDOM` and `PRIORITY`
+        resolution scan the whole bounded product, which the eager path does faster. So does a
+        transition wider than `_LAZY_PRODUCT_MAX_STREAMS`, whose product `_lazy_product`
+        would build eagerly anyway: streamed pools would only re-peek each place in chunks.
+        """
+        head_only = self._is_head_only(transition, policy)
+        if head_only or len(transition.inputs) > _LAZY_PRODUCT_MAX_STREAMS:
+            return head_only, False
+        return False, probe or policy is BindingPolicy.FIRST
 
     @staticmethod
     def _is_head_only(transition: Transition, policy: BindingPolicy) -> bool:
@@ -2073,13 +2226,14 @@ class PetriNet:
         fast = self._try_count_only_binding(transition, m_time, ignore_timing)
         if fast is not _NO_FAST_PATH:
             return cast("_Binding | None", fast)
-        pools = self._gather_arc_pools(transition, m_time, ignore_timing)
+        policy = self._effective_policy(transition)
+        head_only, lazy = self._search_mode(transition, policy, probe=False)
+        pools = self._gather_arc_pools(transition, m_time, ignore_timing, head_only=head_only, lazy=lazy)
         if pools is None:
             return None
-        policy = self._effective_policy(transition)
-        if self._is_head_only(transition, policy):
+        if head_only:
             return self._head_binding(transition, pools)
-        return self._select_binding(transition, pools, policy)
+        return self._select_binding(transition, pools, policy, lazy=lazy)
 
     def _binding_exists(self, transition: Transition, m_time: float | None, *, ignore_timing: bool = False) -> bool:
         """Return whether *any* guard-satisfying binding exists — a probe that never draws RNG.
@@ -2093,14 +2247,15 @@ class PetriNet:
         fast = self._try_count_only_binding(transition, m_time, ignore_timing)
         if fast is not _NO_FAST_PATH:
             return fast is not None
-        pools = self._gather_arc_pools(transition, m_time, ignore_timing)
+        head_only, lazy = self._search_mode(transition, self._effective_policy(transition), probe=True)
+        pools = self._gather_arc_pools(transition, m_time, ignore_timing, head_only=head_only, lazy=lazy)
         if pools is None:
             return False
-        if self._is_head_only(transition, self._effective_policy(transition)):
+        if head_only:
             return self._head_binding(transition, pools) is not None
-        return next(self._iter_satisfying_bindings(transition, pools), None) is not None
+        return next(self._iter_satisfying_bindings(transition, pools, lazy=lazy), None) is not None
 
-    def _head_binding(self, transition: Transition, pools: list[tuple[InputArc, list[Token]]]) -> _Binding | None:
+    def _head_binding(self, transition: Transition, pools: list[tuple[InputArc, _Pool]]) -> _Binding | None:
         """Build the head binding: the first `count` tokens per arc, in the arc's own order.
 
         Both callers reach this only through `_is_head_only`, which is now exactly
@@ -2117,7 +2272,7 @@ class PetriNet:
         """
         binding: _Binding = []
         for arc, available in pools:
-            tokens = self._resolve_input_tokens(arc, available, transition_name=transition.name)
+            tokens = self._resolve_input_tokens(arc, _as_list(available), transition_name=transition.name)
             if tokens is None:
                 return None
             binding.append((arc, tokens))
@@ -2126,7 +2281,7 @@ class PetriNet:
         return binding
 
     def _iter_satisfying_bindings(
-        self, transition: Transition, pools: list[tuple[InputArc, list[Token]]]
+        self, transition: Transition, pools: list[tuple[InputArc, _Pool]], *, lazy: bool = False
     ) -> Iterator[tuple[_Binding, list[Token]]]:
         """Yield each guard-satisfying `(binding, flat_tokens)` in insertion order, bounded by the limit.
 
@@ -2136,8 +2291,11 @@ class PetriNet:
         have been examined, signalling exhaustion via `on_binding_search_exhausted` (deferred
         until the lock releases). This is the shared engine for every search policy: `FIRST`
         takes the first item, `RANDOM` samples, and `PRIORITY` takes the min-key item.
+
+        `lazy` selects how candidates are enumerated (see `_iter_candidate_bindings` and
+        `_search_mode`). Both settings yield the same bindings in the same order.
         """
-        candidates = self._iter_candidate_bindings(pools, transition_name=transition.name)
+        candidates = self._iter_candidate_bindings(pools, transition_name=transition.name, lazy=lazy)
         for examined, binding in enumerate(candidates, start=1):
             if examined > self.binding_search_limit:
                 self._signal_search_exhausted(transition.name)
@@ -2147,10 +2305,10 @@ class PetriNet:
                 yield binding, flat
 
     def _select_binding(
-        self, transition: Transition, pools: list[tuple[InputArc, list[Token]]], policy: BindingPolicy
+        self, transition: Transition, pools: list[tuple[InputArc, _Pool]], policy: BindingPolicy, *, lazy: bool = False
     ) -> _Binding | None:
         """Pick one satisfying binding under a search policy (`FIRST`/`RANDOM`/`PRIORITY`)."""
-        gen = self._iter_satisfying_bindings(transition, pools)
+        gen = self._iter_satisfying_bindings(transition, pools, lazy=lazy)
         if policy is BindingPolicy.RANDOM:
             return self._reservoir_pick(gen)
         if policy is BindingPolicy.PRIORITY:
@@ -2222,34 +2380,42 @@ class PetriNet:
         return best, first, first_exc
 
     def _iter_candidate_bindings(
-        self, pools: list[tuple[InputArc, list[Token]]], *, transition_name: str = ""
+        self, pools: list[tuple[InputArc, _Pool]], *, transition_name: str = "", lazy: bool = False
     ) -> Iterator[_Binding]:
         """Yield candidate bindings as the Cartesian product of each arc's token-group options.
 
         Options are generated in insertion order, so the first binding yielded is the head
-        selection and iteration proceeds deterministically from there.
+        selection and iteration proceeds deterministically from there: lexicographic in arc
+        order, the last arc varying fastest.
 
-        Each per-arc option stream is truncated to `binding_search_limit + 1` groups before
-        being handed to `itertools.product`. This keeps both time and memory bounded by the
-        search limit: `product` materializes each input iterable in full before yielding, so
-        an un-truncated arc with `C(n, count)` combinations would be built eagerly (defeating
-        the bound and risking OOM). The truncation is loss-free within the limit — in
-        `product`'s lexicographic output order a candidate's overall rank is at least its
-        index in any single dimension, so any group beyond index `binding_search_limit` can
-        never appear among the first `binding_search_limit` bindings the search inspects.
+        Each per-arc option stream is truncated to `binding_search_limit + 1` groups. This
+        keeps both time and memory bounded by the search limit even for an arc with
+        `C(n, count)` combinations. The truncation is loss-free within the limit — in the
+        product's lexicographic order a candidate's overall rank is at least its index in any
+        single dimension, so any group beyond index `binding_search_limit` can never appear
+        among the first `binding_search_limit` bindings the search inspects.
+
+        `lazy` chooses between two enumerations of the same sequence:
+
+        - `True`: `_lazy_product` reads each arc's options at most twice as far as the
+          enumeration has reached, so a caller that stops at the first satisfying binding pays
+          for the candidates it inspected, not for the length of the option lists. A
+          `_PeekStream` pool extends that to the place read itself.
+        - `False`: `itertools.product` over the fully built option lists. It builds every
+          list before yielding, but iterates in C, which is cheaper for a caller that will
+          drain the whole bounded product anyway.
         """
         arcs = [arc for arc, _ in pools]
         cap = self.binding_search_limit + 1
-        option_lists = [
-            list(itertools.islice(self._arc_options(arc, available, transition_name=transition_name), cap))
+        streams = [
+            itertools.islice(self._arc_options(arc, available, transition_name=transition_name), cap)
             for arc, available in pools
         ]
-        for combo in itertools.product(*option_lists):
+        combos = _lazy_product(streams) if lazy else itertools.product(*(list(stream) for stream in streams))
+        for combo in combos:
             yield list(zip(arcs, combo, strict=True))
 
-    def _arc_options(
-        self, arc: InputArc, available: list[Token], *, transition_name: str = ""
-    ) -> Iterator[list[Token]]:
+    def _arc_options(self, arc: InputArc, available: _Pool, *, transition_name: str = "") -> Iterator[list[Token]]:
         """Yield each `count`-sized token group one input `arc` could consume, in order.
 
         A `consume_all` arc has a single option: every available token, FIFO, with `key`
@@ -2258,12 +2424,20 @@ class PetriNet:
         `count`-sized combination is yielded in index order — so the first yielded group is
         the arc's head selection. An arc whose `key`/`filter` raises, or that has fewer than
         `count` eligible tokens, yields nothing (making the transition unbindable).
+
+        `available` is a `_PeekStream` only for an arc with no selection and `count == 1`, so
+        it normally reaches the single-token loop unchanged and is read only as far as the
+        consumer pulls. Every other branch takes `_as_list(available)`, so a pool and an arc
+        shape that disagree (after a concurrent reassignment) still read correctly.
         """
         if arc.consume_all:
-            yield available
+            yield _as_list(available)
             return
-        ordered = self._order_available(arc, available, transition_name=transition_name)
-        if ordered is None or len(ordered) < arc.count:
+        if arc.filter is None and arc.key is None:
+            ordered: _Pool | None = available
+        else:
+            ordered = self._order_available(arc, _as_list(available), transition_name=transition_name)
+        if ordered is None:
             return
         if arc.count == 1:
             # Fast path for the common single-token arc. `combinations(ordered, 1)` yields one
