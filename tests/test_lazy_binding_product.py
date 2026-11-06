@@ -82,24 +82,28 @@ def test_every_arc_selection_runs_when_an_earlier_arc_is_empty():
     assert sorted(keyed) == [2, 3]
 
 
-def _eager_first(net, transition):
-    """`FIRST`'s binding as `main` computed it: the full capped product, filtered by the guard."""
-    pools = net._gather_arc_pools(transition, net.model_time, False)
+def _eager_first(net, transition, m_time, ignore_timing):
+    """`FIRST` as `main` ran it: `(binding, exhausted)` from the full capped product, eager pools."""
+    pools = net._gather_arc_pools(transition, m_time, ignore_timing)
     if pools is None:
-        return None
+        return None, False
     cap = net.binding_search_limit + 1
     option_lists = [list(itertools.islice(net._arc_options(arc, pool), cap)) for arc, pool in pools]
     for examined, combo in enumerate(itertools.product(*option_lists), start=1):
         if examined > net.binding_search_limit:
-            return None
-        if transition.guard([t for group in combo for t in group]):
-            return [list(group) for group in combo]
-    return None
+            return None, True
+        if net._check_transition_guard(transition, [t for group in combo for t in group]):
+            return [list(group) for group in combo], False
+    return None, False
+
+
+NOW = 10.0
 
 
 def _random_net(rng):
     limit = rng.choice([3, 7, 50, 1_000])
     net = PetriNet(seed=rng.randrange(1_000), binding_search_limit=limit)
+    net.advance_time(NOW)
     arcs = []
     for p in range(rng.randint(1, 3)):
         name = f"bin{p}"
@@ -107,8 +111,10 @@ def _random_net(rng):
         count = rng.choice([1, 1, 2])
         keyed = rng.random() < 0.3
         arcs.append(InputArc(name, count=count, key=(lambda t: -t.payload["v"]) if keyed else None))
-        for i in range(rng.randint(0, 12)):
-            net.deposit(name, Token(payload={"v": rng.randrange(6), "i": i}))
+        timed_share = rng.choice([0.0, 0.0, 0.3, 0.8])
+        for i in range(rng.choice([rng.randint(0, 12), rng.randint(9, 40)])):
+            at = rng.uniform(0.0, 2 * NOW) if rng.random() < timed_share else 0.0
+            net.deposit(name, Token(payload={"v": rng.randrange(6), "i": i}, available_at=at))
     net.add_place(Place("out"))
     modulus, residue = rng.randint(2, 7), rng.randrange(7)
     net.add_transition(
@@ -123,19 +129,55 @@ def _random_net(rng):
     return net
 
 
-def test_first_picks_the_same_binding_as_the_eager_product():
+def _record_search(monkeypatch, net):
+    """Record every guard evaluation (as token ids) and every exhaustion signal on *net*."""
+    calls: list[tuple[str, tuple[str, ...]]] = []
+    check, signal = net._check_transition_guard, net._signal_search_exhausted
+
+    def recording_check(transition, tokens):
+        calls.append(("guard", tuple(t.id for t in tokens)))
+        return check(transition, tokens)
+
+    def recording_signal(name):
+        calls.append(("exhausted", ()))
+        return signal(name)
+
+    monkeypatch.setattr(net, "_check_transition_guard", recording_check)
+    monkeypatch.setattr(net, "_signal_search_exhausted", recording_signal)
+    return calls
+
+
+@pytest.mark.parametrize("ignore_timing", [False, True], ids=["at-model-time", "ignoring-timing"])
+def test_first_runs_the_same_search_as_the_eager_product(monkeypatch, ignore_timing):
+    """Same binding, same guard evaluations in the same order, same exhaustion, timed tokens included."""
     rng = random.Random(1959)
-    found = 0
+    found = exhausted = streamed = 0
     for _ in range(600):
         net = _random_net(rng)
         transition = net.transitions["pick"]
-        expected = _eager_first(net, transition)
-        binding = net._resolve_binding(transition, net.model_time)
+        m_time = float("inf") if ignore_timing else NOW
+        calls = _record_search(monkeypatch, net)
+
+        expected, expected_exhausted = _eager_first(net, transition, m_time, ignore_timing)
+        eager_calls = list(calls)
+        calls.clear()
+        binding = net._resolve_binding(transition, m_time, ignore_timing=ignore_timing)
         got = None if binding is None else [tokens for _arc, tokens in binding]
         assert got == expected
-        assert net._binding_exists(transition, net.model_time) is (expected is not None)
+        assert [c for c in calls if c[0] == "guard"] == eager_calls
+        assert (("exhausted", ()) in calls) is expected_exhausted
+
+        calls.clear()
+        assert net._binding_exists(transition, m_time, ignore_timing=ignore_timing) is (expected is not None)
+        assert [c for c in calls if c[0] == "guard"] == [c for c in eager_calls if c[0] == "guard"]
+
+        pools = net._gather_arc_pools(transition, m_time, ignore_timing, lazy=True) or []
+        streamed += any(isinstance(pool, _PeekStream) for _arc, pool in pools)
         found += expected is not None
+        exhausted += expected_exhausted
     assert 100 < found < 500, found
+    assert exhausted > 20, exhausted
+    assert streamed > 50, streamed
 
 
 WORKERS = 8
