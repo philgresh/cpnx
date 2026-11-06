@@ -674,9 +674,11 @@ class SubstitutionTransition(Transition):
     A firing is all-or-nothing as far as the subnet is concerned. Firings of one
     `SubstitutionTransition` run one at a time, so each collects only its own outputs. The
     firing fails if a port rejects a deposited token, the subnet raises, the subnet has not
-    reached quiescence by its bound (`subnet_deadline_secs` on the wall clock,
+    finished by its bound (`subnet_deadline_secs` on the wall clock,
     [`drive_to_quiescence`][cpnx.PetriNet.drive_to_quiescence]'s `max_ticks` on the logical
-    clock), or the parent cannot commit the outputs. The parent's consumed tokens are then
+    clock), or the parent cannot commit the outputs. The subnet has finished once it is
+    quiescent, or once nothing can fire at the current time or any finite later time (a
+    token parked at `available_at = inf` never becomes available). The parent's consumed tokens are then
     rolled back as for any transition, and every subnet place except resource pools and
     [`SinkPlace`][cpnx.SinkPlace]s is restored to its marking from before the firing.
     Resource permits are not restored. The firings that borrowed them return them, so each

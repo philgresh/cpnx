@@ -100,7 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     hits `drive_to_quiescence`'s `max_ticks` (`RuntimeError`). Before, the parent took whatever
     had reached the output ports. If that was enough to commit, the leftover work came out in a
     later firing. The parent's `on_error` now reports why, where it used to get a "returned 0
-    non-resource token(s)" error.
+    non-resource token(s)" error. A subnet left holding only tokens parked at
+    `available_at = inf` has finished: nothing can ever fire, so the firing completes as before.
   - **Firings of one `SubstitutionTransition` now run one at a time.** With `max_workers > 1`,
     concurrent firings shared the subnet's ports, so a firing could collect another's output.
     The surplus was dropped and the starved firing retried, so some orders were served twice and

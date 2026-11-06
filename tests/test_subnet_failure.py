@@ -11,6 +11,7 @@ must survive every purge), and lands in `Ready`.
 """
 
 import functools
+import math
 import threading
 import time
 from collections import Counter
@@ -153,12 +154,15 @@ def test_dead_letter_inside_the_subnet_is_rolled_back_with_the_firing(logical):
 
 @pytest.mark.parametrize("logical", [True, False], ids=["logical", "wall"])
 def test_port_rejecting_a_deposit_is_purged(logical):
-    """A port stricter than its socket raises mid-deposit, after an earlier port was filled."""
+    """A port stricter than its socket raises mid-deposit, after an earlier port was filled.
+
+    The port is stricter by schema, not colour set: hierarchical CPN requires a port and its
+    socket to share a colour set, so a colour mismatch is a malformed net rather than a route."""
     recipe = Token(payload={"recipe": "flat white"})
     subnet = PetriNet(
         places=[
             Place("Orders"),
-            Place("Cups", color_set={"cup"}),
+            Place("Cups", schema=lambda payload: payload.get("size") in {"small", "large"}),
             Place("Ready"),
             Place("Recipe", initial_marking=[recipe]),
             ResourcePlace("Barista", capacity=1),
@@ -189,13 +193,13 @@ def test_port_rejecting_a_deposit_is_purged(logical):
     )
     with parent:
         parent.deposit("Queue", Token(payload={"order": 1}))
-        parent.deposit("CupShelf", Token(color="saucer"))
+        parent.deposit("CupShelf", Token(payload={"size": "bucket"}))
         _drive(parent, logical)
         assert len(parent.marking["failed"]) == 2
         assert subnet.marking["Orders"] == (), "the order deposited before the rejected cup was stranded"
 
         parent.deposit("Queue", Token(payload={"order": 2}))
-        parent.deposit("CupShelf", Token(color="cup"))
+        parent.deposit("CupShelf", Token(payload={"size": "small"}))
         _drive(parent, logical)
         assert _served(parent) == [2]
         assert all(subnet.marking[name] == () for name in ("Orders", "Cups", "Ready", "failed"))
@@ -332,3 +336,42 @@ def test_brew_still_running_at_the_deadline_returns_only_its_permit():
         parent.deposit("Queue", Token(payload={"order": 2}))
         parent.run(deadline=time.monotonic() + 5.0)
         assert _served(parent) == [2]
+
+
+@pytest.mark.parametrize("logical", [True, False], ids=["logical", "wall"])
+def test_token_parked_at_infinity_does_not_fail_the_firing(logical):
+    """A token at `available_at = inf` never enables anything, so the subnet is in a timed dead
+    marking and the firing completes, even though `is_quiescent` counts the token as pending."""
+
+    def brew(tokens: list[Token]) -> list[Token]:
+        return [tokens[0].evolve({"brewed": True}), Token(payload={"punch": 1}, available_at=math.inf)]
+
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Ready"), Place("Punches")],
+        transitions=[
+            Transition("Brew", [InputArc("Orders")], [OutputArc("Ready"), OutputArc("Punches")], brew),
+            Transition("Redeem", [InputArc("Punches")], [OutputArc("Ready")], lambda tokens: tokens),
+        ],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Cafe",
+                inputs=[InputArc("Queue")],
+                outputs=[OutputArc("Served")],
+                action=lambda tokens: tokens,
+                subnet=subnet,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                subnet_deadline_secs=0.2,
+                max_retries=0,
+            )
+        ],
+    )
+    with parent:
+        parent.deposit("Queue", Token(payload={"order": 1}))
+        _drive(parent, logical)
+    assert _served(parent) == [1]
+    assert parent.marking["failed"] == ()
+    assert len(subnet.marking["Punches"]) == 1

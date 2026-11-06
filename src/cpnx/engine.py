@@ -2888,6 +2888,20 @@ class PetriNet:
                 subnet._restore_marking(checkpoint)
         return outcome
 
+    def _is_finished(self) -> bool:
+        """Return whether no transition can fire at the current time or any finite later time.
+
+        `is_quiescent` counts every time-gated token as eventually available, including one
+        parked at `available_at = inf` by a saturated `RetryPolicy`. Nothing ever releases such
+        a token, so a net holding one is in a timed dead marking and has finished.
+        """
+        if self.is_quiescent():
+            return True
+        with self._lock:
+            if self._running_count:
+                return False
+        return self.is_dead() and self._next_availability_boundary() is None
+
     def _checkpoint_marking(self) -> dict[str, tuple[Token, ...]]:
         """Snapshot the places a purge restores: every place except resource pools and sinks."""
         with self._lock:
@@ -3238,14 +3252,14 @@ class PetriNet:
             parent_on_logical_clock = self._model_time is not None
         if parent_on_logical_clock:
             ticks = subnet.drive_to_quiescence().ticks
-            if not subnet.is_quiescent():
+            if not subnet._is_finished():
                 raise RuntimeError(
                     f"SubstitutionTransition '{transition.name}': subnet did not reach quiescence "
                     f"on the logical clock after {ticks} clock advance(s)."
                 )
         else:
             subnet.run(deadline=time.monotonic() + transition.subnet_deadline_secs)
-            if not subnet.is_quiescent():
+            if not subnet._is_finished():
                 raise TimeoutError(
                     f"SubstitutionTransition '{transition.name}': subnet did not reach quiescence "
                     f"within subnet_deadline_secs={transition.subnet_deadline_secs}."
