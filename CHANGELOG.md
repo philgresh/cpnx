@@ -27,14 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     parent's `run()`. The next firing of the transition waits up to `subnet_deadline_secs` for
     it, then fails with `RuntimeError` without depositing anything, and that failure counts
     toward `max_retries`. To bound a subnet action that may hang, set `action_timeout_secs` on
-    it.
+    it. `subnet_deadline_secs=None` removes both bounds, so a hung subnet action then holds the
+    transition and the parent's shutdown indefinitely; any other value must be positive.
   - **Firings of one `SubstitutionTransition` now run one at a time.** A firing selected while
     another is in progress waits for it on a worker thread. With `max_workers > 1`, concurrent
     firings shared the subnet's ports, so a firing could collect another's output. The surplus
     was dropped and the starved firing retried, so some orders were served twice and others
     never.
   - **A substitution transition cannot wrap the net it is in, or a net enclosing it, and one
-    `SubstitutionTransition` cannot be added to two nets.** `add_transition` raises `ValueError`.
+    `SubstitutionTransition` cannot be in two nets at once.** `add_transition` raises
+    `ValueError`. Replacing a substitution transition by name releases its subnet.
 
 - **A certified callable may no longer close over a `frozenset` whose members are not themselves
   immutable.** `cpnx.certification` decides what a callable can close over and still earn the

@@ -124,8 +124,8 @@ def test_substitution_transition_no_parent_mutation():
 
 
 def test_subnet_holds_only_a_weak_link_to_its_parent():
-    """`add_transition` gives the subnet a weak reference to its parent, used only to signal that
-    a failed firing has settled; the subnet never keeps the parent alive."""
+    """`add_transition` gives the subnet a weak reference to its parent (for abort propagation,
+    settle signals and link checks); the subnet never keeps the parent alive."""
     child = PetriNet(places=[Place("child_port_in")])
     parent = PetriNet(places=[Place("parent_socket_in")])
     parent.add_transition(

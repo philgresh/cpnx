@@ -1038,6 +1038,7 @@ class PetriNet:
             self._validate_new_transition(transition)
             if isinstance(transition, SubstitutionTransition):
                 self._reject_subnet_link(transition)
+            self._unlink_replaced(self.transitions.get(transition.name))
             self.transitions[transition.name] = transition
             if isinstance(transition, SubstitutionTransition):
                 self._subnets.append(transition.subnet)
@@ -1062,8 +1063,15 @@ class PetriNet:
                 )
             net = net._parent_net()
         parent = transition.subnet._parent_net()
-        if parent is not None and parent is not self:
+        if parent is not None and parent is not self and transition.subnet in parent._subnets:
             raise ValueError(f"SubstitutionTransition '{transition.name}': its subnet already belongs to another net.")
+
+    def _unlink_replaced(self, replaced: Transition | None) -> None:
+        """Drop the subnet link of a substitution transition that `add_transition` is replacing."""
+        if isinstance(replaced, SubstitutionTransition) and replaced.subnet in self._subnets:
+            self._subnets.remove(replaced.subnet)
+            if replaced.subnet._parent_net() is self:
+                replaced.subnet._parent = None
 
     def _parent_net(self) -> "PetriNet | None":
         """The net whose substitution transition wraps this one, if it is still alive."""
@@ -3133,22 +3141,24 @@ class PetriNet:
         subnet = transition.subnet
         with transition._firing_lock:
             start_time = time.monotonic()
+            try:
+                bound = transition.subnet_deadline_secs
+                settled = subnet._await_settled(math.inf if bound is None else start_time + bound, self._aborted)
+            except BaseException as exc:
+                return self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, exc)
             if self._aborted():
                 self._return_unstarted(token_sources)
                 return None
-            try:
-                bound = transition.subnet_deadline_secs
-                deadline = math.inf if bound is None else start_time + bound
-                settled = subnet._await_settled(deadline, self._aborted)
-                checkpoint = subnet._checkpoint_marking() if settled else {}
-            except BaseException as exc:
-                return self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, exc)
             if not settled:
                 error = RuntimeError(
                     f"SubstitutionTransition '{transition.name}': subnet is still running an action of a "
                     f"failed firing after subnet_deadline_secs={transition.subnet_deadline_secs}."
                 )
                 return self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, error)
+            try:
+                checkpoint = subnet._checkpoint_marking()
+            except BaseException as exc:
+                return self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, exc)
             subnet._nested_undo = nested = []
             try:
                 outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time)
@@ -3578,16 +3588,22 @@ class PetriNet:
         #   - parent on the wall clock (`run()`, production): run the subnet on the wall clock, so
         #     real cooldowns are genuinely waited out — the correct production semantics.
         #
-        # `subnet_deadline_secs` bounds only the wall-clock path; a logically-driven subnet is
-        # bounded by `drive_to_quiescence`'s own `max_ticks`/`max_spins`. A subnet left short of
-        # quiescence by either bound fails the firing. See `tests/test_subnet.py`,
+        # `subnet_deadline_secs` bounds the drive only on the wall-clock path (`None`: unbounded); a
+        # logically-driven subnet is bounded by `drive_to_quiescence`'s own `max_ticks`/`max_spins`.
+        # A subnet left short of quiescence by either bound fails the firing. See `tests/test_subnet.py`,
         # `tests/test_subnet_failure.py` and `benchmarks/bench_subnet.py`.
         with self._lock:
             parent_on_logical_clock = self._model_time is not None
-        if parent_on_logical_clock:
-            ticks = subnet.drive_to_quiescence().ticks
-        else:
-            subnet.run(deadline=time.monotonic() + transition.subnet_deadline_secs)
+        try:
+            if parent_on_logical_clock:
+                ticks = subnet.drive_to_quiescence().ticks
+            else:
+                bound = transition.subnet_deadline_secs
+                subnet.run(deadline=None if bound is None else time.monotonic() + bound)
+        except Exception:
+            if self._aborted():
+                raise _EnclosingFiringFailed(transition.name) from None
+            raise
         # Closed before the check: work still queued must not start while the verdict is out.
         subnet._closing = True
         if subnet._is_finished():

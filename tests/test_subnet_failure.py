@@ -1779,9 +1779,8 @@ def test_one_kitchen_cannot_serve_two_front_counters():
 
 
 @pytest.mark.parametrize("logical", [True, False], ids=["logical", "wall"])
-def test_unbounded_deadline_never_loses_the_order(logical):
-    """`subnet_deadline_secs=None` has no meaning on the wall clock and is ignored on the logical
-    one. Either way the order must end up somewhere: served, or dead-lettered with an error."""
+def test_unbounded_deadline_serves_on_both_clocks(logical):
+    """`subnet_deadline_secs=None` removes the bound on the drive and on the settle wait."""
     subnet = PetriNet(
         places=[Place("Orders"), Place("Ready")],
         transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], lambda tokens: tokens)],
@@ -1806,19 +1805,17 @@ def test_unbounded_deadline_never_loses_the_order(logical):
     with parent:
         parent.deposit("Queue", Token(payload={"order": 1}))
         _drive(parent, logical)
-    if logical:
-        assert _served(parent) == [1] and errors == []
-    else:
-        assert [t.payload["order"] for t in parent.marking["failed"]] == [1]
-        assert [type(e) for e in errors] == [TypeError]
+    assert _served(parent) == [1] and errors == []
 
 
 def test_logical_drive_raises_when_a_subnet_will_not_settle_in_time():
-    """The subnet's drive gives up after 2,000 spins; the parent's allows 50,000, plenty for the
-    firing itself but far short of the 1.5 s straggler it would then have to wait out."""
+    """The subnet's drive gives up after 2,000 spins, so the firing fails with a brew still
+    running. The brew is held until after the assertion, so the parent's 50,000-spin settle
+    wait always runs out first, however fast a spin is on this platform."""
+    release = threading.Event()
 
     def slow(tokens: list[Token]) -> list[Token]:
-        time.sleep(1.5)
+        release.wait(10.0)
         return tokens
 
     subnet = PetriNet(
@@ -1841,8 +1838,11 @@ def test_logical_drive_raises_when_a_subnet_will_not_settle_in_time():
         ],
     )
     parent.deposit("Queue", Token(payload={"order": 1}))
-    with pytest.raises(RuntimeError, match="still settling"):
-        parent.drive_to_quiescence(max_spins=50_000)
+    try:
+        with pytest.raises(RuntimeError, match="still settling"):
+            parent.drive_to_quiescence(max_spins=50_000)
+    finally:
+        release.set()
     _wait_until_settled(subnet)
 
 
@@ -1884,12 +1884,17 @@ def test_serialized_firings_report_their_own_duration():
 
 @pytest.mark.parametrize("logical", [True, False], ids=["logical", "wall"])
 def test_failure_before_the_drive_is_reported_not_lost(logical):
-    """A deadline that cannot be added to a float fails the firing before the subnet is driven.
-    The order must still be rolled back and dead-lettered with the error, as for any failure."""
+    """Taking the checkpoint fails before the subnet is driven. The order must still be rolled
+    back and dead-lettered with the error, as for any failure."""
     subnet = PetriNet(
         places=[Place("Orders"), Place("Ready")],
         transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], lambda tokens: tokens)],
     )
+
+    def broken_checkpoint():
+        raise OSError("checkpoint unavailable")
+
+    subnet._checkpoint_marking = broken_checkpoint
     parent = PetriNet(
         places=[Place("Queue"), Place("Served")],
         max_workers=1,
@@ -1901,7 +1906,6 @@ def test_failure_before_the_drive_is_reported_not_lost(logical):
                 action=lambda tokens: tokens,
                 subnet=subnet,
                 port_socket_map={"Orders": "Queue", "Ready": "Served"},
-                subnet_deadline_secs="soon",  # type: ignore[arg-type]
                 max_retries=0,
             )
         ],
@@ -1911,5 +1915,80 @@ def test_failure_before_the_drive_is_reported_not_lost(logical):
         parent.deposit("Queue", Token(payload={"order": 1}))
         _drive(parent, logical)
     assert [t.payload["order"] for t in parent.marking["failed"]] == [1]
-    assert [type(e) for e in errors] == [TypeError]
+    assert [type(e) for e in errors] == [OSError]
     assert subnet.marking["Orders"] == ()
+
+
+@pytest.mark.parametrize("deadline", [0, -1.0, float("nan"), "soon", True])
+def test_deadline_must_be_positive_or_none(deadline):
+    subnet = PetriNet(places=[Place("Orders"), Place("Ready")])
+    with pytest.raises(ValueError, match="positive number or None"):
+        SubstitutionTransition(
+            name="Cafe",
+            inputs=[InputArc("Queue")],
+            outputs=[OutputArc("Served")],
+            action=lambda tokens: tokens,
+            subnet=subnet,
+            port_socket_map={"Orders": "Queue", "Ready": "Served"},
+            subnet_deadline_secs=deadline,
+        )
+    assert subnet not in SubstitutionTransition._mapped_subnets
+
+
+def test_nested_drive_that_raises_after_an_enclosing_failure_reports_nothing():
+    """On the logical clock the front of house gives up while the station is still being driven.
+    The station's drive then raises; that failure belongs to the outer one, so the front must not
+    report it or dead-letter the order."""
+    station = PetriNet(
+        places=[Place("Orders"), Place("Ready")],
+        transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], lambda tokens: tokens)],
+    )
+    front = PetriNet(
+        places=[Place("Orders"), Place("Ready"), SinkPlace("Spoiled", keep_last=10)],
+        error_place="Spoiled",
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Station",
+                inputs=[InputArc("Orders")],
+                outputs=[OutputArc("Ready")],
+                action=lambda tokens: tokens,
+                subnet=station,
+                port_socket_map={"Orders": "Orders", "Ready": "Ready"},
+                max_retries=0,
+            )
+        ],
+    )
+
+    def station_drive(*_args, **_kwargs):
+        deadline = time.monotonic() + 5.0
+        while not front._aborted() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        raise RuntimeError("station drive gave up")
+
+    station.drive_to_quiescence = station_drive
+    front.drive_to_quiescence = functools.partial(front.drive_to_quiescence, max_spins=2000)
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        max_workers=1,
+        transitions=[
+            SubstitutionTransition(
+                name="Front",
+                inputs=[InputArc("Queue")],
+                outputs=[OutputArc("Served")],
+                action=lambda tokens: tokens,
+                subnet=front,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                max_retries=0,
+            )
+        ],
+    )
+    front_errors = _collect_errors(front)
+    dead_letters: list[Token] = []
+    front.on_token_dead_lettered = lambda _name, token: dead_letters.append(token)
+    parent.deposit("Queue", Token(payload={"order": 1}))
+    parent.drive_to_quiescence()
+    _wait_until_settled(front)
+    assert [t.payload["order"] for t in parent.marking["failed"]] == [1]
+    assert front_errors == [] and dead_letters == []
+    assert front.places["Spoiled"].stats()["absorbed"] == 0

@@ -17,8 +17,9 @@ Demonstrates:
     that fixed per-firing overhead is charged once per food order. It is the only
     place in the corpus where engine cost is not proportional to a single action.
 
-    **Isolation, precisely.** The child subnet holds only a weak reference to its parent, used to
-    signal when a failed firing has settled. Otherwise
+    **Isolation, precisely.** The child subnet holds one weak reference to its parent, used to
+    stop its work when an enclosing firing fails and to signal when a failed firing has settled.
+    Otherwise
     it is constructed, run, and drained as a wholly separate [`PetriNet`][cpnx.PetriNet] with its own
     lock, its own clock, its own thread pools. Communication crosses the boundary
     *only* through `port_socket_map`: a port place inside the subnet (`P_Pastry_In`,

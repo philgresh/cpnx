@@ -659,6 +659,17 @@ class Transition:
         super().__setattr__(name, value)
 
 
+def _check_subnet_deadline(name: str, deadline: object) -> None:
+    """Raise unless *deadline* is a positive number or `None`."""
+    if deadline is None:
+        return
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not deadline > 0:
+        raise ValueError(
+            f"SubstitutionTransition '{name}': subnet_deadline_secs must be a positive number or None, "
+            f"not {deadline!r}."
+        )
+
+
 @dataclass
 class SubstitutionTransition(Transition):
     """A [`Transition`][cpnx.Transition] that encapsulates an entire sub-PetriNet (Hierarchical CPN).
@@ -667,9 +678,11 @@ class SubstitutionTransition(Transition):
     `SubstitutionTransition` delegates firing to a nested [`PetriNet`][cpnx.PetriNet] (the
     `subnet`): named port places inside the subnet are bound to named socket places in the
     parent net via `port_socket_map`, and `subnet_deadline_secs` bounds how long the subnet
-    is given to reach quiescence. The child subnet is fully insulated from the parent net —
-    it holds only a weak reference to its parent, used to tell it when a failed firing has
-    settled. Tokens move strictly through the `port_socket_map`.
+    is given to reach quiescence. Tokens move strictly through the `port_socket_map`. The
+    subnet holds one weak reference to its parent net, which `add_transition` sets. It is used
+    to stop the subnet's work when an enclosing firing fails, to tell the parent when a failed
+    firing has settled, and to reject a subnet that would enclose its own parent or belong to
+    two nets.
 
     A firing is all-or-nothing as far as the subnet is concerned. Firings of one
     `SubstitutionTransition` run one at a time, so each collects only its own outputs. A firing
@@ -690,6 +703,10 @@ class SubstitutionTransition(Transition):
     failed firing, and a permit one transition moves into another pool, for a later transition
     to return, stays there if the firing fails in between. A firing that commits
     leaves the subnet as it reached it, so a subnet may keep state across firings.
+
+    Callbacks on the subnet (`on_transition_fired`, `on_token_deposited`) report its internal
+    firings as they commit, and a later restore does not retract them: treat them as provisional
+    until the enclosing firing commits.
 
     The restore happens only once the subnet has settled. An action of the failed firing
     still running cannot be stopped: it finishes and commits through its own arcs inside the
@@ -717,15 +734,17 @@ class SubstitutionTransition(Transition):
                          to the same bound for the subnet to settle from an earlier failed
                          firing, on either clock. It bounds the firing, not the parent's
                          `run()`, which waits for a failed firing's still-running action;
-                         set `action_timeout_secs` on subnet actions that may hang.
-                         Defaults to `30.0`.
+                         set `action_timeout_secs` on subnet actions that may hang. `None`
+                         removes both bounds, so a hung subnet action then holds this
+                         transition, and the parent's shutdown, indefinitely. Must be
+                         positive or `None`. Defaults to `30.0`.
     """
 
     _mapped_subnets: ClassVar[weakref.WeakSet] = weakref.WeakSet()
 
     subnet: "PetriNet" = field(default=None)  # type: ignore[assignment]
     port_socket_map: dict[str, str] = field(default_factory=dict)
-    subnet_deadline_secs: float = 30.0
+    subnet_deadline_secs: float | None = 30.0
 
     def __post_init__(self):
         # Guard purity/inline-safety is handled by Transition.__setattr__ during field
@@ -738,6 +757,8 @@ class SubstitutionTransition(Transition):
         for port, socket in self.port_socket_map.items():
             if not isinstance(port, str) or not isinstance(socket, str):
                 raise TypeError("Port and socket mapping names must be strings.")
+
+        _check_subnet_deadline(self.name, self.subnet_deadline_secs)
 
         missing = [p for p in self.port_socket_map if p not in self.subnet.places]
         if missing:
