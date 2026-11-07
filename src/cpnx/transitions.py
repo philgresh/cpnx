@@ -706,12 +706,12 @@ class SubstitutionTransition(Transition):
     [`SinkPlace`][cpnx.SinkPlace]s is restored to its marking from before the firing. The
     rollback reaches nested subnets: a `SubstitutionTransition` inside the subnet that
     committed during the failed firing has its own subnet restored too.
-    Resource permits are not restored. The firings that borrowed them return them, so each
-    pool the subnet owns keeps its capacity and any cooldown the failed firing started. Two
-    exceptions: a `ResourcePlace` mapped as a port still gains the parent's permit copy on each
-    failed firing, and a permit one transition moves into another pool, for a later transition
-    to return, stays there if the firing fails in between. A firing that commits
-    leaves the subnet as it reached it, so a subnet may keep state across firings.
+    A resource pool gets back only its permit count. The firings that borrowed permits return
+    them, so each pool keeps any cooldown the failed firing started, the restore drops the
+    parent's permit copy from a `ResourcePlace` mapped as a port, and a permit one transition
+    moved into another pool, for a later transition to return, goes back to where it started.
+    A firing that commits leaves the subnet as it reached it, so a subnet may keep state across
+    firings.
 
     Callbacks on the subnet (`on_transition_fired`, `on_token_deposited`) report its internal
     firings as they commit, and a later restore does not retract them: treat them as provisional

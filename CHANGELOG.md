@@ -117,6 +117,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing no longer changes
+  how many permits a subnet pool holds** ([#38](https://github.com/philgresh/cpnx/issues/38)).
+  A `ResourcePlace` mapped as a port used to gain the parent's permit copy on every failed
+  firing, and a permit moved into another pool for a later transition to return stayed there,
+  starving the next firing. The restore now returns each pool to its pre-firing permit count,
+  and any cooldown the failed firing started keeps running.
 - **A failed [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing no longer leaves
   tokens inside its subnet** ([#38](https://github.com/philgresh/cpnx/issues/38)). The parent
   rolled back its own consumed tokens, but the copies deposited into the subnet's ports, and

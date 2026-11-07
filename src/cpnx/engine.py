@@ -3298,24 +3298,25 @@ class PetriNet:
         return self._next_availability_boundary() is None and self.is_dead()
 
     def _checkpoint_marking(self) -> dict[str, tuple[Token, ...]]:
-        """Snapshot the places a purge restores: every place except resource pools and sinks."""
+        """Snapshot the places a rollback touches: every place except sinks."""
         with self._lock:
-            return {name: place.tokens for name, place in self.places.items() if place._restorable}
+            return {name: place.tokens for name, place in self.places.items() if not isinstance(place, SinkPlace)}
 
     def _restore_marking(self, checkpoint: dict[str, tuple[Token, ...]]) -> None:
         """Put each checkpointed place back to its checkpointed tokens.
 
         A token deposited into a restored place since the checkpoint is discarded, even one
         deposited from outside the subnet, so a subnet should take input only through its ports.
-        Resource pools and sinks are left as they are: a permit borrowed and returned by one
-        transition has already come back through that firing's arcs, and a sink cannot enable
-        anything. A permit one transition moves into another pool for a later transition to
-        return stays where the failed firing left it. The clock is not moved; checkpointed
-        tokens were available then and the clock has only advanced.
+        A resource pool gets back only its permit count: a permit borrowed and returned by one
+        transition has already come back through that firing's arcs, with any cooldown it
+        started, so this drops a port's copy of a parent permit and puts back a permit one
+        transition moved into another pool for a later transition to return. A sink is left
+        as it is, because it cannot enable anything. The clock is not moved; checkpointed tokens
+        were available then and the clock has only advanced.
         """
         with self._lock:
             for name, tokens in checkpoint.items():
-                if not self.places[name]._restore_tokens(tokens):
+                if not self.places[name]._roll_back_to(tokens):
                     continue
                 self._mark_dirty(name)
                 for token in tokens:
