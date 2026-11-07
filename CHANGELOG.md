@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing now fails loudly, runs one
+  at a time, and keeps its parent busy until a failed firing has settled**
+  ([#38](https://github.com/philgresh/cpnx/issues/38)). These come with the subnet restore
+  under **Fixed** below:
+
+  - **A subnet that does not reach quiescence now fails the firing.** That covers a wall-clock
+    subnet still busy at `subnet_deadline_secs` (`TimeoutError`) and a logical-clock subnet that
+    hits the `max_ticks` of the parent's `drive_to_quiescence` (`RuntimeError`). Each firing's
+    subnet drive now gets the parent's `max_ticks` and `max_spins`; it used to run on the
+    defaults, whatever the parent was given. Before, the parent took whatever
+    had reached the output ports. If that was enough to commit, the leftover work came out in a
+    later firing. The parent's `on_error` now reports why, where it used to get a "returned 0
+    non-resource token(s)" error. A subnet left holding only tokens parked at
+    `available_at = inf` has finished: nothing can ever fire, so the firing completes as before.
+  - **While a failed firing's action is still running, its subnet is not settled.** The parent
+    is not quiescent until it settles, so `run()` without a deadline waits for it, as it would
+    for any running action in a flat net; `subnet_deadline_secs` bounds the firing, not the
+    parent's `run()`. The next firing of the transition waits up to `subnet_deadline_secs` for
+    it, then fails with `RuntimeError` without depositing anything, and that failure counts
+    toward `max_retries`. Firings queued together share one wait, so a backlog behind a hung
+    action does not hold shutdown for one deadline per order. To bound a subnet action that may hang, set `action_timeout_secs` on
+    it. `subnet_deadline_secs=None` removes both bounds, so a hung subnet action then holds the
+    transition and the parent's shutdown indefinitely. Any other value must be a positive real
+    number (`TypeError` for a non-number, `ValueError` otherwise), is checked on assignment too,
+    and is stored as a float.
+  - **Firings of one `SubstitutionTransition` now run one at a time.** A firing selected while
+    another is in progress waits for it on a worker thread. With `max_workers > 1`, concurrent
+    firings shared the subnet's ports, so a firing could collect another's output. The surplus
+    was dropped and the starved firing retried, so some orders were served twice and others
+    never.
+  - **A substitution transition cannot wrap the net it is in, or a net enclosing it, and one
+    `SubstitutionTransition` cannot be in two nets at once.** `add_transition` raises
+    `ValueError`. A substitution transition replaced by name in `add_transition` can then be
+    added to another net. Reassigning a `SubstitutionTransition`'s `subnet` raises
+    `AttributeError`; the engine used to pick the new subnet up at the next firing.
+
 - **A certified callable may no longer close over a `frozenset` whose members are not themselves
   immutable.** `cpnx.certification` decides what a callable can close over and still earn the
   **inline** execution path — run directly under the engine lock, with no timeout — so that
@@ -80,6 +116,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fix below as well.
 
 ### Fixed
+
+- **A failed [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing no longer leaves
+  tokens inside its subnet** ([#38](https://github.com/philgresh/cpnx/issues/38)). The parent
+  rolled back its own consumed tokens, but the copies deposited into the subnet's ports, and
+  anything half-processed, stayed in the reused subnet. The next firing then brewed the stale
+  order as well and returned it in place of its own. Now, if the firing fails for any reason,
+  every subnet place except resource pools and sinks is restored to its marking from before the
+  firing. The reasons are a port rejecting a deposit, the subnet raising, the subnet not
+  quiescing in time, or the parent being unable to commit the outputs. Resource permits are left
+  to the firings that borrowed them, so a pool the subnet owns keeps its capacity and any
+  cooldown the failed firing started (a `ResourcePlace` mapped as a port still gains the parent's
+  permit copy on each failed firing; one that times out used to drain it, and now leaves it there
+  too. A permit one transition moves into another pool for a later one to return stays there if
+  the firing fails in between). An
+  action of the failed firing still running when the subnet gives up finishes through its own
+  arcs first: the restore waits until the subnet has settled, so nothing in use (a permit, a
+  recipe card, a one-token machine) is ever put back twice, and work the failed firing had
+  queued, at any depth, is not started and reports nothing. A token deposited into a restored
+  subnet place during the failed firing is discarded with it, even one deposited from outside
+  the subnet. The rollback reaches nested subnets, and a place
+  that holds the same `Token` object more than once is restored with exactly that many. A
+  committed firing still leaves the subnet as it reached it, so subnets that keep state across
+  firings, such as a batching port, are unaffected. `docs/cpn-invariants.json` now records the
+  theory this rests on, with page references: the CPN occurrence, compound-place, timed and
+  place-invariant rules (`CPN-*`), zero-safe nets' stable markings and transactions (`ZS-*`),
+  and closed nested transactions (`NESTED-TX*`).
+
+  A rolled-back firing also no longer keeps its effect on subnet-owned state: a subnet that
+  updates its own tokens, such as a stamp card, used to keep the update when the parent could
+  not commit, and applied it again on every retry. The behavior changes that come with this fix
+  are under **Changed** above.
 
 - **A backlog of matured timed tokens no longer makes every logical-clock advance O(backlog).**
   `_TokenStore` kept a timed token in its cooling heap after it matured, so

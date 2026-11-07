@@ -1,4 +1,5 @@
 import time
+import weakref
 
 from cpnx.engine import PetriNet
 from cpnx.places import Place
@@ -106,7 +107,7 @@ def test_substitution_transition_requires_predeclared_ports():
 
 
 def test_substitution_transition_no_parent_mutation():
-    """Subnet must remain unaware of its parent — no _parent_transition attribute written."""
+    """Constructing a SubstitutionTransition writes no strong or transition back-reference into the subnet."""
     child = PetriNet()
     child.add_place(Place("child_port_in"))
 
@@ -120,6 +121,25 @@ def test_substitution_transition_no_parent_mutation():
     )
 
     assert not hasattr(child, "_parent_transition"), "Subnet must not carry a back-reference to its parent transition"
+    assert child._parent_net() is None
+
+
+def test_subnet_holds_only_a_weak_link_to_its_parent():
+    """`add_transition` gives the subnet a weak reference to its parent (for abort propagation,
+    settle signals and link checks); the subnet never keeps the parent alive."""
+    child = PetriNet(places=[Place("child_port_in")])
+    parent = PetriNet(places=[Place("parent_socket_in")])
+    parent.add_transition(
+        SubstitutionTransition(
+            name="sub1",
+            inputs=[],
+            outputs=[],
+            action=None,  # type: ignore[assignment]
+            subnet=child,
+            port_socket_map={"child_port_in": "parent_socket_in"},
+        )
+    )
+    assert isinstance(child._parent, weakref.ref) and child._parent() is parent
 
 
 def test_substitution_transition_subnet_sharing_raises():

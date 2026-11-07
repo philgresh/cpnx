@@ -1,4 +1,7 @@
 import enum
+import math
+import numbers
+import threading
 import typing
 import warnings
 import weakref
@@ -658,6 +661,24 @@ class Transition:
         super().__setattr__(name, value)
 
 
+def _check_subnet_deadline(name: str, deadline: object) -> float | None:
+    """Return *deadline* as a float, raising unless it is a positive real number or `None`."""
+    if deadline is None:
+        return None
+    message = (
+        f"SubstitutionTransition '{name}': subnet_deadline_secs must be a positive number or None, not {deadline!r}."
+    )
+    if isinstance(deadline, bool) or not isinstance(deadline, numbers.Real):
+        raise TypeError(message)
+    try:
+        secs = float(deadline)
+    except OverflowError:
+        secs = math.inf if deadline > 0 else -math.inf
+    if not secs > 0:
+        raise ValueError(message)
+    return secs
+
+
 @dataclass
 class SubstitutionTransition(Transition):
     """A [`Transition`][cpnx.Transition] that encapsulates an entire sub-PetriNet (Hierarchical CPN).
@@ -666,15 +687,51 @@ class SubstitutionTransition(Transition):
     `SubstitutionTransition` delegates firing to a nested [`PetriNet`][cpnx.PetriNet] (the
     `subnet`): named port places inside the subnet are bound to named socket places in the
     parent net via `port_socket_map`, and `subnet_deadline_secs` bounds how long the subnet
-    is given to reach quiescence. The child subnet is fully insulated from the parent net —
-    it carries no reference to its parent. Communication occurs strictly through the
-    `port_socket_map`.
+    is given to reach quiescence. Tokens move strictly through the `port_socket_map`. The
+    subnet holds one weak reference to its parent net, which `add_transition` sets. It is used
+    to stop the subnet's work when an enclosing firing fails, to tell the parent when a failed
+    firing has settled, and to reject a subnet that would enclose its own parent or belong to
+    two nets.
+
+    A firing is all-or-nothing as far as the subnet is concerned. Firings of one
+    `SubstitutionTransition` run one at a time, so each collects only its own outputs. A firing
+    selected while another is in progress waits for it on a worker thread. The
+    firing fails if a port rejects a deposited token, the subnet raises, the subnet has not
+    finished by its bound (`subnet_deadline_secs` on the wall clock,
+    the parent's [`drive_to_quiescence`][cpnx.PetriNet.drive_to_quiescence] `max_ticks` on the
+    logical clock, applied to each firing), or the parent cannot commit the outputs. The subnet has finished once it is
+    quiescent, or once nothing can fire at the current time or any finite later time (a
+    token parked at `available_at = inf` never becomes available). The parent's consumed tokens are then
+    rolled back as for any transition, and every subnet place except resource pools and
+    [`SinkPlace`][cpnx.SinkPlace]s is restored to its marking from before the firing. The
+    rollback reaches nested subnets: a `SubstitutionTransition` inside the subnet that
+    committed during the failed firing has its own subnet restored too.
+    Resource permits are not restored. The firings that borrowed them return them, so each
+    pool the subnet owns keeps its capacity and any cooldown the failed firing started. Two
+    exceptions: a `ResourcePlace` mapped as a port still gains the parent's permit copy on each
+    failed firing, and a permit one transition moves into another pool, for a later transition
+    to return, stays there if the firing fails in between. A firing that commits
+    leaves the subnet as it reached it, so a subnet may keep state across firings.
+
+    Callbacks on the subnet (`on_transition_fired`, `on_token_deposited`) report its internal
+    firings as they commit, and a later restore does not retract them: treat them as provisional
+    until the enclosing firing commits.
+
+    The restore happens only once the subnet has settled. An action of the failed firing
+    still running cannot be stopped: it finishes and commits through its own arcs inside the
+    subnet, and only then is the subnet restored, so nothing it holds (a permit, a recipe
+    card, a one-token machine) is ever put back while in use. Work the failed firing had
+    queued, in the subnet or in any subnet below it, is not started: it hands its tokens back
+    without retrying, dead-lettering or reporting an error. Until the subnet settles, the parent is not
+    quiescent, and the next firing waits up to `subnet_deadline_secs` for it, then fails
+    without depositing anything. That wait runs from the failure or from the firing's arrival,
+    whichever is later, so firings queued together share one wait.
 
     A subnet instance may only be wrapped by one `SubstitutionTransition` at a
     time; this is tracked process-wide via a weak set. Attempting to wrap the same subnet
-    twice raises `ValueError`. Constructing with a non-dict `port_socket_map`, or with
-    non-string port/socket names, raises `TypeError`. Referencing a port place that does not
-    exist in the subnet raises `ValueError`.
+    twice raises `ValueError`, and reassigning `subnet` raises `AttributeError`. Constructing
+    with a non-dict `port_socket_map`, or with non-string port/socket names, raises `TypeError`.
+    Referencing a port place that does not exist in the subnet raises `ValueError`.
 
     Attributes:
         subnet: The nested `PetriNet` this transition wraps and fires as a unit.
@@ -682,14 +739,25 @@ class SubstitutionTransition(Transition):
                          (in the parent net). Every key must name a place that already
                          exists in `subnet`. Defaults to an empty dict.
         subnet_deadline_secs: Maximum wall-clock seconds allowed for the subnet to reach
-                         quiescence when this transition fires. Defaults to `30.0`.
+                         quiescence when this transition fires. A subnet still short of
+                         quiescence at the deadline fails the firing. A firing first waits up
+                         to the same bound for the subnet to settle from an earlier failed
+                         firing, on either clock; firings queued together share that wait.
+                         It bounds the firing, not the parent's
+                         `run()`, which waits for a failed firing's still-running action;
+                         set `action_timeout_secs` on subnet actions that may hang. `None`
+                         removes both bounds, so a hung subnet action then holds this
+                         transition, and the parent's shutdown, indefinitely. Must be a
+                         positive number or `None`, checked on assignment too, and is stored
+                         as a float. Defaults to `30.0`.
     """
 
     _mapped_subnets: ClassVar[weakref.WeakSet] = weakref.WeakSet()
 
     subnet: "PetriNet" = field(default=None)  # type: ignore[assignment]
     port_socket_map: dict[str, str] = field(default_factory=dict)
-    subnet_deadline_secs: float = 30.0
+    subnet_deadline_secs: float | None = 30.0
+    _firing_lock: "threading.Lock" = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         # Guard purity/inline-safety is handled by Transition.__setattr__ during field
@@ -715,3 +783,13 @@ class SubstitutionTransition(Transition):
                 f"SubstitutionTransition '{self.name}': child subnet is already mapped to another transition."
             )
         SubstitutionTransition._mapped_subnets.add(self.subnet)
+
+    def __setattr__(self, name, value):
+        if name == "subnet" and "subnet" in self.__dict__:
+            raise AttributeError(
+                f"SubstitutionTransition '{self.name}': subnet cannot be reassigned; wrap the new subnet in a "
+                "new SubstitutionTransition."
+            )
+        if name == "subnet_deadline_secs":
+            value = _check_subnet_deadline(self.name, value)
+        super().__setattr__(name, value)

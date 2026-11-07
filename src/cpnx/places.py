@@ -20,7 +20,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any
+from typing import Any, ClassVar
 
 from cpnx.tokens import AVAILABLE_NOW, Token
 
@@ -61,6 +61,10 @@ class _KeyIndex:
         self._heap: list[tuple[object, int]] = []
         self.disabled = False
         self._last_build: int = 0
+
+    def clear(self) -> None:
+        """Discard every entry, for a store that has just dropped all of its tokens."""
+        self._heap.clear()
 
     def add(self, seq: int, token: Token) -> bool:
         """Index *token* under *seq*. Returns ``False`` (and disables) if it cannot be keyed."""
@@ -407,6 +411,14 @@ class _TokenStore:
             if seq is not None:
                 self.drop(seq)
 
+    def drop_all(self) -> None:
+        """Remove every stored token, keeping key-index registrations but not their entries."""
+        for seq in [*self._ready, *self._cooling_by_seq]:
+            self.drop(seq)
+        self._seq_of.clear()
+        for index in self._key_indexes.values():
+            index.clear()
+
     def missing_identities(self, ids: set[int]) -> set[int]:
         """Return the subset of `id(token)` values in *ids* that are not currently stored."""
         return set(ids) - self._seq_of.keys()
@@ -475,6 +487,9 @@ class Place:
 
     All operations are thread-safe via an internal `threading.Lock`.
     """
+
+    _restorable: ClassVar[bool] = True
+    """Whether a failed substitution firing restores this place from its checkpoint."""
 
     def __init__(
         self,
@@ -706,6 +721,28 @@ class Place:
             t_limit = model_time if model_time is not None else time.monotonic()
             return self._store.take_available(len(self._store), t_limit)
 
+    def _return_token(self, token: Token) -> None:
+        """Put back a token this place gave up, unchanged and without re-applying any deposit rule."""
+        with self._lock:
+            self._store.append(token)
+
+    def _restore_tokens(self, tokens: tuple[Token, ...]) -> bool:
+        """Replace the contents with exactly *tokens*, bypassing colour, schema and pacing.
+
+        Used to roll a subnet back after a failed substitution firing; *tokens* is an earlier
+        `tokens` snapshot of this same place. Returns whether the contents changed.
+        """
+        if not self._restorable:
+            raise TypeError(f"{type(self).__name__} '{self.name}' is never restored from a checkpoint")
+        with self._lock:
+            current = self._store.iter_insertion_order()
+            if len(current) == len(tokens) and all(a is b for a, b in zip(current, tokens, strict=True)):
+                return False
+            self._store.drop_all()
+            for token in tokens:
+                self._store.append(token)
+            return True
+
     def peek(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Return up to *count* available tokens from the head without removing them.
 
@@ -895,6 +932,8 @@ class ResourcePlace(Place):
         gpu_pool = ResourcePlace("gpu_slots", capacity=4)
         ```
     """
+
+    _restorable: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -1199,6 +1238,8 @@ class SinkPlace(Place):
         colour will raise a `TypeError` inside the locked transition failure branch,
         causing the token to be lost rather than successfully dead-lettered.
     """
+
+    _restorable: ClassVar[bool] = False
 
     def __init__(
         self,

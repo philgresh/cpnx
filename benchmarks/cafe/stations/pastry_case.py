@@ -17,7 +17,9 @@ Demonstrates:
     that fixed per-firing overhead is charged once per food order. It is the only
     place in the corpus where engine cost is not proportional to a single action.
 
-    **Isolation, precisely.** The child subnet carries no reference to its parent —
+    **Isolation, precisely.** The child subnet holds one weak reference to its parent, used to
+    stop its work when an enclosing firing fails, to signal when a failed firing has settled,
+    and to reject a subnet that would enclose its parent or belong to two nets. Otherwise
     it is constructed, run, and drained as a wholly separate [`PetriNet`][cpnx.PetriNet] with its own
     lock, its own clock, its own thread pools. Communication crosses the boundary
     *only* through `port_socket_map`: a port place inside the subnet (`P_Pastry_In`,
@@ -219,8 +221,8 @@ def transitions(
         **Firing a [`SubstitutionTransition`][cpnx.SubstitutionTransition]**: `port_socket_map` binds the kitchen's
         `P_Pastry_In` to this net's `P_Food_Order` socket, and its `P_Pastry_Out` to
         `P_Served`. Each firing drives `build_kitchen_subnet()`'s three internal
-        transitions to quiescence (or to `subnet_deadline_secs`, whichever comes
-        first) before this transition can be said to have completed — see the module
+        transitions to quiescence before this transition can be said to have completed;
+        a kitchen still busy at `subnet_deadline_secs` fails the firing — see the module
         docstring for the performance questions that per-firing cost raises.
 
     Warning:
