@@ -3608,11 +3608,13 @@ class PetriNet:
         # `run()` returns only once quiescent, which a back-pressured subnet never is. A slice
         # shorter than `run()`'s own setup would end before its first step.
         slice_secs = max(subnet.cooldown_interval, _MIN_SUBNET_SLICE_SECS)
-        while not subnet._is_finished() and not self._aborted():
+        while not self._aborted():
             now = time.monotonic()
             if now >= end:
                 return
             subnet.run(deadline=min(end, now + slice_secs))
+            if subnet._is_finished():
+                return
 
     def _drive_subnet(self, transition: SubstitutionTransition) -> None:
         """Drive the subnet to quiescence in the parent's clock regime, raising if it gets stuck."""
