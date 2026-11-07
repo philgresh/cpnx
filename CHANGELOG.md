@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     firings shared the subnet's ports, so a firing could collect another's output. The surplus
     was dropped and the starved firing retried, so some orders were served twice and others
     never.
+  - **A subnet that produces more outputs than the parent's active output arcs take now fails
+    the firing** with `ValueError`, and the subnet is restored. The extra tokens used to be
+    dropped silently. Plain transitions are unchanged.
+  - **A port and socket that both declare a `color_set` must declare the same one.**
+    `add_transition`, `add_place` and `validate` raise `ValueError`. An undeclared colour set
+    still matches anything.
   - **A substitution transition cannot wrap the net it is in, or a net enclosing it, and one
     `SubstitutionTransition` cannot be in two nets at once.** `add_transition` raises
     `ValueError`. A substitution transition replaced by name in `add_transition` can then be
@@ -117,19 +123,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A token parked at `available_at = inf` no longer counts as pending work.**
+  [`is_quiescent`][cpnx.PetriNet.is_quiescent] used to report such a net as busy, so `run()`
+  waited out its deadline, or forever without one.
+- **A failed [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing no longer changes
+  how many permits a subnet pool holds** ([#38](https://github.com/philgresh/cpnx/issues/38)).
+  A `ResourcePlace` mapped as a port used to gain the parent's permit copy on every failed
+  firing, and a permit moved into another pool for a later transition to return stayed there,
+  starving the next firing. The restore now returns each pool to its pre-firing permit count,
+  and any cooldown the failed firing started keeps running.
 - **A failed [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing no longer leaves
   tokens inside its subnet** ([#38](https://github.com/philgresh/cpnx/issues/38)). The parent
   rolled back its own consumed tokens, but the copies deposited into the subnet's ports, and
   anything half-processed, stayed in the reused subnet. The next firing then brewed the stale
   order as well and returned it in place of its own. Now, if the firing fails for any reason,
-  every subnet place except resource pools and sinks is restored to its marking from before the
-  firing. The reasons are a port rejecting a deposit, the subnet raising, the subnet not
-  quiescing in time, or the parent being unable to commit the outputs. Resource permits are left
-  to the firings that borrowed them, so a pool the subnet owns keeps its capacity and any
-  cooldown the failed firing started (a `ResourcePlace` mapped as a port still gains the parent's
-  permit copy on each failed firing; one that times out used to drain it, and now leaves it there
-  too. A permit one transition moves into another pool for a later one to return stays there if
-  the firing fails in between). An
+  every subnet place except sinks is restored to its marking from before the firing, and a
+  resource pool gets back only its permit count. The reasons are a port rejecting a deposit, the subnet raising, the subnet not
+  quiescing in time, or the parent being unable to commit the outputs. An
   action of the failed firing still running when the subnet gives up finishes through its own
   arcs first: the restore waits until the subnet has settled, so nothing in use (a permit, a
   recipe card, a one-token machine) is ever put back twice, and work the failed firing had

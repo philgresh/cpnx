@@ -696,22 +696,23 @@ class SubstitutionTransition(Transition):
     A firing is all-or-nothing as far as the subnet is concerned. Firings of one
     `SubstitutionTransition` run one at a time, so each collects only its own outputs. A firing
     selected while another is in progress waits for it on a worker thread. The
-    firing fails if a port rejects a deposited token, the subnet raises, the subnet has not
+    firing fails if a port rejects a deposited token, the subnet raises, the subnet produces
+    more outputs than the active output arcs take (dropping them would lose tokens), the subnet has not
     finished by its bound (`subnet_deadline_secs` on the wall clock,
     the parent's [`drive_to_quiescence`][cpnx.PetriNet.drive_to_quiescence] `max_ticks` on the
     logical clock, applied to each firing), or the parent cannot commit the outputs. The subnet has finished once it is
     quiescent, or once nothing can fire at the current time or any finite later time (a
     token parked at `available_at = inf` never becomes available). The parent's consumed tokens are then
-    rolled back as for any transition, and every subnet place except resource pools and
+    rolled back as for any transition, and every subnet place except
     [`SinkPlace`][cpnx.SinkPlace]s is restored to its marking from before the firing. The
     rollback reaches nested subnets: a `SubstitutionTransition` inside the subnet that
     committed during the failed firing has its own subnet restored too.
-    Resource permits are not restored. The firings that borrowed them return them, so each
-    pool the subnet owns keeps its capacity and any cooldown the failed firing started. Two
-    exceptions: a `ResourcePlace` mapped as a port still gains the parent's permit copy on each
-    failed firing, and a permit one transition moves into another pool, for a later transition
-    to return, stays there if the firing fails in between. A firing that commits
-    leaves the subnet as it reached it, so a subnet may keep state across firings.
+    A resource pool gets back only its permit count. The firings that borrowed permits return
+    them, so each pool keeps any cooldown the failed firing started, the restore drops the
+    parent's permit copy from a `ResourcePlace` mapped as a port, and a permit one transition
+    moved into another pool, for a later transition to return, goes back to where it started.
+    A firing that commits leaves the subnet as it reached it, so a subnet may keep state across
+    firings.
 
     Callbacks on the subnet (`on_transition_fired`, `on_token_deposited`) report its internal
     firings as they commit, and a later restore does not retract them: treat them as provisional
@@ -731,7 +732,12 @@ class SubstitutionTransition(Transition):
     time; this is tracked process-wide via a weak set. Attempting to wrap the same subnet
     twice raises `ValueError`, and reassigning `subnet` raises `AttributeError`. Constructing
     with a non-dict `port_socket_map`, or with non-string port/socket names, raises `TypeError`.
-    Referencing a port place that does not exist in the subnet raises `ValueError`.
+    Referencing a port place that does not exist in the subnet raises `ValueError`. So does
+    a port and socket that both declare a colour set, if the two differ, since they are one
+    compound place: [`add_transition`][cpnx.PetriNet.add_transition],
+    [`add_place`][cpnx.PetriNet.add_place] and [`validate`][cpnx.PetriNet.validate] check it.
+    An undeclared colour set matches anything. A schema can still be stricter on one side; a
+    token the port's schema rejects fails the firing.
 
     Attributes:
         subnet: The nested `PetriNet` this transition wraps and fires as a unit.

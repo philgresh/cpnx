@@ -6,6 +6,7 @@ import itertools
 import math
 import operator
 import random
+import sys
 import threading
 import time
 import weakref
@@ -109,6 +110,9 @@ _EXHAUSTED = object()
 #: Widest product `_lazy_product` enumerates lazily. Its recursion is one generator frame per
 #: stream, so a transition with hundreds of input arcs would hit `RecursionError`.
 _LAZY_PRODUCT_MAX_STREAMS = 32
+_LAST_FINITE_TIME = sys.float_info.max
+"""The horizon of a timing-ignoring probe: past every finite time, short of a token parked at `inf`."""
+
 _MIN_SUBNET_SLICE_SECS = 0.05
 
 
@@ -998,11 +1002,15 @@ class PetriNet:
                    `ThresholdPlace`/`SinkPlace` instance.
 
         Raises:
-            ValueError: If `place.name` is already registered as a transition name.
+            ValueError: If `place.name` is already registered as a transition name, or the
+                place is a socket whose colour set differs from its port's.
         """
         with self._lock:
             if place.name in self.transitions:
                 raise ValueError(f"Name overlap: '{place.name}' is already registered as a Transition.")
+            for transition in self.transitions.values():
+                if isinstance(transition, SubstitutionTransition):
+                    self._reject_port_colour_mismatch(transition, {place.name: place})
             self.places[place.name] = place
             if isinstance(place, PacedResourcePlace):
                 self._has_timed_features = True
@@ -1032,7 +1040,8 @@ class PetriNet:
         Raises:
             ValueError: If `transition.name` is already registered as a place name, or if
                 `transition` is a [`SubstitutionTransition`][cpnx.SubstitutionTransition] whose
-                subnet is this net, encloses it, or is already wrapped in another net.
+                subnet is this net, encloses it, or is already wrapped in another net, or with
+                a port whose colour set differs from its socket's.
             TypeError: If one of the transition's arcs targets another transition's name
                 instead of a place.
         """
@@ -1040,6 +1049,7 @@ class PetriNet:
             self._validate_new_transition(transition)
             if isinstance(transition, SubstitutionTransition):
                 self._reject_subnet_link(transition)
+                self._reject_port_colour_mismatch(transition, self.places)
             self._unlink_replaced(self.transitions.get(transition.name))
             self.transitions[transition.name] = transition
             if isinstance(transition, SubstitutionTransition):
@@ -1074,6 +1084,23 @@ class PetriNet:
             )
         ):
             raise ValueError(f"SubstitutionTransition '{transition.name}': its subnet already belongs to another net.")
+
+    @staticmethod
+    def _reject_port_colour_mismatch(transition: SubstitutionTransition, sockets: dict[str, Place]) -> None:
+        """Raise if a port and a socket in *sockets* declare different colour sets.
+
+        A port and its socket are one compound place, so they have one colour set. An undeclared
+        colour set accepts any colour and matches whatever the other side declares.
+        """
+        for port_name, socket_name in transition.port_socket_map.items():
+            port, socket = transition.subnet.places.get(port_name), sockets.get(socket_name)
+            if port is None or socket is None or port.color_set is None or socket.color_set is None:
+                continue
+            if set(port.color_set) != set(socket.color_set):
+                raise ValueError(
+                    f"SubstitutionTransition '{transition.name}': port '{port_name}' and socket "
+                    f"'{socket_name}' declare different colour sets."
+                )
 
     def _unlink_replaced(self, replaced: Transition | None) -> None:
         """Drop the subnet link of a substitution transition that `add_transition` is replacing."""
@@ -1527,7 +1554,8 @@ class PetriNet:
         implicit path.
 
         Raises:
-            ValueError: If a name is registered as both a place and a transition.
+            ValueError: If a name is registered as both a place and a transition, or a
+                port and its socket declare different colour sets.
             TypeError: If a transition's arc targets another transition's name.
             KeyError: If a transition's arc references a place that has not been
                 registered via [`add_place`][cpnx.PetriNet.add_place].
@@ -1544,6 +1572,8 @@ class PetriNet:
 
             for name, transition in self.transitions.items():
                 self._validate_transition_arcs(name, transition)
+                if isinstance(transition, SubstitutionTransition):
+                    self._reject_port_colour_mismatch(transition, self.places)
 
     def _wait_for_work(self, deadline: float | None, stop_event: threading.Event | None) -> None:
         timeout = self.cooldown_interval
@@ -1730,7 +1760,9 @@ class PetriNet:
         in-flight transitions (including those still running in a subnet whose firing failed,
         until it has settled and been restored) and treats time-gated tokens (cooldowns, settle
         windows) as if they were already present — so the net is not considered quiescent merely because
-        work is temporarily blocked by timing. This is the condition [`run`][cpnx.PetriNet.run]
+        work is temporarily blocked by timing. A token parked at `available_at = inf`, as a
+        saturated [`RetryPolicy`][cpnx.RetryPolicy] leaves one, stays out of this: nothing ever
+        releases it, so it is no pending work. This is the condition [`run`][cpnx.PetriNet.run]
         loops until.
 
         Returns:
@@ -2041,7 +2073,8 @@ class PetriNet:
             arc: The input arc whose source place is inspected.
             place: The source place, or `None` if unregistered.
             m_time: The current model time (used when `ignore_timing` is `False`).
-            ignore_timing: When `True`, treat cooling-down/not-yet-settled tokens as available
+            ignore_timing: When `True`, treat cooling-down/not-yet-settled tokens as available,
+                except a token parked at `available_at = inf`, which nothing ever releases
                 (used by [`is_quiescent`][cpnx.PetriNet.is_quiescent]).
             cap: How many ordered tokens the caller can actually consume (see
                 `_gather_arc_pools`). An upper bound on what a bounded FIFO peek or a
@@ -2056,7 +2089,7 @@ class PetriNet:
         """
         if place is None:
             return None
-        t_limit = float("inf") if ignore_timing else m_time
+        t_limit = _LAST_FINITE_TIME if ignore_timing else m_time
         if not place.can_retrieve(arc.count, model_time=t_limit):
             return None
         if not ignore_timing and not self._is_settle_time_met(place, arc):
@@ -2275,7 +2308,7 @@ class PetriNet:
             return (arc, tokens)
         if place is None:
             return None
-        t_limit = float("inf") if ignore_timing else m_time
+        t_limit = _LAST_FINITE_TIME if ignore_timing else m_time
         if not place.can_retrieve(arc.count, model_time=t_limit):
             return None
         if not ignore_timing and not self._is_settle_time_met(place, arc):
@@ -3285,9 +3318,9 @@ class PetriNet:
     def _is_finished(self) -> bool:
         """Return whether no transition can fire at the current time or any finite later time.
 
-        `is_quiescent` counts every time-gated token as eventually available, including one
-        parked at `available_at = inf` by a saturated `RetryPolicy`. Nothing ever releases such
-        a token, so a net holding one is in a timed dead marking and has finished.
+        Wider than `is_quiescent`, which ignores output back-pressure: a transition with a
+        consumable binding but a full output place is potentially enabled, yet can never fire
+        if nothing drains that place.
         """
         if self.is_quiescent():
             return True
@@ -3298,24 +3331,25 @@ class PetriNet:
         return self._next_availability_boundary() is None and self.is_dead()
 
     def _checkpoint_marking(self) -> dict[str, tuple[Token, ...]]:
-        """Snapshot the places a purge restores: every place except resource pools and sinks."""
+        """Snapshot the places a rollback touches: every place except sinks."""
         with self._lock:
-            return {name: place.tokens for name, place in self.places.items() if place._restorable}
+            return {name: place.tokens for name, place in self.places.items() if not isinstance(place, SinkPlace)}
 
     def _restore_marking(self, checkpoint: dict[str, tuple[Token, ...]]) -> None:
         """Put each checkpointed place back to its checkpointed tokens.
 
         A token deposited into a restored place since the checkpoint is discarded, even one
         deposited from outside the subnet, so a subnet should take input only through its ports.
-        Resource pools and sinks are left as they are: a permit borrowed and returned by one
-        transition has already come back through that firing's arcs, and a sink cannot enable
-        anything. A permit one transition moves into another pool for a later transition to
-        return stays where the failed firing left it. The clock is not moved; checkpointed
-        tokens were available then and the clock has only advanced.
+        A resource pool gets back only its permit count: a permit borrowed and returned by one
+        transition has already come back through that firing's arcs, with any cooldown it
+        started, so this drops a port's copy of a parent permit and puts back a permit one
+        transition moved into another pool for a later transition to return. A sink is left
+        as it is, because it cannot enable anything. The clock is not moved; checkpointed tokens
+        were available then and the clock has only advanced.
         """
         with self._lock:
             for name, tokens in checkpoint.items():
-                if not self.places[name]._restore_tokens(tokens):
+                if not self.places[name]._roll_back_to(tokens):
                     continue
                 self._mark_dirty(name)
                 for token in tokens:
@@ -3436,6 +3470,20 @@ class PetriNet:
         return None
 
     @staticmethod
+    def _verify_no_surplus_outputs(
+        transition_name: str, active_outputs: list[tuple[OutputArc, bool]], out_count: int
+    ) -> ValueError | None:
+        """Refuse subnet outputs the parent's arcs cannot take: dropping them would lose tokens."""
+        data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)
+        if out_count > data_demand:
+            return ValueError(
+                f"SubstitutionTransition '{transition_name}': subnet produced {out_count} output "
+                f"token(s) but active non-resource output arcs take {data_demand}, leaving "
+                f"{out_count - data_demand} surplus."
+            )
+        return None
+
+    @staticmethod
     def _build_deposit_plan(
         active_outputs: list[tuple[OutputArc, bool]],
         res_deque: deque[Token],
@@ -3490,6 +3538,8 @@ class PetriNet:
         out_deque: deque[Token],
     ) -> tuple[list[tuple[str, Token]], Exception | None]:
         demand_err = self._verify_token_demand(transition.name, active_outputs, len(res_deque), len(out_deque))
+        if demand_err is None and isinstance(transition, SubstitutionTransition):
+            demand_err = self._verify_no_surplus_outputs(transition.name, active_outputs, len(out_deque))
         if demand_err:
             return [], demand_err
 

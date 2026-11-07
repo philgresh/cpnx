@@ -395,9 +395,10 @@ enabled at any future time.  A net with tokens whose `available_at > current_tim
 is time-blocked, not dead.
 
 **Implementation:** [`engine.py:390-407`](../src/cpnx/engine.py)
-`is_quiescent()` calls `_is_transition_potentially_enabled()` with
-`model_time=float("inf")` — so it *does* consider tokens in cooldown as
-potentially-available.  This is documented as intentional for `PacedResourcePlace`.
+`is_quiescent()` calls `_is_transition_potentially_enabled()` with `model_time`
+set to the last finite time — so it *does* consider tokens in cooldown as
+potentially-available, but not a token parked at `available_at = inf`.  This is
+documented as intentional for `PacedResourcePlace`.
 
 However, `is_dead()` ([`engine.py:423-435`](../src/cpnx/engine.py)) uses
 `_is_transition_enabled()` with the current model time.  If time has not been
