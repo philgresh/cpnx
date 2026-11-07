@@ -655,6 +655,7 @@ class PetriNet:
         self.places: dict[str, Place] = {}
         self.transitions: dict[str, Transition] = {}
         self._running_count = 0
+        self._drive_limits: dict[str, int] = {}
         self._nested_undo: list[_NestedUndo] | None = None
         self._pending_restore: tuple[dict[str, tuple[Token, ...]], list[_NestedUndo], float] | None = None
         self._settle_lock = threading.Lock()
@@ -1647,13 +1648,15 @@ class PetriNet:
 
         Args:
             max_ticks: Safety cap on logical-clock advances, so a pathological net cannot loop
-                forever.
+                forever. Each [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing passes
+                it to its subnet's drive as that firing's own cap, and a subnet that hits the cap
+                fails the firing.
             max_spins: Safety cap on the per-firing barrier that awaits each in-flight action, and
                 on the wait for a subnet to settle after a failed substitution firing. The
                 default suits the fast (~microsecond) actions this driver is built for; raise it for
                 nets whose actions legitimately block for longer, so a slow-but-healthy action is
                 not mistaken for a hung one. It counts spins, so how long it lasts depends on the
-                machine; it is not a time bound.
+                machine; it is not a time bound. It is passed to subnet drives as `max_ticks` is.
 
         Returns:
             A [`DriveResult`][cpnx.DriveResult] with the number of firings and clock advances.
@@ -1669,6 +1672,14 @@ class PetriNet:
         if self._model_time is None:
             self.advance_time(math.nextafter(self.model_time, math.inf))
 
+        self._drive_limits = {"max_ticks": max_ticks, "max_spins": max_spins}
+        try:
+            return self._drive_logical_clock(max_ticks, max_spins)
+        finally:
+            self._drive_limits = {}
+
+    def _drive_logical_clock(self, max_ticks: int, max_spins: int) -> DriveResult:
+        """Fire and advance until a fixed point or *max_ticks*; see `drive_to_quiescence`."""
         steps = 0
         ticks = 0
         while ticks < max_ticks:
@@ -3642,14 +3653,14 @@ class PetriNet:
         #     real cooldowns are genuinely waited out — the correct production semantics.
         #
         # `subnet_deadline_secs` bounds the drive only on the wall-clock path (`None`: unbounded); a
-        # logically-driven subnet is bounded by `drive_to_quiescence`'s own `max_ticks`/`max_spins`.
+        # logically-driven subnet is bounded by the parent's `drive_to_quiescence` limits, per firing.
         # A subnet left short of quiescence by either bound fails the firing. See `tests/test_subnet.py`,
         # `tests/test_subnet_failure.py` and `benchmarks/bench_subnet.py`.
         with self._lock:
             parent_on_logical_clock = self._model_time is not None
         try:
             if parent_on_logical_clock:
-                ticks = subnet.drive_to_quiescence().ticks
+                ticks = subnet.drive_to_quiescence(**self._drive_limits).ticks
             else:
                 self._run_subnet(subnet, transition.subnet_deadline_secs)
         except Exception:

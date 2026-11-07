@@ -16,7 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   - **A subnet that does not reach quiescence now fails the firing.** That covers a wall-clock
     subnet still busy at `subnet_deadline_secs` (`TimeoutError`) and a logical-clock subnet that
-    hits `drive_to_quiescence`'s `max_ticks` (`RuntimeError`). Before, the parent took whatever
+    hits the `max_ticks` of the parent's `drive_to_quiescence` (`RuntimeError`). Each firing's
+    subnet drive now gets the parent's `max_ticks` and `max_spins`; it used to run on the
+    defaults, whatever the parent was given. Before, the parent took whatever
     had reached the output ports. If that was enough to commit, the leftover work came out in a
     later firing. The parent's `on_error` now reports why, where it used to get a "returned 0
     non-resource token(s)" error. A subnet left holding only tokens parked at

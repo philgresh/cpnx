@@ -106,6 +106,12 @@ def _wait_until_settled(net: PetriNet, timeout: float = 5.0) -> None:
     assert net._pending_restore is None and net._running_count == 0, "the subnet never settled"
 
 
+def _cap_drive(net: PetriNet, **limits: int) -> None:
+    """Hold *net*'s subnet drive to *limits*, over whatever its parent passes down."""
+    drive = net.drive_to_quiescence
+    net.drive_to_quiescence = lambda **passed: drive(**{**passed, **limits})
+
+
 def _collect_errors(net: PetriNet) -> list[Exception]:
     errors: list[Exception] = []
     net.on_error = lambda _name, exc, _token: errors.append(exc)
@@ -151,7 +157,7 @@ def _fail_then_serve(parent: PetriNet, subnet: PetriNet, grinder: _Grinder, reci
 def test_logical_subnet_over_its_tick_cap_is_purged():
     grinder = _Grinder(jammed=True)
     parent, subnet, recipe = _cafe(grinder)
-    subnet.drive_to_quiescence = functools.partial(subnet.drive_to_quiescence, max_ticks=5)
+    _cap_drive(subnet, max_ticks=5)
     errors = _collect_errors(parent)
     _fail_then_serve(parent, subnet, grinder, recipe, logical=True)
     assert len(errors) == 1
@@ -1400,7 +1406,9 @@ def test_logical_drive_stops_new_work_two_levels_down():
     )
     first_drive = itertools.count()
     drive_front = front.drive_to_quiescence
-    front.drive_to_quiescence = lambda: drive_front(max_spins=2000 if next(first_drive) == 0 else 10_000_000)
+    front.drive_to_quiescence = lambda **limits: drive_front(
+        **{**limits, "max_spins": 2000 if next(first_drive) == 0 else 10_000_000}
+    )
     parent = PetriNet(
         places=[Place("Queue"), Place("Served")],
         transitions=[
@@ -1658,7 +1666,7 @@ def test_logical_drive_returns_only_once_its_subnet_has_settled():
         places=[Place("Orders"), Place("Ready")],
         transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], slow)],
     )
-    subnet.drive_to_quiescence = functools.partial(subnet.drive_to_quiescence, max_spins=2000)
+    _cap_drive(subnet, max_spins=2000)
     parent = PetriNet(
         places=[Place("Queue"), Place("Served")],
         transitions=[
@@ -1955,7 +1963,7 @@ def test_logical_drive_raises_when_a_subnet_will_not_settle_in_time():
         places=[Place("Orders"), Place("Ready")],
         transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], slow)],
     )
-    subnet.drive_to_quiescence = functools.partial(subnet.drive_to_quiescence, max_spins=2000)
+    _cap_drive(subnet, max_spins=2000)
     parent = PetriNet(
         places=[Place("Queue"), Place("Served")],
         transitions=[
@@ -2278,7 +2286,7 @@ def test_nested_drive_that_raises_after_an_enclosing_failure_reports_nothing():
         raise RuntimeError("station drive gave up")
 
     station.drive_to_quiescence = station_drive
-    front.drive_to_quiescence = functools.partial(front.drive_to_quiescence, max_spins=2000)
+    _cap_drive(front, max_spins=2000)
     parent = PetriNet(
         places=[Place("Queue"), Place("Served")],
         max_workers=1,
@@ -2382,3 +2390,74 @@ def test_firing_parked_before_the_failure_gets_a_full_bound_to_wait_out_a_stragg
     # Which order takes the lock first is up to the scheduler: exactly one is the failed firing.
     assert len(_served(parent)) == 1
     assert len(parent.marking["failed"]) == 1
+
+
+def _paced_kitchen() -> tuple[PetriNet, PetriNet]:
+    """Serving five orders takes the kitchen four clock advances, one per cooldown."""
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Ready"), PacedResourcePlace("Grinder", capacity=1, pacing_secs=1.0)],
+        transitions=[
+            Transition(
+                "Brew",
+                [InputArc("Orders"), InputArc("Grinder")],
+                [OutputArc("Ready")],
+                lambda tokens: [t for t in tokens if not t.is_resource],
+            )
+        ],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        transitions=[
+            SubstitutionTransition(
+                name="Cafe",
+                inputs=[InputArc("Queue", count=5)],
+                outputs=[OutputArc("Served", count=5)],
+                action=lambda tokens: tokens,
+                subnet=subnet,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                max_retries=0,
+            )
+        ],
+    )
+    for order in range(5):
+        parent.deposit("Queue", Token(payload={"order": order}))
+    return parent, subnet
+
+
+def test_parent_max_ticks_bounds_a_logical_subnet():
+    parent, _ = _paced_kitchen()
+    errors = _collect_errors(parent)
+    with parent:
+        parent.drive_to_quiescence(max_ticks=2)
+    assert _served(parent) == []
+    assert len(parent.marking["failed"]) == 5
+    assert len(errors) == 5, "on_error reports each rolled-back order"
+    assert all("after 2 clock advance" in str(error) for error in errors)
+
+
+def test_parent_drive_limits_reach_the_subnet_drive():
+    parent, subnet = _paced_kitchen()
+    seen: list[dict[str, int]] = []
+    drive = subnet.drive_to_quiescence
+
+    def recording_drive(**limits: int):
+        seen.append(limits)
+        return drive(**limits)
+
+    subnet.drive_to_quiescence = recording_drive
+    with parent:
+        parent.drive_to_quiescence(max_ticks=50, max_spins=5_000_000)
+    assert seen == [{"max_ticks": 50, "max_spins": 5_000_000}]
+    assert len(_served(parent)) == 5
+
+
+def test_drive_limits_do_not_outlive_the_drive():
+    """A later logical `run()` drives its subnets with the defaults, not the last drive's caps."""
+    parent, _ = _paced_kitchen()
+    with parent:
+        parent.drive_to_quiescence(max_ticks=2)
+        assert len(parent.marking["failed"]) == 5
+        for order in range(5, 10):
+            parent.deposit("Queue", Token(payload={"order": order}))
+        parent.run(deadline=time.monotonic() + 10.0)
+    assert sorted(_served(parent)) == [5, 6, 7, 8, 9]
