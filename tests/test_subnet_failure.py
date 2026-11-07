@@ -1295,7 +1295,7 @@ def test_outer_restore_waits_for_a_nested_subnet_to_settle():
 def test_net_with_an_unsettled_subnet_is_not_finished():
     _, front, kitchen = _stamping_front(_stamp, kitchen_deadline=1.0, front_deadline=1.0, orders=1)
     assert front._is_finished()
-    kitchen._pending_restore = (kitchen._checkpoint_marking(), [])
+    kitchen._pending_restore = (kitchen._checkpoint_marking(), [], time.monotonic())
     assert not front._is_finished()
     kitchen._pending_restore = None
 
@@ -1510,7 +1510,7 @@ def test_two_settle_attempts_restore_only_once():
         original(checkpoint)
 
     kitchen._restore_marking = slow_restore
-    kitchen._pending_restore = (kitchen._checkpoint_marking(), [])
+    kitchen._pending_restore = (kitchen._checkpoint_marking(), [], time.monotonic())
     first = threading.Thread(target=kitchen._try_settle)
     first.start()
     assert entered.wait(5.0)
@@ -1891,7 +1891,7 @@ def test_replacing_a_kitchen_by_name_releases_its_subnet():
     del second.transitions["Kitchen"]
     third = PetriNet(places=[Place("Queue"), Place("Served")], transitions=[station])
     assert kitchen._parent_net() is third
-    kitchen._pending_restore = (kitchen._checkpoint_marking(), [])
+    kitchen._pending_restore = (kitchen._checkpoint_marking(), [], time.monotonic())
     assert second.is_quiescent() and not third.is_quiescent()
     kitchen._pending_restore = None
 
@@ -2303,3 +2303,82 @@ def test_nested_drive_that_raises_after_an_enclosing_failure_reports_nothing():
     assert [t.payload["order"] for t in parent.marking["failed"]] == [1]
     assert front_errors == [] and dead_letters == []
     assert front.places["Spoiled"].stats()["absorbed"] == 0
+
+
+def _slow_kitchen(brew, *, deadline: float, workers: int) -> tuple[PetriNet, PetriNet]:
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Ready")],
+        transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], brew)],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        max_workers=workers,
+        transitions=[
+            SubstitutionTransition(
+                name="Cafe",
+                inputs=[InputArc("Queue")],
+                outputs=[OutputArc("Served")],
+                action=lambda tokens: tokens,
+                subnet=subnet,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                subnet_deadline_secs=deadline,
+                max_retries=0,
+            )
+        ],
+    )
+    return parent, subnet
+
+
+def test_firings_queued_behind_a_hung_action_share_one_settle_wait():
+    """Firings parked on the transition at the same time wait out one bound together, so a
+    backlog behind a hung action does not hold the parent's shutdown for N deadlines."""
+    deadline = 0.2
+    orders = 5
+    release = threading.Event()
+
+    def hung(tokens: list[Token]) -> list[Token]:
+        release.wait(10.0)
+        return tokens
+
+    parent, subnet = _slow_kitchen(hung, deadline=deadline, workers=orders)
+    failed_at: list[float] = []
+    done = threading.Event()
+
+    def on_error(_name: str, _exc: Exception, _token: Token | None) -> None:
+        failed_at.append(time.monotonic())
+        if len(failed_at) == orders:
+            done.set()
+
+    parent.on_error = on_error
+    with parent:
+        for order in range(orders):
+            parent.deposit("Queue", Token(payload={"order": order}))
+        try:
+            parent.run(deadline=time.monotonic() + 10.0, stop_event=done)
+            assert done.is_set()
+        finally:
+            release.set()
+        _wait_until_settled(subnet)
+    assert failed_at[-1] - failed_at[0] < 2.5 * deadline
+
+
+def test_firing_parked_before_the_failure_gets_a_full_bound_to_wait_out_a_straggler():
+    """The wait runs from the failure, not from when the firing arrived, so an order that
+    spent its bound parked behind the failed firing is not failed by a brief straggler."""
+    deadline = 0.2
+    first = threading.Event()
+
+    def brew(tokens: list[Token]) -> list[Token]:
+        if not first.is_set():
+            first.set()
+            time.sleep(deadline * 1.5)
+        return tokens
+
+    parent, subnet = _slow_kitchen(brew, deadline=deadline, workers=2)
+    with parent:
+        parent.deposit("Queue", Token(payload={"order": 1}))
+        parent.deposit("Queue", Token(payload={"order": 2}))
+        parent.run(deadline=time.monotonic() + 10.0)
+    # Which order takes the lock first is up to the scheduler: exactly one is the failed firing.
+    assert len(_served(parent)) == 1
+    assert len(parent.marking["failed"]) == 1

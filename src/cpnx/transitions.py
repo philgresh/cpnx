@@ -724,7 +724,8 @@ class SubstitutionTransition(Transition):
     queued, in the subnet or in any subnet below it, is not started: it hands its tokens back
     without retrying, dead-lettering or reporting an error. Until the subnet settles, the parent is not
     quiescent, and the next firing waits up to `subnet_deadline_secs` for it, then fails
-    without depositing anything.
+    without depositing anything. That wait runs from the failure or from the firing's arrival,
+    whichever is later, so firings queued together share one wait.
 
     A subnet instance may only be wrapped by one `SubstitutionTransition` at a
     time; this is tracked process-wide via a weak set. Attempting to wrap the same subnet
@@ -741,7 +742,8 @@ class SubstitutionTransition(Transition):
                          quiescence when this transition fires. A subnet still short of
                          quiescence at the deadline fails the firing. A firing first waits up
                          to the same bound for the subnet to settle from an earlier failed
-                         firing, on either clock. It bounds the firing, not the parent's
+                         firing, on either clock; firings queued together share that wait.
+                         It bounds the firing, not the parent's
                          `run()`, which waits for a failed firing's still-running action;
                          set `action_timeout_secs` on subnet actions that may hang. `None`
                          removes both bounds, so a hung subnet action then holds this

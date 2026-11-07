@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     for any running action in a flat net; `subnet_deadline_secs` bounds the firing, not the
     parent's `run()`. The next firing of the transition waits up to `subnet_deadline_secs` for
     it, then fails with `RuntimeError` without depositing anything, and that failure counts
-    toward `max_retries`. To bound a subnet action that may hang, set `action_timeout_secs` on
+    toward `max_retries`. Firings queued together share one wait, so a backlog behind a hung
+    action does not hold shutdown for one deadline per order. To bound a subnet action that may hang, set `action_timeout_secs` on
     it. `subnet_deadline_secs=None` removes both bounds, so a hung subnet action then holds the
     transition and the parent's shutdown indefinitely. Any other value must be a positive real
     number (`TypeError` for a non-number, `ValueError` otherwise), is checked on assignment too,

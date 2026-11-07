@@ -656,7 +656,7 @@ class PetriNet:
         self.transitions: dict[str, Transition] = {}
         self._running_count = 0
         self._nested_undo: list[_NestedUndo] | None = None
-        self._pending_restore: tuple[dict[str, tuple[Token, ...]], list[_NestedUndo]] | None = None
+        self._pending_restore: tuple[dict[str, tuple[Token, ...]], list[_NestedUndo], float] | None = None
         self._settle_lock = threading.Lock()
         self._closing = False
         self._parent: weakref.ref[PetriNet] | None = None
@@ -3169,11 +3169,12 @@ class PetriNet:
         action of the failed firing is still running.
         """
         subnet = transition.subnet
+        arrived = time.monotonic()
         with transition._firing_lock:
             start_time = time.monotonic()
             try:
                 bound = transition.subnet_deadline_secs
-                settled = subnet._await_settled(math.inf if bound is None else start_time + bound, self._aborted)
+                settled = subnet._await_settled(arrived, math.inf if bound is None else bound, self._aborted)
             except BaseException as exc:
                 return self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, exc)
             if self._aborted():
@@ -3211,7 +3212,7 @@ class PetriNet:
         failed firing that is still running and commits later is undone too.
         """
         with self._lock:
-            self._pending_restore = (checkpoint, journal)
+            self._pending_restore = (checkpoint, journal, time.monotonic())
         self._try_settle()
 
     def _try_settle(self) -> None:
@@ -3229,7 +3230,7 @@ class PetriNet:
                 pending = self._pending_restore
                 if pending is None or self._running_count or self._has_unsettled_subnet():
                     return
-            checkpoint, journal = pending
+            checkpoint, journal, _ = pending
             self._restore_marking(checkpoint)
             self._roll_back_nested(journal)
             with self._lock:
@@ -3242,10 +3243,15 @@ class PetriNet:
             parent._work_available.set()
             parent._try_settle()
 
-    def _await_settled(self, deadline: float, abandon: Callable[[], bool]) -> bool:
-        """Wait until no restore is pending on this subnet; `False` if *deadline* passes or *abandon*."""
-        while self._pending_restore is not None:
-            if time.monotonic() >= deadline or abandon():
+    def _await_settled(self, arrived: float, bound: float, abandon: Callable[[], bool]) -> bool:
+        """Wait until no restore is pending on this subnet; `False` if *bound* runs out or *abandon*.
+
+        The bound runs from the failure or from *arrived*, whichever is later. A firing that
+        arrived before the failure gets the full bound, however long it sat behind the failed
+        firing, and firings parked together share one wait instead of taking it in turn.
+        """
+        while (pending := self._pending_restore) is not None:
+            if time.monotonic() >= max(arrived, pending[2]) + bound or abandon():
                 return False
             time.sleep(0.001)
         return True
