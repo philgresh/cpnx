@@ -114,6 +114,19 @@ def test_dropping_a_port_copy_keeps_the_cooldown_a_failed_firing_started():
     assert pool.tokens == (cooling,)
 
 
+def test_a_shortfall_beside_a_port_copy_restores_only_the_missing_permits():
+    pool = ResourcePlace("Barista", capacity=3)
+    snapshot = pool.tokens
+    own, *moved = snapshot
+    pool._store.remove_identity(moved)
+    pool._store.append(replace(own, id="port-copy"))
+
+    assert pool._restore_permits(snapshot) is True
+
+    assert len(pool.tokens) == 3
+    assert len({id(token) for token in pool.tokens}) == 3
+
+
 def test_restoring_an_unchanged_pool_reports_no_change():
     pool = ResourcePlace("Barista", capacity=2)
     assert pool._restore_permits(pool.tokens) is False

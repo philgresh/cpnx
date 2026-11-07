@@ -703,7 +703,7 @@ class SubstitutionTransition(Transition):
     logical clock, applied to each firing), or the parent cannot commit the outputs. The subnet has finished once it is
     quiescent, or once nothing can fire at the current time or any finite later time (a
     token parked at `available_at = inf` never becomes available). The parent's consumed tokens are then
-    rolled back as for any transition, and every subnet place except resource pools and
+    rolled back as for any transition, and every subnet place except
     [`SinkPlace`][cpnx.SinkPlace]s is restored to its marking from before the firing. The
     rollback reaches nested subnets: a `SubstitutionTransition` inside the subnet that
     committed during the failed firing has its own subnet restored too.

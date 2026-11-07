@@ -489,7 +489,10 @@ class Place:
     """
 
     _restorable: ClassVar[bool] = True
-    """Whether a failed substitution firing restores this place from its checkpoint."""
+    """Whether `_restore_tokens` may replace this place's whole contents.
+
+    A sink is never restored, and a pool rolls back by count through `_roll_back_to`.
+    """
 
     def __init__(
         self,
@@ -744,7 +747,10 @@ class Place:
             return True
 
     def _roll_back_to(self, tokens: tuple[Token, ...]) -> bool:
-        """Return this place to its `tokens` snapshot from a checkpoint; whether anything changed."""
+        """Return this place to its `tokens` snapshot from a checkpoint; whether anything changed.
+
+        Resource pools override this to restore only their permit count.
+        """
         return self._restore_tokens(tokens)
 
     def peek(self, count: int = 1, model_time: float | None = None) -> list[Token]:

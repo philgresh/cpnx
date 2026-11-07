@@ -137,14 +137,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rolled back its own consumed tokens, but the copies deposited into the subnet's ports, and
   anything half-processed, stayed in the reused subnet. The next firing then brewed the stale
   order as well and returned it in place of its own. Now, if the firing fails for any reason,
-  every subnet place except resource pools and sinks is restored to its marking from before the
-  firing. The reasons are a port rejecting a deposit, the subnet raising, the subnet not
-  quiescing in time, or the parent being unable to commit the outputs. Resource permits are left
-  to the firings that borrowed them, so a pool the subnet owns keeps its capacity and any
-  cooldown the failed firing started (a `ResourcePlace` mapped as a port still gains the parent's
-  permit copy on each failed firing; one that times out used to drain it, and now leaves it there
-  too. A permit one transition moves into another pool for a later one to return stays there if
-  the firing fails in between). An
+  every subnet place except sinks is restored to its marking from before the firing, and a
+  resource pool gets back only its permit count. The reasons are a port rejecting a deposit, the subnet raising, the subnet not
+  quiescing in time, or the parent being unable to commit the outputs. An
   action of the failed firing still running when the subnet gives up finishes through its own
   arcs first: the restore waits until the subnet has settled, so nothing in use (a permit, a
   recipe card, a one-token machine) is ever put back twice, and work the failed firing had
