@@ -1041,7 +1041,8 @@ class PetriNet:
             ValueError: If `transition.name` is already registered as a place name, or if
                 `transition` is a [`SubstitutionTransition`][cpnx.SubstitutionTransition] whose
                 subnet is this net, encloses it, or is already wrapped in another net, or with
-                a port whose colour set differs from its socket's.
+                a port whose colour set differs from its socket's, or a resource pool mapped as
+                a port that holds permits of its own.
             TypeError: If one of the transition's arcs targets another transition's name
                 instead of a place.
         """
@@ -1050,6 +1051,7 @@ class PetriNet:
             if isinstance(transition, SubstitutionTransition):
                 self._reject_subnet_link(transition)
                 self._reject_port_colour_mismatch(transition, self.places)
+                self._reject_filled_pool_port(transition)
             self._unlink_replaced(self.transitions.get(transition.name))
             self.transitions[transition.name] = transition
             if isinstance(transition, SubstitutionTransition):
@@ -1100,6 +1102,23 @@ class PetriNet:
                 raise ValueError(
                     f"SubstitutionTransition '{transition.name}': port '{port_name}' and socket "
                     f"'{socket_name}' declare different colour sets."
+                )
+
+    @staticmethod
+    def _reject_filled_pool_port(transition: SubstitutionTransition) -> None:
+        """Raise if a port is a resource pool that holds permits of its own.
+
+        A port and its socket are one compound place, so the permits behind a pool port are the
+        parent's. The subnet sees them only as the firing borrows them, which the port's empty
+        marking stands in for. A pool the subnet owns is an internal place: leave it unmapped.
+        """
+        for port_name in transition.port_socket_map:
+            port = transition.subnet.places.get(port_name)
+            if isinstance(port, ResourcePlace) and port.capacity > 0:
+                raise ValueError(
+                    f"SubstitutionTransition '{transition.name}': port '{port_name}' is a pool with "
+                    f"capacity {port.capacity}, but a port shares its socket's permits. Use capacity=0, "
+                    f"or leave the pool out of port_socket_map to keep it private to the subnet."
                 )
 
     def _unlink_replaced(self, replaced: Transition | None) -> None:
@@ -1554,8 +1573,9 @@ class PetriNet:
         implicit path.
 
         Raises:
-            ValueError: If a name is registered as both a place and a transition, or a
-                port and its socket declare different colour sets.
+            ValueError: If a name is registered as both a place and a transition, a port
+                and its socket declare different colour sets, or a resource pool mapped as
+                a port holds permits of its own.
             TypeError: If a transition's arc targets another transition's name.
             KeyError: If a transition's arc references a place that has not been
                 registered via [`add_place`][cpnx.PetriNet.add_place].
@@ -1574,6 +1594,7 @@ class PetriNet:
                 self._validate_transition_arcs(name, transition)
                 if isinstance(transition, SubstitutionTransition):
                     self._reject_port_colour_mismatch(transition, self.places)
+                    self._reject_filled_pool_port(transition)
 
     def _wait_for_work(self, deadline: float | None, stop_event: threading.Event | None) -> None:
         timeout = self.cooldown_interval
@@ -3647,10 +3668,24 @@ class PetriNet:
             if socket in parent_outputs:
                 port_place = subnet.places.get(port)
                 if port_place:
-                    # Retrieve all available tokens
-                    tokens = port_place.retrieve_all(model_time=subnet.model_time)
+                    # A pool port hands back every permit: its cooldown belongs to the socket.
+                    is_pool = isinstance(port_place, ResourcePlace)
+                    tokens = port_place.retrieve_all(model_time=_LAST_FINITE_TIME if is_pool else subnet.model_time)
                     output_tokens.extend(tokens)
         return output_tokens
+
+    @staticmethod
+    def _verify_no_surplus_permits(
+        transition_name: str, consumed_tokens: list[Token], output_tokens: list[Token]
+    ) -> None:
+        """Refuse permits the parent never lent: it returns the ones it consumed, so these would vanish."""
+        lent = sum(token.is_resource for token in consumed_tokens)
+        returned = sum(token.is_resource for token in output_tokens)
+        if returned > lent:
+            raise ValueError(
+                f"SubstitutionTransition '{transition_name}': subnet returned {returned} permit(s) "
+                f"through its ports but the firing borrowed {lent}."
+            )
 
     def _execute_substitution_transition(
         self,
@@ -3667,7 +3702,9 @@ class PetriNet:
         self._drive_subnet(transition)
 
         parent_outputs = [arc.place for arc in transition.outputs]
-        return self._retrieve_subnet_outputs(subnet, transition.port_socket_map, parent_outputs)
+        output_tokens = self._retrieve_subnet_outputs(subnet, transition.port_socket_map, parent_outputs)
+        self._verify_no_surplus_permits(transition.name, consumed_tokens, output_tokens)
+        return output_tokens
 
     def _run_subnet(self, subnet: "PetriNet", bound: float | None) -> None:
         """Run *subnet* on the wall clock until it has finished, for at most *bound* seconds."""

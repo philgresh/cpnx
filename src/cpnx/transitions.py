@@ -697,7 +697,8 @@ class SubstitutionTransition(Transition):
     `SubstitutionTransition` run one at a time, so each collects only its own outputs. A firing
     selected while another is in progress waits for it on a worker thread. The
     firing fails if a port rejects a deposited token, the subnet raises, the subnet produces
-    more outputs than the active output arcs take (dropping them would lose tokens), the subnet has not
+    more outputs than the active output arcs take, or more permits than the firing borrowed
+    (dropping them would lose tokens), the subnet has not
     finished by its bound (`subnet_deadline_secs` on the wall clock,
     the parent's [`drive_to_quiescence`][cpnx.PetriNet.drive_to_quiescence] `max_ticks` on the
     logical clock, applied to each firing), or the parent cannot commit the outputs. The subnet has finished once it is
@@ -713,6 +714,11 @@ class SubstitutionTransition(Transition):
     moved into another pool, for a later transition to return, goes back to where it started.
     A firing that commits leaves the subnet as it reached it, so a subnet may keep state across
     firings.
+
+    A port and its socket are one compound place, so a resource pool mapped as a port must have
+    `capacity=0`: the parent owns the permits, and the subnet holds one only while a firing has
+    borrowed it. A pool the subnet owns stays out of `port_socket_map`, and is limited by its
+    own capacity on top of the parent's.
 
     Callbacks on the subnet (`on_transition_fired`, `on_token_deposited`) report its internal
     firings as they commit, and a later restore does not retract them: treat them as provisional

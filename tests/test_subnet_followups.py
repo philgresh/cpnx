@@ -90,16 +90,6 @@ def test_failed_firings_leave_no_permit_copy_in_a_resource_port(logical):
     assert len(parent.marking["Staff"]) == 1
 
 
-@pytest.mark.parametrize("logical", [True, False], ids=["logical", "wall"])
-def test_a_resource_port_keeps_its_own_permits_through_a_failure(logical):
-    parent, subnet = _permit_port_cafe(_Jam(), ResourcePlace("Barista", capacity=2))
-    parent.deposit("Queue", _order(1))
-
-    _drive(parent, logical)
-
-    assert len(subnet.marking["Barista"]) == 2
-
-
 def test_dropping_a_port_copy_keeps_the_cooldown_a_failed_firing_started():
     """The copy is the permit that can go at once, so the one still cooling stays."""
     pool = PacedResourcePlace("Barista", capacity=1, pacing_secs=60.0)
@@ -357,3 +347,152 @@ def test_a_parent_run_with_a_parked_token_returns_without_its_deadline():
 
     assert time.monotonic() - started < 2.0
     assert len(net.marking["Queue"]) == 1
+
+
+# A port and its socket are one compound place (`CPN-COMPOUND`): the parent owns the permits.
+
+
+@pytest.mark.parametrize(
+    "pool",
+    [ResourcePlace("Barista", capacity=1), PacedResourcePlace("Barista", capacity=2, pacing_secs=1.0)],
+    ids=["same-capacity", "paced"],
+)
+def test_add_transition_rejects_a_pool_port_that_holds_permits(pool):
+    with pytest.raises(ValueError, match="Barista"):
+        _permit_port_cafe(_Jam(), pool)
+
+
+def test_validate_rejects_a_port_refilled_after_wrapping():
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Ready"), ResourcePlace("Barista", capacity=0)],
+        transitions=[],
+    )
+    kitchen = SubstitutionTransition(
+        "Kitchen",
+        [InputArc("Queue"), InputArc("Staff")],
+        [OutputArc("Served")],
+        action=lambda tokens: tokens,
+        subnet=subnet,
+        port_socket_map={"Orders": "Queue", "Barista": "Staff", "Ready": "Served"},
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served"), ResourcePlace("Staff", capacity=1)],
+        transitions=[kitchen],
+    )
+
+    subnet.add_place(ResourcePlace("Barista", capacity=1))
+
+    with pytest.raises(ValueError, match="Barista"):
+        parent.validate()
+
+
+@pytest.mark.parametrize("logical", [True, False], ids=["logical", "wall"])
+def test_committed_firings_leave_an_empty_pool_port_empty(logical):
+    jam = _Jam()
+    jam.on = False
+    parent, subnet = _permit_port_cafe(jam, ResourcePlace("Barista", capacity=0))
+    parent.deposit("Queue", _order(1))
+    parent.deposit("Queue", _order(2))
+
+    _drive(parent, logical)
+
+    assert _served(parent) == [1, 2]
+    assert subnet.marking["Barista"] == ()
+    assert len(parent.marking["Staff"]) == 1
+
+
+def test_a_cooling_permit_does_not_stay_behind_in_a_paced_port():
+    brew = Transition("Brew", [InputArc("Orders"), InputArc("Oven")], [OutputArc("Ready")], action=lambda t: [t[0]])
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Ready"), PacedResourcePlace("Oven", capacity=0, pacing_secs=60.0)],
+        transitions=[brew],
+    )
+    kitchen = SubstitutionTransition(
+        "Kitchen",
+        [InputArc("Queue"), InputArc("Staff")],
+        [OutputArc("Served")],
+        action=lambda tokens: tokens,
+        subnet=subnet,
+        port_socket_map={"Orders": "Queue", "Oven": "Staff", "Ready": "Served"},
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served"), ResourcePlace("Staff", capacity=1)],
+        transitions=[kitchen],
+    )
+    parent.deposit("Queue", _order(1))
+
+    parent.drive_to_quiescence()
+
+    assert _served(parent) == [1]
+    assert subnet.marking["Oven"] == ()
+    assert len(parent.marking["Staff"]) == 1
+
+
+@pytest.mark.parametrize("logical", [True, False], ids=["logical", "wall"])
+def test_a_private_pool_keeps_its_permits_across_committed_firings(logical):
+    brew = Transition("Brew", [InputArc("Orders"), InputArc("Barista")], [OutputArc("Ready")], action=lambda t: [t[0]])
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Ready"), ResourcePlace("Barista", capacity=2)],
+        transitions=[brew],
+    )
+    kitchen = SubstitutionTransition(
+        "Kitchen",
+        [InputArc("Queue")],
+        [OutputArc("Served")],
+        action=lambda tokens: tokens,
+        subnet=subnet,
+        port_socket_map={"Orders": "Queue", "Ready": "Served"},
+    )
+    parent = PetriNet(places=[Place("Queue"), Place("Served")], transitions=[kitchen])
+    parent.deposit("Queue", _order(1))
+    parent.deposit("Queue", _order(2))
+
+    _drive(parent, logical)
+
+    assert _served(parent) == [1, 2]
+    assert len(subnet.marking["Barista"]) == 2
+
+
+def test_a_private_permit_moved_into_a_port_fails_the_firing():
+    """The subnet hands out a permit the parent never lent it, which the parent has nowhere to put."""
+    brew = Transition(
+        "Brew",
+        [InputArc("Orders"), InputArc("Spare")],
+        [OutputArc("Ready"), OutputArc("Barista")],
+        action=lambda tokens: tokens,
+        max_retries=0,
+        auto_return_resources=False,
+    )
+    subnet = PetriNet(
+        places=[
+            Place("Orders"),
+            Place("Ready"),
+            ResourcePlace("Spare", capacity=1),
+            ResourcePlace("Barista", capacity=0),
+        ],
+        transitions=[brew],
+    )
+    kitchen = SubstitutionTransition(
+        "Kitchen",
+        [InputArc("Queue"), InputArc("Staff")],
+        [OutputArc("Served")],
+        action=lambda tokens: tokens,
+        subnet=subnet,
+        port_socket_map={"Orders": "Queue", "Barista": "Staff", "Ready": "Served"},
+        max_retries=0,
+    )
+    errors: list[Exception] = []
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served"), ResourcePlace("Staff", capacity=1)],
+        transitions=[kitchen],
+    )
+    parent.on_error = lambda _name, error, _token: errors.append(error)
+    parent.deposit("Queue", _order(1))
+
+    parent.drive_to_quiescence()
+
+    assert any("permit" in str(error) for error in errors)
+    assert _served(parent) == []
+    assert len(subnet.marking["Spare"]) == 1
+    assert subnet.marking["Barista"] == ()
+    assert len(parent.marking["Staff"]) == 1

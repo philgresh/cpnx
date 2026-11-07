@@ -126,6 +126,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A token parked at `available_at = inf` no longer counts as pending work.**
   [`is_quiescent`][cpnx.PetriNet.is_quiescent] used to report such a net as busy, so `run()`
   waited out its deadline, or forever without one.
+- **A resource pool mapped as a port shares its socket's permits**
+  ([#38](https://github.com/philgresh/cpnx/issues/38)). A committed firing used to empty a
+  `ResourcePlace` mapped as a port and silently discard its permits, so its capacity lasted one
+  firing, and a paced port could keep a cooling permit copy that added capacity to the next
+  firing. A port and its socket are one compound place (`CPN-COMPOUND`), so a pool port now
+  needs `capacity=0`; anything else raises `ValueError` from `add_transition` or `validate`. A
+  pool the subnet owns stays out of `port_socket_map`. A firing that returns more permits
+  through its ports than it borrowed now fails.
 - **A failed [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing no longer changes
   how many permits a subnet pool holds** ([#38](https://github.com/philgresh/cpnx/issues/38)).
   A `ResourcePlace` mapped as a port used to gain the parent's permit copy on every failed
