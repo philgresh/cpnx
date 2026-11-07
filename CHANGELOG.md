@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     firings shared the subnet's ports, so a firing could collect another's output. The surplus
     was dropped and the starved firing retried, so some orders were served twice and others
     never.
+  - **A subnet that produces more outputs than the parent's active output arcs take now fails
+    the firing** with `ValueError`, and the subnet is restored. The extra tokens used to be
+    dropped silently. Plain transitions are unchanged.
+  - **A port and socket that both declare a `color_set` must declare the same one.**
+    `add_transition`, `add_place` and `validate` raise `ValueError`. An undeclared colour set
+    still matches anything.
   - **A substitution transition cannot wrap the net it is in, or a net enclosing it, and one
     `SubstitutionTransition` cannot be in two nets at once.** `add_transition` raises
     `ValueError`. A substitution transition replaced by name in `add_transition` can then be
@@ -117,6 +123,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A token parked at `available_at = inf` no longer counts as pending work.**
+  [`is_quiescent`][cpnx.PetriNet.is_quiescent] used to report such a net as busy, so `run()`
+  waited out its deadline, or forever without one.
 - **A failed [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing no longer changes
   how many permits a subnet pool holds** ([#38](https://github.com/philgresh/cpnx/issues/38)).
   A `ResourcePlace` mapped as a port used to gain the parent's permit copy on every failed

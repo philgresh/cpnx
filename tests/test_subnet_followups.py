@@ -1,5 +1,11 @@
-"""Follow-ups to the subnet transaction of #38."""
+"""Follow-ups to the subnet transaction of #38: permits, surplus outputs, colour sets and parked tokens.
 
+Permits survive a failed firing (`CPN-PINV`), a firing conserves its outputs, a port and its
+socket share one colour set (`CPN-COMPOUND-COLSET`), and a token no finite time releases does
+not keep a net busy.
+"""
+
+import math
 import time
 from dataclasses import replace
 
@@ -168,3 +174,173 @@ def test_a_permit_moved_between_pools_comes_back_when_the_firing_fails(logical):
 
     assert _served(parent) == [2]
     assert len(subnet.marking["Oven"]) == 1
+
+
+def _copying_kitchen(copies: int, **arc) -> tuple[PetriNet, PetriNet, list[BaseException]]:
+    def brew(tokens: list[Token]) -> list[Token]:
+        return [tokens[0].evolve() for _ in range(copies)]
+
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Ready")],
+        transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready", count=copies)], action=brew)],
+    )
+    kitchen = SubstitutionTransition(
+        "Kitchen",
+        [InputArc("Queue")],
+        [OutputArc("Served", **arc)],
+        action=lambda tokens: tokens,
+        subnet=subnet,
+        port_socket_map={"Orders": "Queue", "Ready": "Served"},
+        max_retries=0,
+    )
+    parent = PetriNet(places=[Place("Queue"), Place("Served")], transitions=[kitchen])
+    errors: list[BaseException] = []
+    parent.on_error = lambda _name, error, _token: errors.append(error)
+    return parent, subnet, errors
+
+
+@pytest.mark.parametrize("logical", [True, False], ids=["logical", "wall"])
+def test_subnet_outputs_beyond_the_parent_demand_fail_the_firing(logical):
+    parent, subnet, errors = _copying_kitchen(2)
+    parent.deposit("Queue", _order(1))
+
+    _drive(parent, logical)
+
+    assert parent.marking["Served"] == ()
+    assert any("surplus" in str(error) for error in errors), errors
+    assert subnet.marking["Ready"] == ()
+    assert subnet.marking["Orders"] == ()
+
+
+def test_a_subnet_that_meets_the_parent_demand_exactly_commits():
+    parent, _subnet, errors = _copying_kitchen(2, count=2)
+    parent.deposit("Queue", _order(1))
+
+    parent.drive_to_quiescence()
+
+    assert _served(parent) == [1, 1]
+    assert errors == []
+
+
+def test_a_plain_transition_may_still_return_more_than_its_arcs_take():
+    def spill(tokens: list[Token]) -> list[Token]:
+        return [tokens[0], tokens[0]]
+
+    net = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        transitions=[Transition("Pour", [InputArc("Queue")], [OutputArc("Served")], action=spill)],
+    )
+    net.deposit("Queue", _order(1))
+
+    net.drive_to_quiescence()
+
+    assert _served(net) == [1]
+
+
+def _coloured_kitchen(port: frozenset | set | None) -> SubstitutionTransition:
+    subnet = PetriNet(places=[Place("Orders", color_set=port), Place("Ready")])
+    return SubstitutionTransition(
+        "Kitchen",
+        [InputArc("Queue")],
+        [OutputArc("Served")],
+        action=lambda tokens: tokens,
+        subnet=subnet,
+        port_socket_map={"Orders": "Queue", "Ready": "Served"},
+    )
+
+
+def test_add_transition_rejects_a_port_and_socket_with_different_colour_sets():
+    parent = PetriNet(places=[Place("Queue", color_set={"latte", "mocha"}), Place("Served")])
+
+    with pytest.raises(ValueError, match=r"Orders.*Queue.*colour set"):
+        parent.add_transition(_coloured_kitchen({"latte"}))
+
+    assert "Kitchen" not in parent.transitions
+
+
+def test_add_place_rejects_a_socket_whose_colour_set_differs_from_its_port():
+    parent = PetriNet()
+    parent.add_transition(_coloured_kitchen({"latte"}))
+
+    with pytest.raises(ValueError, match=r"Orders.*Queue.*colour set"):
+        parent.add_place(Place("Queue", color_set={"mocha"}))
+
+    assert "Queue" not in parent.places
+
+
+def test_validate_rejects_a_colour_set_changed_after_wrapping():
+    queue = Place("Queue", color_set={"latte"})
+    parent = PetriNet(places=[queue, Place("Served")])
+    parent.add_transition(_coloured_kitchen({"latte"}))
+    queue.color_set = {"mocha"}
+
+    with pytest.raises(ValueError, match="colour set"):
+        parent.validate()
+
+
+@pytest.mark.parametrize(
+    ("port", "socket"),
+    [({"latte"}, {"latte"}), (None, {"latte"}), ({"latte"}, None), (None, None)],
+    ids=["same", "untyped-port", "untyped-socket", "both-untyped"],
+)
+def test_matching_or_undeclared_colour_sets_are_accepted(port, socket):
+    parent = PetriNet(places=[Place("Queue", color_set=socket), Place("Served")])
+    parent.add_transition(_coloured_kitchen(port))
+    parent.validate()
+
+
+def _parked() -> Token:
+    return Token(payload={"order": 1}, available_at=math.inf)
+
+
+def _parked_net() -> PetriNet:
+    return PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        transitions=[Transition("Pour", [InputArc("Queue")], [OutputArc("Served")], action=lambda tokens: tokens)],
+    )
+
+
+def test_a_parked_token_leaves_a_net_quiescent():
+    net = _parked_net()
+    net.deposit("Queue", _parked())
+    assert net.is_quiescent()
+
+
+def test_a_token_cooling_for_a_finite_time_still_counts_as_pending():
+    net = _parked_net()
+    net.deposit("Queue", Token(payload={"order": 1}, available_at=1e300))
+    assert not net.is_quiescent()
+
+
+def test_a_parked_token_does_not_mask_real_work():
+    net = _parked_net()
+    net.deposit("Queue", _parked())
+    net.deposit("Queue", _order(2))
+    assert not net.is_quiescent()
+    net.drive_to_quiescence()
+    assert _served(net) == [2]
+    assert net.is_quiescent()
+
+
+def test_a_consume_all_arc_is_not_kept_busy_by_a_parked_token():
+    net = PetriNet(
+        places=[Place("Queue"), Place("Served")],
+        transitions=[
+            Transition(
+                "Pour", [InputArc("Queue", consume_all=True)], [OutputArc("Served")], action=lambda tokens: tokens[:1]
+            )
+        ],
+    )
+    net.deposit("Queue", _parked())
+    assert net.is_quiescent()
+
+
+def test_a_parent_run_with_a_parked_token_returns_without_its_deadline():
+    net = _parked_net()
+    net.deposit("Queue", _parked())
+
+    started = time.monotonic()
+    net.run(deadline=started + 5.0)
+
+    assert time.monotonic() - started < 2.0
+    assert len(net.marking["Queue"]) == 1
