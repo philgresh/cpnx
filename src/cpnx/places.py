@@ -931,7 +931,10 @@ class ResourcePlace(Place):
     This class is a Python shorthand — it sets the colour set and initial marking
     automatically and documents the resource-return invariant explicitly. It does not
     otherwise change [`Place`][cpnx.Place]'s behavior: all inherited methods (`deposit`,
-    `retrieve`, etc.) work exactly as on the base class.
+    `retrieve`, etc.) work exactly as on the base class. One exception: across a
+    [`SubstitutionTransition`][cpnx.SubstitutionTransition] boundary a port and its socket
+    must both be `ResourcePlace`s or neither, so a plain `Place` written as above does not
+    stand in for a pool on either side.
 
     Resource tokens (``color="resource"``) are consumed when a transition fires
     and must be returned via a matching output arc. This models finite resources

@@ -320,11 +320,12 @@ sequential, but cpnx now enforces the compound-place rules it can check at the b
 - A pool port must have `capacity=0`: its permits are the socket's.
 - A firing must hand back exactly the permit copies its pool ports were lent, and every
   pool port is emptied afterwards, so a firing neither mints nor loses permits.
-- A failed firing restores the subnet's marking (sinks excepted), so a rollback leaves no
-  trace of the half-run firing in the subnet.
+- A failed firing restores the subnet's marking (sinks excepted), and each pool's permit
+  count. Pools are restored by count only, so a cooldown the failed firing started keeps
+  running.
 
-The `SubstitutionTransition` docstring documents the sequential model and the quiescence
-wait.
+The `SubstitutionTransition` docstring documents the sequential model, the quiescence
+wait, and that the subnet's liveness must be checked on its own.
 
 ---
 
@@ -581,8 +582,9 @@ No semantic error, but users should be aware this guard is hidden inside the pla
 **Medium priority (documentation):**
 2. **Findings 1, 2, 3** — Add a `docs/cpn-alignment.md` (or section in README)
    explaining how cpnx arc expressions and guards differ from CPN theory, and why.
-3. **Finding 6** — Document that hierarchical execution is sequential (not compound-place
-   unfolding) and what that means for liveness analysis.
+3. ~~**Finding 6** — Document that hierarchical execution is sequential (not compound-place
+   unfolding) and what that means for liveness analysis.~~ **Done** in the
+   `SubstitutionTransition` docstring ([#38](https://github.com/philgresh/cpnx/issues/38)).
 4. **Finding 10** — Fix guard docstring in `Transition`.
 
 **Low priority (enhancements):**

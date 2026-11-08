@@ -47,11 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     still matches anything.
   - **A resource pool mapped as a port must have `capacity=0`, and a firing must hand back
     exactly the permit copies its ports were lent.** `add_transition` and `validate` raise
-    `ValueError` for a pool port with permits of its own, and `add_transition`, `add_place`
-    and `validate` raise it when only one of a port and its socket is a resource pool. A
-    firing whose subnet keeps a borrowed permit, or returns permits the parent never lent, now
-    fails with `ValueError` and the subnet is restored. See the shared-pool entry under
-    **Fixed** below.
+    `ValueError` for a pool port with permits of its own, and `add_transition`, `add_place` and
+    `validate` raise it when only one of a port and its socket is a resource pool. A plain
+    `Place(color_set={"resource"}, ...)` counts as not a pool here, although `ResourcePlace` is
+    otherwise shorthand for one. A firing whose subnet keeps a borrowed permit, or returns
+    permits the parent never lent, now fails with `ValueError` and the subnet is restored. See
+    the shared-pool entry under **Fixed** below.
   - **A substitution transition cannot wrap the net it is in, or a net enclosing it, and one
     `SubstitutionTransition` cannot be in two nets at once.** `add_transition` raises
     `ValueError`. A substitution transition replaced by name in `add_transition` can then be

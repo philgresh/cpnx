@@ -686,12 +686,15 @@ class SubstitutionTransition(Transition):
     Unlike a plain `Transition`, whose `action` is an arbitrary callable, a
     `SubstitutionTransition` delegates firing to a nested [`PetriNet`][cpnx.PetriNet] (the
     `subnet`): named port places inside the subnet are bound to named socket places in the
-    parent net via `port_socket_map`, and `subnet_deadline_secs` bounds how long the subnet
-    is given to reach quiescence. Tokens move strictly through the `port_socket_map`. The
-    subnet holds one weak reference to its parent net, which `add_transition` sets. It is used
-    to stop the subnet's work when an enclosing firing fails, to tell the parent when a failed
-    firing has settled, and to reject a subnet that would enclose its own parent or belong to
-    two nets.
+    parent net via `port_socket_map`, and `subnet_deadline_secs` bounds how long the subnet is
+    given to reach quiescence. Tokens move strictly through the `port_socket_map`. This is a
+    sequential handoff, not an unfolding into one flat net: the parent deposits into the ports,
+    the subnet runs to quiescence, and only then do its outputs come back, so subnet transitions
+    never interleave with the parent's. Check the subnet's own liveness separately: the parent
+    sees only whether each firing finishes. The subnet holds one weak reference to its parent
+    net, which `add_transition` sets. It is used to stop the subnet's work when an enclosing
+    firing fails, to tell the parent when a failed firing has settled, and to reject a subnet
+    that would enclose its own parent or belong to two nets.
 
     A firing is all-or-nothing as far as the subnet is concerned. Firings of one
     `SubstitutionTransition` run one at a time, so each collects only its own outputs. A firing
