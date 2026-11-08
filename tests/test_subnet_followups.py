@@ -362,6 +362,42 @@ def test_add_transition_rejects_a_pool_port_that_holds_permits(pool):
         _permit_port_cafe(_Jam(), pool)
 
 
+def test_add_transition_rejects_a_plain_port_on_a_pool_socket():
+    with pytest.raises(ValueError, match="'Barista'.*'Staff'"):
+        _permit_port_cafe(_Jam(), Place("Barista"))
+
+
+def test_add_transition_rejects_a_pool_port_on_a_plain_socket():
+    subnet = PetriNet(places=[Place("Orders"), ResourcePlace("Barista", capacity=0)], transitions=[])
+    kitchen = SubstitutionTransition(
+        "Kitchen",
+        [InputArc("Queue"), InputArc("Staff")],
+        [],
+        action=lambda tokens: tokens,
+        subnet=subnet,
+        port_socket_map={"Orders": "Queue", "Barista": "Staff"},
+    )
+
+    with pytest.raises(ValueError, match="'Barista'.*'Staff'"):
+        PetriNet(places=[Place("Queue"), Place("Staff")], transitions=[kitchen])
+
+
+def test_add_place_rejects_a_pool_socket_behind_a_plain_port():
+    subnet = PetriNet(places=[Place("Orders"), Place("Barista")], transitions=[])
+    kitchen = SubstitutionTransition(
+        "Kitchen",
+        [InputArc("Queue"), InputArc("Staff")],
+        [],
+        action=lambda tokens: tokens,
+        subnet=subnet,
+        port_socket_map={"Orders": "Queue", "Barista": "Staff"},
+    )
+    parent = PetriNet(places=[Place("Queue")], transitions=[kitchen])
+
+    with pytest.raises(ValueError, match="'Barista'.*'Staff'"):
+        parent.add_place(ResourcePlace("Staff", capacity=1))
+
+
 def test_validate_rejects_a_port_refilled_after_wrapping():
     subnet = PetriNet(
         places=[Place("Orders"), Place("Ready"), ResourcePlace("Barista", capacity=0)],

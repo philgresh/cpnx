@@ -715,12 +715,12 @@ class SubstitutionTransition(Transition):
     A firing that commits leaves the subnet as it reached it, so a subnet may keep state across
     firings.
 
-    A port and its socket are one compound place, so a resource pool mapped as a port must have
-    `capacity=0`: the parent owns the permits, and the subnet holds one only while a firing has
-    borrowed it. Every pool port is emptied after the firing, and the firing fails if the subnet
-    keeps a borrowed permit or returns one it was never lent, because the parent returns its own
-    permits either way. A pool the subnet owns stays out of `port_socket_map`, and is limited by
-    its own capacity on top of the parent's.
+    A port and its socket are one compound place, so a pool socket needs a pool port and the
+    reverse, and a resource pool mapped as a port must have `capacity=0`: the parent owns the
+    permits, and the subnet holds one only while a firing has borrowed it. Every pool port is
+    emptied after the firing, and the firing fails if the subnet keeps a borrowed permit or returns
+    one it was never lent, because the parent returns its own permits either way. A pool the subnet
+    owns stays out of `port_socket_map`, and is limited by its own capacity on top of the parent's.
 
     Callbacks on the subnet (`on_transition_fired`, `on_token_deposited`) report its internal
     firings as they commit, and a later restore does not retract them: treat them as provisional

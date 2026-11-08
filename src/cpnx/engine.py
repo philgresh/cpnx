@@ -1010,7 +1010,7 @@ class PetriNet:
                 raise ValueError(f"Name overlap: '{place.name}' is already registered as a Transition.")
             for transition in self.transitions.values():
                 if isinstance(transition, SubstitutionTransition):
-                    self._reject_port_colour_mismatch(transition, {place.name: place})
+                    self._reject_port_socket_mismatch(transition, {place.name: place})
             self.places[place.name] = place
             if isinstance(place, PacedResourcePlace):
                 self._has_timed_features = True
@@ -1041,8 +1041,9 @@ class PetriNet:
             ValueError: If `transition.name` is already registered as a place name, or if
                 `transition` is a [`SubstitutionTransition`][cpnx.SubstitutionTransition] whose
                 subnet is this net, encloses it, or is already wrapped in another net, or with
-                a port whose colour set differs from its socket's, or a resource pool mapped as
-                a port that holds permits of its own.
+                a port whose colour set differs from its socket's, a port that is a resource
+                pool when its socket is not (or the reverse), or a resource pool mapped as a port
+                that holds permits of its own.
             TypeError: If one of the transition's arcs targets another transition's name
                 instead of a place.
         """
@@ -1050,7 +1051,7 @@ class PetriNet:
             self._validate_new_transition(transition)
             if isinstance(transition, SubstitutionTransition):
                 self._reject_subnet_link(transition)
-                self._reject_port_colour_mismatch(transition, self.places)
+                self._reject_port_socket_mismatch(transition, self.places)
                 self._reject_filled_pool_port(transition)
             self._unlink_replaced(self.transitions.get(transition.name))
             self.transitions[transition.name] = transition
@@ -1088,15 +1089,24 @@ class PetriNet:
             raise ValueError(f"SubstitutionTransition '{transition.name}': its subnet already belongs to another net.")
 
     @staticmethod
-    def _reject_port_colour_mismatch(transition: SubstitutionTransition, sockets: dict[str, Place]) -> None:
-        """Raise if a port and a socket in *sockets* declare different colour sets.
+    def _reject_port_socket_mismatch(transition: SubstitutionTransition, sockets: dict[str, Place]) -> None:
+        """Raise if a port and a socket in *sockets* differ in kind or declare different colour sets.
 
-        A port and its socket are one compound place, so they have one colour set. An undeclared
-        colour set accepts any colour and matches whatever the other side declares.
+        A port and its socket are one compound place, so either both are resource pools or
+        neither is, and they have one colour set. An undeclared colour set accepts any colour and
+        matches whatever the other side declares.
         """
         for port_name, socket_name in transition.port_socket_map.items():
             port, socket = transition.subnet.places.get(port_name), sockets.get(socket_name)
-            if port is None or socket is None or port.color_set is None or socket.color_set is None:
+            if port is None or socket is None:
+                continue
+            if isinstance(port, ResourcePlace) != isinstance(socket, ResourcePlace):
+                pool, plain = (port_name, socket_name) if isinstance(port, ResourcePlace) else (socket_name, port_name)
+                raise ValueError(
+                    f"SubstitutionTransition '{transition.name}': port '{port_name}' and socket "
+                    f"'{socket_name}' are one place, but '{pool}' is a resource pool and '{plain}' is not."
+                )
+            if port.color_set is None or socket.color_set is None:
                 continue
             if set(port.color_set) != set(socket.color_set):
                 raise ValueError(
@@ -1574,8 +1584,8 @@ class PetriNet:
 
         Raises:
             ValueError: If a name is registered as both a place and a transition, a port
-                and its socket declare different colour sets, or a resource pool mapped as
-                a port holds permits of its own.
+                and its socket declare different colour sets, only one of them is a resource
+                pool, or a resource pool mapped as a port holds permits of its own.
             TypeError: If a transition's arc targets another transition's name.
             KeyError: If a transition's arc references a place that has not been
                 registered via [`add_place`][cpnx.PetriNet.add_place].
@@ -1593,7 +1603,7 @@ class PetriNet:
             for name, transition in self.transitions.items():
                 self._validate_transition_arcs(name, transition)
                 if isinstance(transition, SubstitutionTransition):
-                    self._reject_port_colour_mismatch(transition, self.places)
+                    self._reject_port_socket_mismatch(transition, self.places)
                     self._reject_filled_pool_port(transition)
 
     def _wait_for_work(self, deadline: float | None, stop_event: threading.Event | None) -> None:

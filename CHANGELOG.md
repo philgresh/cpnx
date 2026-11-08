@@ -47,9 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     still matches anything.
   - **A resource pool mapped as a port must have `capacity=0`, and a firing must hand back
     exactly the permit copies its ports were lent.** `add_transition` and `validate` raise
-    `ValueError` for a pool port with permits of its own. A firing whose subnet keeps a
-    borrowed permit, or returns permits the parent never lent, now fails with `ValueError` and
-    the subnet is restored. See the shared-pool entry under **Fixed** below.
+    `ValueError` for a pool port with permits of its own, and `add_transition`, `add_place`
+    and `validate` raise it when only one of a port and its socket is a resource pool. A
+    firing whose subnet keeps a borrowed permit, or returns permits the parent never lent, now
+    fails with `ValueError` and the subnet is restored. See the shared-pool entry under
+    **Fixed** below.
   - **A substitution transition cannot wrap the net it is in, or a net enclosing it, and one
     `SubstitutionTransition` cannot be in two nets at once.** `add_transition` raises
     `ValueError`. A substitution transition replaced by name in `add_transition` can then be
@@ -156,11 +158,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resource pool gets back only its permit count. The reasons are a port rejecting a deposit,
   the subnet raising, the subnet not quiescing in time, or the parent being unable to commit
   the outputs. An action of the failed firing still running when the subnet gives up finishes
-  through its own arcs first: the restore waits until the subnet has settled, so nothing in use (a permit, a
-  recipe card, a one-token machine) is ever put back twice, and work the failed firing had
-  queued, at any depth, is not started and reports nothing. A token deposited into a restored
-  subnet place during the failed firing is discarded with it, even one deposited from outside
-  the subnet. The rollback reaches nested subnets, and a place
+  through its own arcs first: the restore waits until the subnet has settled, so nothing in
+  use (a permit, a recipe card, a one-token machine) is ever put back twice, and work the
+  failed firing had queued, at any depth, is not started and reports nothing. A token
+  deposited into a restored subnet place during the failed firing is discarded with it, even
+  one deposited from outside the subnet. The rollback reaches nested subnets, and a place
   that holds the same `Token` object more than once is restored with exactly that many. A
   committed firing still leaves the subnet as it reached it, so subnets that keep state across
   firings, such as a batching port, are unaffected. `docs/cpn-invariants.json` now records the
