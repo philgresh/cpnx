@@ -237,6 +237,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   1–4% slower than before; avoiding that walk needs an index on the join key. Part of
   [#59](https://github.com/philgresh/cpnx/issues/59) (cause C).
 
+- **Consuming specific tokens no longer costs O(place size).** `retrieve_specific`, which
+  every firing uses for each arc that is not a `consume_all` drain, checked the requested ids
+  with `set(ids) - dict.keys()`, which walks every stored key. It now looks up only the
+  requested ids. `bench_guard_join.py`'s drive holds at about 145 µs/step from 4 000 to
+  16 000 jobs (was 161 → 240)
+  ([#65](https://github.com/philgresh/cpnx/issues/65)).
+
 ## [0.7.0] — 2026-10-20
 
 ### Removed

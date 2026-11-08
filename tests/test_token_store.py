@@ -482,3 +482,34 @@ def test_restore_resets_key_index_entries():
     index = place._store.key_index(1)
     assert len(index._heap) == len(place)
     assert [t.payload["prio"] for t in index.peek_ordered(place._store._ready, 3)] == [0, 1, 2]
+
+
+class _NoIterDict(dict):
+    """A `_seq_of` stand-in that fails any walk over its keys, so a lookup must use `in`."""
+
+    def __iter__(self):
+        raise AssertionError("walked every stored key")
+
+    def keys(self):
+        raise AssertionError("walked every stored key")
+
+
+def test_missing_identities_reports_only_absent_ids():
+    store = _TokenStore()
+    stored = [Token(payload={"i": i}) for i in range(5)]
+    for token in stored:
+        store.append(token)
+    absent = Token(payload={"i": "absent"})
+    assert store.missing_identities({id(stored[1]), id(stored[3])}) == set()
+    assert store.missing_identities({id(stored[0]), id(absent)}) == {id(absent)}
+    assert store.missing_identities(set()) == set()
+
+
+def test_missing_identities_does_not_walk_the_stored_keys():
+    """#65: `set(ids) - keys()` cost O(tokens stored) per `retrieve_specific`."""
+    place = Place("Backlog", initial_marking=[Token(payload={"i": i}) for i in range(1_000)])
+    place._store._seq_of = _NoIterDict(place._store._seq_of)
+    head = place.tokens[0]
+    assert place.retrieve_specific([head]) == [head]
+    with pytest.raises(ValueError):
+        place.retrieve_specific([Token()])

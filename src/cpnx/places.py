@@ -420,8 +420,13 @@ class _TokenStore:
             index.clear()
 
     def missing_identities(self, ids: set[int]) -> set[int]:
-        """Return the subset of `id(token)` values in *ids* that are not currently stored."""
-        return set(ids) - self._seq_of.keys()
+        """Return the subset of `id(token)` values in *ids* that are not currently stored.
+
+        O(len(ids)). `set - dict.keys()` would walk every stored key, making each
+        `retrieve_specific` cost O(place size).
+        """
+        seq_of = self._seq_of
+        return {i for i in ids if i not in seq_of}
 
     def earliest_cooling_after(self, now: float) -> float | None:
         """Smallest timed ``available_at`` strictly greater than *now*, or ``None``.
