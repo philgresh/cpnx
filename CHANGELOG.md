@@ -81,6 +81,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`InputArc.join_key` joins input arcs on equal keys, and a join with no match no longer
+  walks every candidate** ([#64](https://github.com/philgresh/cpnx/issues/64),
+  [ADR 0010](https://github.com/philgresh/cpnx/blob/main/docs/adr/0010-equi-join-index.md)).
+  Every input arc of a transition that sets `join_key` must agree on it, so a binding is
+  considered only when those arcs' tokens have equal keys, and the guard runs as before on
+  what remains. The candidates keep the product search's order, so adding `join_key` to a
+  guard that already tests the same equality fires exactly the same bindings under `FIRST`,
+  `RANDOM` (same seeded stream) and `PRIORITY`. A certified join key is served from a
+  per-place index that also covers timed tokens, so a probe costs O(keys in the smallest join
+  place) lookups. In `bench_guard_join.py`, a miss over 8 workers holds at about 7 µs from
+  1 000 to 16 000 jobs (the guard takes 7 → 113 ms). In #59's `shop` net, with the rejoin
+  join on `wid` and the requeue route split by output condition, 16 000 jobs run at 588
+  µs/step against 1 622 with the guard alone. That net still grows by 1.2 to 1.4× per
+  doubling, because its worker count grows with its job count and the probe looks up every
+  idle worker's key. Join arcs need `count == 1` and no `key`, `filter` or `consume_all`;
+  `binding_search_limit` counts only agreeing candidates. Nets that do not set `join_key` are
+  unaffected.
+
 - **Official Python 3.15 support, and 3.14 is now a blocking CI entry.** Both versions run the
   full suite, `ruff` and the complexity gate on every PR; 3.14 had been stable for a year while
   still pinned `experimental` with `continue-on-error`, which meant its failures were invisible.

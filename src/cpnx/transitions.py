@@ -281,6 +281,18 @@ class InputArc:
                 raises makes the arc unsatisfiable rather than firing on a partial pool.
                 **Same performance warning as `key`** — an uncertified filter is quadratic
                 on a deep place, and (unlike `key`) a certified `key` cannot rescue it.
+        join_key: Per-token join key — a pure `Callable[[Token], object]` returning a hashable
+                  value. Every input arc of a transition that sets one joins on it: a binding
+                  is considered only when all of those arcs' tokens have equal join keys, and
+                  the transition's guard (if any) is then evaluated as usual. A transition with
+                  a `join_key` arc fires the same bindings as one whose guard tests the same
+                  equality, under every [`BindingPolicy`][cpnx.BindingPolicy], but a
+                  *certified* join key is served from a per-place index, so a join with no
+                  match costs a few lookups instead of a walk over every candidate. Requires
+                  `count == 1` and no `key`, `filter` or `consume_all` (`ValueError`
+                  otherwise). A join key that raises or returns an unhashable value makes the
+                  arc unsatisfiable. `None` (default) means the arc takes no part in a join.
+                  See `docs/adr/0010-equi-join-index.md`.
 
     Warning:
         **`consume_all=True` ignores both `key` and `filter`.** A draining arc takes every
@@ -348,6 +360,14 @@ class InputArc:
     Example:
         ```python
         InputArc("inbox", count=2, key=lambda t: t.payload["priority"], filter=lambda t: not t.payload["held"])
+
+        # A job rejoins the worker it was assigned to, matched on `wid`.
+        wid = lambda t: t.payload["wid"]
+        Transition(
+            name="resume",
+            inputs=[InputArc("rejoin", join_key=wid), InputArc("idle", join_key=wid)],
+            outputs=[OutputArc("busy")],
+        )
         ```
     """
 
@@ -357,8 +377,10 @@ class InputArc:
     settle_secs: float = 0.0
     key: Callable[[Token], object] | None = field(default=None, compare=False, kw_only=True)
     filter: Callable[[Token], bool] | None = field(default=None, compare=False, kw_only=True)
+    join_key: Callable[[Token], object] | None = field(default=None, compare=False, kw_only=True)
 
     def __post_init__(self):
+        self._check_join_shape({})
         # Marks construction complete, so `__setattr__` can tell a field assignment made by
         # the generated ``__init__`` (all of which this hook already covers, once) from a
         # later reassignment by the caller (which must warn on its own).
@@ -366,10 +388,12 @@ class InputArc:
         self._warn_if_drain_ignores_selection(stacklevel=4)
 
     def __setattr__(self, name, value):
+        if name in _JOIN_SHAPE_FIELDS and getattr(self, "_constructed", False):
+            self._check_join_shape({name: value})
         # Keep each selection callable's inline-safe flag in sync, including
         # post-construction reassignment. Reject/verify before mutating so a bad
         # value leaves the arc in its previous valid state.
-        if name in ("key", "filter"):
+        if name in ("key", "filter", "join_key"):
             _reject_string_expression(f"InputArc.{name}", value)
             if callable(value):
                 verify_callable_purity(value)
@@ -385,6 +409,31 @@ class InputArc:
         # reports the finished arc once, rather than once per conflicting field.
         if name in ("consume_all", "key", "filter") and getattr(self, "_constructed", False):
             self._warn_if_drain_ignores_selection(stacklevel=3)
+
+    def _check_join_shape(self, overrides: dict[str, object]) -> None:
+        """Raise `ValueError` if this arc, with *overrides* applied, sets `join_key` on an unsupported shape.
+
+        A join arc contributes exactly one token, chosen by place order among the tokens whose
+        join key matches. `count`, `consume_all`, `key` and `filter` would each change which
+        token that is, and the join index does not model them yet.
+        """
+
+        def value(name: str) -> object:
+            return overrides[name] if name in overrides else getattr(self, name, None)
+
+        if value("join_key") is None:
+            return
+        conflicts = [name for name in ("key", "filter") if value(name) is not None]
+        if value("consume_all"):
+            conflicts.append("consume_all")
+        if value("count") != 1:
+            conflicts.append("count != 1")
+        if conflicts:
+            raise ValueError(
+                f"InputArc(place={self.place!r}): join_key cannot be combined with {', '.join(conflicts)}. "
+                "A join arc consumes one token in FIFO order among those whose join key matches; "
+                "move any other condition into the transition's guard."
+            )
 
     def _warn_if_drain_ignores_selection(self, *, stacklevel: int) -> None:
         """Warn when this arc sets `key`/`filter` that `consume_all` will silently ignore.
@@ -413,6 +462,10 @@ class InputArc:
             UserWarning,
             stacklevel=stacklevel,
         )
+
+
+_JOIN_SHAPE_FIELDS = frozenset({"count", "consume_all", "key", "filter", "join_key"})
+"""The `InputArc` fields `_check_join_shape` depends on."""
 
 
 @dataclass
