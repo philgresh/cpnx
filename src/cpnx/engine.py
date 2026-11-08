@@ -3665,26 +3665,39 @@ class PetriNet:
     ) -> list[Token]:
         output_tokens = []
         for port, socket in port_socket_map.items():
-            if socket in parent_outputs:
-                port_place = subnet.places.get(port)
-                if port_place:
-                    # A pool port hands back every permit: its cooldown belongs to the socket.
-                    is_pool = isinstance(port_place, ResourcePlace)
-                    tokens = port_place.retrieve_all(model_time=_LAST_FINITE_TIME if is_pool else subnet.model_time)
-                    output_tokens.extend(tokens)
+            port_place = subnet.places.get(port)
+            # A pool port hands back every permit, whether or not the parent declares a return
+            # arc and whatever its cooldown: the permits and their cooldown belong to the socket.
+            is_pool = isinstance(port_place, ResourcePlace)
+            if port_place is not None and (is_pool or socket in parent_outputs):
+                tokens = port_place.retrieve_all(model_time=_LAST_FINITE_TIME if is_pool else subnet.model_time)
+                output_tokens.extend(tokens)
         return output_tokens
 
     @staticmethod
-    def _verify_no_surplus_permits(
-        transition_name: str, consumed_tokens: list[Token], output_tokens: list[Token]
+    def _verify_permit_balance(
+        transition_name: str,
+        token_sources: list[tuple[str, Token]],
+        socket_to_ports: dict[str, list[str]],
+        output_tokens: list[Token],
     ) -> None:
-        """Refuse permits the parent never lent: it returns the ones it consumed, so these would vanish."""
-        lent = sum(token.is_resource for token in consumed_tokens)
+        """Refuse a firing whose ports do not hand back exactly the permit copies they were lent.
+
+        The parent returns the permits it consumed whatever the subnet does, so a copy the subnet
+        keeps would mint a permit and one it adds would vanish. Permits share one colour, so the
+        place flow over them (`CPN-PFLOW`) holds exactly when the counts match.
+        """
+        lent = sum(len(socket_to_ports[socket]) for socket, token in token_sources if token.is_resource)
         returned = sum(token.is_resource for token in output_tokens)
+        if returned < lent:
+            raise ValueError(
+                f"SubstitutionTransition '{transition_name}': subnet kept {lent - returned} of the "
+                f"{lent} permit copies lent to its ports; the parent returns its own permits anyway."
+            )
         if returned > lent:
             raise ValueError(
                 f"SubstitutionTransition '{transition_name}': subnet returned {returned} permit(s) "
-                f"through its ports but the firing borrowed {lent}."
+                f"through its ports but the firing lent it {lent}."
             )
 
     def _execute_substitution_transition(
@@ -3703,7 +3716,7 @@ class PetriNet:
 
         parent_outputs = [arc.place for arc in transition.outputs]
         output_tokens = self._retrieve_subnet_outputs(subnet, transition.port_socket_map, parent_outputs)
-        self._verify_no_surplus_permits(transition.name, consumed_tokens, output_tokens)
+        self._verify_permit_balance(transition.name, token_sources, socket_to_ports, output_tokens)
         return output_tokens
 
     def _run_subnet(self, subnet: "PetriNet", bound: float | None) -> None:

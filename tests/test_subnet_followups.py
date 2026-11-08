@@ -496,3 +496,81 @@ def test_a_private_permit_moved_into_a_port_fails_the_firing():
     assert len(subnet.marking["Spare"]) == 1
     assert subnet.marking["Barista"] == ()
     assert len(parent.marking["Staff"]) == 1
+
+
+# Every permit copy the parent hands a pool port comes back out (`CPN-PFLOW`, `ZS-STABLE`).
+
+
+def _kitchen_on_staff(
+    brew: Transition, ports: list[ResourcePlace], private: tuple[ResourcePlace, ...] = (), **kitchen: object
+) -> tuple[PetriNet, PetriNet]:
+    """A one-permit `Staff` pool lent to *brew*'s subnet through each pool in *ports*."""
+    subnet = PetriNet(places=[Place("Orders"), Place("Ready"), *ports, *private], transitions=[brew])
+    port_socket_map = {"Orders": "Queue", "Ready": "Served"} | {pool.name: "Staff" for pool in ports}
+    wrapper = SubstitutionTransition(
+        "Kitchen",
+        [InputArc("Queue"), InputArc("Staff")],
+        [OutputArc("Served")],
+        action=lambda tokens: tokens,
+        subnet=subnet,
+        port_socket_map=port_socket_map,
+        max_retries=0,
+        **kitchen,
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served"), ResourcePlace("Staff", capacity=1)],
+        transitions=[wrapper],
+    )
+    return parent, subnet
+
+
+@pytest.mark.parametrize("logical", [True, False], ids=["logical", "wall"])
+def test_a_pool_port_is_emptied_when_the_parent_returns_its_permit_implicitly(logical):
+    brew = Transition("Brew", [InputArc("Orders"), InputArc("Barista")], [OutputArc("Ready")], action=lambda t: [t[0]])
+    parent, subnet = _kitchen_on_staff(brew, [ResourcePlace("Barista", capacity=0)], auto_return_resources=False)
+    for number in (1, 2, 3):
+        parent.deposit("Queue", _order(number))
+
+    _drive(parent, logical)
+
+    assert _served(parent) == [1, 2, 3]
+    assert subnet.marking["Barista"] == ()
+    assert len(parent.marking["Staff"]) == 1
+
+
+@pytest.mark.parametrize("logical", [True, False], ids=["logical", "wall"])
+def test_a_subnet_that_keeps_a_borrowed_permit_fails_the_firing(logical):
+    brew = Transition(
+        "Brew",
+        [InputArc("Orders"), InputArc("Barista")],
+        [OutputArc("Ready"), OutputArc("Private")],
+        action=lambda tokens: tokens,
+        auto_return_resources=False,
+    )
+    parent, subnet = _kitchen_on_staff(
+        brew, [ResourcePlace("Barista", capacity=0)], private=(ResourcePlace("Private", capacity=0),)
+    )
+    errors: list[Exception] = []
+    parent.on_error = lambda _name, error, _token: errors.append(error)
+    parent.deposit("Queue", _order(1))
+
+    _drive(parent, logical)
+
+    assert any("kept" in str(error) for error in errors)
+    assert _served(parent) == []
+    assert subnet.marking["Private"] == ()
+    assert subnet.marking["Barista"] == ()
+    assert len(parent.marking["Staff"]) == 1
+
+
+def test_a_socket_lent_to_two_pool_ports_gets_both_copies_back():
+    brew = Transition("Brew", [InputArc("Orders"), InputArc("Front")], [OutputArc("Ready")], action=lambda t: [t[0]])
+    parent, subnet = _kitchen_on_staff(brew, [ResourcePlace("Front", capacity=0), ResourcePlace("Back", capacity=0)])
+    parent.deposit("Queue", _order(1))
+
+    parent.drive_to_quiescence()
+
+    assert _served(parent) == [1]
+    assert subnet.marking["Front"] == ()
+    assert subnet.marking["Back"] == ()
+    assert len(parent.marking["Staff"]) == 1
