@@ -312,6 +312,20 @@ execution model, not an unfolding to a flat net.  Add a note that the subnet run
 quiescence before tokens are returned — so any liveness property of the subnet must
 be verified independently.
 
+**Update ([#38](https://github.com/philgresh/cpnx/issues/38)):** the handoff is still
+sequential, but cpnx now enforces the compound-place rules it can check at the boundary
+(`CPN-COMPOUND`, `CPN-PFLOW` in `docs/cpn-invariants.json`):
+- A port and its socket must declare the same colour set (when both declare one), and
+  either both are resource pools or neither is.
+- A pool port must have `capacity=0`: its permits are the socket's.
+- A firing must hand back exactly the permit copies its pool ports were lent, and every
+  pool port is emptied afterwards, so a firing neither mints nor loses permits.
+- A failed firing restores the subnet's marking (sinks excepted), so a rollback leaves no
+  trace of the half-run firing in the subnet.
+
+The `SubstitutionTransition` docstring documents the sequential model and the quiescence
+wait.
+
 ---
 
 ### Finding 7 — Port/Socket Boundary: Token is Cloned, not Shared
@@ -545,7 +559,7 @@ No semantic error, but users should be aware this guard is hidden inside the pla
 | 3 | No binding concept | Deliberate (§0) | Deferred feature; documentation gap |
 | 4 | Back-pressure in enabling rule | Minor extension | Correct; well-commented |
 | 5 | Token UUID identity | Extension | Intentional; documented |
-| 6 | SubstitutionTransition: sequential, not compound-place | Structural divergence | Intentional; needs documentation |
+| 6 | SubstitutionTransition: sequential, not compound-place | Structural divergence | Intentional; documented, boundary rules enforced (#38) |
 | 7 | Token cloned across port/socket boundary | Minor divergence | Acceptable; needs documentation |
 | 8 | No automatic time advancement | Usability gap | Enhancement opportunity |
 | 9 | is_dead() may misread time-blocked nets | Semantic gap | Enhancement opportunity |
