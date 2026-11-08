@@ -312,6 +312,21 @@ execution model, not an unfolding to a flat net.  Add a note that the subnet run
 quiescence before tokens are returned — so any liveness property of the subnet must
 be verified independently.
 
+**Update ([#38](https://github.com/philgresh/cpnx/issues/38)):** the handoff is still
+sequential, but cpnx now enforces the compound-place rules it can check at the boundary
+(`CPN-COMPOUND`, `CPN-PFLOW` in `docs/cpn-invariants.json`):
+- A port and its socket must declare the same colour set (when both declare one), and
+  either both are resource pools or neither is.
+- A pool port must have `capacity=0`: its permits are the socket's.
+- A firing must hand back exactly the permit copies its pool ports were lent, and every
+  pool port is emptied afterwards, so a firing neither mints nor loses permits.
+- A failed firing restores the subnet's marking (sinks excepted), and each pool's permit
+  count. Pools are restored by count only, so a cooldown the failed firing started keeps
+  running.
+
+The `SubstitutionTransition` docstring documents the sequential model, the quiescence
+wait, and that the subnet's liveness must be checked on its own.
+
 ---
 
 ### Finding 7 — Port/Socket Boundary: Token is Cloned, not Shared
@@ -395,9 +410,10 @@ enabled at any future time.  A net with tokens whose `available_at > current_tim
 is time-blocked, not dead.
 
 **Implementation:** [`engine.py:390-407`](../src/cpnx/engine.py)
-`is_quiescent()` calls `_is_transition_potentially_enabled()` with
-`model_time=float("inf")` — so it *does* consider tokens in cooldown as
-potentially-available.  This is documented as intentional for `PacedResourcePlace`.
+`is_quiescent()` calls `_is_transition_potentially_enabled()` with `model_time`
+set to the last finite time — so it *does* consider tokens in cooldown as
+potentially-available, but not a token parked at `available_at = inf`.  This is
+documented as intentional for `PacedResourcePlace`.
 
 However, `is_dead()` ([`engine.py:423-435`](../src/cpnx/engine.py)) uses
 `_is_transition_enabled()` with the current model time.  If time has not been
@@ -544,7 +560,7 @@ No semantic error, but users should be aware this guard is hidden inside the pla
 | 3 | No binding concept | Deliberate (§0) | Deferred feature; documentation gap |
 | 4 | Back-pressure in enabling rule | Minor extension | Correct; well-commented |
 | 5 | Token UUID identity | Extension | Intentional; documented |
-| 6 | SubstitutionTransition: sequential, not compound-place | Structural divergence | Intentional; needs documentation |
+| 6 | SubstitutionTransition: sequential, not compound-place | Structural divergence | Intentional; documented, boundary rules enforced (#38) |
 | 7 | Token cloned across port/socket boundary | Minor divergence | Acceptable; needs documentation |
 | 8 | No automatic time advancement | Usability gap | Enhancement opportunity |
 | 9 | is_dead() may misread time-blocked nets | Semantic gap | Enhancement opportunity |
@@ -566,8 +582,9 @@ No semantic error, but users should be aware this guard is hidden inside the pla
 **Medium priority (documentation):**
 2. **Findings 1, 2, 3** — Add a `docs/cpn-alignment.md` (or section in README)
    explaining how cpnx arc expressions and guards differ from CPN theory, and why.
-3. **Finding 6** — Document that hierarchical execution is sequential (not compound-place
-   unfolding) and what that means for liveness analysis.
+3. ~~**Finding 6** — Document that hierarchical execution is sequential (not compound-place
+   unfolding) and what that means for liveness analysis.~~ **Done** in the
+   `SubstitutionTransition` docstring ([#38](https://github.com/philgresh/cpnx/issues/38)).
 4. **Finding 10** — Fix guard docstring in `Transition`.
 
 **Low priority (enhancements):**

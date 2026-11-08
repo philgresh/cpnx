@@ -18,7 +18,7 @@ import itertools
 import math
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, ClassVar
 
@@ -489,7 +489,10 @@ class Place:
     """
 
     _restorable: ClassVar[bool] = True
-    """Whether a failed substitution firing restores this place from its checkpoint."""
+    """Whether `_restore_tokens` may replace this place's whole contents.
+
+    A sink is never restored, and a pool rolls back by count through `_roll_back_to`.
+    """
 
     def __init__(
         self,
@@ -743,6 +746,13 @@ class Place:
                 self._store.append(token)
             return True
 
+    def _roll_back_to(self, tokens: tuple[Token, ...]) -> bool:
+        """Return this place to its `tokens` snapshot from a checkpoint; whether anything changed.
+
+        Resource pools override this to restore only their permit count.
+        """
+        return self._restore_tokens(tokens)
+
     def peek(self, count: int = 1, model_time: float | None = None) -> list[Token]:
         """Return up to *count* available tokens from the head without removing them.
 
@@ -921,7 +931,10 @@ class ResourcePlace(Place):
     This class is a Python shorthand — it sets the colour set and initial marking
     automatically and documents the resource-return invariant explicitly. It does not
     otherwise change [`Place`][cpnx.Place]'s behavior: all inherited methods (`deposit`,
-    `retrieve`, etc.) work exactly as on the base class.
+    `retrieve`, etc.) work exactly as on the base class. One exception: across a
+    [`SubstitutionTransition`][cpnx.SubstitutionTransition] boundary a port and its socket
+    must both be `ResourcePlace`s or neither, so a plain `Place` written as above does not
+    stand in for a pool on either side.
 
     Resource tokens (``color="resource"``) are consumed when a transition fires
     and must be returned via a matching output arc. This models finite resources
@@ -957,6 +970,40 @@ class ResourcePlace(Place):
             initial_marking=[Token(color="resource") for _ in range(capacity)],
             schema=schema,
         )
+
+    def _roll_back_to(self, tokens: tuple[Token, ...]) -> bool:
+        return self._restore_permits(tokens)
+
+    def _restore_permits(self, tokens: tuple[Token, ...]) -> bool:
+        """Bring the pool back to the number of permits in *tokens*, its checkpoint snapshot.
+
+        Permits are interchangeable, and a settled firing has handed back every one it used, so
+        only the count is rolled back. The permits here stay as they are: a surplus (a port's
+        copy from the parent) gives up the soonest available, which keeps any cooldown running,
+        and a shortfall (a permit left in another pool) is made up from the snapshot. Returns
+        whether the contents changed.
+        """
+        with self._lock:
+            current = list(self._store.iter_insertion_order())
+            surplus = len(current) - len(tokens)
+            if surplus == 0:
+                return False
+            if surplus > 0:
+                dropped = {id(t) for t in sorted(current, key=lambda t: t.available_at)[:surplus]}
+                kept = [t for t in current if id(t) not in dropped]
+            else:
+                present = Counter(id(t) for t in current)
+                missing = []
+                for token in tokens:
+                    if present[id(token)] > 0:
+                        present[id(token)] -= 1
+                    else:
+                        missing.append(token)
+                kept = current + missing[:-surplus]
+            self._store.drop_all()
+            for token in kept:
+                self._store.append(token)
+            return True
 
 
 class PacedResourcePlace(ResourcePlace):
