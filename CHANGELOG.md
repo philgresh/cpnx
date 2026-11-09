@@ -158,6 +158,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two input arcs on one place now take two different tokens**
+  ([#75](https://github.com/philgresh/cpnx/issues/75)). A transition with two arcs reading the
+  same place, whether the same `InputArc` twice or two separate ones, with or without
+  `join_key`, could bind one token to both. Firing then removed it twice and
+  `retrieve_specific` raised `ValueError`. Each arc now takes tokens of its own, as one arc with
+  `count=2` does. The head-only path gives each arc the head of what the earlier arcs left; the
+  product, lazy and `join_key` searches skip a candidate that reuses a token, and that
+  candidate still counts toward `binding_search_limit`. One token no longer enables two arcs.
+  A `consume_all` arc that shares its place with another input arc is never enabled, since
+  draining the place leaves nothing for the other arc. Finding the shared places costs about
+  0.2 µs per resolution; `bench_enablement.py` and `bench_cafe_throughput.py` are within noise
+  of `main`.
 - **`drive_to_quiescence` no longer stops before a later cooling token matures**
   ([#68](https://github.com/philgresh/cpnx/issues/68)). When a place already held two or more
   timed tokens as the incremental scheduler started, it tracked only that place's earliest

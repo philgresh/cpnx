@@ -259,6 +259,9 @@ class InputArc:
     Attributes:
         place: Name of the source place.
         count: Number of tokens to consume. Ignored when `consume_all=True`. Defaults to 1.
+               Two arcs on the same place take different tokens, so `[InputArc("p"),
+               InputArc("p")]` needs two tokens in `p`, as `InputArc("p", count=2)` does. A
+               `consume_all` arc that shares its place with another input arc is never enabled.
         consume_all: Drain the entire place atomically. Defaults to `False`. **Overrides
                      `key` and `filter`** — see the warning below.
         settle_secs: Wait for no new arrivals for this many seconds before

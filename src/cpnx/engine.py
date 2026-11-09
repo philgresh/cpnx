@@ -378,6 +378,45 @@ def _has_join(transition: Transition) -> bool:
     return any(arc.join_key is not None for arc in transition.inputs)
 
 
+def _shared_places(transition: Transition) -> frozenset[str]:
+    """The places that two or more input arcs of `transition` read (read per call: arcs are mutable).
+
+    Each such arc takes tokens of its own: a binding that hands one token to two arcs is not a
+    binding, as two arcs on one place take two tokens like one arc with `count=2` (issue #75).
+    Empty for the usual transition, whose arcs all read different places.
+    """
+    inputs = transition.inputs
+    if len(inputs) < 2:
+        return frozenset()
+    seen: set[str] = set()
+    shared: set[str] = set()
+    for arc in inputs:
+        (shared if arc.place in seen else seen).add(arc.place)
+    return frozenset(shared)
+
+
+def _place_demand(transition: Transition) -> dict[str, int]:
+    """How many tokens the input arcs of `transition` take from each place, in all."""
+    demand: dict[str, int] = {}
+    for arc in transition.inputs:
+        demand[arc.place] = demand.get(arc.place, 0) + arc.count
+    return demand
+
+
+def _reuses_a_token(binding: _Binding, shared: frozenset[str]) -> bool:
+    """Whether `binding` hands one token of a `shared` place to more than one arc."""
+    taken: set[tuple[str, int]] = set()
+    for arc, tokens in binding:
+        if arc.place not in shared:
+            continue
+        for token in tokens:
+            entry = (arc.place, id(token))
+            if entry in taken:
+                return True
+            taken.add(entry)
+    return False
+
+
 def _join_candidate_count(per_key: list[list]) -> int:
     """How many candidates the per-key products of `_join_candidates` hold in all."""
     total = 0
@@ -2434,7 +2473,9 @@ class PetriNet:
         the place. The two cases:
 
         - **head-only** (per `_is_head_only`): `_resolve_input_tokens` takes the leading
-          `count`, so `count` tokens is exactly enough.
+          `count`, so `count` tokens is exactly enough. When several arcs read one place,
+          `_head_binding` gives each the tokens the earlier ones left, so each of them reads
+          as many as all of them take from that place.
         - **searching**: `_iter_candidate_bindings` keeps the first `binding_search_limit + 1`
           *combinations* per arc, and for `count > 1` those reach further into the ordering
           than that many *tokens* — the `(limit + 1)`-th `count`-sized combination spans
@@ -2447,8 +2488,12 @@ class PetriNet:
         `_PeekStream`.
         """
         pools: list[tuple[InputArc, _Pool]] = []
+        demand = _place_demand(transition) if head_only and _shared_places(transition) else None
         for arc in transition.inputs:
-            cap = arc.count if head_only else self.binding_search_limit + arc.count
+            if not head_only:
+                cap = self.binding_search_limit + arc.count
+            else:
+                cap = arc.count if demand is None else demand[arc.place]
             available = self._arc_available(arc, self.places.get(arc.place), m_time, ignore_timing, cap, lazy=lazy)
             if available is None:
                 return None
@@ -2534,12 +2579,16 @@ class PetriNet:
         `_is_head_only`), and requires at least one `consume_all` arc — the only arc shape
         whose ordinary resolution is unbounded. See `_try_count_only_binding` for why this
         exact set keeps the deferral behaviour- and RNG-identical.
+
+        Also excludes a transition with two arcs on one place: this path resolves each arc on
+        its own, so it would hand them the same head tokens. `_head_binding` keeps them apart.
         """
         return (
             transition.guard is None
             and transition.binding_priority_key is None
             and self._is_head_only(transition, self._effective_policy(transition))
             and any(arc.consume_all for arc in transition.inputs)
+            and not _shared_places(transition)
         )
 
     def _count_only_arc_binding(
@@ -2660,16 +2709,42 @@ class PetriNet:
         `_is_head_only` gate would otherwise fire a guarded transition on its head without
         consulting the guard. Guarding the *guard* on `transition.guard is not None` keeps that
         safety while paying nothing on the hot path.
+
+        When several arcs read one place, each takes its head from the tokens the earlier arcs
+        left, so no token is bound twice (issue #75). A `consume_all` arc on such a place is
+        never satisfied, as in the search, where its option is the whole pool and so always
+        overlaps the other arcs' tokens.
         """
+        shared = _shared_places(transition)
+        taken: set[tuple[str, int]] = set()
         binding: _Binding = []
         for arc, available in pools:
-            tokens = self._resolve_input_tokens(arc, _as_list(available), transition_name=transition.name)
+            if arc.place in shared:
+                tokens = self._resolve_untaken(arc, available, taken, transition.name)
+            else:
+                tokens = self._resolve_input_tokens(arc, _as_list(available), transition_name=transition.name)
             if tokens is None:
                 return None
             binding.append((arc, tokens))
         if transition.guard is not None and not self._check_transition_guard(transition, _flatten_binding(binding)):
             return None
         return binding
+
+    def _resolve_untaken(
+        self, arc: InputArc, available: _Pool, taken: set[tuple[str, int]], transition_name: str
+    ) -> list[Token] | None:
+        """`_resolve_input_tokens` over the tokens of `available` not in `taken`, adding its pick to `taken`.
+
+        For an arc of `_head_binding` whose place another arc also reads. A `consume_all` arc
+        there is never satisfied (see `_head_binding`).
+        """
+        if arc.consume_all:
+            return None
+        pool = [token for token in _as_list(available) if (arc.place, id(token)) not in taken]
+        tokens = self._resolve_input_tokens(arc, pool, transition_name=transition_name)
+        if tokens is not None:
+            taken.update((arc.place, id(token)) for token in tokens)
+        return tokens
 
     def _iter_satisfying_bindings(
         self, transition: Transition, pools: list[tuple[InputArc, _Pool]], *, lazy: bool = False
@@ -2697,11 +2772,20 @@ class PetriNet:
         The loop shared by the product search (`_iter_satisfying_bindings`) and the join search
         (`_join_candidates`): it examines at most `binding_search_limit` candidates, then
         signals exhaustion.
+
+        When two arcs read one place, each arc's options are drawn from the same pool, so the
+        product holds candidates that hand one token to both. Those are skipped before the
+        guard sees them (issue #75). They still count toward the limit: that keeps the limit a
+        bound on the candidates enumerated, and keeps the per-arc truncation in
+        `_iter_candidate_bindings` loss-free.
         """
+        shared = _shared_places(transition)
         for examined, binding in enumerate(candidates, start=1):
             if examined > self.binding_search_limit:
                 self._signal_search_exhausted(transition.name)
                 return
+            if shared and _reuses_a_token(binding, shared):
+                continue
             flat = _flatten_binding(binding)
             if self._check_transition_guard(transition, flat):
                 yield binding, flat
