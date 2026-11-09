@@ -414,6 +414,23 @@ class TestParkedTokenIsNotQueued:
         assert net.is_quiescent() is True
         assert all(math.isfinite(boundary) for boundary, _ in net._reactivation)
 
+    def test_parked_token_present_at_seed_is_not_queued(self):
+        net = PetriNet(seed=0)
+        for name in ("jobs", "workers", "out"):
+            net.add_place(Place(name))
+        net.add_transition(
+            Transition(
+                name="match",
+                inputs=[InputArc("jobs"), InputArc("workers")],
+                outputs=[OutputArc("out")],
+                action=lambda toks: [toks[0]],
+            )
+        )
+        net.deposit("jobs", Token(payload={}, available_at=math.inf))
+        assert net._incremental_eligible is True
+        assert net.is_quiescent() is True  # seeds the scheduler
+        assert net._reactivation == []
+
 
 class TestInputlessSourceTransition:
     """An input-less transition is always volatile and always (re-)evaluated."""
