@@ -1,6 +1,7 @@
 """Concurrent Petri net executor."""
 
 import bisect
+import collections
 import concurrent.futures
 import heapq
 import itertools
@@ -393,6 +394,19 @@ def _shared_places(transition: Transition) -> frozenset[str]:
     for arc in inputs:
         (shared if arc.place in seen else seen).add(arc.place)
     return frozenset(shared)
+
+
+def _has_filtered_shared_arc(transition: Transition) -> bool:
+    """Whether an input arc with a `filter` reads a place that another input arc of `transition` reads."""
+    shared = _shared_places(transition)
+    return bool(shared) and any(arc.filter is not None and arc.place in shared for arc in transition.inputs)
+
+
+def _with_enough_tokens(groups: "dict | None", need: int) -> "dict | None":
+    """`groups` without the groups holding fewer than `need` tokens: a self-join's arcs take one each."""
+    if not groups or need < 2:
+        return groups
+    return {key: group for key, group in groups.items() if len(group) >= need}
 
 
 def _place_demand(transition: Transition) -> dict[str, int]:
@@ -2530,9 +2544,22 @@ class PetriNet:
         A transition with a `join_key` arc is never head-only: the head of each place need not
         share a join key, so even a guard-free one searches (see `_join_candidates`).
 
+        Nor is one where an arc with a `filter` shares its place with another input arc. The
+        head binding hands out a shared place's tokens greedily in arc order (see
+        `_head_binding`), so an earlier arc can take the only token a later arc's filter
+        accepts, while another assignment would bind both. The search tries those assignments.
+        Without a filter every token suits every arc on the place, and the greedy assignment
+        binds whenever enough tokens exist, picking the same tokens the search's first
+        candidate would.
+
         Depends only on its arguments (no net state), hence `staticmethod`.
         """
-        return policy is BindingPolicy.FIRST and transition.guard is None and not _has_join(transition)
+        return (
+            policy is BindingPolicy.FIRST
+            and transition.guard is None
+            and not _has_join(transition)
+            and not _has_filtered_shared_arc(transition)
+        )
 
     def _try_count_only_binding(
         self, transition: Transition, m_time: float | None, ignore_timing: bool
@@ -2961,9 +2988,10 @@ class PetriNet:
         one matched key. That holds because a join arc takes exactly one token and has no
         `key` or `filter` (ADR 0010 §1), so every token of an available group is a valid choice
         for its arc. The assertion keeps a future relaxation of that rule from breaking this
-        silently. A self-join, two join arcs on one place, is the exception: a key whose group
-        holds one token has no binding there, since the arcs take distinct tokens (issue #75),
-        so its probe reads every matched key.
+        silently. A self-join, two join arcs on one place, is the exception: the match lists a
+        key once the place holds one available token of it, but the arcs take distinct tokens
+        (issue #75), so that key may have no binding. Its probe reads every matched key, and
+        `_join_key_groups` drops the ones with too few tokens.
         """
         assert all(arc.count == 1 and arc.key is None and arc.filter is None for _, arc, _ in joins)
         one_key = unordered and transition.guard is None and not _shared_places(transition)
@@ -2982,12 +3010,21 @@ class PetriNet:
         keys each place has. Returns the groups by arc index and the surviving keys, or `None`
         when no key survives, including when `keys` is empty: the match knows that no key is
         available in every join place.
+
+        In a self-join, where several join arcs read one place, each takes a different token of
+        the key's group (issue #75), so a group smaller than that number of arcs is dropped.
+        Its candidates would all reuse a token, and each would spend one of the
+        `binding_search_limit` candidates `_satisfying` examines: a backlog of keys holding one
+        token each could then hide a key that holds a pair.
         """
         if keys is not None and not keys:
             return None
+        arcs_per_place = collections.Counter(id(place) for _, _, place in joins)
         groups_by_arc: dict[int, dict] = {}
         for i, arc, place in sorted(joins, key=lambda join: len(join[2])):
-            groups = self._join_groups(i, arc, place, keys, t_limit, transition_name)
+            groups = _with_enough_tokens(
+                self._join_groups(i, arc, place, keys, t_limit, transition_name), arcs_per_place[id(place)]
+            )
             if not groups:
                 return None
             groups_by_arc[i] = groups

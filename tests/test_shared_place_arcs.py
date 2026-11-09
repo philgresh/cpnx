@@ -226,3 +226,67 @@ def test_a_self_join_probe_looks_past_a_key_with_one_token():
     net.drive_to_quiescence()
     assert [token.payload["wid"] for token in net.marking["out"]] == [1, 1]
     assert net.is_dead()
+
+
+# -- review follow-ups -------------------------------------------------------------------------
+
+
+def _is_zero(token: Token) -> bool:
+    return token.payload["n"] == 0
+
+
+@pytest.mark.parametrize("guarded", [False, True])
+def test_a_filtered_shared_arc_finds_the_assignment_greedy_misses(guarded):
+    # The first arc's head is n=0, the only token the second arc's filter accepts. Taking the
+    # heads greedily in arc order would leave the second arc nothing; the search binds n=1 then
+    # n=0, with or without a guard.
+    guard = {"guard": lambda tokens: True} if guarded else {}
+    net = _net_moving([InputArc("jobs"), InputArc("jobs", filter=_is_zero)], n_tokens=2, **guard)
+    t = net.transitions["t"]
+    assert net._binding_exists(t, net.model_time)
+    assert not net.is_dead()
+    binding = net._resolve_binding(t, net.model_time)
+    assert [tokens[0].payload["n"] for _, tokens in binding] == [1, 0]
+    net.drive_to_quiescence()
+    assert len(net.marking["jobs"]) == 0
+    assert len(net.marking["out"]) == 2
+
+
+def test_an_unfiltered_shared_arc_stays_head_only():
+    net = _net_moving([InputArc("jobs"), InputArc("jobs", key=N)], n_tokens=2)
+    t = net.transitions["t"]
+    assert net._is_head_only(t, net._effective_policy(t))
+    net = _net_moving([InputArc("jobs"), InputArc("jobs", filter=_is_zero)], n_tokens=2)
+    t = net.transitions["t"]
+    assert not net._is_head_only(t, net._effective_policy(t))
+
+
+@pytest.mark.parametrize("certified", [True, False])
+@pytest.mark.parametrize("guarded", [False, True])
+def test_one_token_keys_do_not_use_up_a_self_joins_search_limit(certified, guarded):
+    # More keys holding one token than the search limit, then one key holding a pair. Every
+    # candidate of a one-token key reuses its token, so none may count against the limit.
+    table = {}
+    key = WID if certified else (lambda t: table.get("x", t.payload["wid"]))
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    same = InputArc("jobs", join_key=key)
+    guard = {"guard": lambda tokens: True} if guarded else {}
+    net.add_transition(
+        Transition(name="t", inputs=[same, same], outputs=[OutputArc("out", count=2)], action=_passthrough, **guard)
+    )
+    net.binding_search_limit = 10
+    exhausted = []
+    net.on_binding_search_exhausted = exhausted.append
+    for wid in range(net.binding_search_limit + 1):
+        net.deposit("jobs", Token(payload={"wid": wid}))
+    net.deposit("jobs", Token(payload={"wid": -1}))
+    net.deposit("jobs", Token(payload={"wid": -1}))
+    t = net.transitions["t"]
+    assert [net._binding_exists(t, net.model_time) for _ in range(3)] == [True, True, True]
+    assert net._resolve_binding(t, net.model_time) is not None
+    net.drive_to_quiescence()
+    assert [token.payload["wid"] for token in net.marking["out"]] == [-1, -1]
+    assert net.is_dead()
+    assert exhausted == []

@@ -167,7 +167,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   product, lazy and `join_key` searches skip a candidate that reuses a token, and that
   candidate still counts toward `binding_search_limit`. One token no longer enables two arcs.
   A guard-free existence probe of a self-join reads every matched key, not just the first,
-  since a key with one token has no binding there.
+  since a key with one token has no binding there, and a self-join drops such keys before
+  building candidates, so a backlog of them can't use up `binding_search_limit` ahead of a
+  key that holds a pair. A guard-free `FIRST` transition whose `filter` arc shares its place
+  with another arc now searches instead of taking heads greedily, which could leave the
+  filtered arc without the one token it accepts and report the transition dead.
   A `consume_all` arc that shares its place with another input arc is never enabled, since
   draining the place leaves nothing for the other arc. Finding the shared places costs about
   0.2 µs per resolution; `bench_enablement.py` and `bench_cafe_throughput.py` are within noise
