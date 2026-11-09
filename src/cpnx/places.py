@@ -57,26 +57,40 @@ class _KeyIndex:
     succeeds again for the arc (see issue #34). A broken key must not turn a `deposit()`
     into an exception, and must not be able to corrupt the ordering of a partially-built
     heap, so the heap is dropped outright.
+
+    When `key_fn` raised, `_bad_seq` remembers that token, and `rearm` tries no rebuild
+    while it is still ready, since the rebuild would only re-key the whole ready set and
+    fail on it again (the same gate as `_JoinIndex`). An incomparable key records nothing:
+    which of the two tokens is at fault depends on heap order, so that case keeps only the
+    rate limit.
     """
 
-    __slots__ = ("key_fn", "_heap", "disabled", "_last_build")
+    __slots__ = ("key_fn", "_heap", "disabled", "_last_build", "_bad_seq")
 
     def __init__(self, key_fn: Callable[[Token], object]) -> None:
         self.key_fn = key_fn
         self._heap: list[tuple[object, int]] = []
         self.disabled = False
         self._last_build: int = 0
+        self._bad_seq: int | None = None
 
     def clear(self) -> None:
         """Discard every entry, for a store that has just dropped all of its tokens."""
         self._heap.clear()
+        self._bad_seq = None
 
     def add(self, seq: int, token: Token) -> bool:
         """Index *token* under *seq*. Returns ``False`` (and disables) if it cannot be keyed."""
         if self.disabled:
             return False
         try:
-            heapq.heappush(self._heap, (self.key_fn(token), seq))
+            key = self.key_fn(token)
+        except Exception:
+            self.disable()
+            self._bad_seq = seq
+            return False
+        try:
+            heapq.heappush(self._heap, (key, seq))
         except Exception:
             self.disable()
             return False
@@ -96,11 +110,14 @@ class _KeyIndex:
         ``_KEY_INDEX_REARM_MIN_DEPOSITS`` deposits (``deposit_clock`` is the store's monotonic
         deposit counter): a key that raises intermittently cannot rebuild the heap on every
         recovery. When the limit has not yet elapsed this returns ``False`` and a later
-        success retries. A back-fill that hits a token it still cannot key re-disables the
-        index and returns ``False``.
+        success retries. While the token whose key raised is still in *ready* this returns
+        ``False`` at once, without re-keying anything. A back-fill that hits a token it still
+        cannot key re-disables the index and returns ``False``.
         """
         if not self.disabled:
             return True
+        if self._bad_seq is not None and self._bad_seq in ready:
+            return False
         if deposit_clock - self._last_build < _KEY_INDEX_REARM_MIN_DEPOSITS:
             return False
         self._last_build = deposit_clock

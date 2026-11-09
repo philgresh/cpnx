@@ -45,6 +45,11 @@ def even_filter(token: Token) -> bool:
     return token.payload["p"] % 2 == 0
 
 
+def not_hidden(token: Token) -> bool:
+    """Certified per-token eligibility: every token not marked hidden."""
+    return "hidden" not in token.payload
+
+
 _MUTABLE: dict[str, int] = {}
 
 
@@ -348,6 +353,110 @@ class TestKeyIndexRearm:
         served = place.peek_by_key(id(arc), 3)
         assert served is not None
         assert [t.payload["p"] for t in served] == [1, 2, 3]
+
+    def test_rearm_does_not_rebuild_while_the_bad_token_stays(self, monkeypatch):
+        """While the token whose key raised is still ready, `rearm` re-keys nothing.
+
+        Before the gate every rearm past the rate limit re-keyed the whole ready set and
+        failed on the same token again, once per `_KEY_INDEX_REARM_MIN_DEPOSITS` deposits.
+        """
+        monkeypatch.setattr(places_module, "_KEY_INDEX_REARM_MIN_DEPOSITS", 4)
+        calls: list[Token] = []
+
+        def counting_key(token: Token) -> int:
+            calls.append(token)
+            return token.payload["p"]
+
+        place = Place("p")
+        place.register_key_index(1, counting_key)
+        poison = Token(payload={})
+        place.deposit(poison)
+        for p in range(20):
+            place.deposit(Token(payload={"p": p}))
+            assert place.rearm_key_index(1) is False
+        assert calls == [poison], "only the bad token was ever keyed"
+
+        place.retrieve_specific([poison])
+        assert place.rearm_key_index(1) is True, "the gate lifts once the bad token leaves"
+        served = place.peek_by_key(1, 3)
+        assert served is not None
+        assert [t.payload["p"] for t in served] == [0, 1, 2]
+
+    def test_rearm_gates_on_the_newest_bad_token_after_a_failed_rebuild(self, monkeypatch):
+        """A rebuild that meets a second bad token gates on that one next."""
+        monkeypatch.setattr(places_module, "_KEY_INDEX_REARM_MIN_DEPOSITS", 0)
+        place = Place("p")
+        place.register_key_index(1, priority_key)
+        first_bad, second_bad = Token(payload={}), Token(payload={})
+        place.deposit(first_bad)
+        place.deposit(second_bad)
+        place.deposit(Token(payload={"p": 1}))
+
+        place.retrieve_specific([first_bad])
+        assert place.rearm_key_index(1) is False  # the rebuild meets `second_bad`
+        assert place._store.key_index(1)._bad_seq == place._store._seq_of[id(second_bad)]
+
+        place.retrieve_specific([second_bad])
+        assert place.rearm_key_index(1) is True
+
+    def test_incomparable_keys_keep_the_rate_limited_rebuild(self, monkeypatch):
+        """A comparison failure names no single bad token, so a later rebuild is still tried."""
+        monkeypatch.setattr(places_module, "_KEY_INDEX_REARM_MIN_DEPOSITS", 0)
+        place = Place("p")
+        place.register_key_index(1, priority_key)
+        a = Token(payload={"p": 1})
+        b = Token(payload={"p": "x"})  # int vs str: the heap push raises TypeError
+        place.deposit(a)
+        place.deposit(b)
+        assert place.key_index_disabled(1) is True
+
+        place.retrieve_specific([a])  # the newer token stays; the rebuild must still run
+        assert place.rearm_key_index(1) is True
+        served = place.peek_by_key(1, 1)
+        assert served is not None
+        assert served == [b]
+
+    def test_engine_does_not_rebuild_while_a_filtered_bad_token_stays(self, monkeypatch):
+        """End to end: a bad token the filter hides keeps the index off without rebuilds.
+
+        `hidden` disables the index at deposit but never reaches selection. `visible` makes
+        selection fail, so the engine tracks the arc, and once it is removed every success
+        asks the place to re-arm. Without the gate each of those, once per
+        `_KEY_INDEX_REARM_MIN_DEPOSITS` deposits, re-keyed the whole ready set and failed on
+        `hidden` again, for as long as it stayed.
+        """
+        monkeypatch.setattr(places_module, "_KEY_INDEX_REARM_MIN_DEPOSITS", 2)
+        net = PetriNet(max_workers=1)
+        net.add_place(Place("in"))
+        net.add_place(Place("out"))
+        errors: list[Exception] = []
+        net.on_error = lambda name, exc, tok: errors.append(exc)
+        arc = InputArc("in", key=priority_key, filter=not_hidden)
+        net.add_transition(Transition("t", inputs=[arc], outputs=[OutputArc("out")], action=lambda toks: toks))
+        place = net.places["in"]
+        hidden = Token(payload={"hidden": True})  # filtered out, so it stays for good
+        visible = Token(payload={})  # passes the filter; priority_key raises on it
+        net.deposit("in", hidden)
+        net.deposit("in", visible)
+        net.drive_to_quiescence()  # registers the index (disabled by `hidden`); `visible` faults
+        assert errors, "the selection fault must be reported"
+        assert place.key_index_disabled(id(arc)) is True
+        place.retrieve_specific([visible])
+
+        keyed: list[Token] = []
+        real_add = places_module._KeyIndex.add
+
+        def counting_add(self, seq, token):
+            keyed.append(token)
+            return real_add(self, seq, token)
+
+        monkeypatch.setattr(places_module._KeyIndex, "add", counting_add)
+        for p in range(20):
+            net.deposit("in", Token(payload={"p": p}))
+            net.drive_to_quiescence()
+        assert len(net.places["out"]) == 20
+        assert place.key_index_disabled(id(arc)) is True
+        assert len(keyed) == 20, "each deposit offers its token once; no rebuild re-keys the place"
 
 
 class TestTokenArgCertification:
