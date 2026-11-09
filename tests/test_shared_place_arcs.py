@@ -393,3 +393,41 @@ def test_a_join_place_shared_with_a_plain_arc_probes_past_the_first_key():
         assert [net._binding_exists(t, net.model_time) for _ in range(3)] == [True, True, True]
         net.drive_to_quiescence()
         assert sorted(token.payload["wid"] for token in net.marking["out"]) == [0, 1, 1]
+
+
+def _f(token: Token) -> object:
+    return token.payload["f"]
+
+
+def _g(token: Token) -> object:
+    return token.payload["g"]
+
+
+@pytest.mark.parametrize("certified", [True, False])
+@pytest.mark.parametrize("guarded", [False, True])
+def test_self_join_arcs_with_different_join_keys_need_one_token_each(certified, guarded):
+    # Arcs with different `join_key` functions on one place match one token each, not N tokens
+    # of one key: a (f=1) for the first arc and b (g=1) for the second is a binding, though no
+    # key holds two tokens under either function.
+    table = {}
+    f = _f if certified else (lambda t: table.get("x", t.payload["f"]))
+    guard = {"guard": lambda tokens: True} if guarded else {}
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("jobs", join_key=f), InputArc("jobs", join_key=_g)],
+            outputs=[OutputArc("out", count=2)],
+            action=_passthrough,
+            **guard,
+        )
+    )
+    net.deposit("jobs", Token(payload={"f": 1, "g": 2}))
+    net.deposit("jobs", Token(payload={"f": 2, "g": 1}))
+    t = net.transitions["t"]
+    assert [net._binding_exists(t, net.model_time) for _ in range(3)] == [True, True, True]
+    _assert_distinct(net)
+    net.drive_to_quiescence()
+    assert len(net.marking["out"]) == 2

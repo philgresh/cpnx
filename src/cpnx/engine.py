@@ -388,16 +388,21 @@ def _join_place_has_plain_arc(transition: Transition) -> bool:
 
 
 def _join_depths(joins: "list[tuple[int, InputArc, Place]]") -> dict[int, int]:
-    """How many of a transition's join arcs read each place, by `id(place)`.
+    """Each join arc's depth, by input position: how many join arcs read its place with its `join_key`.
 
-    A self-join's arcs on one place each take a different token of the key (issue #75), so a
-    key binds there only once the place holds that many of its tokens: the depth its join
-    index is registered with, and the group size `_join_key_groups` requires.
+    A self-join's arcs that read one place with one `join_key` function each take a different
+    token of the key (issue #75), so a key binds there only once the place holds that many of
+    its tokens under that function: the depth the arc's join index is registered with, and the
+    group size `_join_key_groups` requires. Arcs on one place with *different* functions match
+    a key through different tokens, one each, so they do not add to each other's depth.
+    Functions are told apart by identity, as `_registration_matches` does; two equal but
+    distinct functions only cost the shortcut, never a binding.
     """
-    depths: dict[int, int] = {}
-    for _, _, place in joins:
-        depths[id(place)] = depths.get(id(place), 0) + 1
-    return depths
+    counts: dict[tuple[int, int], int] = {}
+    for _, arc, place in joins:
+        group = (id(place), id(arc.join_key))
+        counts[group] = counts.get(group, 0) + 1
+    return {i: counts[(id(place), id(arc.join_key))] for i, arc, place in joins}
 
 
 def _has_join(transition: Transition) -> bool:
@@ -3016,9 +3021,10 @@ class PetriNet:
         for its arc. The assertion keeps a future relaxation of that rule from breaking this
         silently.
 
-        A self-join, several join arcs on one place, keeps the shortcut: its join indexes are
-        registered with that many arcs as their depth (`_join_depths`), so the match lists a key
-        only once the place holds enough of its tokens for each arc to take its own (issue #75).
+        A self-join, several join arcs on one place, keeps the shortcut: each join index is
+        registered with the number of join arcs reading its place with its `join_key` as its
+        depth (`_join_depths`), so the match lists a key only once the place holds enough of its
+        tokens for each arc to take its own (issue #75).
         A place that a join arc shares with an arc *without* a `join_key` does not: that arc's
         options are the place's tokens, and when it may take only the matched key's token, as
         its `filter` can make it, another key would be needed. Such a probe reads every key.
@@ -3041,8 +3047,9 @@ class PetriNet:
         when no key survives, including when `keys` is empty: the match knows that no key is
         available in every join place.
 
-        In a self-join, where several join arcs read one place, each takes a different token of
-        the key's group (issue #75), so a group smaller than that number of arcs is dropped.
+        In a self-join, where several join arcs read one place with one `join_key` function, each
+        takes a different token of the key's group (issue #75), so a group smaller than that
+        number of arcs is dropped (`_join_depths`).
         Its candidates would all reuse a token, and each would spend one of the
         `binding_search_limit` candidates `_satisfying` examines: a backlog of keys holding one
         token each could then hide a key that holds a pair.
@@ -3052,7 +3059,7 @@ class PetriNet:
         depths = _join_depths(joins)
         groups_by_arc: dict[int, dict] = {}
         for i, arc, place in sorted(joins, key=lambda join: len(join[2])):
-            depth = depths[id(place)]
+            depth = depths[i]
             groups = _with_enough_tokens(self._join_groups(i, arc, place, keys, t_limit, transition_name, depth), depth)
             if not groups:
                 return None
@@ -3097,7 +3104,7 @@ class PetriNet:
             join_key = arc.join_key
             if not certified or type(place) is not Place or join_key is None:
                 return None
-            index_ids.append(self._ensure_join_index(transition_name, i, arc, place, join_key, depths[id(place)]))
+            index_ids.append(self._ensure_join_index(transition_name, i, arc, place, join_key, depths[i]))
         ids = tuple(index_ids)
         places = tuple(place for _, _, place in joins)
         match = self._join_matches.get(transition_name)
@@ -3170,7 +3177,8 @@ class PetriNet:
     ) -> "dict[object, Iterable[tuple[object, Token]]] | None":
         """Return `arc`'s available tokens grouped by `join_key`, restricted to `keys` unless `None`.
 
-        `depth` is how many join arcs of the transition read `place` (see `_join_depths`).
+        `depth` is how many join arcs of the transition read `place` with this arc's `join_key`
+        (see `_join_depths`).
 
         Each group yields `(position, token)` in the place's read order, where positions order
         the tokens the same way, and has a `len`. A certified `join_key` on a plain
