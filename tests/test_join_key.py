@@ -334,14 +334,93 @@ def test_a_disabled_index_rearms_once_the_bad_token_leaves_a_non_empty_store(mon
     keep = [Token(payload={"wid": n % 2, "n": n}) for n in range(3)]
     for token in keep:
         store.append(token)
-    bad = Token(payload={})
-    store.append(bad)
-    assert store.join_groups(1, None, 0.0) is None  # disabled, and the rebuild meets `bad` again
-    store.remove_identity([bad])
-    assert store.join_groups(1, None, 0.0) is None  # too soon to rebuild
+    first_bad, second_bad = Token(payload={}), Token(payload={})
+    store.append(first_bad)
+    store.append(second_bad)
+    assert store.join_groups(1, None, 0.0) is None  # `first_bad` is still stored
+    store.remove_identity([first_bad])
+    assert store.join_groups(1, None, 0.0) is None  # the rebuild meets `second_bad`
+    store.remove_identity([second_bad])
+    assert store.join_groups(1, None, 0.0) is None  # too soon after that rebuild
     for n in range(3, 7):
         store.append(Token(payload={"wid": n % 2, "n": n}))
     assert _groups(store, 0.0) == {0: [0, 2, 4, 6], 1: [1, 3, 5]}
+
+
+def test_a_disabled_index_does_not_rebuild_while_its_bad_token_stays(monkeypatch):
+    monkeypatch.setattr(places, "_KEY_INDEX_REARM_MIN_DEPOSITS", 4)
+    calls = []
+
+    def counting_wid(token: Token) -> object:
+        calls.append(token)
+        return token.payload["wid"]
+
+    store = _TokenStore()
+    store.register_join_index(1, counting_wid)
+    store.append(Token(payload={}))
+    for n in range(20):
+        store.append(Token(payload={"wid": n % 2, "n": n}))
+        assert store.join_groups(1, None, 0.0) is None
+    assert len(calls) == 1  # only the bad token was ever keyed
+
+
+def test_a_group_view_skips_entries_shifted_back_by_a_concurrent_insert():
+    store = _TokenStore()
+    store.register_join_index(1, WID)
+    for n, at in ((0, 3.0), (1, 4.0)):
+        store.append(Token(payload={"wid": 0, "n": n}, available_at=at))
+    groups = store.join_groups(1, [0], 5.0)
+    assert groups is not None
+    reader = iter(groups[0])
+    assert next(reader)[1].payload["n"] == 0
+    # An earlier-maturing token lands in front of both, shifting them one place right.
+    store.append(Token(payload={"wid": 0, "n": 2}, available_at=2.0))
+    assert [token.payload["n"] for _, token in reader] == []
+
+
+def test_resetting_join_key_releases_the_place_index():
+    net = _two_place_join_net()
+    arc = net.transitions["match"].inputs[0]
+    net.drive_to_quiescence()
+    jobs = net.places["jobs"]
+    assert jobs.peek_join(id(arc), None) is not None
+    arc.join_key = None
+    net.transitions["match"].inputs[1].join_key = None
+    net.drive_to_quiescence()
+    assert jobs.peek_join(id(arc), None) is None
+    assert not jobs._store._join_indexes
+
+
+def test_a_replaced_place_gets_the_join_index_and_the_old_one_drops_it():
+    net = _two_place_join_net()
+    arc = net.transitions["match"].inputs[0]
+    net.drive_to_quiescence()
+    old = net.places["jobs"]
+    assert old.peek_join(id(arc), None) is not None
+    new = Place("jobs")
+    net.places["jobs"] = new
+    new.deposit(Token(payload={"wid": 1, "n": 5}))
+    net.deposit("workers", Token(payload={"wid": 1}))
+    assert net.drive_to_quiescence().steps == 1
+    assert not old._store._join_indexes
+    assert new._store._join_indexes
+
+
+def _two_place_join_net() -> PetriNet:
+    net = PetriNet(seed=0)
+    for name in ("jobs", "workers", "out"):
+        net.add_place(Place(name))
+    net.add_transition(
+        Transition(
+            name="match",
+            inputs=[InputArc("jobs", join_key=WID), InputArc("workers", join_key=WID)],
+            outputs=[OutputArc("out")],
+            action=lambda toks: [toks[0]],
+        )
+    )
+    net.deposit("jobs", Token(payload={"wid": 9, "n": 0}))
+    net.deposit("workers", Token(payload={"wid": 1}))
+    return net
 
 
 def test_a_net_gets_its_join_index_back_after_a_bad_token_is_consumed(monkeypatch):

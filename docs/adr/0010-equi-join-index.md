@@ -74,12 +74,18 @@ the available tokens of a group are always a **prefix** of it, found with one bi
 the key index of ADR 0004, the join index covers timed tokens, which a discrete-event net is
 full of. It is maintained on every append and removal, with eager deletion through a
 `seq -> key` map, so the cost is O(group size) per change and O(1) per looked-up key. The
-engine registers the index lazily and re-registers it if `join_key` is reassigned.
+engine registers the index lazily and re-registers it if `join_key` is reassigned. It also
+drops an index whose arc no longer reads that place through it, because the arc's `join_key`
+was set back to `None` or the place under that name was replaced, so deposits stop paying to
+key tokens for an index nothing reads.
 
 A resolution reads the join arcs' places smallest first. The first returns its groups for
 every available key; each later one is asked only for the keys every earlier one had. The
 groups come back as lazy views (`places._JoinGroup`), so a deep group costs only what is read
-from it. Each surviving key contributes the product of its groups with the other arcs'
+from it. A view reads the live group list, so a thread that changes the place directly while
+it is read can shift entries under it. The view therefore yields only strictly increasing
+entries no later than the availability cut: a token can be skipped, as with any stale read,
+but never yielded twice. Each surviving key contributes the product of its groups with the other arcs'
 options, read through `_lazy_product`, and `heapq.merge` interleaves the per-key products
 back into product order by each candidate's per-arc read positions. Keys are disjoint, so no
 two candidates tie.
@@ -105,8 +111,10 @@ happens when:
 A `join_key` that raises or returns an unhashable value disables that place's index (a
 deposit never raises because of it). The fallback then meets the same failure, makes the arc
 unsatisfiable, and reports it once through `on_error`, as a raising `key` or `filter` does
-(issue #29). A disabled index re-enables at once when its place empties. Otherwise each read
-offers it a rebuild from every stored token, rate-limited to once per
+(issue #29). A disabled index re-enables at once when its place empties. Otherwise it
+remembers the token that disabled it, and while that token is still stored a read costs one
+membership check and no rebuild. Once it has left, each read offers a rebuild from every
+stored token, rate-limited to once per
 `_KEY_INDEX_REARM_MIN_DEPOSITS` (64) deposits as `_KeyIndex.rearm` is (issue #34). So once
 the offending token has left, a queue that never drains gets its index back within 64
 deposits, instead of grouping the whole pool on every probe from then on.

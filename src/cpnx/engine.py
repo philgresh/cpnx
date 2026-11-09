@@ -738,9 +738,11 @@ class PetriNet:
         #: Lets `_ensure_key_index` skip re-registering on the hot path, while still
         #: rebuilding when an arc's ``key`` is reassigned after construction.
         self._key_index_arcs: dict[int, Callable[[Token], object]] = {}
-        #: ``id(InputArc)`` -> the ``join_key`` last registered as a place join index for it,
-        #: the same bookkeeping as `_key_index_arcs` (see `_join_groups`).
-        self._join_index_arcs: dict[int, Callable[[Token], object]] = {}
+        #: Transition name -> ``{id(arc): (arc, place, join_key)}`` for each place join index
+        #: registered for one of its arcs (see `_ensure_join_index`). Holding the arc keeps its
+        #: id from being reused, and holding the place lets `_release_stale_join_indexes` drop
+        #: an index once its arc stops reading that place through it.
+        self._join_registrations: dict[str, dict[int, tuple[InputArc, Place, Callable[[Token], object]]]] = {}
         #: Transition name -> first exception from a `binding_priority_key` that raised for
         #: *every* candidate binding during the current enabling pass (so `PRIORITY` silently
         #: fell back to insertion order). Drained and dispatched via `on_error` (de-duplicated)
@@ -2412,6 +2414,8 @@ class PetriNet:
             The resolved binding (each arc paired with the tokens it will consume), or `None`
             if no guard-satisfying binding exists within the search limit.
         """
+        if self._join_registrations:
+            self._release_stale_join_indexes(transition)
         fast = self._try_count_only_binding(transition, m_time, ignore_timing)
         if fast is not _NO_FAST_PATH:
             return cast("_Binding | None", fast)
@@ -2438,6 +2442,8 @@ class PetriNet:
         which must not perturb the seeded RNG — otherwise a timing-dependent number of probe
         calls would make `RANDOM` runs non-reproducible.
         """
+        if self._join_registrations:
+            self._release_stale_join_indexes(transition)
         fast = self._try_count_only_binding(transition, m_time, ignore_timing)
         if fast is not _NO_FAST_PATH:
             return fast is not None
@@ -2747,9 +2753,7 @@ class PetriNet:
         assert join_key is not None
         inline_safe = arc._join_key_inline_safe  # type: ignore[attr-defined]
         if inline_safe and type(place) is Place:
-            if self._join_index_arcs.get(id(arc)) is not join_key:
-                place.register_join_index(id(arc), join_key)
-                self._join_index_arcs[id(arc)] = join_key
+            self._ensure_join_index(arc, place, join_key, transition_name)
             indexed = place.peek_join(id(arc), keys, model_time=t_limit)
             if indexed is not None:
                 return indexed
@@ -2757,6 +2761,39 @@ class PetriNet:
         if grouped is None or keys is None:
             return grouped
         return {key: grouped[key] for key in keys if key in grouped}
+
+    def _ensure_join_index(
+        self, arc: InputArc, place: Place, join_key: Callable[[Token], object], transition_name: str
+    ) -> None:
+        """Register `arc`'s join index on `place`, unless that exact registration is in place.
+
+        A registration left on a different place, which happens when the net's place under that
+        name was replaced, is dropped from the old place first.
+        """
+        registered = self._join_registrations.setdefault(transition_name, {})
+        entry = registered.get(id(arc))
+        if entry is not None and entry[1] is place and entry[2] is join_key:
+            return
+        if entry is not None and entry[1] is not place:
+            entry[1].unregister_join_index(id(arc))
+        place.register_join_index(id(arc), join_key)
+        registered[id(arc)] = (arc, place, join_key)
+
+    def _release_stale_join_indexes(self, transition: Transition) -> None:
+        """Drop each join index of `transition` whose arc no longer reads its place through it.
+
+        That is an arc whose `join_key` was reassigned (including back to `None`), or whose
+        place name now maps to another place. Without this, every later deposit into the old
+        place would keep keying tokens for an index nothing reads. A `join_key` that is still in
+        use is registered again by `_ensure_join_index` on its next read.
+        """
+        registered = self._join_registrations.get(transition.name)
+        if not registered:
+            return
+        for arc_id, (arc, place, join_key) in list(registered.items()):
+            if arc.join_key is not join_key or self.places.get(arc.place) is not place:
+                place.unregister_join_index(arc_id)
+                del registered[arc_id]
 
     def _group_pool_by_join_key(
         self, arc: InputArc, place: Place, t_limit: float | None, transition_name: str

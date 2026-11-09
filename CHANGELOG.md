@@ -99,8 +99,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `binding_search_limit` counts only agreeing candidates. **Certify the join key:** an
   uncertified one is never indexed, so each resolution keys every available token through the
   executor, and a miss over 4 000 jobs costs about 90× the equality guard. A join key that
-  raises disables that place's index until a rate-limited rebuild succeeds (at most once per 64
-  deposits) or the place empties. Nets that do not set `join_key` are unaffected.
+  raises disables that place's index. No rebuild is tried while the bad token stays, and once it
+  has left the index comes back through a rate-limited rebuild (at most once per 64 deposits)
+  or when the place empties. Setting `join_key` back to `None`, or replacing the place, drops the
+  index. Nets that do not set `join_key` are unaffected.
 
 - **Official Python 3.15 support, and 3.14 is now a blocking CI entry.** Both versions run the
   full suite, `ruff` and the complexity gate on every PR; 3.14 had been stable for a year while
