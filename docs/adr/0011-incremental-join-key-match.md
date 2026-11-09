@@ -101,11 +101,13 @@ Two or more join arcs can read one place. Each takes a different token, so where
 `join_key` function, a key binds there only once the place holds as many of its tokens under
 that function as there are such arcs. Arcs with different functions match a key through
 different tokens, one each, so each counts only the arcs that share its function (functions
-compared by identity). Each index is
-registered with that number as its **depth**, and its "head" is its group's first `depth`
-entries: it reports a key, and the time it becomes available, only once its `depth`-th token
-is in the group. The match then lists only keys that bind, and the one-key probe of §3 still
-holds. A key whose tokens all sit in a backlog of one-token keys costs nothing to probe past,
+compared by identity). Each index is registered with that number as its **depth**, and its
+"head" is its group's first `depth` entries: it reports a key, and the time it becomes
+available, only once its `depth`-th token is in the group. Where all of a place's join arcs
+share one function, the match then lists only keys that bind, and the one-key probe of §3
+still holds. Where they do not, the depth is only a necessary condition: a token whose key is
+the same under two functions lists that key under each, though its only candidate hands it to
+both arcs. Such a probe asks for every key. A key whose tokens all sit in a backlog of one-token keys costs nothing to probe past,
 as for an ordinary join. Changing the depth (an arc moved onto or off the place) replaces the
 index.
 
