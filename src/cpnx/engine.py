@@ -2961,12 +2961,13 @@ class PetriNet:
         one matched key. That holds because a join arc takes exactly one token and has no
         `key` or `filter` (ADR 0010 §1), so every token of an available group is a valid choice
         for its arc. The assertion keeps a future relaxation of that rule from breaking this
-        silently.
+        silently. A self-join, two join arcs on one place, is the exception: a key whose group
+        holds one token has no binding there, since the arcs take distinct tokens (issue #75),
+        so its probe reads every matched key.
         """
         assert all(arc.count == 1 and arc.key is None and arc.filter is None for _, arc, _ in joins)
-        return self._matched_join_keys(
-            transition.name, joins, t_limit, 1 if unordered and transition.guard is None else None
-        )
+        one_key = unordered and transition.guard is None and not _shared_places(transition)
+        return self._matched_join_keys(transition.name, joins, t_limit, 1 if one_key else None)
 
     def _join_key_groups(
         self,
