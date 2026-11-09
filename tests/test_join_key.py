@@ -378,25 +378,30 @@ def test_a_group_view_skips_entries_shifted_back_by_a_concurrent_insert():
     assert [token.payload["n"] for _, token in reader] == []
 
 
+def _index_id(net: PetriNet, position: int = 0, transition: str = "match") -> int:
+    """The id of the join index the engine registered for that input of that transition."""
+    return net._join_registrations[transition][position][3]
+
+
 def test_resetting_join_key_releases_the_place_index():
     net = _two_place_join_net()
     arc = net.transitions["match"].inputs[0]
     net.drive_to_quiescence()
     jobs = net.places["jobs"]
-    assert jobs.peek_join(id(arc), None) is not None
+    index_id = _index_id(net)
+    assert jobs.peek_join(index_id, None) is not None
     arc.join_key = None
     net.transitions["match"].inputs[1].join_key = None
     net.drive_to_quiescence()
-    assert jobs.peek_join(id(arc), None) is None
+    assert jobs.peek_join(index_id, None) is None
     assert not jobs._store._join_indexes
 
 
 def test_a_replaced_place_gets_the_join_index_and_the_old_one_drops_it():
     net = _two_place_join_net()
-    arc = net.transitions["match"].inputs[0]
     net.drive_to_quiescence()
     old = net.places["jobs"]
-    assert old.peek_join(id(arc), None) is not None
+    assert old.peek_join(_index_id(net), None) is not None
     new = Place("jobs")
     net.places["jobs"] = new
     new.deposit(Token(payload={"wid": 1, "n": 5}))
@@ -443,13 +448,12 @@ def test_a_net_gets_its_join_index_back_after_a_bad_token_is_consumed(monkeypatc
     net.deposit("workers", Token(payload={"wid": 1}))
     bad = Token(payload={})
     net.deposit("jobs", bad)
-    arc = net.transitions["match"].inputs[0]
     assert net.drive_to_quiescence().steps == 0
-    assert net.places["jobs"].peek_join(id(arc), None) is None
+    assert net.places["jobs"].peek_join(_index_id(net), None) is None
     net.places["jobs"].retrieve_specific([bad])
     for n in range(3, 8):
         net.deposit("jobs", Token(payload={"wid": 9, "n": n}))
-    assert net.places["jobs"].peek_join(id(arc), [9]) is not None
+    assert net.places["jobs"].peek_join(_index_id(net), [9]) is not None
     net.deposit("jobs", Token(payload={"wid": 1, "n": 99}))
     assert net.drive_to_quiescence().steps == 1
     assert [t.payload["n"] for t in net.places["out"].tokens] == [99]
@@ -469,7 +473,7 @@ def test_restore_resets_join_index_entries():
 # -- the cross-place key match (ADR 0011) -----------------------------------------------------
 
 
-def _busy_net(seed: int, *, join: bool, policy: BindingPolicy) -> list[tuple[int, int]]:
+def _busy_net(seed: int, *, join: bool, policy: BindingPolicy) -> tuple[list[tuple[int, int]], list[tuple[bool, bool]]]:
     """Jobs each need the worker with their `wid`, who is then busy (a timed token) for a while.
 
     Everything starts ready: a place holding several timed tokens before the drive starts is
@@ -503,17 +507,22 @@ def _busy_net(seed: int, *, join: bool, policy: BindingPolicy) -> list[tuple[int
     net.advance_time(1.0)
     for wid in range(12):
         net.deposit("workers", Token(payload={"wid": wid}))
-    for n in range(150):
-        net.deposit("jobs", Token(payload={"n": n, "wid": rng.randrange(16)}))
-    net.drive_to_quiescence()
-    return fired
+    states: list[tuple[bool, bool]] = []
+    for batch in range(3):
+        for n in range(50 * batch, 50 * batch + 50):
+            net.deposit("jobs", Token(payload={"n": n, "wid": rng.randrange(16)}))
+        states.append((net.is_dead(), net.is_quiescent()))
+        net.drive_to_quiescence()
+        states.append((net.is_dead(), net.is_quiescent()))
+    return fired, states
 
 
 @pytest.mark.parametrize("policy", [BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY])
 def test_the_key_match_fires_what_the_guard_fires_as_heads_come_and_go(policy):
     for seed in range(6):
         expected = _busy_net(seed, join=False, policy=policy)
-        assert len(expected) > 100
+        assert len(expected[0]) > 100
+        assert expected[1][-1] == (True, True)
         assert _busy_net(seed, join=True, policy=policy) == expected
 
 
@@ -563,21 +572,86 @@ def test_head_changes_report_each_head_change_once():
     store = _TokenStore()
     store.register_join_index(1, WID)
     store.append(Token(payload={"wid": 0, "n": 0}, available_at=5.0))
-    generation, full, heads = store.join_head_changes(1, None)
-    assert full and heads == {0: 5.0}
+    generation, every_head, changes = store.join_head_changes(1, None)
+    assert every_head == {0: 5.0} and changes == {}
     late = Token(payload={"wid": 0, "n": 1}, available_at=9.0)
     store.append(late)
-    assert store.join_head_changes(1, generation) == (generation, False, {})
+    assert store.join_head_changes(1, generation) == (generation, None, {})
     early = Token(payload={"wid": 0, "n": 2})
     store.append(early)
     store.append(Token(payload={"wid": 3, "n": 3}, available_at=1.0))
-    assert store.join_head_changes(1, generation) == (generation, False, {0: float("-inf"), 3: 1.0})
+    assert store.join_head_changes(1, generation) == (generation, None, {0: float("-inf"), 3: 1.0})
     store.remove_identity([late])
-    assert store.join_head_changes(1, generation) == (generation, False, {})
+    assert store.join_head_changes(1, generation) == (generation, None, {})
     store.remove_identity([early])
-    assert store.join_head_changes(1, generation) == (generation, False, {0: 5.0})
+    assert store.join_head_changes(1, generation) == (generation, None, {0: 5.0})
     store.drop_all()
-    new_generation, full, heads = store.join_head_changes(1, generation)
-    assert new_generation != generation and full and heads == {}
+    new_generation, every_head, changes = store.join_head_changes(1, generation)
+    assert new_generation != generation and every_head == {} and changes == {}
     store.append(Token(payload={}))
     assert store.join_head_changes(1, new_generation) is None
+
+
+def test_two_transitions_sharing_a_join_arc_each_see_every_change():
+    # Each transition reads the shared arc through its own index, so neither drains the
+    # other's head changes.
+    shared = InputArc("workers", join_key=WID)
+    net = PetriNet(seed=0)
+    for name in ("jobs", "other", "workers", "out1", "out2"):
+        net.add_place(Place(name))
+    for name, source, out in (("t1", "jobs", "out1"), ("t2", "other", "out2")):
+        net.add_transition(
+            Transition(
+                name=name,
+                inputs=[InputArc(source, join_key=WID), shared],
+                outputs=[OutputArc(out)],
+                action=lambda toks: [toks[0]],
+            )
+        )
+    net.deposit("other", Token(payload={"wid": 98}))
+    net.deposit("workers", Token(payload={"wid": 1}))
+    net.drive_to_quiescence()
+    net.deposit("jobs", Token(payload={"wid": 5}))  # t1 probes again, so both have a match
+    net.drive_to_quiescence()
+    net.deposit("workers", Token(payload={"wid": 98}))
+    net.drive_to_quiescence()
+    assert len(net.places["out2"]) == 1
+    assert net.is_dead()
+
+
+def test_the_key_match_keeps_its_state_while_an_index_is_down_and_rebuilds_after(monkeypatch):
+    monkeypatch.setattr(places, "_KEY_INDEX_REARM_MIN_DEPOSITS", 4)
+    full_reports = []
+    original = places._JoinIndex.head_changes
+
+    def spy(self, generation):
+        report = original(self, generation)
+        if report[1] is not None:
+            full_reports.append(report[1])
+        return report
+
+    monkeypatch.setattr(places._JoinIndex, "head_changes", spy)
+    net = _join_net()
+    net.on_error = lambda *args: None
+    for wid in range(50):
+        net.deposit("workers", Token(payload={"wid": wid}))
+    net.deposit("jobs", Token(payload={"wid": 100, "n": 0}))
+    transition = net.transitions["match"]
+    for _ in range(2):  # the first probe registers the indexes, the second builds the match
+        assert not net._binding_exists(transition, net.model_time)
+    built = len(full_reports)
+    assert built == 2
+    bad = Token(payload={})
+    net.deposit("workers", bad)  # disables the index of the later join place
+    for _ in range(5):
+        assert not net._binding_exists(transition, net.model_time)
+    assert "match" in net._join_matches
+    assert len(full_reports) == built, "a probe that falls back must not rebuild the match"
+    net.places["workers"].retrieve_specific([bad])
+    for wid in range(50, 54):
+        net.deposit("workers", Token(payload={"wid": wid}))
+    net.deposit("jobs", Token(payload={"wid": 7, "n": 9}))
+    assert net._binding_exists(transition, net.model_time)
+    assert len(full_reports) > built, "the rearmed index reports every head again"
+    binding = net._resolve_binding(transition, net.model_time)
+    assert [tokens[0].payload["wid"] for _, tokens in binding] == [7, 7]

@@ -116,6 +116,10 @@ _LAST_FINITE_TIME = sys.float_info.max
 
 _MIN_SUBNET_SLICE_SECS = 0.05
 
+_JOIN_INDEX_IDS = itertools.count(1)
+"""Ids for place join indexes, one per (transition, input position). Module-wide, because a place
+object may be shared by two nets and its indexes are keyed by id alone."""
+
 
 class _JoinMatch:
     """The join keys that every `join_key` place of one transition holds, by when they all become available.
@@ -144,33 +148,51 @@ class _JoinMatch:
     live from the places, which drops a key that has gone, as with any stale read.
     """
 
-    __slots__ = ("arc_ids", "places", "_generations", "_heads", "_when", "_order", "_key_by_uid", "_uids")
+    __slots__ = (
+        "index_ids",
+        "places",
+        "_generations",
+        "_heads",
+        "_when",
+        "_order",
+        "_key_by_uid",
+        "_uids",
+    )
 
-    def __init__(self, arc_ids: tuple[int, ...], places: tuple[Place, ...]) -> None:
-        self.arc_ids = arc_ids
+    def __init__(self, index_ids: tuple[int, ...], places: tuple[Place, ...]) -> None:
+        self.index_ids = index_ids
         self.places = places
-        self._generations: list[int | None] = [None] * len(arc_ids)
-        self._heads: list[dict[object, float]] = [{} for _ in arc_ids]
+        self._generations: list[int | None] = [None] * len(index_ids)
+        self._heads: list[dict[object, float]] = [{} for _ in index_ids]
         self._when: dict[object, tuple[float, int]] = {}
         self._order: list[tuple[float, int]] = []
         self._key_by_uid: dict[int, object] = {}
         self._uids = itertools.count()
 
-    def serves(self, arc_ids: tuple[int, ...], places: tuple[Place, ...]) -> bool:
+    def serves(self, index_ids: tuple[int, ...], places: tuple[Place, ...]) -> bool:
         """Whether this match was built for exactly these join arcs reading exactly these places."""
-        return self.arc_ids == arc_ids and all(map(operator.is_, self.places, places))
+        return self.index_ids == index_ids and all(map(operator.is_, self.places, places))
 
     def refresh(self) -> bool:
-        """Bring the match up to date with its places; `False` when one of their indexes is not serving."""
+        """Bring the match up to date with its places; `False` when one of their indexes is not serving.
+
+        A place whose index is not serving stops the refresh there, so a probe that falls back
+        costs only the earlier places' drains, never a rebuild.
+        """
         rebuild = False
         changed: set[object] = set()
-        for i, (arc_id, place) in enumerate(zip(self.arc_ids, self.places, strict=True)):
-            got = place.join_head_changes(arc_id, self._generations[i])
+        serving = True
+        for i, (index_id, place) in enumerate(zip(self.index_ids, self.places, strict=True)):
+            got = place.join_head_changes(index_id, self._generations[i])
             if got is None:
-                return False
-            self._generations[i], full, heads = got
-            if full:
-                self._heads[i] = cast("dict[object, float]", heads)
+                # Keep what the earlier places reported: their changes are drained now. This
+                # place's mirror is stale, but its next report is a full one (its generation
+                # changed when it stopped serving), and that rebuilds.
+                serving = False
+                break
+            self._generations[i], every_head, heads = got
+            if every_head is not None:
+                self._heads[i] = every_head
                 rebuild = True
                 continue
             mirror = self._heads[i]
@@ -185,10 +207,11 @@ class _JoinMatch:
         else:
             for key in changed:
                 self._update(key)
-        return True
+        return serving
 
     def keys_at(self, t_limit: float, limit: int | None = None) -> list[object]:
         """The keys every place has a token of available at `t_limit`, at most `limit` of them."""
+        # Every uid is a finite int, so `(t_limit, inf)` sorts after every entry at `t_limit`.
         end = bisect.bisect_right(self._order, (t_limit, math.inf))
         if limit is not None:
             end = min(end, limit)
@@ -858,11 +881,13 @@ class PetriNet:
         #: Lets `_ensure_key_index` skip re-registering on the hot path, while still
         #: rebuilding when an arc's ``key`` is reassigned after construction.
         self._key_index_arcs: dict[int, Callable[[Token], object]] = {}
-        #: Transition name -> ``{id(arc): (arc, place, join_key)}`` for each place join index
-        #: registered for one of its arcs (see `_ensure_join_index`). Holding the arc keeps its
-        #: id from being reused, and holding the place lets `_release_stale_join_indexes` drop
-        #: an index once its arc stops reading that place through it.
-        self._join_registrations: dict[str, dict[int, tuple[InputArc, Place, Callable[[Token], object]]]] = {}
+        #: Transition name -> ``{input position: (arc, place, join_key, index_id)}`` for each
+        #: place join index registered for one of its arcs (see `_ensure_join_index`). Each
+        #: (transition, input position) gets its own index id, so an `InputArc` object shared by
+        #: two transitions is read through two indexes, each with one reader (ADR 0011 §2).
+        #: Holding the place lets `_release_stale_join_indexes` drop an index once its arc stops
+        #: reading that place through it.
+        self._join_registrations: dict[str, dict[int, tuple[InputArc, Place, Callable[[Token], object], int]]] = {}
         #: Transition name -> the `_JoinMatch` that tracks which join keys all its join places
         #: hold (see `_matched_join_keys`). Dropped whenever it cannot serve.
         self._join_matches: dict[str, _JoinMatch] = {}
@@ -2818,11 +2843,9 @@ class PetriNet:
         if gathered is None:
             return None
         options, joins = gathered
-        # With no guard, any candidate satisfies, so a probe needs only one matched key.
-        keys = self._matched_join_keys(
-            transition.name, joins, t_limit, 1 if unordered and transition.guard is None else None
+        grouped = self._join_key_groups(
+            transition.name, joins, self._join_probe_keys(transition, joins, t_limit, unordered), t_limit
         )
-        grouped = self._join_key_groups(transition.name, joins, keys, t_limit) if keys != [] else None
         if grouped is None:
             return None
         groups_by_arc, keys = grouped
@@ -2831,6 +2854,22 @@ class PetriNet:
             for key in keys
         ]
         return self._join_bindings(transition.inputs, options, self._join_combos(per_key, unordered=unordered))
+
+    def _join_probe_keys(
+        self, transition: Transition, joins: list[tuple[int, InputArc, Place]], t_limit: float | None, unordered: bool
+    ) -> list[object] | None:
+        """The keys `_join_candidates` should look up: the match's available keys, or `None` for all.
+
+        With no guard, any candidate satisfies, so an existence probe (`unordered`) needs only
+        one matched key. That holds because a join arc takes exactly one token and has no
+        `key` or `filter` (ADR 0010 §1), so every token of an available group is a valid choice
+        for its arc. The assertion keeps a future relaxation of that rule from breaking this
+        silently.
+        """
+        assert all(arc.count == 1 and arc.key is None and arc.filter is None for _, arc, _ in joins)
+        return self._matched_join_keys(
+            transition.name, joins, t_limit, 1 if unordered and transition.guard is None else None
+        )
 
     def _join_key_groups(
         self,
@@ -2843,11 +2882,14 @@ class PetriNet:
 
         Starts from `keys`, or from every key of the first place for `None`, and narrows to the
         keys each place has. Returns the groups by arc index and the surviving keys, or `None`
-        when no key survives.
+        when no key survives, including when `keys` is empty: the match knows that no key is
+        available in every join place.
         """
+        if keys is not None and not keys:
+            return None
         groups_by_arc: dict[int, dict] = {}
         for i, arc, place in sorted(joins, key=lambda join: len(join[2])):
-            groups = self._join_groups(arc, place, keys, t_limit, transition_name)
+            groups = self._join_groups(i, arc, place, keys, t_limit, transition_name)
             if not groups:
                 return None
             groups_by_arc[i] = groups
@@ -2869,23 +2911,31 @@ class PetriNet:
         places' indexes: the match starts on the next one.
         """
         match = self._join_match(transition_name, joins) if t_limit is not None else None
-        if match is None or not match.refresh():
+        if match is None:
             self._join_matches.pop(transition_name, None)
             return None
-        return match.keys_at(cast(float, t_limit), limit)
+        assert t_limit is not None
+        # A place whose index is not serving makes this probe fall back, but the match is kept:
+        # it absorbed the other places' changes, and that place's next report is a full one.
+        return match.keys_at(t_limit, limit) if match.refresh() else None
 
     def _join_match(self, transition_name: str, joins: list[tuple[int, InputArc, Place]]) -> _JoinMatch | None:
-        """The transition's `_JoinMatch` for `joins`, made anew if they changed; `None` if one is not indexed."""
-        if not all(
-            arc._join_key_inline_safe and type(place) is Place  # type: ignore[attr-defined]
-            for _, arc, place in joins
-        ):
-            return None
-        arc_ids = tuple(id(arc) for _, arc, _ in joins)
+        """The transition's `_JoinMatch` for `joins`, made anew if they changed; `None` if one is not indexed.
+
+        Each join arc must be read through a registered place join index: a certified key on a
+        plain `Place`, registered by an earlier `_join_groups`.
+        """
+        index_ids: list[int] = []
+        for i, arc, place in joins:
+            index_id = self._join_index_id(transition_name, i, arc, place)
+            if index_id is None or not arc._join_key_inline_safe or type(place) is not Place:  # type: ignore[attr-defined]
+                return None
+            index_ids.append(index_id)
+        ids = tuple(index_ids)
         places = tuple(place for _, _, place in joins)
         match = self._join_matches.get(transition_name)
-        if match is None or not match.serves(arc_ids, places):
-            match = self._join_matches[transition_name] = _JoinMatch(arc_ids, places)
+        if match is None or not match.serves(ids, places):
+            match = self._join_matches[transition_name] = _JoinMatch(ids, places)
         return match
 
     def _join_arc_options(
@@ -2942,7 +2992,13 @@ class PetriNet:
             ]
 
     def _join_groups(
-        self, arc: InputArc, place: Place, keys: list[object] | None, t_limit: float | None, transition_name: str
+        self,
+        position: int,
+        arc: InputArc,
+        place: Place,
+        keys: list[object] | None,
+        t_limit: float | None,
+        transition_name: str,
     ) -> "dict[object, Iterable[tuple[object, Token]]] | None":
         """Return `arc`'s available tokens grouped by `join_key`, restricted to `keys` unless `None`.
 
@@ -2959,8 +3015,8 @@ class PetriNet:
         assert join_key is not None
         inline_safe = arc._join_key_inline_safe  # type: ignore[attr-defined]
         if inline_safe and type(place) is Place:
-            self._ensure_join_index(arc, place, join_key, transition_name)
-            indexed = place.peek_join(id(arc), keys, model_time=t_limit)
+            index_id = self._ensure_join_index(transition_name, position, arc, place, join_key)
+            indexed = place.peek_join(index_id, keys, model_time=t_limit)
             if indexed is not None:
                 return indexed
         grouped = self._group_pool_by_join_key(arc, place, t_limit, transition_name)
@@ -2969,37 +3025,54 @@ class PetriNet:
         return {key: grouped[key] for key in keys if key in grouped}
 
     def _ensure_join_index(
-        self, arc: InputArc, place: Place, join_key: Callable[[Token], object], transition_name: str
-    ) -> None:
-        """Register `arc`'s join index on `place`, unless that exact registration is in place.
+        self, transition_name: str, position: int, arc: InputArc, place: Place, join_key: Callable[[Token], object]
+    ) -> int:
+        """Register the join index for input `position` of the transition on `place`; return its id.
 
-        A registration left on a different place, which happens when the net's place under that
-        name was replaced, is dropped from the old place first.
+        A no-op returning the existing id when that exact registration (same arc, place and
+        `join_key`) is in place. Any other registration at that position is dropped from its
+        place first, and the new one gets a fresh id from `_JOIN_INDEX_IDS`.
         """
         registered = self._join_registrations.setdefault(transition_name, {})
-        entry = registered.get(id(arc))
-        if entry is not None and entry[1] is place and entry[2] is join_key:
-            return
-        if entry is not None and entry[1] is not place:
-            entry[1].unregister_join_index(id(arc))
-        place.register_join_index(id(arc), join_key)
-        registered[id(arc)] = (arc, place, join_key)
+        entry = registered.get(position)
+        if entry is not None:
+            if entry[0] is arc and entry[1] is place and entry[2] is join_key:
+                return entry[3]
+            entry[1].unregister_join_index(entry[3])
+        index_id = next(_JOIN_INDEX_IDS)
+        place.register_join_index(index_id, join_key)
+        registered[position] = (arc, place, join_key, index_id)
+        return index_id
+
+    def _join_index_id(self, transition_name: str, position: int, arc: InputArc, place: Place) -> int | None:
+        """The id of the join index registered for this exact arc and place at `position`, if any."""
+        entry = self._join_registrations.get(transition_name, {}).get(position)
+        if entry is None or entry[0] is not arc or entry[1] is not place or entry[2] is not arc.join_key:
+            return None
+        return entry[3]
 
     def _release_stale_join_indexes(self, transition: Transition) -> None:
         """Drop each join index of `transition` whose arc no longer reads its place through it.
 
-        That is an arc whose `join_key` was reassigned (including back to `None`), or whose
-        place name now maps to another place. Without this, every later deposit into the old
-        place would keep keying tokens for an index nothing reads. A `join_key` that is still in
-        use is registered again by `_ensure_join_index` on its next read.
+        That is an arc whose `join_key` was reassigned (including back to `None`), an arc no
+        longer at that input position, or one whose place name now maps to another place.
+        Without this, every later deposit into the old place would keep keying tokens for an
+        index nothing reads. A `join_key` that is still in use is registered again by
+        `_ensure_join_index` on its next read.
         """
         registered = self._join_registrations.get(transition.name)
         if not registered:
             return
-        for arc_id, (arc, place, join_key) in list(registered.items()):
-            if arc.join_key is not join_key or self.places.get(arc.place) is not place:
-                place.unregister_join_index(arc_id)
-                del registered[arc_id]
+        inputs = transition.inputs
+        for position, (arc, place, join_key, index_id) in list(registered.items()):
+            if (
+                position >= len(inputs)
+                or inputs[position] is not arc
+                or arc.join_key is not join_key
+                or self.places.get(arc.place) is not place
+            ):
+                place.unregister_join_index(index_id)
+                del registered[position]
                 self._join_matches.pop(transition.name, None)
 
     def _group_pool_by_join_key(

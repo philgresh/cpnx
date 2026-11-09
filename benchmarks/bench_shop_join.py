@@ -178,7 +178,10 @@ def main() -> None:
     prev_join: float | None = None
     for n in depths:
         guard_us, steps = drive_us_per_step(n, join=False)
-        join_us, _ = drive_us_per_step(n, join=True)
+        join_us, join_steps = drive_us_per_step(n, join=True)
+        # The arms are different nets drawing from the same seeded stream in firing order, so
+        # a different firing order would change the workload. Same step count, same workload.
+        assert join_steps == steps, f"the arms diverged at N={n}: {steps} vs {join_steps} steps"
         guard_growth = f"x{guard_us / prev_guard:.2f}" if prev_guard else "-"
         join_growth = f"x{join_us / prev_join:.2f}" if prev_join else "-"
         print(f"   {n:>8}  {steps:>7}  {guard_us:>14.1f}  {guard_growth:>7}  {join_us:>17.1f}  {join_growth:>7}")

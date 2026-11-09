@@ -98,7 +98,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   In #59's `shop` net (`bench_shop_join.py`), where workers grow with jobs, `join_key` now holds
   flat at about 280 to 310 µs/step from 1 000 to 16 000 jobs. Without that tracking it grew 1.2
   to 1.4× per doubling to 567 µs/step, and the equality guard reaches 1 355. A join whose
-  keys all match pays about 7 µs more per probe for it (35 → 42 µs in `bench_guard_join.py`). Join arcs need `count == 1` and no `key`, `filter` or `consume_all`;
+  keys all match pays about 7 µs more per probe for it (35 → 42 µs in
+  `bench_guard_join.py`). Join arcs need `count == 1` and no `key`, `filter` or `consume_all`;
   `binding_search_limit` counts only agreeing candidates. **Certify the join key:** an
   uncertified one is never indexed, so each resolution keys every available token through the
   executor, and a miss over 4 000 jobs costs about 90× the equality guard. A join key that

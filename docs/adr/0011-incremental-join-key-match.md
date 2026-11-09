@@ -51,6 +51,14 @@ groups are replaced wholesale: disabled, cleared (the store emptied, or `drop_al
 subnet restore), rebuilt by `rearm`, or replaced by a new index for a reassigned `join_key`.
 A reader that sees a new generation gets every head and rebuilds from its mirrors.
 
+**One reader per index.** A report drains the changes it hands over, so two readers of one
+index would each miss what the other drained. The engine therefore registers one index per
+(transition, input position), with ids from a module-wide counter, rather than per `InputArc`
+object. Two transitions that share an `InputArc` object get two indexes on its place, each with
+one reader. Once a reader has asked, the index keeps collecting changes until it is cleared or
+disabled, even if the match is dropped (a switch to the wall clock, a fallback, or changed join
+arcs) and nothing asks again. That set is bounded by the index's distinct keys.
+
 ### 3. Using it
 
 `_join_candidates` asks the match for the available keys and then reads only those keys'
@@ -59,7 +67,10 @@ product order, and the search limit. The candidates and their order are therefor
 ADR 0010's, which `tests/test_join_key.py` checks under all three policies.
 
 An existence probe on a transition with no guard asks the match for **one** key. Any candidate
-satisfies such a transition, so one available key answers the probe. The timing-ignoring probe
+satisfies such a transition, so one available key answers the probe. That relies on ADR 0010
+§1: a join arc takes exactly one token and has no `key` or `filter`, so every token of an
+available group is a valid choice for its arc. `_join_candidates` asserts it, so lifting that
+restriction must revisit this. The timing-ignoring probe
 in the `shop` net drops from O(matched keys) to O(1).
 
 ### 4. When it does not serve
@@ -67,16 +78,20 @@ in the `shop` net drops from O(matched keys) to O(1).
 The match is an optimisation over the index, which is itself an optimisation. It serves only
 when every join arc is served by a place join index (certified `join_key`, plain `Place`,
 index enabled) and the probe has a definite time. Otherwise `_join_candidates` reads the keys
-itself as before, and the engine drops the match:
+itself as before. The engine drops the match when the cause is structural or a matter of clock:
 
 - an uncertified `join_key`, or a join place that is a `Place` subclass;
-- a disabled index (a key that raised or was unhashable). Once it re-enables, its new
-  generation makes the next match rebuild;
 - the wall clock (`model_time=None`), where the place, not the engine, picks the read time;
 - the transition's first probe, before `_join_groups` has registered the indexes.
 
-A match also rebuilds when its transition's join arcs or their places change, which it
-detects by arc identity and place identity on every probe.
+A disabled index (a key that raised or was unhashable) is different: it is expected to come
+back, and `rearm` is rate-limited, so it can stay down for many probes. The match is kept.
+`refresh` stops at the first place whose index is not serving, after folding in what the
+earlier places reported, so a probe that falls back costs those places' drains and never a
+rebuild. When the index re-enables, its new generation makes the match rebuild once.
+
+A match is replaced when its transition's join arcs, their index ids or their places change,
+which it checks on every probe.
 
 ### 5. Concurrent changes
 
@@ -95,8 +110,10 @@ place that changes during resolution. The change is reported at the next probe.
   and the key list. A join whose keys all match, such as `bench_guard_join.py`'s `hit` with 8
   workers, pays that and gains nothing: its probe rises from about 35 to 42 µs. Its drive is
   unchanged within noise (160 to 185 µs/step before and after).
-- Each join place keeps a set of changed keys, bounded by its distinct keys, while a match
-  reads it. Each match keeps a mirror of every join place's heads, one entry per distinct key
+- Each join index keeps a set of changed keys, bounded by its distinct keys, from the first
+  time a match reads it until it is cleared or disabled.
+- An `InputArc` object shared by two transitions is now indexed twice on its place, once per
+  transition, so each deposit there keys the token twice. Each match keeps a mirror of every join place's heads, one entry per distinct key
   per place, and a sorted list of the keys all places hold.
 - The order of the keys handed to the per-key products changes (by availability, then first
   match). It cannot change a result. The firing path merges the products back into product

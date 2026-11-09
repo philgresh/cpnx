@@ -173,6 +173,10 @@ _JOIN_GENERATIONS = itertools.count(1)
 """Source of `_JoinIndex.generation` values, shared so that no two indexes ever hand out the same one."""
 
 
+_HeadReport = tuple[int, dict[object, float] | None, dict[object, float | None]]
+"""What `_JoinIndex.head_changes` returns: ``(generation, every_head, changes)``."""
+
+
 def _join_head_time(group: list[_JoinEntry]) -> float:
     """When the head of a non-empty join group becomes available: ``-inf`` for a ready token."""
     head = group[0]
@@ -207,7 +211,8 @@ class _JoinIndex:
     because a group's head decides when the key becomes available. `head_changes` hands it the
     keys whose head changed since its last call, which `add` and `discard` collect once a reader
     has asked. `generation` changes whenever the groups are replaced wholesale (disabled,
-    cleared or rebuilt), and a reader that sees a new one gets every head instead.
+    cleared or rebuilt), and a reader that sees a new one gets every head instead. Each index
+    has exactly one reader; see `head_changes`.
     """
 
     __slots__ = ("key_fn", "_groups", "_key_of", "disabled", "_last_build", "_bad_seq", "_dirty", "generation")
@@ -300,30 +305,35 @@ class _JoinIndex:
         self._dirty = None
         self.generation = next(_JOIN_GENERATIONS)
 
-    def head_changes(self, generation: int | None) -> "tuple[int, bool, dict[object, float | None]]":
+    def head_changes(self, generation: int | None) -> "_HeadReport":
         """Report the group heads that changed since a reader last saw *generation*.
 
-        Returns ``(generation, full, heads)``. When *generation* is this index's current one,
-        *heads* maps each key whose group head changed since the previous call to its new
-        `_join_head_time`, or to ``None`` if the key has no token left, and *full* is false.
-        Otherwise (including a first call with ``None``) *full* is true and *heads* holds every
-        key's head time. Either way change tracking restarts from here, so each change is
-        reported once. One reader per index: the engine's `_JoinMatch` for the arc that
-        registered it.
+        Returns ``(generation, every_head, changes)``. When *generation* is this index's
+        current one, *every_head* is ``None`` and *changes* maps each key whose group head
+        changed since the previous call to its new `_join_head_time`, or to ``None`` if the key
+        has no token left. Otherwise (including a first call with ``None``) *every_head* maps
+        every key to its head time and *changes* is empty. Either way change tracking restarts
+        from here, so each change is reported once.
+
+        **One reader per index.** A call drains the changes, so a second reader would miss
+        them. The engine registers one index per (transition, input position) for that reason,
+        even when two transitions share an `InputArc` object. Once a reader has asked, changes
+        are collected until the index is cleared or disabled, whether or not it asks again.
+        That set is bounded by the index's distinct keys.
         """
         groups = self._groups
         if generation != self.generation:
             self._dirty = set()
-            return self.generation, True, {key: _join_head_time(group) for key, group in groups.items()}
+            return self.generation, {key: _join_head_time(group) for key, group in groups.items()}, {}
         dirty = self._dirty
         if not dirty:
-            return self.generation, False, {}
+            return self.generation, None, {}
         self._dirty = set()
-        heads: dict[object, float | None] = {}
+        changes: dict[object, float | None] = {}
         for key in dirty:
             group = groups.get(key)
-            heads[key] = _join_head_time(group) if group else None
-        return self.generation, False, heads
+            changes[key] = _join_head_time(group) if group else None
+        return self.generation, None, changes
 
     def available_groups(
         self,
@@ -539,9 +549,7 @@ class _TokenStore:
             return None
         return index.available_groups(keys, t_limit, self._ready, self._cooling_by_seq)
 
-    def join_head_changes(
-        self, index_id: int, generation: int | None
-    ) -> "tuple[int, bool, dict[object, float | None]] | None":
+    def join_head_changes(self, index_id: int, generation: int | None) -> "_HeadReport | None":
         """`_JoinIndex.head_changes` for *index_id*, or ``None`` if that index is not serving."""
         index = self.join_index(index_id)
         if index is None:
@@ -1245,16 +1253,14 @@ class Place:
             t_limit = model_time if model_time is not None else time.monotonic()
             return self._store.join_groups(index_id, keys, t_limit)
 
-    def join_head_changes(
-        self, index_id: int, generation: int | None
-    ) -> "tuple[int, bool, dict[object, float | None]] | None":
+    def join_head_changes(self, index_id: int, generation: int | None) -> "_HeadReport | None":
         """Report which join keys' earliest tokens changed, for the engine's cross-place key match.
 
-        For the join index registered under *index_id*, returns ``(generation, full, heads)``:
-        each key mapped to the time its earliest token becomes available (``-inf`` when that
-        token is ready now), or to ``None`` when the key has left. With the *generation* the
-        previous call returned, only the keys that changed since then are listed and *full* is
-        false. Otherwise every key is listed and *full* is true. ``None`` when the index is not
+        For the join index registered under *index_id*, returns ``(generation, every_head,
+        changes)``. With the *generation* the previous call returned, *every_head* is ``None``
+        and *changes* maps each key whose earliest token changed since then to the time that
+        token becomes available (``-inf`` when it is ready now), or to ``None`` when the key has
+        left. Otherwise *every_head* maps every key to that time and *changes* is empty. ``None`` when the index is not
         registered or not serving, exactly as for [`peek_join`][cpnx.Place.peek_join].
         """
         with self._lock:
