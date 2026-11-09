@@ -422,7 +422,8 @@ class _TokenStore:
     def missing_identities(self, ids: set[int]) -> set[int]:
         """Return the subset of `id(token)` values in *ids* that are not currently stored.
 
-        O(len(ids)). `set - dict.keys()` would walk every stored key, making each
+        Expected O(len(ids)), independent of how many tokens are stored: one average-O(1) dict
+        lookup per requested id. `set - dict.keys()` would walk every stored key, making each
         `retrieve_specific` cost O(place size).
         """
         seq_of = self._seq_of
