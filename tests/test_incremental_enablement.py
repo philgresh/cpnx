@@ -17,6 +17,7 @@ every `guard`/`key`/`binding_priority_key` below is a real module-level `def`. P
 `action=` callables are not purity-checked and may be lambdas/closures freely.
 """
 
+import math
 import time
 
 from cpnx.engine import PetriNet
@@ -369,6 +370,49 @@ class TestLaterCoolingTokenStaysTracked:
         net.advance_time(2.0)  # the earlier boundary has elapsed
         assert net.is_dead() is True
         assert net.is_quiescent() is False
+
+
+class TestParkedTokenIsNotQueued:
+    """A token parked at ``available_at = inf`` never matures, so it gets no heap entry.
+
+    An ``(inf, place)`` entry never pops, and a non-empty heap makes every re-evaluation run the
+    timing-ignoring probe. The answers stay right, but each reconcile pays for that probe forever.
+    """
+
+    def _build(self) -> PetriNet:
+        net = PetriNet(seed=0)
+        for name in ("jobs", "workers", "out"):
+            net.add_place(Place(name))
+        net.add_transition(
+            Transition(
+                name="match",
+                inputs=[InputArc("jobs"), InputArc("workers")],
+                outputs=[OutputArc("out")],
+                guard=_same_wid_guard,
+                action=lambda toks: [toks[0]],
+            )
+        )
+        net.advance_time(1.0)
+        net.deposit("workers", Token(payload={"wid": 1}))
+        net.deposit("jobs", Token(payload={"wid": 2}, available_at=2.0))
+        net.deposit("jobs", Token(payload={"wid": 3}, available_at=math.inf))
+        return net
+
+    def test_no_inf_entry_after_the_finite_boundary_elapses(self):
+        net = self._build()
+        assert net._incremental_eligible is True
+        assert net.is_quiescent() is True  # seed the scheduler at t=1.0
+        net.advance_time(3.0)
+        assert net.is_quiescent() is True
+        assert all(math.isfinite(boundary) for boundary, _ in net._reactivation)
+
+    def test_parked_token_deposited_after_start_is_not_queued(self):
+        net = self._build()
+        net.is_quiescent()  # seed the scheduler at t=1.0
+        net.advance_time(3.0)
+        net.deposit("jobs", Token(payload={"wid": 4}, available_at=math.inf))
+        assert net.is_quiescent() is True
+        assert all(math.isfinite(boundary) for boundary, _ in net._reactivation)
 
 
 class TestInputlessSourceTransition:
