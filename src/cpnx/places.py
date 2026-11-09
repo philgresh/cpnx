@@ -16,6 +16,7 @@ shorthands for a place whose colour set is ``{"resource"}`` with a pre-filled in
 import heapq
 import itertools
 import math
+import operator
 import threading
 import time
 from collections import Counter, OrderedDict, deque
@@ -23,6 +24,9 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any, ClassVar
 
 from cpnx.tokens import AVAILABLE_NOW, Token
+
+_seq_key = operator.itemgetter(0)
+"""Sort key for `(seq, token)` pairs: the seq alone, so tokens are never compared."""
 
 #: Rebuild a disabled key-index at most once per this many deposits, so a key that raises
 #: intermittently (a "flapping" key) cannot trigger a full O(ready) heap rebuild on every
@@ -480,7 +484,7 @@ class _TokenStore:
         if not self._cooling_by_seq:
             return list(self._ready.values())
         items = list(self._ready.items()) + list(self._cooling_by_seq.items())
-        items.sort(key=lambda pair: pair[0])
+        items.sort(key=_seq_key)
         return [token for _, token in items]
 
 
@@ -705,10 +709,9 @@ class Place:
                         f"Place '{self.name}': token {t.id} is not yet available at {t_limit} "
                         f"(available_at={t.available_at})."
                     )
-            requested_ids_by_identity = {id(t): t.id for t in tokens}
-            missing_identities = self._store.missing_identities(set(requested_ids_by_identity))
+            missing_identities = self._store.missing_identities(set(map(id, tokens)))
             if missing_identities:
-                missing = {requested_ids_by_identity[i] for i in missing_identities}
+                missing = {t.id for t in tokens if id(t) in missing_identities}
                 raise ValueError(
                     f"Place '{self.name}': token id(s) {missing} not found — "
                     f"cannot retrieve_specific tokens that are not present."

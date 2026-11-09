@@ -242,7 +242,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `set(ids) - dict.keys()`, which walks every stored key. It now looks up only the
   requested ids. `bench_guard_join.py`'s drive holds at about 145 µs/step from 4 000 to
   16 000 jobs (was 161 → 240)
-  ([#65](https://github.com/philgresh/cpnx/issues/65)).
+  ([#65](https://github.com/philgresh/cpnx/issues/65)). The incremental scheduler also folds
+  each dirty place's dependents into its re-check set with one set union over a precomputed
+  name set, 3–5× faster for that step (22 µs instead of 83 µs with 1 024 dependents).
 
 ## [0.7.0] — 2026-10-20
 

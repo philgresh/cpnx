@@ -775,6 +775,9 @@ class PetriNet:
         #: from such a place can release back-pressure (`_check_output_capacity`) and re-enable
         #: the producer; conditional arcs never block, so they are excluded.
         self._output_routing: dict[str, list[Transition]] = {}
+        #: Place name -> names of every transition in either routing table for it, so a
+        #: reconcile folds each dirty place into its affected set with one C-level set union.
+        self._dirty_routing: dict[str, frozenset[str]] = {}
         #: Places whose token pool changed since the last reconcile (the "dirty set").
         self._dirty_places: set[str] = set()
         #: Transitions re-evaluated on *every* reconcile because their enablement can change
@@ -1245,6 +1248,10 @@ class PetriNet:
                     out.setdefault(arc.place, []).append(t)
         self._input_routing = inp
         self._output_routing = out
+        self._dirty_routing = {
+            place: frozenset(t.name for t in (*inp.get(place, ()), *out.get(place, ())))
+            for place in inp.keys() | out.keys()
+        }
 
     def _is_volatile(self, transition: Transition) -> bool:
         """Whether `transition`'s enablement can change with **no input-place mutation**.
@@ -1314,9 +1321,8 @@ class PetriNet:
             _, place = heapq.heappop(self._reactivation)
             self._dirty_places.add(place)
         affected: set[str] = self._volatile_transitions | self._capacity_blocked
-        for place_name in self._dirty_places:
-            affected.update(t.name for t in self._input_routing.get(place_name, ()))
-            affected.update(t.name for t in self._output_routing.get(place_name, ()))
+        routing = self._dirty_routing
+        affected.update(*(routing.get(place_name, ()) for place_name in self._dirty_places))
         self._dirty_places.clear()
         # Re-evaluate in registration order so bucket membership — and thus the seeded
         # tie-break `_rng.choice` indexes into it — is reproducible across processes.
