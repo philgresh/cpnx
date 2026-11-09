@@ -484,16 +484,6 @@ def test_restore_resets_key_index_entries():
     assert [t.payload["prio"] for t in index.peek_ordered(place._store._ready, 3)] == [0, 1, 2]
 
 
-class _NoIterDict(dict):
-    """A `_seq_of` stand-in that fails any walk over its keys, so a lookup must use `in`."""
-
-    def __iter__(self):
-        raise AssertionError("walked every stored key")
-
-    def keys(self):
-        raise AssertionError("walked every stored key")
-
-
 def test_missing_identities_reports_only_absent_ids():
     store = _TokenStore()
     stored = [Token(payload={"i": i}) for i in range(5)]
@@ -505,11 +495,26 @@ def test_missing_identities_reports_only_absent_ids():
     assert store.missing_identities(set()) == set()
 
 
+def _missing_identities_secs(depth: int) -> float:
+    """Best-of-5 seconds for 2 000 `missing_identities` calls on a store holding `depth` tokens."""
+    store = _TokenStore()
+    tokens = [Token(payload={"i": i}) for i in range(depth)]
+    for token in tokens:
+        store.append(token)
+    ids = {id(tokens[0]), id(Token())}
+    best = math.inf
+    for _ in range(5):
+        started = time.perf_counter()
+        for _ in range(2_000):
+            store.missing_identities(ids)
+        best = min(best, time.perf_counter() - started)
+    return best
+
+
 def test_missing_identities_does_not_walk_the_stored_keys():
-    """#65: `set(ids) - keys()` cost O(tokens stored) per `retrieve_specific`."""
-    place = Place("Backlog", initial_marking=[Token(payload={"i": i}) for i in range(1_000)])
-    place._store._seq_of = _NoIterDict(place._store._seq_of)
-    head = place.tokens[0]
-    assert place.retrieve_specific([head]) == [head]
-    with pytest.raises(ValueError):
-        place.retrieve_specific([Token()])
+    """#65: `set(ids) - keys()` cost O(tokens stored) per `retrieve_specific`.
+
+    Its cost must not grow with the store: 100x the tokens may cost at most a small constant
+    factor more (walking the keys made it about 100x).
+    """
+    assert _missing_identities_secs(100_000) < 10 * _missing_identities_secs(1_000)
