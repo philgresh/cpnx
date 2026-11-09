@@ -154,6 +154,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`Place.retrieve_specific` rejects a token passed more than once**
+  ([#70](https://github.com/philgresh/cpnx/issues/70)). `retrieve_specific([t, t])` used to
+  return `t` twice while removing it once. It now raises `ValueError` and leaves the place
+  unchanged. The engine never passed repeats, so nets are unaffected.
 - **A token parked at `available_at = inf` no longer counts as pending work.**
   [`is_quiescent`][cpnx.PetriNet.is_quiescent] used to report such a net as busy, so `run()`
   waited out its deadline, or forever without one.

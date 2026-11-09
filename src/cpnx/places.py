@@ -331,6 +331,16 @@ class _JoinGroup:
                 yield entry, token
 
 
+def _first_repeated(tokens: list[Token]) -> Token:
+    """Return the first token of *tokens* that also appears earlier in it, by identity."""
+    seen: set[int] = set()
+    for token in tokens:
+        if id(token) in seen:
+            return token
+        seen.add(id(token))
+    raise ValueError("no token is repeated")
+
+
 class _TokenStore:
     """Backing store for [`Place`][cpnx.Place] giving O(1) arbitrary removal and O(1)
     (amortized) earliest-available checks, in place of an O(n)-per-firing deque rebuild.
@@ -959,7 +969,8 @@ class Place:
 
         Raises:
             ValueError: If any token in *tokens* is not yet available (its `available_at`
-                        is after the effective time) or is not found in this place.
+                        is after the effective time), is not found in this place, or appears
+                        more than once in *tokens*.
         """
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
@@ -969,7 +980,11 @@ class Place:
                         f"Place '{self.name}': token {t.id} is not yet available at {t_limit} "
                         f"(available_at={t.available_at})."
                     )
-            missing_identities = self._store.missing_identities(set(map(id, tokens)))
+            ids = set(map(id, tokens))
+            if len(ids) != len(tokens):
+                repeated = _first_repeated(tokens).id
+                raise ValueError(f"Place '{self.name}': token {repeated} passed more than once to retrieve_specific.")
+            missing_identities = self._store.missing_identities(ids)
             if missing_identities:
                 missing = {t.id for t in tokens if id(t) in missing_identities}
                 raise ValueError(

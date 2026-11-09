@@ -163,6 +163,29 @@ class TestInputArcSelection:
         assert len(p.tokens) == 1
         assert p.tokens[0].id == t2.id
 
+    def test_retrieve_specific_rejects_a_repeated_token(self):
+        """Passing one token twice raises and leaves the place unchanged."""
+        p = Place("p")
+        t1 = Token(payload={"x": 1})
+        t2 = Token(payload={"x": 2})
+        p.deposit(t1)
+        p.deposit(t2)
+
+        with pytest.raises(ValueError, match=f"token {t1.id} passed more than once"):
+            p.retrieve_specific([t2, t1, t1])
+        assert [t.id for t in p.tokens] == [t1.id, t2.id]
+
+    def test_retrieve_specific_reports_a_repeat_before_an_absent_token(self):
+        """A token repeated but never deposited is reported as repeated, and nothing is removed."""
+        p = Place("p")
+        present = Token(payload={"x": 1})
+        absent = Token(payload={"x": 2})
+        p.deposit(present)
+
+        with pytest.raises(ValueError, match="more than once"):
+            p.retrieve_specific([present, absent, absent])
+        assert [t.id for t in p.tokens] == [present.id]
+
 
 class TestInputArcSelectionSemantics:
     """Coverage for the now-orthogonal key/filter combinations and their ordering rules."""
