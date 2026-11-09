@@ -202,6 +202,9 @@ class _JoinMatch:
                 else:
                     mirror[key] = when
             changed.update(heads)
+        # Rebuild even when a later place is not serving: the full report is consumed now and
+        # will not come again, so skipping it would leave `_order` stale. The result goes
+        # unused this probe, and the later place's own full report rebuilds once more.
         if rebuild:
             self._rebuild()
         else:
@@ -358,6 +361,16 @@ class _PeekStream:
 
 _Pool: TypeAlias = list[Token] | _PeekStream
 """An arc's eligible tokens: a list, or a `_PeekStream` on the lazy searching path."""
+
+
+def _registration_matches(
+    entry: tuple[InputArc, Place, Callable[[Token], object], int],
+    arc: InputArc,
+    place: Place,
+    join_key: Callable[[Token], object] | None,
+) -> bool:
+    """Whether a `_join_registrations` entry was made for exactly this arc, place and `join_key`."""
+    return entry[0] is arc and entry[1] is place and entry[2] is join_key
 
 
 def _has_join(transition: Transition) -> bool:
@@ -2927,8 +2940,9 @@ class PetriNet:
         """
         index_ids: list[int] = []
         for i, arc, place in joins:
+            certified: bool = arc._join_key_inline_safe  # type: ignore[attr-defined]
             index_id = self._join_index_id(transition_name, i, arc, place)
-            if index_id is None or not arc._join_key_inline_safe or type(place) is not Place:  # type: ignore[attr-defined]
+            if index_id is None or not certified or type(place) is not Place:
                 return None
             index_ids.append(index_id)
         ids = tuple(index_ids)
@@ -3036,7 +3050,7 @@ class PetriNet:
         registered = self._join_registrations.setdefault(transition_name, {})
         entry = registered.get(position)
         if entry is not None:
-            if entry[0] is arc and entry[1] is place and entry[2] is join_key:
+            if _registration_matches(entry, arc, place, join_key):
                 return entry[3]
             entry[1].unregister_join_index(entry[3])
         index_id = next(_JOIN_INDEX_IDS)
@@ -3047,7 +3061,7 @@ class PetriNet:
     def _join_index_id(self, transition_name: str, position: int, arc: InputArc, place: Place) -> int | None:
         """The id of the join index registered for this exact arc and place at `position`, if any."""
         entry = self._join_registrations.get(transition_name, {}).get(position)
-        if entry is None or entry[0] is not arc or entry[1] is not place or entry[2] is not arc.join_key:
+        if entry is None or not _registration_matches(entry, arc, place, arc.join_key):
             return None
         return entry[3]
 

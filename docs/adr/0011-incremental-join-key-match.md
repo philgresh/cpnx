@@ -70,8 +70,8 @@ An existence probe on a transition with no guard asks the match for **one** key.
 satisfies such a transition, so one available key answers the probe. That relies on ADR 0010
 §1: a join arc takes exactly one token and has no `key` or `filter`, so every token of an
 available group is a valid choice for its arc. `_join_candidates` asserts it, so lifting that
-restriction must revisit this. The timing-ignoring probe
-in the `shop` net drops from O(matched keys) to O(1).
+restriction must revisit this. The timing-ignoring probe in the `shop` net drops from
+O(matched keys) to O(1).
 
 ### 4. When it does not serve
 
@@ -113,8 +113,9 @@ place that changes during resolution. The change is reported at the next probe.
 - Each join index keeps a set of changed keys, bounded by its distinct keys, from the first
   time a match reads it until it is cleared or disabled.
 - An `InputArc` object shared by two transitions is now indexed twice on its place, once per
-  transition, so each deposit there keys the token twice. Each match keeps a mirror of every join place's heads, one entry per distinct key
-  per place, and a sorted list of the keys all places hold.
+  transition, so each deposit there keys the token twice.
+- Each match keeps a mirror of every join place's heads, one entry per distinct key per place,
+  and a sorted list of the keys all places hold.
 - The order of the keys handed to the per-key products changes (by availability, then first
   match). It cannot change a result. The firing path merges the products back into product
   order, and the existence probe chains them only when every candidate fits in the search
