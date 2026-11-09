@@ -770,13 +770,16 @@ class PetriNet:
         #: firing or introspection via `_ensure_resource_returns_synthesized`.
         self._resource_returns_synthesized = False
         #: Place name -> transitions with an `InputArc` on it (adding tokens may enable them).
+        #: A source table for `_dirty_routing`, which is what a reconcile reads.
         self._input_routing: dict[str, list[Transition]] = {}
         #: Place name -> transitions with an *unconditional* `OutputArc` on it. Removing tokens
         #: from such a place can release back-pressure (`_check_output_capacity`) and re-enable
-        #: the producer; conditional arcs never block, so they are excluded.
+        #: the producer; conditional arcs never block, so they are excluded. A source table for
+        #: `_dirty_routing`, like `_input_routing`.
         self._output_routing: dict[str, list[Transition]] = {}
-        #: Place name -> names of every transition in either routing table for it, so a
-        #: reconcile folds each dirty place into its affected set with one C-level set union.
+        #: Place name -> names of the transitions in `_input_routing` or `_output_routing` for it:
+        #: the transitions a change to that place may enable or unblock. `_reconcile_dirty` folds
+        #: each dirty place into its re-check set with one set union against this.
         self._dirty_routing: dict[str, frozenset[str]] = {}
         #: Places whose token pool changed since the last reconcile (the "dirty set").
         self._dirty_places: set[str] = set()
