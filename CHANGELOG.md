@@ -162,6 +162,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   queues each place's next boundary whenever one elapses. A token parked at
   `available_at = inf` is never queued, so it can't keep the scheduler doing extra work on every
   pass.
+- **A disabled key index no longer re-keys the whole place while its bad token stays.** When a
+  certified `InputArc.key` raised, the place's key index tried a full rebuild of the ready set
+  once per 64 deposits for as long as the token that disabled it was still there, and each
+  rebuild failed on that token again. It now remembers that token and skips the rebuild while
+  it is ready, as the join index does since
+  [#64](https://github.com/philgresh/cpnx/issues/64). With 100 000 ready tokens ahead of the bad one
+  and a re-arm after every deposit, a deposit cost 390 µs on average and now costs 5 µs; at
+  10 000 tokens, 40 µs and now 6 µs. A key that fails only because two keys cannot be compared
+  names no single bad token, so it keeps the rate-limited rebuild.
 - **`Place.retrieve_specific` rejects a token passed more than once**
   ([#70](https://github.com/philgresh/cpnx/issues/70)). `retrieve_specific([t, t])` used to
   return `t` twice while removing it once. It now raises `ValueError` and leaves the place
