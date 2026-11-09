@@ -399,6 +399,16 @@ class TestKeyIndexRearm:
         place.retrieve_specific([second_bad])
         assert place.rearm_key_index(1) is True
 
+    def test_emptying_the_place_clears_the_gate(self):
+        """`drop_all` forgets the bad token, so the cleared index has nothing to gate on."""
+        place = Place("p")
+        place.register_key_index(1, priority_key)
+        place.deposit(Token(payload={}))
+        index = place._store.key_index(1)
+        assert index._bad_seq is not None
+        place._store.drop_all()
+        assert index._bad_seq is None
+
     def test_incomparable_keys_keep_the_rate_limited_rebuild(self, monkeypatch):
         """A comparison failure names no single bad token, so a later rebuild is still tried."""
         monkeypatch.setattr(places_module, "_KEY_INDEX_REARM_MIN_DEPOSITS", 0)

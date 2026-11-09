@@ -166,7 +166,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   certified `InputArc.key` raised, the place's key index tried a full rebuild of the ready set
   once per 64 deposits for as long as the token that disabled it was still there, and each
   rebuild failed on that token again. It now remembers that token and skips the rebuild while
-  it is ready, as the join index does since #64. With 100 000 ready tokens ahead of the bad one
+  it is ready, as the join index does since
+  [#64](https://github.com/philgresh/cpnx/issues/64). With 100 000 ready tokens ahead of the bad one
   and a re-arm after every deposit, a deposit cost 390 µs on average and now costs 5 µs; at
   10 000 tokens, 40 µs and now 6 µs. A key that fails only because two keys cannot be compared
   names no single bad token, so it keeps the rate-limited rebuild.
