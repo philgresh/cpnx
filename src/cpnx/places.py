@@ -169,6 +169,19 @@ class _KeyIndex:
 _JoinEntry = tuple[int, float, int]
 """A join-index entry: ``(tier, available_at, seq)``, with tier 0 for a ready token and 1 for a timed one."""
 
+_JOIN_GENERATIONS = itertools.count(1)
+"""Source of `_JoinIndex.generation` values, shared so that no two indexes ever hand out the same one."""
+
+
+_HeadReport = tuple[int, dict[object, float] | None, dict[object, float | None]]
+"""What `_JoinIndex.head_changes` returns: ``(generation, every_head, changes)``."""
+
+
+def _join_head_time(group: list[_JoinEntry]) -> float:
+    """When the head of a non-empty join group becomes available: ``-inf`` for a ready token."""
+    head = group[0]
+    return head[1] if head[0] else -math.inf
+
 
 class _JoinIndex:
     """A persistent ``join_key -> tokens`` index over one [`_TokenStore`][]'s tokens (#64).
@@ -192,9 +205,17 @@ class _JoinIndex:
     has left, rebuilds run at most once per `_KEY_INDEX_REARM_MIN_DEPOSITS` deposits, as
     `_KeyIndex.rearm` does, so a place that never drains gets its index back within that many
     deposits.
+
+    **Head changes.** The engine keeps, per join transition, the keys that every join place
+    holds (`cpnx.engine._JoinMatch`, ADR 0011). It needs to hear when a group's *head* changes,
+    because a group's head decides when the key becomes available. `head_changes` hands it the
+    keys whose head changed since its last call, which `add` and `discard` collect once a reader
+    has asked. `generation` changes whenever the groups are replaced wholesale (disabled,
+    cleared or rebuilt), and a reader that sees a new one gets every head instead. Each index
+    has exactly one reader; see `head_changes`.
     """
 
-    __slots__ = ("key_fn", "_groups", "_key_of", "disabled", "_last_build", "_bad_seq")
+    __slots__ = ("key_fn", "_groups", "_key_of", "disabled", "_last_build", "_bad_seq", "_dirty", "generation")
 
     def __init__(self, key_fn: Callable[[Token], object]) -> None:
         self.key_fn = key_fn
@@ -203,6 +224,8 @@ class _JoinIndex:
         self.disabled = False
         self._last_build = 0
         self._bad_seq: int | None = None
+        self._dirty: set[object] | None = None
+        self.generation = next(_JOIN_GENERATIONS)
 
     def rearm(self, tokens: Iterable[tuple[int, Token]], deposit_clock: int, is_stored: Callable[[int], bool]) -> bool:
         """Re-enable a disabled index by rebuilding it from *tokens* (seq, token); return whether it serves.
@@ -222,6 +245,7 @@ class _JoinIndex:
             return False
         self._last_build = deposit_clock
         self.disabled = False
+        self.generation = next(_JOIN_GENERATIONS)
         for seq, token in tokens:
             self.add(seq, token)
             if self.disabled:
@@ -242,9 +266,13 @@ class _JoinIndex:
         entry = (0, 0.0, seq) if token.available_at == AVAILABLE_NOW else (1, token.available_at, seq)
         if not group or group[-1] < entry:
             group.append(entry)
+            at = len(group) - 1
         else:
-            bisect.insort(group, entry)
+            at = bisect.bisect_left(group, entry)
+            group.insert(at, entry)
         self._key_of[seq] = key
+        if at == 0 and self._dirty is not None:
+            self._dirty.add(key)
 
     def discard(self, seq: int, token: Token) -> None:
         """Remove *token*'s entry, if it has one."""
@@ -253,9 +281,12 @@ class _JoinIndex:
         key = self._key_of.pop(seq)
         group = self._groups[key]
         entry = (0, 0.0, seq) if token.available_at == AVAILABLE_NOW else (1, token.available_at, seq)
-        del group[bisect.bisect_left(group, entry)]
+        at = bisect.bisect_left(group, entry)
+        del group[at]
         if not group:
             del self._groups[key]
+        if at == 0 and self._dirty is not None:
+            self._dirty.add(key)
 
     def clear(self) -> None:
         """Discard every entry and re-enable, for a store that has just become empty."""
@@ -263,12 +294,46 @@ class _JoinIndex:
         self._key_of = {}
         self.disabled = False
         self._bad_seq = None
+        self._dirty = None
+        self.generation = next(_JOIN_GENERATIONS)
 
     def disable(self) -> None:
         """Stop serving this index and release its entries until the store next empties."""
         self.disabled = True
         self._groups = {}
         self._key_of = {}
+        self._dirty = None
+        self.generation = next(_JOIN_GENERATIONS)
+
+    def head_changes(self, generation: int | None) -> "_HeadReport":
+        """Report the group heads that changed since a reader last saw *generation*.
+
+        Returns ``(generation, every_head, changes)``. When *generation* is this index's
+        current one, *every_head* is ``None`` and *changes* maps each key whose group head
+        changed since the previous call to its new `_join_head_time`, or to ``None`` if the key
+        has no token left. Otherwise (including a first call with ``None``) *every_head* maps
+        every key to its head time and *changes* is empty. Either way change tracking restarts
+        from here, so each change is reported once.
+
+        **One reader per index.** A call drains the changes, so a second reader would miss
+        them. The engine registers one index per (transition, input position) for that reason,
+        even when two transitions share an `InputArc` object. Once a reader has asked, changes
+        are collected until the index is cleared or disabled, whether or not it asks again.
+        That set is bounded by the index's distinct keys.
+        """
+        groups = self._groups
+        if generation != self.generation:
+            self._dirty = set()
+            return self.generation, {key: _join_head_time(group) for key, group in groups.items()}, {}
+        dirty = self._dirty
+        if not dirty:
+            return self.generation, None, {}
+        self._dirty = set()
+        changes: dict[object, float | None] = {}
+        for key in dirty:
+            group = groups.get(key)
+            changes[key] = _join_head_time(group) if group else None
+        return self.generation, None, changes
 
     def available_groups(
         self,
@@ -483,6 +548,13 @@ class _TokenStore:
         if index is None:
             return None
         return index.available_groups(keys, t_limit, self._ready, self._cooling_by_seq)
+
+    def join_head_changes(self, index_id: int, generation: int | None) -> "_HeadReport | None":
+        """`_JoinIndex.head_changes` for *index_id*, or ``None`` if that index is not serving."""
+        index = self.join_index(index_id)
+        if index is None:
+            return None
+        return index.head_changes(generation)
 
     def append(self, token: Token) -> None:
         """Add *token*, routing it to the ready set or the cooling heap by `available_at`."""
@@ -1180,6 +1252,19 @@ class Place:
         with self._lock:
             t_limit = model_time if model_time is not None else time.monotonic()
             return self._store.join_groups(index_id, keys, t_limit)
+
+    def join_head_changes(self, index_id: int, generation: int | None) -> "_HeadReport | None":
+        """Report which join keys' earliest tokens changed, for the engine's cross-place key match.
+
+        For the join index registered under *index_id*, returns ``(generation, every_head,
+        changes)``. With the *generation* the previous call returned, *every_head* is ``None``
+        and *changes* maps each key whose earliest token changed since then to the time that
+        token becomes available (``-inf`` when it is ready now), or to ``None`` when the key has
+        left. Otherwise *every_head* maps every key to that time and *changes* is empty. ``None`` when the index is not
+        registered or not serving, exactly as for [`peek_join`][cpnx.Place.peek_join].
+        """
+        with self._lock:
+            return self._store.join_head_changes(index_id, generation)
 
     def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
         """Return ``True`` if at least *count* tokens are currently available for retrieval.

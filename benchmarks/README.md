@@ -11,6 +11,7 @@ python benchmarks/bench_transition_scan.py
 python benchmarks/bench_cafe_throughput.py
 python benchmarks/bench_cafe_concurrency.py
 python benchmarks/bench_resource_return.py
+python benchmarks/bench_shop_join.py
 python benchmarks/consensus/benchmark_consensus.py
 ```
 
@@ -32,6 +33,7 @@ Two tiers:
 | `bench_transition_scan.py` | micro + macro | Per-step cost as the **transition count** `T` grows (the axis nothing else here sweeps). Before [ADR 0006](../docs/adr/0006-incremental-enablement.md), `_select_transition_to_fire` re-resolved *every* transition each step (one scan `O(T)`, a `K`-firing run `O(K·T)`, drive wall time `O(T²)`). The incremental per-place dirty-set scheduler collapsed that to `O(K)`; this benchmark is the regression guard, and both the scan-probe and drive per-step columns now stay ~flat as `T` doubles (growth ~1.0). |
 | `bench_timed_backlog.py` | micro + macro | Logical-clock cost when matured timed tokens back up in a place ([#59](https://github.com/philgresh/cpnx/issues/59)). **boundary**: per-call `Place.earliest_available_boundary` over `N` matured tokens, which must stay flat as `N` doubles. **drive**: `drive_to_quiescence` of `N` timed arrivals through one busy worker, against an untimed control. |
 | `bench_guard_join.py` | micro + macro | Binding-search cost of a guard join over a deep place ([#59](https://github.com/philgresh/cpnx/issues/59), cause C; [#64](https://github.com/philgresh/cpnx/issues/64)): N jobs matched to 8 workers on `wid`, once through an equality guard and once through `InputArc.join_key`. **probe**: per-call `_resolve_binding` when the head job matches (`hit`, must stay flat as `N` doubles) and when nothing matches (`miss`: linear with the guard, since `FIRST` inspects every candidate, and flat with `join_key`). **drive**: `drive_to_quiescence` until every job is matched, both ways. |
+| `bench_shop_join.py` | macro | Per-step cost of [#59](https://github.com/philgresh/cpnx/issues/59)'s job-shop net, where workers scale with jobs (one per 130), so both sides of the `resume` join grow with `N`. `drive_to_quiescence` per step, once with the original equality guard and once with `InputArc.join_key` ([ADR 0010](../docs/adr/0010-equi-join-index.md), [ADR 0011](../docs/adr/0011-incremental-join-key-match.md)). The `join_key` column must stay ~flat as `N` doubles. |
 | `bench_cafe_throughput.py` | macro | End-to-end throughput (`us/order`, `us/step`) of the cafe net processing N orders, swept over `N` and the binding regime. Reveals how per-step engine cost scales with marking depth. Single-worker by construction. |
 | `bench_cafe_concurrency.py` | macro | Wall-clock **makespan** against `max_workers`, swept over queue depth and guard regime. The only script here that says anything about parallelism. |
 | `bench_station_costs.py` | macro | µs/order against queue depth for each opt-in station's selection shape (certified vs. uncertified `key`, filter-only, timed×key), plus the arc-ordering and `binding_search_limit` search-budget sweeps. Answers the "Unmeasured combinations" audit below. |

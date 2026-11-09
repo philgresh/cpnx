@@ -1,6 +1,6 @@
 # ADR 0010 — Opt-in equi-join between input arcs (`InputArc.join_key`)
 
-- **Status:** Accepted
+- **Status:** Accepted (§3's probe cost refined by [0011](0011-incremental-join-key-match.md))
 - **Date:** 2026-11-08
 - **Relates to:** [0001](0001-combinatorial-binding-search.md) (the binding search and its
   candidate order), [0004](0004-arc-selection-key-filter.md) (per-token arc callables and their
@@ -132,6 +132,11 @@ deposits, instead of grouping the whole pool on every probe from then on.
   µs/step still grows by about 1.2 to 1.4× per doubling (588 µs/step at 16 000 jobs, against
   1 622 with the guard). Keeping the intersection of keys up to date incrementally, across
   places and a moving clock, would remove that and is left for later.
+
+  > **Update:** [ADR 0011](0011-incremental-join-key-match.md) does this. A per-transition
+  > match tracks which keys every join place holds and when each becomes available, so a
+  > probe costs what changed since the last one plus the keys it returns. The `shop` net is
+  > now flat as N doubles.
 - The fallback is not capped by `binding_search_limit`: it keys every available token in each
   join place, per resolution, and an uncertified key goes through the executor per token. On
   a miss that costs about 22× the equality guard at 1 000 jobs and 88× at 4 000. The
