@@ -1254,12 +1254,17 @@ class PetriNet:
         No-op unless the incremental scheduler is eligible. A future-dated `token` (a
         retry-delayed rollback) also schedules a reactivation at its `available_at`, so the
         place re-dirties once the delay elapses — the one time-gate the fast path handles
-        rather than falling back on. Caller must hold `self._lock`.
+        rather than falling back on. A token parked at ``available_at = inf`` never matures, so
+        it schedules nothing. Caller must hold `self._lock`.
         """
         if not self._incremental_eligible:
             return
         self._dirty_places.add(place_name)
-        if token is not None and token.available_at > self._get_model_time_under_lock():
+        if (
+            token is not None
+            and token.available_at > self._get_model_time_under_lock()
+            and math.isfinite(token.available_at)
+        ):
             heapq.heappush(self._reactivation, (token.available_at, place_name))
 
     def _build_routing(self) -> None:
@@ -1332,7 +1337,7 @@ class PetriNet:
             self._dirty_places.add(name)
             if not isinstance(place, SinkPlace):
                 boundary = place.earliest_available_boundary(now)
-                if boundary is not None:
+                if boundary is not None and math.isfinite(boundary):
                     heapq.heappush(self._reactivation, (boundary, name))
         self._scheduler_ready = True
 
@@ -1345,9 +1350,7 @@ class PetriNet:
         """
         self._ensure_scheduler_ready()
         now = self._get_model_time_under_lock()
-        while self._reactivation and self._reactivation[0][0] <= now:
-            _, place = heapq.heappop(self._reactivation)
-            self._dirty_places.add(place)
+        self._drain_reactivation(now)
         affected: set[str] = self._volatile_transitions | self._capacity_blocked
         routing = self._dirty_routing
         affected.update(*(routing.get(place_name, ()) for place_name in self._dirty_places))
@@ -1356,6 +1359,30 @@ class PetriNet:
         # tie-break `_rng.choice` indexes into it — is reproducible across processes.
         for name in sorted(affected, key=self._transition_order.__getitem__):
             self._reevaluate_transition(self.transitions[name], now)
+
+    def _drain_reactivation(self, now: float) -> None:
+        """Pop elapsed reactivation boundaries, re-dirty their places and queue each one's next.
+
+        A place can hold several cooling tokens while the heap carries only its earliest
+        boundary (`_ensure_scheduler_ready` seeds one entry per place). Re-pushing the place's
+        next boundary after popping keeps a later token tracked until it matures, so the
+        timing-ignoring probe in `_reevaluate_transition` still runs and `is_quiescent` does not
+        report quiescence while a binding waits on that token (#68). A token parked at
+        ``available_at = inf`` never matures, so its boundary is not queued: an entry that never
+        pops would keep that probe running on every reconcile. Caller must hold the lock.
+        """
+        popped: set[str] = set()
+        while self._reactivation and self._reactivation[0][0] <= now:
+            _, place = heapq.heappop(self._reactivation)
+            popped.add(place)
+        for name in popped:
+            self._dirty_places.add(name)
+            place = self.places.get(name)
+            if place is None or isinstance(place, SinkPlace):
+                continue
+            boundary = place.earliest_available_boundary(now)
+            if boundary is not None and math.isfinite(boundary):
+                heapq.heappush(self._reactivation, (boundary, name))
 
     def _reevaluate_transition(self, transition: Transition, m_time: float) -> None:
         """Recompute one transition's membership in the enabled + potentially-enabled sets.
