@@ -1,5 +1,6 @@
 """Concurrent Petri net executor."""
 
+import bisect
 import concurrent.futures
 import heapq
 import itertools
@@ -114,6 +115,125 @@ _LAST_FINITE_TIME = sys.float_info.max
 """The horizon of a timing-ignoring probe: past every finite time, short of a token parked at `inf`."""
 
 _MIN_SUBNET_SLICE_SECS = 0.05
+
+
+class _JoinMatch:
+    """The join keys that every `join_key` place of one transition holds, by when they all become available.
+
+    `_join_candidates` would otherwise read every key of its smallest join place on every
+    probe and look each one up in the others, which costs O(keys in that place) even when
+    only a few keys are held everywhere (ADR 0011). This keeps that intersection up to date
+    from the places' join indexes instead.
+
+    A key's group in a place becomes available when its head token does (the available
+    tokens of a group are a prefix of it), so the key is available everywhere at
+    ``when(key) = max(head time per place)``, with ``-inf`` for a ready head. `_order` holds
+    ``(when, uid)`` for every key held by all the places, sorted, so the keys available at
+    `t` are a prefix of it, found with one bisection. `uid` stands in for the key itself,
+    which need not be orderable.
+
+    `refresh` drains each place's head changes (`Place.join_head_changes`) into a mirror of
+    its heads (`_heads`) and recomputes `when` for each key that changed, so a probe pays for
+    what changed since the last one, not for the size of the places. A place that hands back
+    a whole new set of heads (its index was rebuilt, cleared or replaced) makes this rebuild
+    from the mirrors.
+
+    The mirrors and the order are read under the engine lock and fed under each place's lock
+    in turn, so a change made to a place directly, between those reads, can leave a key listed
+    that a place no longer holds, or miss one it just gained. The caller then reads the groups
+    live from the places, which drops a key that has gone, as with any stale read.
+    """
+
+    __slots__ = ("arc_ids", "places", "_generations", "_heads", "_when", "_order", "_key_by_uid", "_uids")
+
+    def __init__(self, arc_ids: tuple[int, ...], places: tuple[Place, ...]) -> None:
+        self.arc_ids = arc_ids
+        self.places = places
+        self._generations: list[int | None] = [None] * len(arc_ids)
+        self._heads: list[dict[object, float]] = [{} for _ in arc_ids]
+        self._when: dict[object, tuple[float, int]] = {}
+        self._order: list[tuple[float, int]] = []
+        self._key_by_uid: dict[int, object] = {}
+        self._uids = itertools.count()
+
+    def serves(self, arc_ids: tuple[int, ...], places: tuple[Place, ...]) -> bool:
+        """Whether this match was built for exactly these join arcs reading exactly these places."""
+        return self.arc_ids == arc_ids and all(map(operator.is_, self.places, places))
+
+    def refresh(self) -> bool:
+        """Bring the match up to date with its places; `False` when one of their indexes is not serving."""
+        rebuild = False
+        changed: set[object] = set()
+        for i, (arc_id, place) in enumerate(zip(self.arc_ids, self.places, strict=True)):
+            got = place.join_head_changes(arc_id, self._generations[i])
+            if got is None:
+                return False
+            self._generations[i], full, heads = got
+            if full:
+                self._heads[i] = cast("dict[object, float]", heads)
+                rebuild = True
+                continue
+            mirror = self._heads[i]
+            for key, when in heads.items():
+                if when is None:
+                    mirror.pop(key, None)
+                else:
+                    mirror[key] = when
+            changed.update(heads)
+        if rebuild:
+            self._rebuild()
+        else:
+            for key in changed:
+                self._update(key)
+        return True
+
+    def keys_at(self, t_limit: float, limit: int | None = None) -> list[object]:
+        """The keys every place has a token of available at `t_limit`, at most `limit` of them."""
+        end = bisect.bisect_right(self._order, (t_limit, math.inf))
+        if limit is not None:
+            end = min(end, limit)
+        key_by_uid = self._key_by_uid
+        return [key_by_uid[uid] for _, uid in itertools.islice(self._order, end)]
+
+    def _rebuild(self) -> None:
+        """Recompute every key from the mirrors, walking the smallest one."""
+        self._when = {}
+        self._order = []
+        self._key_by_uid = {}
+        for key in min(self._heads, key=len):
+            self._update(key)
+
+    def _when_held(self, key: object) -> float | None:
+        """When `key` is available in every place, or `None` if some place does not hold it."""
+        latest = -math.inf
+        for mirror in self._heads:
+            when = mirror.get(key)
+            if when is None:
+                return None
+            if when > latest:
+                latest = when
+        return latest
+
+    def _update(self, key: object) -> None:
+        """Move `key` to its place in `_order`, adding or dropping it as the mirrors now say."""
+        new = self._when_held(key)
+        old = self._when.get(key)
+        if old is not None:
+            if new == old[0]:
+                return
+            del self._order[bisect.bisect_left(self._order, old)]
+            if new is None:
+                del self._when[key]
+                del self._key_by_uid[old[1]]
+                return
+            entry = (new, old[1])
+        elif new is None:
+            return
+        else:
+            entry = (new, next(self._uids))
+            self._key_by_uid[entry[1]] = key
+        self._when[key] = entry
+        bisect.insort(self._order, entry)
 
 
 def _lazy_product(streams: list[Iterator[_T]]) -> Iterator[tuple[_T, ...]]:
@@ -743,6 +863,9 @@ class PetriNet:
         #: id from being reused, and holding the place lets `_release_stale_join_indexes` drop
         #: an index once its arc stops reading that place through it.
         self._join_registrations: dict[str, dict[int, tuple[InputArc, Place, Callable[[Token], object]]]] = {}
+        #: Transition name -> the `_JoinMatch` that tracks which join keys all its join places
+        #: hold (see `_matched_join_keys`). Dropped whenever it cannot serve.
+        self._join_matches: dict[str, _JoinMatch] = {}
         #: Transition name -> first exception from a `binding_priority_key` that raised for
         #: *every* candidate binding during the current enabling pass (so `PRIORITY` silently
         #: fell back to insertion order). Drained and dispatched via `on_error` (de-duplicated)
@@ -2644,13 +2767,14 @@ class PetriNet:
         fastest). See `docs/adr/0010-equi-join-index.md`.
 
         Each `join_key` arc is read as groups of tokens by key (`_join_groups`), served from
-        the place's persistent join index when the key is certified. The place with the fewest
-        tokens is read first, and each later place is asked only for the keys every earlier
-        one had, so a probe costs O(keys in the smallest place) lookups rather than a walk over
-        the product. Each surviving key contributes the product of its groups with the other
-        arcs' options, and `heapq.merge` interleaves those per-key products back into the
-        product's order by comparing each candidate's per-arc read positions. Keys are
-        disjoint, so no two candidates tie.
+        the place's persistent join index when the key is certified. When every join arc is
+        served that way, the transition's `_JoinMatch` already knows which keys all the places
+        hold available tokens of (ADR 0011), so only those are looked up. Otherwise the place
+        with the fewest tokens is read first, and each later place is asked only for the keys
+        every earlier one had, which costs O(keys in the smallest place). Each surviving key
+        contributes the product of its groups with the other arcs' options, and `heapq.merge`
+        interleaves those per-key products back into the product's order by comparing each
+        candidate's per-arc read positions. Keys are disjoint, so no two candidates tie.
 
         Arcs without a `join_key` contribute their usual options, capped at
         `binding_search_limit + 1` as in `_iter_candidate_bindings`. `join_key` arcs are not
@@ -2667,20 +2791,75 @@ class PetriNet:
         if gathered is None:
             return None
         options, joins = gathered
-        groups_by_arc: dict[int, dict] = {}
-        keys: list[object] | None = None
-        for i, arc, place in sorted(joins, key=lambda join: len(join[2])):
-            groups = self._join_groups(arc, place, keys, t_limit, transition.name)
-            if not groups:
-                return None
-            groups_by_arc[i] = groups
-            keys = list(groups)
-        assert keys is not None
+        # With no guard, any candidate satisfies, so a probe needs only one matched key.
+        keys = self._matched_join_keys(
+            transition.name, joins, t_limit, 1 if unordered and transition.guard is None else None
+        )
+        grouped = self._join_key_groups(transition.name, joins, keys, t_limit) if keys != [] else None
+        if grouped is None:
+            return None
+        groups_by_arc, keys = grouped
         per_key = [
             [groups_by_arc[i][key] if arc_options is None else arc_options for i, arc_options in enumerate(options)]
             for key in keys
         ]
         return self._join_bindings(transition.inputs, options, self._join_combos(per_key, unordered=unordered))
+
+    def _join_key_groups(
+        self,
+        transition_name: str,
+        joins: list[tuple[int, InputArc, Place]],
+        keys: list[object] | None,
+        t_limit: float | None,
+    ) -> "tuple[dict[int, dict], list[object]] | None":
+        """Read each join arc's groups for the keys every join place has, smallest place first.
+
+        Starts from `keys`, or from every key of the first place for `None`, and narrows to the
+        keys each place has. Returns the groups by arc index and the surviving keys, or `None`
+        when no key survives.
+        """
+        groups_by_arc: dict[int, dict] = {}
+        for i, arc, place in sorted(joins, key=lambda join: len(join[2])):
+            groups = self._join_groups(arc, place, keys, t_limit, transition_name)
+            if not groups:
+                return None
+            groups_by_arc[i] = groups
+            keys = list(groups)
+        assert keys is not None
+        return groups_by_arc, keys
+
+    def _matched_join_keys(
+        self, transition_name: str, joins: list[tuple[int, InputArc, Place]], t_limit: float | None, limit: int | None
+    ) -> list[object] | None:
+        """The join keys that every join place holds an available token of, or `None` if unknown.
+
+        Served by the transition's `_JoinMatch`, which costs O(changes since the last probe)
+        plus O(keys returned), not O(keys in the smallest place). See ADR 0011. `None`, so that
+        `_join_candidates` reads the places' keys itself, when some join arc's place is not
+        served by a join index (an uncertified key, a `Place` subclass, a disabled index), or
+        on the wall clock (`t_limit` is `None`), where the place picks the time it reads at.
+        Also `None` on a transition's first probe, before `_join_groups` has registered the
+        places' indexes: the match starts on the next one.
+        """
+        match = self._join_match(transition_name, joins) if t_limit is not None else None
+        if match is None or not match.refresh():
+            self._join_matches.pop(transition_name, None)
+            return None
+        return match.keys_at(cast(float, t_limit), limit)
+
+    def _join_match(self, transition_name: str, joins: list[tuple[int, InputArc, Place]]) -> _JoinMatch | None:
+        """The transition's `_JoinMatch` for `joins`, made anew if they changed; `None` if one is not indexed."""
+        if not all(
+            arc._join_key_inline_safe and type(place) is Place  # type: ignore[attr-defined]
+            for _, arc, place in joins
+        ):
+            return None
+        arc_ids = tuple(id(arc) for _, arc, _ in joins)
+        places = tuple(place for _, _, place in joins)
+        match = self._join_matches.get(transition_name)
+        if match is None or not match.serves(arc_ids, places):
+            match = self._join_matches[transition_name] = _JoinMatch(arc_ids, places)
+        return match
 
     def _join_arc_options(
         self, transition: Transition, t_limit: float | None, ignore_timing: bool
@@ -2794,6 +2973,7 @@ class PetriNet:
             if arc.join_key is not join_key or self.places.get(arc.place) is not place:
                 place.unregister_join_index(arc_id)
                 del registered[arc_id]
+                self._join_matches.pop(transition.name, None)
 
     def _group_pool_by_join_key(
         self, arc: InputArc, place: Place, t_limit: float | None, transition_name: str

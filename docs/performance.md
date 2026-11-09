@@ -128,6 +128,14 @@ each place, so a check costs one lookup per key in the smallest join place rathe
 over the product. In `bench_guard_join.py` a join with no match then takes about 7 µs at
 every depth from 1 000 to 16 000 jobs, where the guard takes 7 to 113 ms.
 
+The engine also keeps track of which keys every join place holds, and when each becomes
+available, as tokens come and go
+([ADR 0011](https://github.com/philgresh/cpnx/blob/main/docs/adr/0011-incremental-join-key-match.md)).
+So a check looks up only the keys that match, not every key of the smallest place. That
+matters when both sides of the join grow with the workload. In `bench_shop_join.py`, #59's job
+shop with one worker per 130 jobs, `join_key` holds at about 280 to 310 µs per step from 1 000
+to 16 000 jobs, where the guard grows to 1 355.
+
 ## What this means for you
 
 You do not have to opt into either optimization or structure your net around them — they are

@@ -91,11 +91,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RANDOM` (same seeded stream) and `PRIORITY`. A certified join key is served from a
   per-place index that also covers timed tokens, so a probe costs O(keys in the smallest join
   place) lookups. In `bench_guard_join.py`, a miss over 8 workers holds at about 7 µs from
-  1 000 to 16 000 jobs (the guard takes 7 → 113 ms). In #59's `shop` net, with the rejoin
-  join on `wid` and the requeue route split by output condition, 16 000 jobs run at 588
-  µs/step against 1 622 with the guard alone. That net still grows by 1.2 to 1.4× per
-  doubling, because its worker count grows with its job count and the probe looks up every
-  idle worker's key. Join arcs need `count == 1` and no `key`, `filter` or `consume_all`;
+  1 000 to 16 000 jobs (the guard takes 7 → 113 ms). The engine also tracks, per join
+  transition, which keys every join place holds and when each becomes available, so a probe
+  looks up only the keys that match rather than every key of the smallest place
+  ([ADR 0011](https://github.com/philgresh/cpnx/blob/main/docs/adr/0011-incremental-join-key-match.md)).
+  In #59's `shop` net (`bench_shop_join.py`), where workers grow with jobs, `join_key` now holds
+  flat at about 280 to 310 µs/step from 1 000 to 16 000 jobs. Without that tracking it grew 1.2
+  to 1.4× per doubling to 567 µs/step, and the equality guard reaches 1 355. A join whose
+  keys all match pays about 7 µs more per probe for it (35 → 42 µs in `bench_guard_join.py`). Join arcs need `count == 1` and no `key`, `filter` or `consume_all`;
   `binding_search_limit` counts only agreeing candidates. **Certify the join key:** an
   uncertified one is never indexed, so each resolution keys every available token through the
   executor, and a miss over 4 000 jobs costs about 90× the equality guard. A join key that

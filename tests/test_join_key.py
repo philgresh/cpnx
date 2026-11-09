@@ -464,3 +464,120 @@ def test_restore_resets_join_index_entries():
     place._restore_tokens(snapshot)
     groups = place.peek_join(1, None)
     assert {k: [t.payload["n"] for _, t in v] for k, v in groups.items()} == {0: [0, 3], 1: [1, 4], 2: [2, 5]}
+
+
+# -- the cross-place key match (ADR 0011) -----------------------------------------------------
+
+
+def _busy_net(seed: int, *, join: bool, policy: BindingPolicy) -> list[tuple[int, int]]:
+    """Jobs each need the worker with their `wid`, who is then busy (a timed token) for a while.
+
+    Everything starts ready: a place holding several timed tokens before the drive starts is
+    #68, which this does not test.
+    """
+    rng = random.Random(seed)
+    net = PetriNet(seed=seed, binding_search_limit=1_000_000)
+    for name in ("jobs", "workers", "out"):
+        net.add_place(Place(name))
+    fired: list[tuple[int, int]] = []
+    busy = random.Random(seed + 1)
+
+    def act(tokens: list[Token]) -> list[Token]:
+        job, worker = tokens
+        fired.append((job.payload["n"], worker.payload["wid"]))
+        return [job, worker.evolve(available_at=net.model_time + busy.uniform(0.5, 3.0))]
+
+    net.add_transition(
+        Transition(
+            name="match",
+            inputs=[
+                InputArc("jobs", join_key=WID if join else None),
+                InputArc("workers", join_key=WID if join else None),
+            ],
+            outputs=[OutputArc("out"), OutputArc("workers")],
+            guard=None if join else _same_wid,
+            binding_policy=policy,
+            action=act,
+        )
+    )
+    net.advance_time(1.0)
+    for wid in range(12):
+        net.deposit("workers", Token(payload={"wid": wid}))
+    for n in range(150):
+        net.deposit("jobs", Token(payload={"n": n, "wid": rng.randrange(16)}))
+    net.drive_to_quiescence()
+    return fired
+
+
+@pytest.mark.parametrize("policy", [BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY])
+def test_the_key_match_fires_what_the_guard_fires_as_heads_come_and_go(policy):
+    for seed in range(6):
+        expected = _busy_net(seed, join=False, policy=policy)
+        assert len(expected) > 100
+        assert _busy_net(seed, join=True, policy=policy) == expected
+
+
+def test_a_probe_looks_up_only_the_keys_every_place_holds(monkeypatch):
+    looked_up: list[int | None] = []
+    original = places._JoinIndex.available_groups
+
+    def spy(self, keys, *args):
+        looked_up.append(None if keys is None else len(list(keys)))
+        return original(self, keys, *args)
+
+    monkeypatch.setattr(places._JoinIndex, "available_groups", spy)
+    net = _join_net()
+    for wid in range(500):
+        net.deposit("workers", Token(payload={"wid": wid}))
+    net.deposit("jobs", Token(payload={"wid": 1_000, "n": 0}))
+    transition = net.transitions["match"]
+    assert net._resolve_binding(transition, net.model_time) is None  # registers the indexes
+    looked_up.clear()
+    assert net._resolve_binding(transition, net.model_time) is None
+    assert looked_up == []
+    net.deposit("jobs", Token(payload={"wid": 7, "n": 1}))
+    assert net._binding_exists(transition, net.model_time)
+    binding = net._resolve_binding(transition, net.model_time)
+    assert [tokens[0].payload["wid"] for _, tokens in binding] == [7, 7]
+    assert looked_up and max(looked_up) == 1
+
+
+def test_the_key_match_follows_a_timed_head_and_a_reassigned_key():
+    net = _join_net()
+    net.advance_time(1.0)
+    net.deposit("workers", Token(payload={"wid": 1, "n": 10}, available_at=4.0))
+    net.deposit("jobs", Token(payload={"wid": 1, "n": 0}, available_at=2.0))
+    transition = net.transitions["match"]
+    assert not net._binding_exists(transition, 3.0)
+    assert net._binding_exists(transition, 4.0)
+    net.deposit("workers", Token(payload={"wid": 1, "n": 11}))
+    assert net._binding_exists(transition, 3.0)
+    assert not net._binding_exists(transition, 1.5)
+    for arc in transition.inputs:
+        arc.join_key = lambda t: t.payload["n"] % 10
+    assert net._binding_exists(transition, 4.0)
+    assert not net._binding_exists(transition, 3.0)
+
+
+def test_head_changes_report_each_head_change_once():
+    store = _TokenStore()
+    store.register_join_index(1, WID)
+    store.append(Token(payload={"wid": 0, "n": 0}, available_at=5.0))
+    generation, full, heads = store.join_head_changes(1, None)
+    assert full and heads == {0: 5.0}
+    late = Token(payload={"wid": 0, "n": 1}, available_at=9.0)
+    store.append(late)
+    assert store.join_head_changes(1, generation) == (generation, False, {})
+    early = Token(payload={"wid": 0, "n": 2})
+    store.append(early)
+    store.append(Token(payload={"wid": 3, "n": 3}, available_at=1.0))
+    assert store.join_head_changes(1, generation) == (generation, False, {0: float("-inf"), 3: 1.0})
+    store.remove_identity([late])
+    assert store.join_head_changes(1, generation) == (generation, False, {})
+    store.remove_identity([early])
+    assert store.join_head_changes(1, generation) == (generation, False, {0: 5.0})
+    store.drop_all()
+    new_generation, full, heads = store.join_head_changes(1, generation)
+    assert new_generation != generation and full and heads == {}
+    store.append(Token(payload={}))
+    assert store.join_head_changes(1, new_generation) is None
