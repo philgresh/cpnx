@@ -17,6 +17,7 @@ every `guard`/`key`/`binding_priority_key` below is a real module-level `def`. P
 `action=` callables are not purity-checked and may be lambdas/closures freely.
 """
 
+import math
 import time
 
 from cpnx.engine import PetriNet
@@ -44,6 +45,11 @@ def _state_guard(tokens: list[Token]) -> bool:
 
 def _raising_action(tokens: list[Token]) -> list[Token]:
     raise RuntimeError("boom: transient failure")
+
+
+def _same_wid_guard(tokens: list[Token]) -> bool:
+    """Match a job to the worker with the same ``wid``."""
+    return tokens[0].payload["wid"] == tokens[1].payload["wid"]
 
 
 def _drain_to_quiescence(net: PetriNet, max_steps: int = 500) -> None:
@@ -320,6 +326,110 @@ class TestRetryReactivation:
         assert net.is_dead() is True
         # ...but the net is not quiescent, since the retry will become enabled soon.
         assert net.is_quiescent() is False
+
+
+class TestLaterCoolingTokenStaysTracked:
+    """Regression for #68: a place seeded with two cooling tokens keeps its later boundary.
+
+    `_ensure_scheduler_ready` seeds only each place's earliest boundary. Once that elapsed,
+    nothing re-queued the next one, so `is_quiescent()` went `True` while a binding still
+    waited on the later token and `drive_to_quiescence` stopped at the first boundary.
+    """
+
+    def _build(self) -> PetriNet:
+        net = PetriNet(seed=0)
+        for name in ("jobs", "workers", "out"):
+            net.add_place(Place(name))
+        net.add_transition(
+            Transition(
+                name="match",
+                inputs=[InputArc("jobs"), InputArc("workers")],
+                outputs=[OutputArc("out")],
+                guard=_same_wid_guard,
+                action=lambda toks: [toks[0]],
+            )
+        )
+        net.advance_time(1.0)
+        net.deposit("workers", Token(payload={"wid": 1}))
+        net.deposit("jobs", Token(payload={"wid": 1}, available_at=5.0))
+        net.deposit("jobs", Token(payload={"wid": 2}, available_at=2.0))
+        return net
+
+    def test_drive_waits_for_the_later_token(self):
+        net = self._build()
+        assert net._incremental_eligible is True
+        result = net.drive_to_quiescence()
+        assert result.steps == 1
+        assert net.model_time == 5.0
+        assert [t.payload["wid"] for t in net.places["out"].tokens] == [1]
+        assert [t.payload["wid"] for t in net.places["jobs"].tokens] == [2]
+
+    def test_not_quiescent_after_the_first_boundary(self):
+        net = self._build()
+        net.is_quiescent()  # seed the scheduler at t=1.0
+        net.advance_time(2.0)  # the earlier boundary has elapsed
+        assert net.is_dead() is True
+        assert net.is_quiescent() is False
+
+
+class TestParkedTokenIsNotQueued:
+    """A token parked at ``available_at = inf`` never matures, so it gets no heap entry.
+
+    An ``(inf, place)`` entry never pops, and a non-empty heap makes every re-evaluation run the
+    timing-ignoring probe. The answers stay right, but each reconcile pays for that probe forever.
+    """
+
+    def _build(self) -> PetriNet:
+        net = PetriNet(seed=0)
+        for name in ("jobs", "workers", "out"):
+            net.add_place(Place(name))
+        net.add_transition(
+            Transition(
+                name="match",
+                inputs=[InputArc("jobs"), InputArc("workers")],
+                outputs=[OutputArc("out")],
+                guard=_same_wid_guard,
+                action=lambda toks: [toks[0]],
+            )
+        )
+        net.advance_time(1.0)
+        net.deposit("workers", Token(payload={"wid": 1}))
+        net.deposit("jobs", Token(payload={"wid": 2}, available_at=2.0))
+        net.deposit("jobs", Token(payload={"wid": 3}, available_at=math.inf))
+        return net
+
+    def test_no_inf_entry_after_the_finite_boundary_elapses(self):
+        net = self._build()
+        assert net._incremental_eligible is True
+        assert net.is_quiescent() is True  # seed the scheduler at t=1.0
+        net.advance_time(3.0)
+        assert net.is_quiescent() is True
+        assert all(math.isfinite(boundary) for boundary, _ in net._reactivation)
+
+    def test_parked_token_deposited_after_start_is_not_queued(self):
+        net = self._build()
+        net.is_quiescent()  # seed the scheduler at t=1.0
+        net.advance_time(3.0)
+        net.deposit("jobs", Token(payload={"wid": 4}, available_at=math.inf))
+        assert net.is_quiescent() is True
+        assert all(math.isfinite(boundary) for boundary, _ in net._reactivation)
+
+    def test_parked_token_present_at_seed_is_not_queued(self):
+        net = PetriNet(seed=0)
+        for name in ("jobs", "workers", "out"):
+            net.add_place(Place(name))
+        net.add_transition(
+            Transition(
+                name="match",
+                inputs=[InputArc("jobs"), InputArc("workers")],
+                outputs=[OutputArc("out")],
+                action=lambda toks: [toks[0]],
+            )
+        )
+        net.deposit("jobs", Token(payload={}, available_at=math.inf))
+        assert net._incremental_eligible is True
+        assert net.is_quiescent() is True  # seeds the scheduler
+        assert net._reactivation == []
 
 
 class TestInputlessSourceTransition:
