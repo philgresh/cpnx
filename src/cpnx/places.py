@@ -217,8 +217,7 @@ class _JoinIndex:
     because a group's head decides when the key becomes available. The head is the group's
     first `depth` entries: a self-join, whose `depth` join arcs read one place and take one
     token each (issue #75), can use a key only once that many of its tokens are available, so
-    its index reports a key only from then on. When the place's join arcs share one function,
-    its `_JoinMatch` then lists only keys that bind; with several, only keys that may.
+    its index reports a key only from then on, and its `_JoinMatch` lists only keys that bind.
     `head_changes` hands it the keys whose head changed since its last call, which `add` and
     `discard` collect once a reader has asked. `generation` changes whenever the groups are
     replaced wholesale (disabled, cleared or rebuilt), and a reader that sees a new one gets

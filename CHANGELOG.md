@@ -167,14 +167,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   product, lazy and `join_key` searches skip a candidate that reuses a token, and that
   candidate still counts toward `binding_search_limit`. One token no longer enables two arcs.
   In a self-join (N join arcs on one place with one `join_key` function), a key binds only
-  once the place holds N of its tokens; arcs with different functions need one token each.
-  Its join indexes now track each key's first N tokens, so ADR 0011's match lists only keys
-  that bind and the one-key existence probe stays correct. A place read by join arcs with
-  different functions gives up that probe and reads every key, since a token whose key is
-  the same under both functions lists a key that only it holds. Without the index, keys with
-  fewer tokens are dropped before building candidates, so a backlog of them can't use up
-  `binding_search_limit` ahead of a key that holds a pair. Draining 200 pairs past 16 000
-  one-token keys took 1 690 ms and now takes about 170 ms, level with a two-place join. A guard-free `FIRST` transition whose `filter` arc shares its place
+  once the place holds N of its tokens; arcs with different functions need one token each. Its join indexes now track each key's first N tokens, so ADR 0011's match lists
+  only keys that bind and the one-key existence probe stays correct; without the index, keys
+  with fewer tokens are dropped before building candidates, so a backlog of them can't use up
+  `binding_search_limit` ahead of a key that holds a pair. Draining 200
+  pairs past 16 000 one-token keys took 1 690 ms and now takes about 170 ms, level with a
+  two-place join. A guard-free `FIRST` transition whose `filter` arc shares its place
   with another arc now searches instead of taking heads greedily, which could leave the
   filtered arc without the one token it accepts and report the transition dead.
   A `consume_all` arc that shares its place with another input arc is never enabled, since

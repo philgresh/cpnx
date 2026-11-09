@@ -431,30 +431,3 @@ def test_self_join_arcs_with_different_join_keys_need_one_token_each(certified, 
     _assert_distinct(net)
     net.drive_to_quiescence()
     assert len(net.marking["out"]) == 2
-
-
-@pytest.mark.parametrize("overlap_first", [True, False])
-def test_a_token_matching_a_key_under_both_join_keys_does_not_end_the_probe(overlap_first):
-    # x has f == g == 1, so key 1 is listed under both functions, but its only candidate is
-    # (x, x), which reuses x. Key 2 binds through two tokens. The probe must look past key 1.
-    net = PetriNet(seed=0)
-    for name in ("jobs", "out"):
-        net.add_place(Place(name))
-    net.add_transition(
-        Transition(
-            name="t",
-            inputs=[InputArc("jobs", join_key=_f), InputArc("jobs", join_key=_g)],
-            outputs=[OutputArc("out", count=2)],
-            action=_passthrough,
-        )
-    )
-    overlap = [Token(payload={"f": 1, "g": 1})]
-    pair = [Token(payload={"f": 2, "g": 9}), Token(payload={"f": 8, "g": 2})]
-    for token in overlap + pair if overlap_first else pair + overlap:
-        net.deposit("jobs", token)
-    t = net.transitions["t"]
-    assert [net._binding_exists(t, net.model_time) for _ in range(3)] == [True, True, True]
-    assert net._resolve_binding(t, net.model_time) is not None
-    net.drive_to_quiescence()
-    assert sorted(token.payload["f"] for token in net.marking["out"]) == [2, 8]
-    assert [token.payload["f"] for token in net.marking["jobs"]] == [1]

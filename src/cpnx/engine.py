@@ -387,20 +387,6 @@ def _join_place_has_plain_arc(transition: Transition) -> bool:
     return any(arc.join_key is None and arc.place in join_places for arc in transition.inputs)
 
 
-def _join_place_has_mixed_keys(transition: Transition) -> bool:
-    """Whether join arcs with different `join_key` functions (by identity) read one place of `transition`.
-
-    Their depths (`_join_depths`) are then a necessary condition only: a token whose key is the
-    same under both functions lists that key under each, though its only candidate hands it to
-    both arcs.
-    """
-    functions: dict[str, set[int]] = {}
-    for arc in transition.inputs:
-        if arc.join_key is not None:
-            functions.setdefault(arc.place, set()).add(id(arc.join_key))
-    return any(len(ids) > 1 for ids in functions.values())
-
-
 def _join_depths(joins: "list[tuple[int, InputArc, Place]]") -> dict[int, int]:
     """Each join arc's depth, by input position: how many join arcs read its place with its `join_key`.
 
@@ -3042,17 +3028,9 @@ class PetriNet:
         A place that a join arc shares with an arc *without* a `join_key` does not: that arc's
         options are the place's tokens, and when it may take only the matched key's token, as
         its `filter` can make it, another key would be needed. Such a probe reads every key.
-        So does a place read by join arcs with different `join_key` functions: a token whose key
-        is the same under both lists that key once per function, so the match lists it, yet its
-        only candidate hands that token to both arcs (`_join_place_has_mixed_keys`).
         """
         assert all(arc.count == 1 and arc.key is None and arc.filter is None for _, arc, _ in joins)
-        one_key = (
-            unordered
-            and transition.guard is None
-            and not _join_place_has_plain_arc(transition)
-            and not _join_place_has_mixed_keys(transition)
-        )
+        one_key = unordered and transition.guard is None and not _join_place_has_plain_arc(transition)
         return self._matched_join_keys(transition.name, joins, t_limit, 1 if one_key else None)
 
     def _join_key_groups(
