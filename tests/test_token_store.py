@@ -482,3 +482,39 @@ def test_restore_resets_key_index_entries():
     index = place._store.key_index(1)
     assert len(index._heap) == len(place)
     assert [t.payload["prio"] for t in index.peek_ordered(place._store._ready, 3)] == [0, 1, 2]
+
+
+def test_missing_identities_reports_only_absent_ids():
+    store = _TokenStore()
+    stored = [Token(payload={"i": i}) for i in range(5)]
+    for token in stored:
+        store.append(token)
+    absent = Token(payload={"i": "absent"})
+    assert store.missing_identities({id(stored[1]), id(stored[3])}) == set()
+    assert store.missing_identities({id(stored[0]), id(absent)}) == {id(absent)}
+    assert store.missing_identities(set()) == set()
+
+
+def _missing_identities_secs(depth: int) -> float:
+    """Best-of-5 seconds for 2 000 `missing_identities` calls on a store holding `depth` tokens."""
+    store = _TokenStore()
+    tokens = [Token(payload={"i": i}) for i in range(depth)]
+    for token in tokens:
+        store.append(token)
+    ids = {id(tokens[0]), id(Token())}
+    best = math.inf
+    for _ in range(5):
+        started = time.perf_counter()
+        for _ in range(2_000):
+            store.missing_identities(ids)
+        best = min(best, time.perf_counter() - started)
+    return best
+
+
+def test_missing_identities_does_not_walk_the_stored_keys():
+    """#65: `set(ids) - keys()` cost O(tokens stored) per `retrieve_specific`.
+
+    Its cost must not grow with the store: 100x the tokens may cost at most a small constant
+    factor more (walking the keys made it about 100x).
+    """
+    assert _missing_identities_secs(100_000) < 10 * _missing_identities_secs(1_000)

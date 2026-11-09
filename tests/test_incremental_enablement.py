@@ -88,6 +88,27 @@ class TestRoutingTables:
         assert net._input_routing.get("c", []) == []
         assert net._output_routing.get("c", []) == []
 
+    def test_dirty_routing_unions_both_tables_by_name(self):
+        """`_dirty_routing` holds, per place, the names from both routing tables, once each."""
+        net = PetriNet(
+            places=[Place("a"), Place("b"), Place("c"), Place("d")],
+            transitions=[
+                Transition(name="t1", inputs=[InputArc("a")], outputs=[OutputArc("b")], action=lambda tokens: tokens),
+                Transition(
+                    name="t2",
+                    inputs=[InputArc("b"), InputArc("a")],
+                    outputs=[OutputArc("a"), OutputArc("c", condition=_below_condition)],
+                    action=lambda tokens: tokens,
+                ),
+            ],
+        )
+        assert net.is_dead() is True
+
+        assert net._dirty_routing == {
+            "a": frozenset({"t1", "t2"}),  # input of both, unconditional output of t2
+            "b": frozenset({"t1", "t2"}),  # output of t1, input of t2
+        }
+
     def test_conditional_output_arc_excluded_from_output_routing(self):
         """An unconditional OutputArc's place is routed; a conditional one's is not."""
         net = PetriNet(

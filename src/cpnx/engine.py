@@ -770,11 +770,17 @@ class PetriNet:
         #: firing or introspection via `_ensure_resource_returns_synthesized`.
         self._resource_returns_synthesized = False
         #: Place name -> transitions with an `InputArc` on it (adding tokens may enable them).
+        #: A source table for `_dirty_routing`, which is what a reconcile reads.
         self._input_routing: dict[str, list[Transition]] = {}
         #: Place name -> transitions with an *unconditional* `OutputArc` on it. Removing tokens
         #: from such a place can release back-pressure (`_check_output_capacity`) and re-enable
-        #: the producer; conditional arcs never block, so they are excluded.
+        #: the producer; conditional arcs never block, so they are excluded. A source table for
+        #: `_dirty_routing`, like `_input_routing`.
         self._output_routing: dict[str, list[Transition]] = {}
+        #: Place name -> names of the transitions in `_input_routing` or `_output_routing` for it:
+        #: the transitions a change to that place may enable or unblock. `_reconcile_dirty` folds
+        #: each dirty place into its re-check set with one set union against this.
+        self._dirty_routing: dict[str, frozenset[str]] = {}
         #: Places whose token pool changed since the last reconcile (the "dirty set").
         self._dirty_places: set[str] = set()
         #: Transitions re-evaluated on *every* reconcile because their enablement can change
@@ -1245,6 +1251,10 @@ class PetriNet:
                     out.setdefault(arc.place, []).append(t)
         self._input_routing = inp
         self._output_routing = out
+        self._dirty_routing = {
+            place: frozenset(t.name for t in (*inp.get(place, ()), *out.get(place, ())))
+            for place in inp.keys() | out.keys()
+        }
 
     def _is_volatile(self, transition: Transition) -> bool:
         """Whether `transition`'s enablement can change with **no input-place mutation**.
@@ -1314,9 +1324,8 @@ class PetriNet:
             _, place = heapq.heappop(self._reactivation)
             self._dirty_places.add(place)
         affected: set[str] = self._volatile_transitions | self._capacity_blocked
-        for place_name in self._dirty_places:
-            affected.update(t.name for t in self._input_routing.get(place_name, ()))
-            affected.update(t.name for t in self._output_routing.get(place_name, ()))
+        routing = self._dirty_routing
+        affected.update(*(routing.get(place_name, ()) for place_name in self._dirty_places))
         self._dirty_places.clear()
         # Re-evaluate in registration order so bucket membership — and thus the seeded
         # tie-break `_rng.choice` indexes into it — is reproducible across processes.
