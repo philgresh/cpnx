@@ -205,3 +205,24 @@ def test_a_self_join_with_one_token_per_key_is_not_enabled():
     assert net._resolve_binding(t, net.model_time) is None
     assert not net._binding_exists(t, net.model_time)
     assert net.is_dead()
+
+
+def test_a_self_join_probe_looks_past_a_key_with_one_token():
+    # wid 0 has one token and wid 1 has two. A guard-free existence probe that checks only the
+    # first key both places hold (as a single-key shortcut would) misses the pair under wid 1.
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    same = InputArc("jobs", join_key=WID)
+    net.add_transition(
+        Transition(name="t", inputs=[same, same], outputs=[OutputArc("out", count=2)], action=_passthrough)
+    )
+    for wid in (0, 1, 1):
+        net.deposit("jobs", Token(payload={"wid": wid}))
+    t = net.transitions["t"]
+    # Repeated probes: the first registers the join indexes, the later ones read them.
+    assert [net._binding_exists(t, net.model_time) for _ in range(3)] == [True, True, True]
+    assert not net.is_dead()
+    net.drive_to_quiescence()
+    assert [token.payload["wid"] for token in net.marking["out"]] == [1, 1]
+    assert net.is_dead()
