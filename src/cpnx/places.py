@@ -168,17 +168,40 @@ class _JoinIndex:
 
     **Self-disabling.** A key that raises or is unhashable disables the index, dropping its
     groups, and the engine falls back to computing the keys itself (which then reports the
-    failure). An index that is disabled re-enables once the store is empty, because then there
-    is nothing it fails to cover.
+    failure). A disabled index re-enables at once when the store empties, and otherwise through
+    `rearm`, which rebuilds it from every stored token at most once per
+    `_KEY_INDEX_REARM_MIN_DEPOSITS` deposits, as `_KeyIndex.rearm` does. So once the offending
+    token has left, a place that never drains gets its index back within that many deposits.
     """
 
-    __slots__ = ("key_fn", "_groups", "_key_of", "disabled")
+    __slots__ = ("key_fn", "_groups", "_key_of", "disabled", "_last_build")
 
     def __init__(self, key_fn: Callable[[Token], object]) -> None:
         self.key_fn = key_fn
         self._groups: dict[object, list[_JoinEntry]] = {}
         self._key_of: dict[int, object] = {}
         self.disabled = False
+        self._last_build = 0
+
+    def rearm(self, tokens: Iterable[tuple[int, Token]], deposit_clock: int) -> bool:
+        """Re-enable a disabled index by rebuilding it from *tokens* (seq, token); return whether it serves.
+
+        A no-op returning ``True`` when the index is enabled. A rebuild re-keys every token, so
+        it runs at most once per `_KEY_INDEX_REARM_MIN_DEPOSITS` deposits (*deposit_clock* is
+        the store's monotonic deposit counter) and returns ``False`` in between. A rebuild that
+        meets a token it still cannot key disables the index again and returns ``False``.
+        """
+        if not self.disabled:
+            return True
+        if deposit_clock - self._last_build < _KEY_INDEX_REARM_MIN_DEPOSITS:
+            return False
+        self._last_build = deposit_clock
+        self.disabled = False
+        for seq, token in tokens:
+            self.add(seq, token)
+            if self.disabled:
+                return False
+        return True
 
     def add(self, seq: int, token: Token) -> None:
         """Index *token* under *seq*, disabling the index if it cannot be keyed."""
@@ -371,9 +394,21 @@ class _TokenStore:
                 break
 
     def join_index(self, index_id: int) -> "_JoinIndex | None":
-        """Return the serving join index for *index_id*, or ``None`` if absent or disabled."""
+        """Return the serving join index for *index_id*, or ``None`` if absent or still disabled.
+
+        A disabled index is offered a rate-limited `_JoinIndex.rearm` first, rebuilt in store
+        read order, so a keying failure is not permanent while the store stays non-empty.
+        """
         index = self._join_indexes.get(index_id)
-        return None if index is None or index.disabled else index
+        if index is None:
+            return None
+        if index.disabled and not index.rearm(self._join_rebuild_order(), self._next_seq):
+            return None
+        return index
+
+    def _join_rebuild_order(self) -> Iterable[tuple[int, Token]]:
+        """Every stored `(seq, token)`, ready then timed, for rebuilding a join index."""
+        return itertools.chain(self._ready.items(), self._cooling_by_seq.items())
 
     def join_groups(
         self, index_id: int, keys: Iterable[object] | None, t_limit: float

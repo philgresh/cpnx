@@ -105,8 +105,11 @@ happens when:
 A `join_key` that raises or returns an unhashable value disables that place's index (a
 deposit never raises because of it). The fallback then meets the same failure, makes the arc
 unsatisfiable, and reports it once through `on_error`, as a raising `key` or `filter` does
-(issue #29). A disabled index re-enables once its place is empty, since it then covers
-everything again.
+(issue #29). A disabled index re-enables at once when its place empties. Otherwise each read
+offers it a rebuild from every stored token, rate-limited to once per
+`_KEY_INDEX_REARM_MIN_DEPOSITS` (64) deposits as `_KeyIndex.rearm` is (issue #34). So once
+the offending token has left, a queue that never drains gets its index back within 64
+deposits, instead of grouping the whole pool on every probe from then on.
 
 ## Consequences
 
@@ -121,6 +124,12 @@ everything again.
   µs/step still grows by about 1.2 to 1.4× per doubling (588 µs/step at 16 000 jobs, against
   1 622 with the guard). Keeping the intersection of keys up to date incrementally, across
   places and a moving clock, would remove that and is left for later.
+- The fallback is not capped by `binding_search_limit`: it keys every available token in each
+  join place, per resolution, and an uncertified key goes through the executor per token. On
+  a miss that costs about 22× the equality guard at 1 000 jobs and 88× at 4 000. The
+  `join_key` docstring and the CHANGELOG say so, like the `key` and `filter` warnings do. No
+  construction-time warning is raised for an uncertified join key, matching `key` and
+  `filter`.
 - Nets that do not set `join_key` take exactly the paths they took before. The only change on
   those paths is one `any(...)` over a transition's input arcs in `_is_head_only` and the
   resolution entry points.

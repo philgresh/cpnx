@@ -292,7 +292,14 @@ class InputArc:
                   `count == 1` and no `key`, `filter` or `consume_all` (`ValueError`
                   otherwise). A join key that raises or returns an unhashable value makes the
                   arc unsatisfiable. `None` (default) means the arc takes no part in a join.
-                  See `docs/adr/0010-equi-join-index.md`.
+                  **Make it closed-world (certified), or it can be far slower than the guard
+                  it replaces:** an *uncertified* join key is never indexed, so every
+                  resolution reads each join place's whole available pool (no
+                  `binding_search_limit` cap) and dispatches the key through the
+                  timeout-bounded executor once per token. A miss over 4 000 jobs then costs
+                  about 90× the equivalent equality guard. The same holds on a place subclass
+                  (`ResourcePlace`, `PacedResourcePlace`, `ThresholdPlace`), which is never
+                  indexed either. See `docs/adr/0010-equi-join-index.md`.
 
     Warning:
         **`consume_all=True` ignores both `key` and `filter`.** A draining arc takes every

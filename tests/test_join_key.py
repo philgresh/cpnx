@@ -10,7 +10,7 @@ import random
 
 import pytest
 
-from cpnx import BindingPolicy, InputArc, OutputArc, PetriNet, Place, ResourcePlace, Token, Transition
+from cpnx import BindingPolicy, InputArc, OutputArc, PetriNet, Place, ResourcePlace, Token, Transition, places
 from cpnx.places import _TokenStore
 
 WID = lambda t: t.payload["wid"]  # noqa: E731
@@ -325,6 +325,56 @@ def test_a_disabled_index_declines_then_recovers_once_the_place_empties():
     store.take_available(2, 0.0)
     store.append(Token(payload={"wid": 5, "n": 1}))
     assert _groups(store, 0.0) == {5: [1]}
+
+
+def test_a_disabled_index_rearms_once_the_bad_token_leaves_a_non_empty_store(monkeypatch):
+    monkeypatch.setattr(places, "_KEY_INDEX_REARM_MIN_DEPOSITS", 4)
+    store = _TokenStore()
+    store.register_join_index(1, WID)
+    keep = [Token(payload={"wid": n % 2, "n": n}) for n in range(3)]
+    for token in keep:
+        store.append(token)
+    bad = Token(payload={})
+    store.append(bad)
+    assert store.join_groups(1, None, 0.0) is None  # disabled, and the rebuild meets `bad` again
+    store.remove_identity([bad])
+    assert store.join_groups(1, None, 0.0) is None  # too soon to rebuild
+    for n in range(3, 7):
+        store.append(Token(payload={"wid": n % 2, "n": n}))
+    assert _groups(store, 0.0) == {0: [0, 2, 4, 6], 1: [1, 3, 5]}
+
+
+def test_a_net_gets_its_join_index_back_after_a_bad_token_is_consumed(monkeypatch):
+    monkeypatch.setattr(places, "_KEY_INDEX_REARM_MIN_DEPOSITS", 4)
+    errors = []
+    net = PetriNet(seed=0)
+    net.on_error = lambda name, exc, tok: errors.append(exc)
+    for name in ("jobs", "workers", "out", "trash"):
+        net.add_place(Place(name))
+    net.add_transition(
+        Transition(
+            name="match",
+            inputs=[InputArc("jobs", join_key=WID), InputArc("workers", join_key=WID)],
+            outputs=[OutputArc("out")],
+            action=lambda toks: [toks[0]],
+        )
+    )
+    for n in range(3):
+        net.deposit("jobs", Token(payload={"wid": 9, "n": n}))
+    net.deposit("workers", Token(payload={"wid": 1}))
+    bad = Token(payload={})
+    net.deposit("jobs", bad)
+    arc = net.transitions["match"].inputs[0]
+    assert net.drive_to_quiescence().steps == 0
+    assert net.places["jobs"].peek_join(id(arc), None) is None
+    net.places["jobs"].retrieve_specific([bad])
+    for n in range(3, 8):
+        net.deposit("jobs", Token(payload={"wid": 9, "n": n}))
+    assert net.places["jobs"].peek_join(id(arc), [9]) is not None
+    net.deposit("jobs", Token(payload={"wid": 1, "n": 99}))
+    assert net.drive_to_quiescence().steps == 1
+    assert [t.payload["n"] for t in net.places["out"].tokens] == [99]
+    assert len(errors) == 1
 
 
 def test_restore_resets_join_index_entries():

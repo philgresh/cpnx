@@ -96,8 +96,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   µs/step against 1 622 with the guard alone. That net still grows by 1.2 to 1.4× per
   doubling, because its worker count grows with its job count and the probe looks up every
   idle worker's key. Join arcs need `count == 1` and no `key`, `filter` or `consume_all`;
-  `binding_search_limit` counts only agreeing candidates. Nets that do not set `join_key` are
-  unaffected.
+  `binding_search_limit` counts only agreeing candidates. **Certify the join key:** an
+  uncertified one is never indexed, so each resolution keys every available token through the
+  executor, and a miss over 4 000 jobs costs about 90× the equality guard. A join key that
+  raises disables that place's index until a rate-limited rebuild succeeds (at most once per 64
+  deposits) or the place empties. Nets that do not set `join_key` are unaffected.
 
 - **Official Python 3.15 support, and 3.14 is now a blocking CI entry.** Both versions run the
   full suite, `ruff` and the complexity gate on every PR; 3.14 had been stable for a year while
