@@ -46,6 +46,11 @@ def _raising_action(tokens: list[Token]) -> list[Token]:
     raise RuntimeError("boom: transient failure")
 
 
+def _same_wid_guard(tokens: list[Token]) -> bool:
+    """Match a job to the worker with the same ``wid``."""
+    return tokens[0].payload["wid"] == tokens[1].payload["wid"]
+
+
 def _drain_to_quiescence(net: PetriNet, max_steps: int = 500) -> None:
     """Fire one transition at a time, fully settling each async action before the next.
 
@@ -319,6 +324,50 @@ class TestRetryReactivation:
         # Immediately after rollback: nothing fires right now (still cooling)...
         assert net.is_dead() is True
         # ...but the net is not quiescent, since the retry will become enabled soon.
+        assert net.is_quiescent() is False
+
+
+class TestLaterCoolingTokenStaysTracked:
+    """Regression for #68: a place seeded with two cooling tokens keeps its later boundary.
+
+    `_ensure_scheduler_ready` seeds only each place's earliest boundary. Once that elapsed,
+    nothing re-queued the next one, so `is_quiescent()` went `True` while a binding still
+    waited on the later token and `drive_to_quiescence` stopped at the first boundary.
+    """
+
+    def _build(self) -> PetriNet:
+        net = PetriNet(seed=0)
+        for name in ("jobs", "workers", "out"):
+            net.add_place(Place(name))
+        net.add_transition(
+            Transition(
+                name="match",
+                inputs=[InputArc("jobs"), InputArc("workers")],
+                outputs=[OutputArc("out")],
+                guard=_same_wid_guard,
+                action=lambda toks: [toks[0]],
+            )
+        )
+        net.advance_time(1.0)
+        net.deposit("workers", Token(payload={"wid": 1}))
+        net.deposit("jobs", Token(payload={"wid": 1}, available_at=5.0))
+        net.deposit("jobs", Token(payload={"wid": 2}, available_at=2.0))
+        return net
+
+    def test_drive_waits_for_the_later_token(self):
+        net = self._build()
+        assert net._incremental_eligible is True
+        result = net.drive_to_quiescence()
+        assert result.steps == 1
+        assert net.model_time == 5.0
+        assert [t.payload["wid"] for t in net.places["out"].tokens] == [1]
+        assert [t.payload["wid"] for t in net.places["jobs"].tokens] == [2]
+
+    def test_not_quiescent_after_the_first_boundary(self):
+        net = self._build()
+        net.is_quiescent()  # seed the scheduler at t=1.0
+        net.advance_time(2.0)  # the earlier boundary has elapsed
+        assert net.is_dead() is True
         assert net.is_quiescent() is False
 
 

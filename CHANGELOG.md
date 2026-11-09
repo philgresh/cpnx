@@ -154,6 +154,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`drive_to_quiescence` no longer stops before a later cooling token matures**
+  ([#68](https://github.com/philgresh/cpnx/issues/68)). When a place already held two or more
+  timed tokens as the incremental scheduler started, it tracked only that place's earliest
+  `available_at`. Once that passed, `is_quiescent()` returned `True` even though a binding was
+  still waiting on a later token, so the drive stopped at the first boundary. The scheduler now
+  queues each place's next boundary whenever one elapses.
 - **`Place.retrieve_specific` rejects a token passed more than once**
   ([#70](https://github.com/philgresh/cpnx/issues/70)). `retrieve_specific([t, t])` used to
   return `t` twice while removing it once. It now raises `ValueError` and leaves the place
