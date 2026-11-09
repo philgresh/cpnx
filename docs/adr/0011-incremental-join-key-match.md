@@ -97,11 +97,8 @@ which it checks on every probe.
 
 ### 4a. Self-joins ([#75](https://github.com/philgresh/cpnx/issues/75))
 
-Two or more join arcs can read one place. Each takes a different token, so where they share a
-`join_key` function, a key binds there only once the place holds as many of its tokens under
-that function as there are such arcs. Arcs with different functions match a key through
-different tokens, one each, so each counts only the arcs that share its function (functions
-compared by identity). Each index is
+Two or more join arcs can read one place. Each takes a different token, so a key binds there
+only once the place holds as many of its tokens as there are such arcs. Each index is
 registered with that number as its **depth**, and its "head" is its group's first `depth`
 entries: it reports a key, and the time it becomes available, only once its `depth`-th token
 is in the group. The match then lists only keys that bind, and the one-key probe of §3 still
