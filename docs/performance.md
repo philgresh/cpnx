@@ -120,6 +120,14 @@ still inspects every candidate, so keep `binding_search_limit` in mind for place
 hold many tokens nobody will accept. Tracked in
 [#59](https://github.com/philgresh/cpnx/issues/59).
 
+When the join is an equality, declare it with `InputArc.join_key` instead of testing it in the
+guard ([#64](https://github.com/philgresh/cpnx/issues/64),
+[ADR 0010](https://github.com/philgresh/cpnx/blob/main/docs/adr/0010-equi-join-index.md)).
+The transition fires the same bindings, but a certified join key is served from an index on
+each place, so a check costs one lookup per key in the smallest join place rather than a walk
+over the product. In `bench_guard_join.py` a join with no match then takes about 7 µs at
+every depth from 1 000 to 16 000 jobs, where the guard takes 7 to 113 ms.
+
 ## What this means for you
 
 You do not have to opt into either optimization or structure your net around them — they are

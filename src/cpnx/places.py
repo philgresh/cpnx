@@ -13,6 +13,7 @@ the type of tokens it accepts. `color_set` exposes this directly.
 shorthands for a place whose colour set is ``{"resource"}`` with a pre-filled initial marking.
 """
 
+import bisect
 import heapq
 import itertools
 import math
@@ -20,7 +21,7 @@ import operator
 import threading
 import time
 from collections import Counter, OrderedDict, deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import Any, ClassVar
 
 from cpnx.tokens import AVAILABLE_NOW, Token
@@ -148,6 +149,188 @@ class _KeyIndex:
         return found
 
 
+_JoinEntry = tuple[int, float, int]
+"""A join-index entry: ``(tier, available_at, seq)``, with tier 0 for a ready token and 1 for a timed one."""
+
+
+class _JoinIndex:
+    """A persistent ``join_key -> tokens`` index over one [`_TokenStore`][]'s tokens (#64).
+
+    Each group is a list of `_JoinEntry` sorted by ``(tier, available_at, seq)``. That is the
+    store's read order: ready tokens first in insertion order, then timed tokens by
+    ``(available_at, seq)``. A token is available at *t_limit* when it is ready or its
+    ``available_at`` is at or before *t_limit*, so the available entries of a group are always
+    a prefix of it, found by one bisection.
+
+    Unlike `_KeyIndex` this covers timed tokens too, and deletes eagerly: `_key_of` remembers
+    each token's key by seq, so a removal finds its group directly. The cost is O(group size)
+    per insert or removal, which is what an equi-join over many distinct keys wants.
+
+    **Self-disabling.** A key that raises or is unhashable disables the index, dropping its
+    groups, and the engine falls back to computing the keys itself (which then reports the
+    failure). A disabled index re-enables at once when the store empties, and otherwise through
+    `rearm`, which rebuilds it from every stored token. `_bad_seq` remembers the token that
+    disabled it, and no rebuild is tried while that token is still stored, so a long-lived bad
+    token costs one O(1) check per lookup rather than a re-keying of the whole place. Once it
+    has left, rebuilds run at most once per `_KEY_INDEX_REARM_MIN_DEPOSITS` deposits, as
+    `_KeyIndex.rearm` does, so a place that never drains gets its index back within that many
+    deposits.
+    """
+
+    __slots__ = ("key_fn", "_groups", "_key_of", "disabled", "_last_build", "_bad_seq")
+
+    def __init__(self, key_fn: Callable[[Token], object]) -> None:
+        self.key_fn = key_fn
+        self._groups: dict[object, list[_JoinEntry]] = {}
+        self._key_of: dict[int, object] = {}
+        self.disabled = False
+        self._last_build = 0
+        self._bad_seq: int | None = None
+
+    def rearm(self, tokens: Iterable[tuple[int, Token]], deposit_clock: int, is_stored: Callable[[int], bool]) -> bool:
+        """Re-enable a disabled index by rebuilding it from *tokens* (seq, token); return whether it serves.
+
+        A no-op returning ``True`` when the index is enabled. While the token that disabled it
+        is still stored (*is_stored* answers by seq) a rebuild would only fail again, so this
+        returns ``False`` at once. A rebuild re-keys every token, so it also runs at most once
+        per `_KEY_INDEX_REARM_MIN_DEPOSITS` deposits (*deposit_clock* is the store's monotonic
+        deposit counter). A rebuild that meets another token it cannot key disables the index
+        again, remembering that token, and returns ``False``.
+        """
+        if not self.disabled:
+            return True
+        if self._bad_seq is not None and is_stored(self._bad_seq):
+            return False
+        if deposit_clock - self._last_build < _KEY_INDEX_REARM_MIN_DEPOSITS:
+            return False
+        self._last_build = deposit_clock
+        self.disabled = False
+        for seq, token in tokens:
+            self.add(seq, token)
+            if self.disabled:
+                return False
+        return True
+
+    def add(self, seq: int, token: Token) -> None:
+        """Index *token* under *seq*, disabling the index if it cannot be keyed."""
+        if self.disabled:
+            return
+        try:
+            key = self.key_fn(token)
+            group = self._groups.setdefault(key, [])
+        except Exception:
+            self.disable()
+            self._bad_seq = seq
+            return
+        entry = (0, 0.0, seq) if token.available_at == AVAILABLE_NOW else (1, token.available_at, seq)
+        if not group or group[-1] < entry:
+            group.append(entry)
+        else:
+            bisect.insort(group, entry)
+        self._key_of[seq] = key
+
+    def discard(self, seq: int, token: Token) -> None:
+        """Remove *token*'s entry, if it has one."""
+        if self.disabled or seq not in self._key_of:
+            return
+        key = self._key_of.pop(seq)
+        group = self._groups[key]
+        entry = (0, 0.0, seq) if token.available_at == AVAILABLE_NOW else (1, token.available_at, seq)
+        del group[bisect.bisect_left(group, entry)]
+        if not group:
+            del self._groups[key]
+
+    def clear(self) -> None:
+        """Discard every entry and re-enable, for a store that has just become empty."""
+        self._groups = {}
+        self._key_of = {}
+        self.disabled = False
+        self._bad_seq = None
+
+    def disable(self) -> None:
+        """Stop serving this index and release its entries until the store next empties."""
+        self.disabled = True
+        self._groups = {}
+        self._key_of = {}
+
+    def available_groups(
+        self,
+        keys: Iterable[object] | None,
+        t_limit: float,
+        ready: "OrderedDict[int, Token]",
+        timed: dict[int, Token],
+    ) -> "dict[object, _JoinGroup]":
+        """Map each of *keys* (or every key, for `None`) to a view of its tokens available at *t_limit*.
+
+        A key with no available token is left out. *ready* and *timed* are the store's token
+        maps by seq. Because a group's available entries are a prefix of it, its view is cut
+        with one bisection, or none when its last entry is available. Nothing is copied, so
+        this costs O(keys looked up), however many tokens share a key.
+        """
+        groups = self._groups
+        result: dict[object, _JoinGroup] = {}
+        cut = (1, t_limit, math.inf)
+        for key in groups if keys is None else keys:
+            group = groups.get(key)
+            if not group:
+                continue
+            head = group[0]
+            if head[0] and head[1] > t_limit:
+                continue
+            last = group[-1]
+            end = bisect.bisect_right(group, cut) if last[0] and last[1] > t_limit else len(group)
+            result[key] = _JoinGroup(group, end, cut, ready, timed)
+        return result
+
+
+class _JoinGroup:
+    """The first `end` entries of one `_JoinIndex` group, read lazily as `(entry, token)` pairs.
+
+    A view, not a copy: the engine reads it within one resolution under its lock, while the
+    marking is fixed, so a join over a deep group pays only for the entries it reaches (the
+    same argument as the engine's `_PeekStream`).
+
+    Something may still change the place directly while the view is read, without the engine
+    lock. A token that has left is then skipped. An insert or removal also shifts the live
+    list under the read, so the reader keeps the entries strictly increasing and no later than
+    *cut*: an entry shifted back into view is not yielded twice, and one shifted in from past
+    the cut is not yielded at all. As with any stale read, a chosen token that is gone by
+    consume time makes `retrieve_specific` raise and the firing roll back.
+    """
+
+    __slots__ = ("_entries", "_end", "_cut", "_ready", "_timed")
+
+    def __init__(
+        self,
+        entries: list[_JoinEntry],
+        end: int,
+        cut: tuple[int, float, float],
+        ready: "OrderedDict[int, Token]",
+        timed: dict[int, Token],
+    ) -> None:
+        self._entries = entries
+        self._end = end
+        self._cut = cut
+        self._ready = ready
+        self._timed = timed
+
+    def __len__(self) -> int:
+        return self._end
+
+    def __iter__(self) -> "Iterator[tuple[_JoinEntry, Token]]":
+        ready, timed, cut = self._ready, self._timed, self._cut
+        last: _JoinEntry | tuple[()] = ()
+        for entry in itertools.islice(self._entries, self._end):
+            if entry <= last:
+                continue
+            if entry > cut:
+                return
+            last = entry
+            token = (timed if entry[0] else ready).get(entry[2])
+            if token is not None:
+                yield entry, token
+
+
 class _TokenStore:
     """Backing store for [`Place`][cpnx.Place] giving O(1) arbitrary removal and O(1)
     (amortized) earliest-available checks, in place of an O(n)-per-firing deque rebuild.
@@ -186,6 +369,7 @@ class _TokenStore:
         self._seq_of: dict[int, int] = {}
         self._next_seq: int = 0
         self._key_indexes: dict[int, _KeyIndex] = {}
+        self._join_indexes: dict[int, _JoinIndex] = {}
 
     def register_key_index(self, index_id: int, key_fn: Callable[[Token], object]) -> None:
         """Maintain a persistent ``(key, seq)`` min-heap over the ready set for *key_fn*.
@@ -220,6 +404,59 @@ class _TokenStore:
         """Return the registered index for *index_id*, or ``None`` if there is none."""
         return self._key_indexes.get(index_id)
 
+    def register_join_index(self, index_id: int, key_fn: Callable[[Token], object]) -> None:
+        """Maintain a persistent `_JoinIndex` for *key_fn* over every stored token.
+
+        Idempotent per *index_id* and function, rebuilt when the function changes, and
+        back-filled from the tokens already present, like `register_key_index`.
+        """
+        existing = self._join_indexes.get(index_id)
+        if existing is not None and existing.key_fn is key_fn:
+            return
+        index = _JoinIndex(key_fn)
+        self._join_indexes[index_id] = index
+        for seq, token in [*self._ready.items(), *self._cooling_by_seq.items()]:
+            index.add(seq, token)
+            if index.disabled:
+                break
+
+    def unregister_join_index(self, index_id: int) -> None:
+        """Stop maintaining the join index registered under *index_id*, if there is one."""
+        self._join_indexes.pop(index_id, None)
+
+    def join_index(self, index_id: int) -> "_JoinIndex | None":
+        """Return the serving join index for *index_id*, or ``None`` if absent or still disabled.
+
+        A disabled index is offered a rate-limited `_JoinIndex.rearm` first, rebuilt in store
+        read order, so a keying failure is not permanent while the store stays non-empty.
+        """
+        index = self._join_indexes.get(index_id)
+        if index is None:
+            return None
+        if index.disabled and not index.rearm(self._join_rebuild_order(), self._next_seq, self._holds_seq):
+            return None
+        return index
+
+    def _holds_seq(self, seq: int) -> bool:
+        """Return whether the token at *seq* is still stored."""
+        return seq in self._ready or seq in self._cooling_by_seq
+
+    def _join_rebuild_order(self) -> Iterable[tuple[int, Token]]:
+        """Every stored `(seq, token)`, ready then timed, for rebuilding a join index."""
+        return itertools.chain(self._ready.items(), self._cooling_by_seq.items())
+
+    def join_groups(
+        self, index_id: int, keys: Iterable[object] | None, t_limit: float
+    ) -> "dict[object, _JoinGroup] | None":
+        """Group the tokens available at *t_limit* by join key, or ``None`` if *index_id* is not serving.
+
+        See `_JoinIndex.available_groups`.
+        """
+        index = self.join_index(index_id)
+        if index is None:
+            return None
+        return index.available_groups(keys, t_limit, self._ready, self._cooling_by_seq)
+
     def append(self, token: Token) -> None:
         """Add *token*, routing it to the ready set or the cooling heap by `available_at`."""
         seq = self._next_seq
@@ -232,6 +469,8 @@ class _TokenStore:
         else:
             self._push_timed((token.available_at, seq))
             self._cooling_by_seq[seq] = token
+        for join_index in self._join_indexes.values():
+            join_index.add(seq, token)
 
     def __len__(self) -> int:
         return len(self._ready) + len(self._cooling_by_seq)
@@ -384,6 +623,7 @@ class _TokenStore:
             del self._ready[seq]
             del self._seq_of[id(token)]
             taken.append(token)
+            self._unjoin(seq, token)
         remaining = k - len(taken)
         if remaining > 0:
             matured = self._pop_matured_cooling(t_limit, remaining)
@@ -391,15 +631,33 @@ class _TokenStore:
                 token = self._cooling_by_seq.pop(seq)
                 del self._seq_of[id(token)]
                 taken.append(token)
+                self._unjoin(seq, token)
             self._reset_if_untimed()
+        self._reenable_join_indexes_if_empty()
         return taken
+
+    def _unjoin(self, seq: int, token: Token) -> None:
+        """Remove a token that just left the store from every join index."""
+        for join_index in self._join_indexes.values():
+            join_index.discard(seq, token)
+
+    def _reenable_join_indexes_if_empty(self) -> None:
+        """Re-enable every disabled join index once the store holds no token (see `_JoinIndex`)."""
+        if self._join_indexes and not self._ready and not self._cooling_by_seq:
+            for join_index in self._join_indexes.values():
+                if join_index.disabled:
+                    join_index.clear()
 
     def drop(self, seq: int) -> None:
         """Remove the token at *seq* from whichever set holds it (heap entry left lazily stale)."""
-        if seq in self._ready:
-            del self._ready[seq]
-        elif self._cooling_by_seq.pop(seq, None) is not None:
+        token = self._ready.pop(seq, None)
+        if token is None:
+            token = self._cooling_by_seq.pop(seq, None)
+            if token is None:
+                return
             self._reset_if_untimed()
+        self._unjoin(seq, token)
+        self._reenable_join_indexes_if_empty()
 
     def _reset_if_untimed(self) -> None:
         """Empty both timed heaps and reset the split once the store holds no timed token."""
@@ -422,6 +680,8 @@ class _TokenStore:
         self._seq_of.clear()
         for index in self._key_indexes.values():
             index.clear()
+        for join_index in self._join_indexes.values():
+            join_index.clear()
 
     def missing_identities(self, ids: set[int]) -> set[int]:
         """Return the subset of `id(token)` values in *ids* that are not currently stored.
@@ -843,6 +1103,51 @@ class Place:
             if count <= 0:
                 return []
             return self._store.peek_by_key(index_id, count, predicate)
+
+    def register_join_index(self, index_id: int, key_fn: Callable[[Token], object]) -> None:
+        """Maintain a persistent index from `key_fn(token)` to this place's tokens.
+
+        Registered by the engine for each [`InputArc`][cpnx.InputArc] whose `join_key` is
+        *certified* (see [`cpnx.certification`]), because keying runs on the deposit path.
+        *index_id* identifies the registering arc. Re-registering the same id with a different
+        function rebuilds the index, and registration back-fills from the tokens already
+        present. Like the key index, this is a pure optimisation: [`peek_join`][cpnx.Place.peek_join]
+        may decline, and the engine then computes the same groups itself.
+        """
+        with self._lock:
+            self._store.register_join_index(index_id, key_fn)
+
+    def unregister_join_index(self, index_id: int) -> None:
+        """Drop the join index registered under *index_id*, so deposits stop keying for it.
+
+        The engine calls this when the registering arc no longer reads this place through that
+        index: its `join_key` was set back to `None`, or the place was replaced. Unknown ids are
+        ignored.
+        """
+        with self._lock:
+            self._store.unregister_join_index(index_id)
+
+    def peek_join(
+        self, index_id: int, keys: Iterable[object] | None, model_time: float | None = None
+    ) -> "dict[object, Iterable[tuple[tuple[int, float, int], Token]]] | None":
+        """Return this place's available tokens grouped by join key, or ``None`` to fall back.
+
+        Args:
+            index_id: The id the join index was registered under.
+            keys: The join keys to look up, or `None` for every key with an available token.
+                A key with no available token is left out of the result.
+            model_time: Optional logical clock timestamp used instead of wall-clock time to
+                decide which tokens are available.
+
+        Returns:
+            Each key mapped to its available tokens in this place's read order, each paired
+            with a sort position that orders them the same way. A group is a sized, lazily
+            read view of the index, valid until the place next changes. `None` when no index
+            is registered under *index_id* or it disabled itself after a keying failure.
+        """
+        with self._lock:
+            t_limit = model_time if model_time is not None else time.monotonic()
+            return self._store.join_groups(index_id, keys, t_limit)
 
     def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
         """Return ``True`` if at least *count* tokens are currently available for retrieval.

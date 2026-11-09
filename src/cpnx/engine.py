@@ -14,7 +14,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass, replace
-from typing import Callable, Iterator, TypeAlias, TypeVar, cast
+from typing import Callable, Iterable, Iterator, TypeAlias, TypeVar, cast
 
 from cpnx.analysis import ImpactMap, risk_report, trace_impact
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace
@@ -215,6 +215,24 @@ class _PeekStream:
 
 _Pool: TypeAlias = list[Token] | _PeekStream
 """An arc's eligible tokens: a list, or a `_PeekStream` on the lazy searching path."""
+
+
+def _has_join(transition: Transition) -> bool:
+    """Whether any input arc of `transition` declares a `join_key` (read per call: arcs are mutable)."""
+    return any(arc.join_key is not None for arc in transition.inputs)
+
+
+def _join_candidate_count(per_key: list[list]) -> int:
+    """How many candidates the per-key products of `_join_candidates` hold in all."""
+    total = 0
+    for lists in per_key:
+        total += math.prod(map(len, lists))
+    return total
+
+
+def _read_positions(combo: tuple) -> tuple:
+    """The per-arc read positions of a `(position, value)` combination, for `heapq.merge`."""
+    return tuple(position for position, _ in combo)
 
 
 def _as_list(pool: _Pool) -> list[Token]:
@@ -720,6 +738,11 @@ class PetriNet:
         #: Lets `_ensure_key_index` skip re-registering on the hot path, while still
         #: rebuilding when an arc's ``key`` is reassigned after construction.
         self._key_index_arcs: dict[int, Callable[[Token], object]] = {}
+        #: Transition name -> ``{id(arc): (arc, place, join_key)}`` for each place join index
+        #: registered for one of its arcs (see `_ensure_join_index`). Holding the arc keeps its
+        #: id from being reused, and holding the place lets `_release_stale_join_indexes` drop
+        #: an index once its arc stops reading that place through it.
+        self._join_registrations: dict[str, dict[int, tuple[InputArc, Place, Callable[[Token], object]]]] = {}
         #: Transition name -> first exception from a `binding_priority_key` that raised for
         #: *every* candidate binding during the current enabling pass (so `PRIORITY` silently
         #: fell back to insertion order). Drained and dispatched via `on_error` (de-duplicated)
@@ -1264,7 +1287,7 @@ class PetriNet:
 
         - **input-less** transitions (sources) read no place, so no dirty flag ever routes to
           them, yet they are (potentially) always enabled;
-        - a transition with a **`guard`**, or an input arc with a **`key`/`filter`**. Even a
+        - a transition with a **`guard`**, or an input arc with a **`key`/`filter`/`join_key`**. Even a
           *certified* callable is not necessarily token-pure: certification's documented
           late-binding rule (see `cpnx.certification`) admits reads of a rebindable global/free
           variable (e.g. `guard=lambda toks: gate_open` with a `bool` `gate_open` that is later
@@ -1279,7 +1302,9 @@ class PetriNet:
             return True
         if transition.guard is not None:
             return True
-        return any(arc.key is not None or arc.filter is not None for arc in transition.inputs)
+        return any(
+            arc.key is not None or arc.filter is not None or arc.join_key is not None for arc in transition.inputs
+        )
 
     def _ensure_scheduler_ready(self) -> None:
         """Rebuild routing + reseed the dirty set after a transition-set change. Under lock.
@@ -2269,9 +2294,12 @@ class PetriNet:
         always enumerate — even guard-free, they select *among* eligible groups, not just the
         head.
 
+        A transition with a `join_key` arc is never head-only: the head of each place need not
+        share a join key, so even a guard-free one searches (see `_join_candidates`).
+
         Depends only on its arguments (no net state), hence `staticmethod`.
         """
-        return policy is BindingPolicy.FIRST and transition.guard is None
+        return policy is BindingPolicy.FIRST and transition.guard is None and not _has_join(transition)
 
     def _try_count_only_binding(
         self, transition: Transition, m_time: float | None, ignore_timing: bool
@@ -2386,10 +2414,17 @@ class PetriNet:
             The resolved binding (each arc paired with the tokens it will consume), or `None`
             if no guard-satisfying binding exists within the search limit.
         """
+        if self._join_registrations:
+            self._release_stale_join_indexes(transition)
         fast = self._try_count_only_binding(transition, m_time, ignore_timing)
         if fast is not _NO_FAST_PATH:
             return cast("_Binding | None", fast)
         policy = self._effective_policy(transition)
+        if _has_join(transition):
+            joined = self._join_candidates(transition, m_time, ignore_timing)
+            if joined is None:
+                return None
+            return self._pick_binding(transition, self._satisfying(transition, joined), policy)
         head_only, lazy = self._search_mode(transition, policy, probe=False)
         pools = self._gather_arc_pools(transition, m_time, ignore_timing, head_only=head_only, lazy=lazy)
         if pools is None:
@@ -2407,9 +2442,14 @@ class PetriNet:
         which must not perturb the seeded RNG — otherwise a timing-dependent number of probe
         calls would make `RANDOM` runs non-reproducible.
         """
+        if self._join_registrations:
+            self._release_stale_join_indexes(transition)
         fast = self._try_count_only_binding(transition, m_time, ignore_timing)
         if fast is not _NO_FAST_PATH:
             return fast is not None
+        if _has_join(transition):
+            joined = self._join_candidates(transition, m_time, ignore_timing, unordered=True)
+            return joined is not None and next(self._satisfying(transition, joined), None) is not None
         head_only, lazy = self._search_mode(transition, self._effective_policy(transition), probe=True)
         pools = self._gather_arc_pools(transition, m_time, ignore_timing, head_only=head_only, lazy=lazy)
         if pools is None:
@@ -2459,6 +2499,17 @@ class PetriNet:
         `_search_mode`). Both settings yield the same bindings in the same order.
         """
         candidates = self._iter_candidate_bindings(pools, transition_name=transition.name, lazy=lazy)
+        return self._satisfying(transition, candidates)
+
+    def _satisfying(
+        self, transition: Transition, candidates: Iterator[_Binding]
+    ) -> Iterator[tuple[_Binding, list[Token]]]:
+        """Yield each `(binding, flat_tokens)` of `candidates` whose guard holds, bounded by the limit.
+
+        The loop shared by the product search (`_iter_satisfying_bindings`) and the join search
+        (`_join_candidates`): it examines at most `binding_search_limit` candidates, then
+        signals exhaustion.
+        """
         for examined, binding in enumerate(candidates, start=1):
             if examined > self.binding_search_limit:
                 self._signal_search_exhausted(transition.name)
@@ -2471,7 +2522,12 @@ class PetriNet:
         self, transition: Transition, pools: list[tuple[InputArc, _Pool]], policy: BindingPolicy, *, lazy: bool = False
     ) -> _Binding | None:
         """Pick one satisfying binding under a search policy (`FIRST`/`RANDOM`/`PRIORITY`)."""
-        gen = self._iter_satisfying_bindings(transition, pools, lazy=lazy)
+        return self._pick_binding(transition, self._iter_satisfying_bindings(transition, pools, lazy=lazy), policy)
+
+    def _pick_binding(
+        self, transition: Transition, gen: Iterator[tuple[_Binding, list[Token]]], policy: BindingPolicy
+    ) -> _Binding | None:
+        """Pick one of the satisfying bindings `gen` yields, as `policy` directs."""
         if policy is BindingPolicy.RANDOM:
             return self._reservoir_pick(gen)
         if policy is BindingPolicy.PRIORITY:
@@ -2577,6 +2633,183 @@ class PetriNet:
         combos = _lazy_product(streams) if lazy else itertools.product(*(list(stream) for stream in streams))
         for combo in combos:
             yield list(zip(arcs, combo, strict=True))
+
+    def _join_candidates(
+        self, transition: Transition, m_time: float | None, ignore_timing: bool, *, unordered: bool = False
+    ) -> Iterator[_Binding] | None:
+        """Return the candidate bindings of a transition with `join_key` arcs, or `None` if there are none.
+
+        The candidates are exactly the product search's candidates whose `join_key` arcs all
+        agree on their key, in the same lexicographic order (arc order, the last arc varying
+        fastest). See `docs/adr/0010-equi-join-index.md`.
+
+        Each `join_key` arc is read as groups of tokens by key (`_join_groups`), served from
+        the place's persistent join index when the key is certified. The place with the fewest
+        tokens is read first, and each later place is asked only for the keys every earlier
+        one had, so a probe costs O(keys in the smallest place) lookups rather than a walk over
+        the product. Each surviving key contributes the product of its groups with the other
+        arcs' options, and `heapq.merge` interleaves those per-key products back into the
+        product's order by comparing each candidate's per-arc read positions. Keys are
+        disjoint, so no two candidates tie.
+
+        Arcs without a `join_key` contribute their usual options, capped at
+        `binding_search_limit + 1` as in `_iter_candidate_bindings`. `join_key` arcs are not
+        capped: their groups hold only matching tokens, however deep the place.
+
+        `unordered` is for the existence probe, which only asks whether some candidate
+        satisfies the guard. When every candidate fits within `binding_search_limit`, the order
+        cannot change that answer, so the per-key products are chained instead of merged. With
+        more candidates than that, the limit decides which are examined, and the probe keeps
+        the firing path's order so the two agree.
+        """
+        t_limit = _LAST_FINITE_TIME if ignore_timing else m_time
+        gathered = self._join_arc_options(transition, t_limit, ignore_timing)
+        if gathered is None:
+            return None
+        options, joins = gathered
+        groups_by_arc: dict[int, dict] = {}
+        keys: list[object] | None = None
+        for i, arc, place in sorted(joins, key=lambda join: len(join[2])):
+            groups = self._join_groups(arc, place, keys, t_limit, transition.name)
+            if not groups:
+                return None
+            groups_by_arc[i] = groups
+            keys = list(groups)
+        assert keys is not None
+        per_key = [
+            [groups_by_arc[i][key] if arc_options is None else arc_options for i, arc_options in enumerate(options)]
+            for key in keys
+        ]
+        return self._join_bindings(transition.inputs, options, self._join_combos(per_key, unordered=unordered))
+
+    def _join_arc_options(
+        self, transition: Transition, t_limit: float | None, ignore_timing: bool
+    ) -> "tuple[list[list[tuple[int, list[Token]]] | None], list[tuple[int, InputArc, Place]]] | None":
+        """Check every input arc of a join transition and read the options of those without a `join_key`.
+
+        Returns `(options, joins)`: per arc, its `(index, group)` options, or `None` for a
+        `join_key` arc, which is listed in `joins` with its place instead. `None` when an arc
+        is unmet, as `_arc_available` decides it.
+        """
+        limit = self.binding_search_limit
+        options: list[list[tuple[int, list[Token]]] | None] = []
+        joins: list[tuple[int, InputArc, Place]] = []
+        for i, arc in enumerate(transition.inputs):
+            place = self.places.get(arc.place)
+            if place is None or not place.can_retrieve(arc.count, model_time=t_limit):
+                return None
+            if not ignore_timing and not self._is_settle_time_met(place, arc):
+                return None
+            if arc.join_key is not None:
+                options.append(None)
+                joins.append((i, arc, place))
+                continue
+            pool = self._materialize_pool(arc, place, t_limit, limit + arc.count)
+            arc_options = list(
+                itertools.islice(self._arc_options(arc, pool, transition_name=transition.name), limit + 1)
+            )
+            if not arc_options:
+                return None
+            options.append(list(enumerate(arc_options)))
+        return options, joins
+
+    def _join_combos(self, per_key: list[list], *, unordered: bool) -> Iterator[tuple]:
+        """Enumerate the per-key products of `_join_candidates`, merged into product order unless `unordered` allows."""
+        products = (_lazy_product([iter(group) for group in lists]) for lists in per_key)
+        if len(per_key) == 1:
+            return next(products)
+        if unordered and _join_candidate_count(per_key) <= self.binding_search_limit:
+            # Every candidate fits within the search limit, so the order they are examined in
+            # cannot change whether one satisfies: skip the merge.
+            return itertools.chain.from_iterable(products)
+        return heapq.merge(*products, key=_read_positions)
+
+    @staticmethod
+    def _join_bindings(
+        arcs: list[InputArc], options: list[list[tuple[int, list[Token]]] | None], combos: Iterator[tuple]
+    ) -> Iterator[_Binding]:
+        """Turn `(position, value)` combinations into bindings: a `join_key` arc's value is one token."""
+        is_join = [arc_options is None for arc_options in options]
+        for combo in combos:
+            yield [
+                (arc, [value] if join else value) for arc, join, (_, value) in zip(arcs, is_join, combo, strict=True)
+            ]
+
+    def _join_groups(
+        self, arc: InputArc, place: Place, keys: list[object] | None, t_limit: float | None, transition_name: str
+    ) -> "dict[object, Iterable[tuple[object, Token]]] | None":
+        """Return `arc`'s available tokens grouped by `join_key`, restricted to `keys` unless `None`.
+
+        Each group yields `(position, token)` in the place's read order, where positions order
+        the tokens the same way, and has a `len`. A certified `join_key` on a plain
+        [`Place`][cpnx.Place] is served from the place's join index
+        ([`peek_join`][cpnx.Place.peek_join]) as lazy views, at O(1) per requested key.
+        Otherwise, or when that index has disabled itself, this reads the whole available pool
+        and keys every token, dispatching the key as certification allows. A key that raises,
+        or returns an unhashable value, makes the arc unsatisfiable and is reported once
+        through `on_error`, as a raising `key` or `filter` is.
+        """
+        join_key = arc.join_key
+        assert join_key is not None
+        inline_safe = arc._join_key_inline_safe  # type: ignore[attr-defined]
+        if inline_safe and type(place) is Place:
+            self._ensure_join_index(arc, place, join_key, transition_name)
+            indexed = place.peek_join(id(arc), keys, model_time=t_limit)
+            if indexed is not None:
+                return indexed
+        grouped = self._group_pool_by_join_key(arc, place, t_limit, transition_name)
+        if grouped is None or keys is None:
+            return grouped
+        return {key: grouped[key] for key in keys if key in grouped}
+
+    def _ensure_join_index(
+        self, arc: InputArc, place: Place, join_key: Callable[[Token], object], transition_name: str
+    ) -> None:
+        """Register `arc`'s join index on `place`, unless that exact registration is in place.
+
+        A registration left on a different place, which happens when the net's place under that
+        name was replaced, is dropped from the old place first.
+        """
+        registered = self._join_registrations.setdefault(transition_name, {})
+        entry = registered.get(id(arc))
+        if entry is not None and entry[1] is place and entry[2] is join_key:
+            return
+        if entry is not None and entry[1] is not place:
+            entry[1].unregister_join_index(id(arc))
+        place.register_join_index(id(arc), join_key)
+        registered[id(arc)] = (arc, place, join_key)
+
+    def _release_stale_join_indexes(self, transition: Transition) -> None:
+        """Drop each join index of `transition` whose arc no longer reads its place through it.
+
+        That is an arc whose `join_key` was reassigned (including back to `None`), or whose
+        place name now maps to another place. Without this, every later deposit into the old
+        place would keep keying tokens for an index nothing reads. A `join_key` that is still in
+        use is registered again by `_ensure_join_index` on its next read.
+        """
+        registered = self._join_registrations.get(transition.name)
+        if not registered:
+            return
+        for arc_id, (arc, place, join_key) in list(registered.items()):
+            if arc.join_key is not join_key or self.places.get(arc.place) is not place:
+                place.unregister_join_index(arc_id)
+                del registered[arc_id]
+
+    def _group_pool_by_join_key(
+        self, arc: InputArc, place: Place, t_limit: float | None, transition_name: str
+    ) -> "dict[object, list[tuple[object, Token]]] | None":
+        """`_join_groups` without the index: key every available token, reporting a failing key."""
+        pool = place.peek(len(place), model_time=t_limit)
+        inline_safe = arc._join_key_inline_safe  # type: ignore[attr-defined]
+        grouped: dict[object, list[tuple[object, Token]]] = {}
+        try:
+            for position, token in enumerate(pool):
+                key = self._eval_expression(arc.join_key, token, inline_safe)
+                grouped.setdefault(key, []).append((position, token))
+        except Exception as exc:
+            self._signal_selection_failure((transition_name, arc.place), exc, pool, arc)
+            return None
+        return grouped
 
     def _arc_options(self, arc: InputArc, available: _Pool, *, transition_name: str = "") -> Iterator[list[Token]]:
         """Yield each `count`-sized token group one input `arc` could consume, in order.
