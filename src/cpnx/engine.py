@@ -1,7 +1,6 @@
 """Concurrent Petri net executor."""
 
 import bisect
-import collections
 import concurrent.futures
 import heapq
 import itertools
@@ -364,14 +363,41 @@ _Pool: TypeAlias = list[Token] | _PeekStream
 """An arc's eligible tokens: a list, or a `_PeekStream` on the lazy searching path."""
 
 
+_JoinRegistration: TypeAlias = tuple[InputArc, Place, Callable[[Token], object], int, int]
+"""A `_join_registrations` entry: `(arc, place, join_key, index_id, depth)`."""
+
+
 def _registration_matches(
-    entry: tuple[InputArc, Place, Callable[[Token], object], int],
+    entry: _JoinRegistration,
     arc: InputArc,
     place: Place,
     join_key: Callable[[Token], object] | None,
+    depth: int,
 ) -> bool:
-    """Whether a `_join_registrations` entry was made for exactly this arc, place and `join_key`."""
-    return entry[0] is arc and entry[1] is place and entry[2] is join_key
+    """Whether a `_join_registrations` entry was made for exactly this arc, place, `join_key` and depth."""
+    return entry[0] is arc and entry[1] is place and entry[2] is join_key and entry[4] == depth
+
+
+def _join_place_has_plain_arc(transition: Transition) -> bool:
+    """Whether an input arc without a `join_key` reads a place that a join arc of `transition` reads."""
+    shared = _shared_places(transition)
+    if not shared:
+        return False
+    join_places = {arc.place for arc in transition.inputs if arc.join_key is not None}
+    return any(arc.join_key is None and arc.place in join_places for arc in transition.inputs)
+
+
+def _join_depths(joins: "list[tuple[int, InputArc, Place]]") -> dict[int, int]:
+    """How many of a transition's join arcs read each place, by `id(place)`.
+
+    A self-join's arcs on one place each take a different token of the key (issue #75), so a
+    key binds there only once the place holds that many of its tokens: the depth its join
+    index is registered with, and the group size `_join_key_groups` requires.
+    """
+    depths: dict[int, int] = {}
+    for _, _, place in joins:
+        depths[id(place)] = depths.get(id(place), 0) + 1
+    return depths
 
 
 def _has_join(transition: Transition) -> bool:
@@ -953,7 +979,7 @@ class PetriNet:
         #: two transitions is read through two indexes, each with one reader (ADR 0011 §2).
         #: Holding the place lets `_release_stale_join_indexes` drop an index once its arc stops
         #: reading that place through it.
-        self._join_registrations: dict[str, dict[int, tuple[InputArc, Place, Callable[[Token], object], int]]] = {}
+        self._join_registrations: dict[str, dict[int, _JoinRegistration]] = {}
         #: Transition name -> the `_JoinMatch` that tracks which join keys all its join places
         #: hold (see `_matched_join_keys`). Dropped whenever it cannot serve.
         self._join_matches: dict[str, _JoinMatch] = {}
@@ -2988,13 +3014,17 @@ class PetriNet:
         one matched key. That holds because a join arc takes exactly one token and has no
         `key` or `filter` (ADR 0010 §1), so every token of an available group is a valid choice
         for its arc. The assertion keeps a future relaxation of that rule from breaking this
-        silently. A self-join, two join arcs on one place, is the exception: the match lists a
-        key once the place holds one available token of it, but the arcs take distinct tokens
-        (issue #75), so that key may have no binding. Its probe reads every matched key, and
-        `_join_key_groups` drops the ones with too few tokens.
+        silently.
+
+        A self-join, several join arcs on one place, keeps the shortcut: its join indexes are
+        registered with that many arcs as their depth (`_join_depths`), so the match lists a key
+        only once the place holds enough of its tokens for each arc to take its own (issue #75).
+        A place that a join arc shares with an arc *without* a `join_key` does not: that arc's
+        options are the place's tokens, and when it may take only the matched key's token, as
+        its `filter` can make it, another key would be needed. Such a probe reads every key.
         """
         assert all(arc.count == 1 and arc.key is None and arc.filter is None for _, arc, _ in joins)
-        one_key = unordered and transition.guard is None and not _shared_places(transition)
+        one_key = unordered and transition.guard is None and not _join_place_has_plain_arc(transition)
         return self._matched_join_keys(transition.name, joins, t_limit, 1 if one_key else None)
 
     def _join_key_groups(
@@ -3019,12 +3049,11 @@ class PetriNet:
         """
         if keys is not None and not keys:
             return None
-        arcs_per_place = collections.Counter(id(place) for _, _, place in joins)
+        depths = _join_depths(joins)
         groups_by_arc: dict[int, dict] = {}
         for i, arc, place in sorted(joins, key=lambda join: len(join[2])):
-            groups = _with_enough_tokens(
-                self._join_groups(i, arc, place, keys, t_limit, transition_name), arcs_per_place[id(place)]
-            )
+            depth = depths[id(place)]
+            groups = _with_enough_tokens(self._join_groups(i, arc, place, keys, t_limit, transition_name, depth), depth)
             if not groups:
                 return None
             groups_by_arc[i] = groups
@@ -3042,8 +3071,6 @@ class PetriNet:
         `_join_candidates` reads the places' keys itself, when some join arc's place is not
         served by a join index (an uncertified key, a `Place` subclass, a disabled index), or
         on the wall clock (`t_limit` is `None`), where the place picks the time it reads at.
-        Also `None` on a transition's first probe, before `_join_groups` has registered the
-        places' indexes: the match starts on the next one.
         """
         match = self._join_match(transition_name, joins) if t_limit is not None else None
         if match is None:
@@ -3057,16 +3084,20 @@ class PetriNet:
     def _join_match(self, transition_name: str, joins: list[tuple[int, InputArc, Place]]) -> _JoinMatch | None:
         """The transition's `_JoinMatch` for `joins`, made anew if they changed; `None` if one is not indexed.
 
-        Each join arc must be read through a registered place join index: a certified key on a
-        plain `Place`, registered by an earlier `_join_groups`.
+        Each join arc must be read through a place join index: a certified key on a plain
+        `Place`. Each is registered here if it is not yet, as `_join_groups` would register it,
+        so the match serves from a transition's first probe. Waiting for `_join_groups` would
+        not do: it stops at the first place with no usable key, so a self-join whose keys all
+        hold one token would leave its later arcs unregistered, and fall back on every probe.
         """
         index_ids: list[int] = []
+        depths = _join_depths(joins)
         for i, arc, place in joins:
             certified: bool = arc._join_key_inline_safe  # type: ignore[attr-defined]
-            index_id = self._join_index_id(transition_name, i, arc, place)
-            if index_id is None or not certified or type(place) is not Place:
+            join_key = arc.join_key
+            if not certified or type(place) is not Place or join_key is None:
                 return None
-            index_ids.append(index_id)
+            index_ids.append(self._ensure_join_index(transition_name, i, arc, place, join_key, depths[id(place)]))
         ids = tuple(index_ids)
         places = tuple(place for _, _, place in joins)
         match = self._join_matches.get(transition_name)
@@ -3135,8 +3166,11 @@ class PetriNet:
         keys: list[object] | None,
         t_limit: float | None,
         transition_name: str,
+        depth: int = 1,
     ) -> "dict[object, Iterable[tuple[object, Token]]] | None":
         """Return `arc`'s available tokens grouped by `join_key`, restricted to `keys` unless `None`.
+
+        `depth` is how many join arcs of the transition read `place` (see `_join_depths`).
 
         Each group yields `(position, token)` in the place's read order, where positions order
         the tokens the same way, and has a `len`. A certified `join_key` on a plain
@@ -3151,7 +3185,7 @@ class PetriNet:
         assert join_key is not None
         inline_safe = arc._join_key_inline_safe  # type: ignore[attr-defined]
         if inline_safe and type(place) is Place:
-            index_id = self._ensure_join_index(transition_name, position, arc, place, join_key)
+            index_id = self._ensure_join_index(transition_name, position, arc, place, join_key, depth)
             indexed = place.peek_join(index_id, keys, model_time=t_limit)
             if indexed is not None:
                 return indexed
@@ -3161,31 +3195,30 @@ class PetriNet:
         return {key: grouped[key] for key in keys if key in grouped}
 
     def _ensure_join_index(
-        self, transition_name: str, position: int, arc: InputArc, place: Place, join_key: Callable[[Token], object]
+        self,
+        transition_name: str,
+        position: int,
+        arc: InputArc,
+        place: Place,
+        join_key: Callable[[Token], object],
+        depth: int = 1,
     ) -> int:
         """Register the join index for input `position` of the transition on `place`; return its id.
 
-        A no-op returning the existing id when that exact registration (same arc, place and
-        `join_key`) is in place. Any other registration at that position is dropped from its
+        A no-op returning the existing id when that exact registration (same arc, place,
+        `join_key` and `depth`) is in place. Any other registration at that position is dropped from its
         place first, and the new one gets a fresh id from `_JOIN_INDEX_IDS`.
         """
         registered = self._join_registrations.setdefault(transition_name, {})
         entry = registered.get(position)
         if entry is not None:
-            if _registration_matches(entry, arc, place, join_key):
+            if _registration_matches(entry, arc, place, join_key, depth):
                 return entry[3]
             entry[1].unregister_join_index(entry[3])
         index_id = next(_JOIN_INDEX_IDS)
-        place.register_join_index(index_id, join_key)
-        registered[position] = (arc, place, join_key, index_id)
+        place.register_join_index(index_id, join_key, depth)
+        registered[position] = (arc, place, join_key, index_id, depth)
         return index_id
-
-    def _join_index_id(self, transition_name: str, position: int, arc: InputArc, place: Place) -> int | None:
-        """The id of the join index registered for this exact arc and place at `position`, if any."""
-        entry = self._join_registrations.get(transition_name, {}).get(position)
-        if entry is None or not _registration_matches(entry, arc, place, arc.join_key):
-            return None
-        return entry[3]
 
     def _release_stale_join_indexes(self, transition: Transition) -> None:
         """Drop each join index of `transition` whose arc no longer reads its place through it.
@@ -3200,7 +3233,7 @@ class PetriNet:
         if not registered:
             return
         inputs = transition.inputs
-        for position, (arc, place, join_key, index_id) in list(registered.items()):
+        for position, (arc, place, join_key, index_id, _depth) in list(registered.items()):
             if (
                 position >= len(inputs)
                 or inputs[position] is not arc

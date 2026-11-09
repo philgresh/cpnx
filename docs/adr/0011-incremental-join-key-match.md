@@ -81,8 +81,10 @@ index enabled) and the probe has a definite time. Otherwise `_join_candidates` r
 itself as before. The engine drops the match when the cause is structural or a matter of clock:
 
 - an uncertified `join_key`, or a join place that is a `Place` subclass;
-- the wall clock (`model_time=None`), where the place, not the engine, picks the read time;
-- the transition's first probe, before `_join_groups` has registered the indexes.
+- the wall clock (`model_time=None`), where the place, not the engine, picks the read time.
+
+The match registers any index it needs that is not registered yet, so it serves from a
+transition's first probe.
 
 A disabled index (a key that raised or was unhashable) is different: it is expected to come
 back, and `rearm` is rate-limited, so it can stay down for many probes. The match is kept.
@@ -92,6 +94,21 @@ rebuild. When the index re-enables, its new generation makes the match rebuild o
 
 A match is replaced when its transition's join arcs, their index ids or their places change,
 which it checks on every probe.
+
+### 4a. Self-joins ([#75](https://github.com/philgresh/cpnx/issues/75))
+
+Two or more join arcs can read one place. Each takes a different token, so a key binds there
+only once the place holds as many of its tokens as there are such arcs. Each index is
+registered with that number as its **depth**, and its "head" is its group's first `depth`
+entries: it reports a key, and the time it becomes available, only once its `depth`-th token
+is in the group. The match then lists only keys that bind, and the one-key probe of §3 still
+holds. A key whose tokens all sit in a backlog of one-token keys costs nothing to probe past,
+as for an ordinary join. Changing the depth (an arc moved onto or off the place) replaces the
+index.
+
+The one-key probe does not apply when a join place is also read by an arc *without* a
+`join_key`. That arc's options are the place's tokens, and when its `filter` accepts only the
+matched key's token, another key would be needed. Such a probe asks for every key.
 
 ### 5. Concurrent changes
 

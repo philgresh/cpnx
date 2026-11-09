@@ -177,9 +177,15 @@ _HeadReport = tuple[int, dict[object, float] | None, dict[object, float | None]]
 """What `_JoinIndex.head_changes` returns: ``(generation, every_head, changes)``."""
 
 
-def _join_head_time(group: list[_JoinEntry]) -> float:
-    """When the head of a non-empty join group becomes available: ``-inf`` for a ready token."""
-    head = group[0]
+def _join_head_time(group: list[_JoinEntry], depth: int = 1) -> float | None:
+    """When a join group's first *depth* tokens are all available: ``-inf`` if they are ready now.
+
+    That is when its *depth*-th entry becomes available, since entries are in read order.
+    ``None`` when the group holds fewer than *depth* tokens.
+    """
+    if len(group) < depth:
+        return None
+    head = group[depth - 1]
     return head[1] if head[0] else -math.inf
 
 
@@ -208,17 +214,31 @@ class _JoinIndex:
 
     **Head changes.** The engine keeps, per join transition, the keys that every join place
     holds (`cpnx.engine._JoinMatch`, ADR 0011). It needs to hear when a group's *head* changes,
-    because a group's head decides when the key becomes available. `head_changes` hands it the
-    keys whose head changed since its last call, which `add` and `discard` collect once a reader
-    has asked. `generation` changes whenever the groups are replaced wholesale (disabled,
-    cleared or rebuilt), and a reader that sees a new one gets every head instead. Each index
-    has exactly one reader; see `head_changes`.
+    because a group's head decides when the key becomes available. The head is the group's
+    first `depth` entries: a self-join, whose `depth` join arcs read one place and take one
+    token each (issue #75), can use a key only once that many of its tokens are available, so
+    its index reports a key only from then on, and its `_JoinMatch` lists only keys that bind.
+    `head_changes` hands it the keys whose head changed since its last call, which `add` and
+    `discard` collect once a reader has asked. `generation` changes whenever the groups are
+    replaced wholesale (disabled, cleared or rebuilt), and a reader that sees a new one gets
+    every head instead. Each index has exactly one reader; see `head_changes`.
     """
 
-    __slots__ = ("key_fn", "_groups", "_key_of", "disabled", "_last_build", "_bad_seq", "_dirty", "generation")
+    __slots__ = (
+        "key_fn",
+        "depth",
+        "_groups",
+        "_key_of",
+        "disabled",
+        "_last_build",
+        "_bad_seq",
+        "_dirty",
+        "generation",
+    )
 
-    def __init__(self, key_fn: Callable[[Token], object]) -> None:
+    def __init__(self, key_fn: Callable[[Token], object], depth: int = 1) -> None:
         self.key_fn = key_fn
+        self.depth = depth
         self._groups: dict[object, list[_JoinEntry]] = {}
         self._key_of: dict[int, object] = {}
         self.disabled = False
@@ -271,7 +291,7 @@ class _JoinIndex:
             at = bisect.bisect_left(group, entry)
             group.insert(at, entry)
         self._key_of[seq] = key
-        if at == 0 and self._dirty is not None:
+        if at < self.depth and self._dirty is not None:
             self._dirty.add(key)
 
     def discard(self, seq: int, token: Token) -> None:
@@ -285,7 +305,7 @@ class _JoinIndex:
         del group[at]
         if not group:
             del self._groups[key]
-        if at == 0 and self._dirty is not None:
+        if at < self.depth and self._dirty is not None:
             self._dirty.add(key)
 
     def clear(self) -> None:
@@ -311,8 +331,9 @@ class _JoinIndex:
         Returns ``(generation, every_head, changes)``. When *generation* is this index's
         current one, *every_head* is ``None`` and *changes* maps each key whose group head
         changed since the previous call to its new `_join_head_time`, or to ``None`` if the key
-        has no token left. Otherwise (including a first call with ``None``) *every_head* maps
-        every key to its head time and *changes* is empty. Either way change tracking restarts
+        has fewer than `depth` tokens left. Otherwise (including a first call with ``None``)
+        *every_head* maps every key with at least `depth` tokens to its head time and *changes*
+        is empty. Either way change tracking restarts
         from here, so each change is reported once.
 
         **One reader per index.** A call drains the changes, so a second reader would miss
@@ -321,10 +342,11 @@ class _JoinIndex:
         are collected until the index is cleared or disabled, whether or not it asks again.
         That set is bounded by the index's distinct keys.
         """
-        groups = self._groups
+        groups, depth = self._groups, self.depth
         if generation != self.generation:
             self._dirty = set()
-            return self.generation, {key: _join_head_time(group) for key, group in groups.items()}, {}
+            every = {key: _join_head_time(group, depth) for key, group in groups.items() if len(group) >= depth}
+            return self.generation, every, {}  # type: ignore[return-value]  # filtered to depth
         dirty = self._dirty
         if not dirty:
             return self.generation, None, {}
@@ -332,7 +354,7 @@ class _JoinIndex:
         changes: dict[object, float | None] = {}
         for key in dirty:
             group = groups.get(key)
-            changes[key] = _join_head_time(group) if group else None
+            changes[key] = _join_head_time(group, depth) if group else None
         return self.generation, None, changes
 
     def available_groups(
@@ -496,16 +518,16 @@ class _TokenStore:
         """Return the registered index for *index_id*, or ``None`` if there is none."""
         return self._key_indexes.get(index_id)
 
-    def register_join_index(self, index_id: int, key_fn: Callable[[Token], object]) -> None:
+    def register_join_index(self, index_id: int, key_fn: Callable[[Token], object], depth: int = 1) -> None:
         """Maintain a persistent `_JoinIndex` for *key_fn* over every stored token.
 
-        Idempotent per *index_id* and function, rebuilt when the function changes, and
-        back-filled from the tokens already present, like `register_key_index`.
+        Idempotent per *index_id*, function and *depth* (see `_JoinIndex`), rebuilt when either
+        changes, and back-filled from the tokens already present, like `register_key_index`.
         """
         existing = self._join_indexes.get(index_id)
-        if existing is not None and existing.key_fn is key_fn:
+        if existing is not None and existing.key_fn is key_fn and existing.depth == depth:
             return
-        index = _JoinIndex(key_fn)
+        index = _JoinIndex(key_fn, depth)
         self._join_indexes[index_id] = index
         for seq, token in [*self._ready.items(), *self._cooling_by_seq.items()]:
             index.add(seq, token)
@@ -1208,7 +1230,7 @@ class Place:
                 return []
             return self._store.peek_by_key(index_id, count, predicate)
 
-    def register_join_index(self, index_id: int, key_fn: Callable[[Token], object]) -> None:
+    def register_join_index(self, index_id: int, key_fn: Callable[[Token], object], depth: int = 1) -> None:
         """Maintain a persistent index from `key_fn(token)` to this place's tokens.
 
         Registered by the engine for each [`InputArc`][cpnx.InputArc] whose `join_key` is
@@ -1217,9 +1239,14 @@ class Place:
         function rebuilds the index, and registration back-fills from the tokens already
         present. Like the key index, this is a pure optimisation: [`peek_join`][cpnx.Place.peek_join]
         may decline, and the engine then computes the same groups itself.
+
+        *depth* is how many join arcs of the registering transition read this place, each
+        taking a different token. [`join_head_changes`][cpnx.Place.join_head_changes] then
+        reports a key only while it holds at least that many tokens. Changing it rebuilds the
+        index.
         """
         with self._lock:
-            self._store.register_join_index(index_id, key_fn)
+            self._store.register_join_index(index_id, key_fn, depth)
 
     def unregister_join_index(self, index_id: int) -> None:
         """Drop the join index registered under *index_id*, so deposits stop keying for it.
@@ -1258,10 +1285,12 @@ class Place:
 
         For the join index registered under *index_id*, returns ``(generation, every_head,
         changes)``. With the *generation* the previous call returned, *every_head* is ``None``
-        and *changes* maps each key whose earliest token changed since then to the time that
-        token becomes available (``-inf`` when it is ready now), or to ``None`` when the key has
-        left. Otherwise *every_head* maps every key to that time and *changes* is empty. ``None`` when the index is not
-        registered or not serving, exactly as for [`peek_join`][cpnx.Place.peek_join].
+        and *changes* maps each key whose earliest tokens changed since then to the time they
+        are all available (``-inf`` when they are ready now), or to ``None`` when the key has
+        left. Otherwise *every_head* maps every key to that time and *changes* is empty. "Earliest
+        tokens" means the first `depth` given at registration, one by default; a key with fewer
+        is reported as left. ``None`` when the index is not registered or not serving, exactly
+        as for [`peek_join`][cpnx.Place.peek_join].
         """
         with self._lock:
             return self._store.join_head_changes(index_id, generation)

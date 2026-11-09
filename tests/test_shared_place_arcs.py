@@ -10,6 +10,7 @@ search, and the `consume_all` count-only path.
 import pytest
 
 from cpnx import BindingPolicy, InputArc, OutputArc, PetriNet, Place, Token, Transition
+from cpnx.places import _TokenStore
 
 WID = lambda t: t.payload["wid"]  # noqa: E731
 N = lambda t: t.payload["n"]  # noqa: E731
@@ -290,3 +291,105 @@ def test_one_token_keys_do_not_use_up_a_self_joins_search_limit(certified, guard
     assert [token.payload["wid"] for token in net.marking["out"]] == [-1, -1]
     assert net.is_dead()
     assert exhausted == []
+
+
+# -- self-join match depth ---------------------------------------------------------------------
+
+
+def test_a_depth_two_join_index_reports_a_key_once_it_holds_two_tokens():
+    store = _TokenStore()
+    store.register_join_index(1, WID, depth=2)
+    first = Token(payload={"wid": 0, "n": 0})
+    store.append(first)
+    generation, every_head, changes = store.join_head_changes(1, None)
+    assert every_head == {} and changes == {}
+    timed = Token(payload={"wid": 0, "n": 1}, available_at=4.0)
+    store.append(timed)
+    assert store.join_head_changes(1, generation) == (generation, None, {0: 4.0})
+    # A third token behind the second changes nothing; one ahead of it does.
+    store.append(Token(payload={"wid": 0, "n": 2}, available_at=9.0))
+    assert store.join_head_changes(1, generation) == (generation, None, {})
+    ready = Token(payload={"wid": 0, "n": 3})
+    store.append(ready)
+    assert store.join_head_changes(1, generation) == (generation, None, {0: float("-inf")})
+    store.remove_identity([first, ready])
+    assert store.join_head_changes(1, generation) == (generation, None, {0: 9.0})
+    store.remove_identity([timed])
+    assert store.join_head_changes(1, generation) == (generation, None, {0: None})
+
+
+def _self_join(n_single: int) -> PetriNet:
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    same = InputArc("jobs", join_key=WID)
+    net.add_transition(
+        Transition(name="t", inputs=[same, same], outputs=[OutputArc("out", count=2)], action=_passthrough)
+    )
+    for wid in range(n_single):
+        net.deposit("jobs", Token(payload={"wid": wid}))
+    return net
+
+
+def test_a_self_joins_match_lists_only_keys_that_bind():
+    # The match is what keeps a self-join's probe and firing costs off the backlog of keys with
+    # one token: it lists a key only once the place holds a token for each join arc.
+    net = _self_join(50)
+    t = net.transitions["t"]
+    assert not net._binding_exists(t, net.model_time)  # registers the indexes
+    assert not net._binding_exists(t, net.model_time)
+    assert net._join_matches["t"].keys_at(net.model_time) == []
+    net.deposit("jobs", Token(payload={"wid": 7}))
+    assert net._binding_exists(t, net.model_time)
+    assert net._join_matches["t"].keys_at(net.model_time) == [7]
+    net.drive_to_quiescence()
+    assert [token.payload["wid"] for token in net.marking["out"]] == [7, 7]
+    assert net._join_matches["t"].keys_at(net.model_time) == []
+
+
+def test_a_self_join_index_is_rebuilt_when_its_depth_changes():
+    a, b = InputArc("jobs", join_key=WID), InputArc("other", join_key=WID)
+    net = PetriNet(seed=0)
+    for name in ("jobs", "other", "out"):
+        net.add_place(Place(name))
+    net.add_transition(Transition(name="t", inputs=[a, b], outputs=[OutputArc("out", count=2)], action=_passthrough))
+    net.deposit("jobs", Token(payload={"wid": 0}))
+    net.deposit("other", Token(payload={"wid": 0}))
+    t = net.transitions["t"]
+    assert [net._binding_exists(t, net.model_time) for _ in range(2)] == [True, True]
+    b.place = "jobs"  # now a self-join on `jobs`, which holds one token of key 0
+    assert [net._binding_exists(t, net.model_time) for _ in range(3)] == [False, False, False]
+    net.deposit("jobs", Token(payload={"wid": 0}))
+    assert [net._binding_exists(t, net.model_time) for _ in range(2)] == [True, True]
+
+
+def _wid_is_zero(token: Token) -> bool:
+    return token.payload["wid"] == 0
+
+
+def test_a_join_place_shared_with_a_plain_arc_probes_past_the_first_key():
+    # Key 0's only `jobs` token is also the only one the plain arc's filter accepts, so key 0
+    # has no binding; key 1 does. The probe must not stop at whichever key the match lists first.
+    for first_key in (0, 1):
+        net = PetriNet(seed=0)
+        for name in ("jobs", "other", "out"):
+            net.add_place(Place(name))
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[
+                    InputArc("jobs", join_key=WID),
+                    InputArc("other", join_key=WID),
+                    InputArc("jobs", filter=_wid_is_zero),
+                ],
+                outputs=[OutputArc("out", count=3)],
+                action=_passthrough,
+            )
+        )
+        for wid in (first_key, 1 - first_key):
+            net.deposit("jobs", Token(payload={"wid": wid}))
+            net.deposit("other", Token(payload={"wid": wid}))
+        t = net.transitions["t"]
+        assert [net._binding_exists(t, net.model_time) for _ in range(3)] == [True, True, True]
+        net.drive_to_quiescence()
+        assert sorted(token.payload["wid"] for token in net.marking["out"]) == [0, 1, 1]
