@@ -132,7 +132,9 @@ The invariants this section relies on, and the tests that hold the engine to the
   condition at every join place. `test_a_self_join_binds_exactly_when_hall_condition_holds`
   checks this against a brute-force search.
 - **Probe and firing agree.** `_binding_exists` and `_resolve_binding` give the same answer
-  (ADR 0010 §3). The same property test checks it.
+  (ADR 0010 §3). The same property test checks it, and
+  `test_the_guard_free_probe_agrees_with_firing_past_the_search_limit` checks it with more
+  keys than `binding_search_limit`, where the probe's shortcuts could differ from firing.
 - **Filters drop only keys that cannot bind.** Depth and Hall filtering may only shrink the
   candidates to those that do not reuse a token, never change which binding fires (ADR 0010
   §4).
@@ -143,12 +145,25 @@ from the remaining tokens. A residual Hall check prunes either kind's choice whe
 a later join arc on the place, such as an arc without a `join_key` read first taking a key's
 only token there. Pruning drops only choices no binding extends, so it never changes which
 binding fires. Any other choice that leaves a later arc nothing counts toward
-`binding_search_limit`, which keeps the search bounded. The one-key probe and its doubling
-variant need every key to show the same pattern of candidates and such dead ends, so they do
-not apply when an arc without a `join_key` reads a join place (its `filter` may accept only the
-matched key's token, so another key would be needed). An arc without a `join_key` on any other
-shared place makes the same choices under every key, wherever it sits among the join arcs, so
-it keeps them. Such a probe asks for every key, in firing's order.
+`binding_search_limit`, which keeps the search bounded.
+
+The one-key probe and its doubling variant must answer as firing does, and firing merges every
+key's candidates and dead ends in product order and stops at the limit. So they apply only
+when no dead end can repeat once per key ahead of the first candidate. Two kinds of arc
+without a `join_key` on a shared place rule them out:
+
+- One that reads a join place. Its choices depend on the key, and its `filter` may accept only
+  the matched key's token, so another key would be needed.
+- One that sits before a join arc, on a place where some arc has a `filter`. If it takes the
+  token a filtered arc needs, that is a dead end, and in product order it comes once for every
+  key before the arc moves to its next token. With more keys than the limit, firing runs out
+  where one key alone would bind: `[c, a:k, b:k, c(filter)]`.
+
+An arc after the last join arc keeps the shortcuts, since its dead ends fall inside one choice
+of the join arcs and the first key meets them once. So does one before a join arc on a place
+with no `filter`: the arcs there all choose among the same tokens, so none runs out while
+another has an option. When the shortcuts do not apply, the probe asks for every key, in
+firing's order.
 
 ### 5. Concurrent changes
 

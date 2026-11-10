@@ -198,7 +198,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reading them, so its cost stays with the options it yields. Each key's walk costs O(1) to
   start, and plain arcs after every join arc, off the key's places, are walked once for all
   keys. The existence probe keeps its one-key and first-binding-key shortcuts unless an arc
-  without a `join_key` reads a join place.
+  without a `join_key` on a shared place reads a join place, or sits before a join arc on a
+  place where some arc has a `filter`. Such an arc can run a later arc out of tokens once
+  per key, so firing can use up `binding_search_limit` where one key alone would bind, and
+  the probe then reads every key as firing does.
   Draining 200 pairs past 16 000
   one-token keys took 1 690 ms and now takes about 170 ms, level with a two-place join.
   A guard-free `FIRST` transition whose `filter` arc shares its place
