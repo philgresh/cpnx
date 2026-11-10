@@ -163,9 +163,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same place, whether the same `InputArc` twice or two separate ones, with or without
   `join_key`, could bind one token to both. Firing then removed it twice and
   `retrieve_specific` raised `ValueError`. Each arc now takes tokens of its own, as one arc with
-  `count=2` does. The head-only path gives each arc the head of what the earlier arcs left; the
-  product, lazy and `join_key` searches skip a candidate that reuses a token, and that
-  candidate still counts toward `binding_search_limit`. One token no longer enables two arcs.
+  `count=2` does. The head-only path gives each arc the head of what the earlier arcs left,
+  reading the place's whole demand even past `binding_search_limit`. The product search
+  draws a later arc's options from the tokens the earlier arcs left and only then cuts them to
+  the limit, so a guarded `[p, p×2]` on a deep place still binds; an option that leaves a
+  later arc nothing counts toward the limit. The `join_key` search skips a candidate that
+  reuses a token, which counts toward the limit too. One token no longer enables two arcs.
   In a self-join (N join arcs on one place with one `join_key` function), a key binds only
   once the place holds N of its tokens; arcs with different functions need one token each.
   Its join indexes now track each key's first N tokens, so ADR 0011's match lists only keys
@@ -182,9 +185,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with another arc now searches instead of taking heads greedily, which could leave the
   filtered arc without the one token it accepts and report the transition dead.
   A `consume_all` arc that shares its place with another input arc is never enabled, since
-  draining the place leaves nothing for the other arc. Finding the shared places costs about
-  0.2 µs per resolution; `bench_enablement.py` and `bench_cafe_throughput.py` are within noise
-  of `main`.
+  draining the place leaves nothing for the other arc. The shared places are found once per
+  resolution: a guard-free two-arc probe costs 3.16 µs against 3.04 µs on `main`.
 - **`drive_to_quiescence` no longer stops before a later cooling token matures**
   ([#68](https://github.com/philgresh/cpnx/issues/68)). When a place already held two or more
   timed tokens as the incremental scheduler started, it tracked only that place's earliest

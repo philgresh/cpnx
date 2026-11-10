@@ -177,6 +177,16 @@ _HeadReport = tuple[int, dict[object, float] | None, dict[object, float | None]]
 """What `_JoinIndex.head_changes` returns: ``(generation, every_head, changes)``."""
 
 
+def _check_join_depth(depth: object) -> None:
+    """Raise `ValueError` unless *depth* is an `int` of at least 1 (not a `bool`).
+
+    `_join_head_time` reads a group's *depth*-th entry, so a depth of 0 or less would read from
+    the end and report a wrong head time without failing.
+    """
+    if isinstance(depth, bool) or not isinstance(depth, int) or depth < 1:
+        raise ValueError(f"join index depth must be an int >= 1, got {depth!r}")
+
+
 def _join_head_time(group: list[_JoinEntry], depth: int = 1) -> float | None:
     """When a join group's first *depth* tokens are all available: ``-inf`` if they are ready now.
 
@@ -238,6 +248,7 @@ class _JoinIndex:
     )
 
     def __init__(self, key_fn: Callable[[Token], object], depth: int = 1) -> None:
+        _check_join_depth(depth)
         self.key_fn = key_fn
         self.depth = depth
         self._groups: dict[object, list[_JoinEntry]] = {}
@@ -1245,7 +1256,11 @@ class Place:
         *key_fn*, each taking a different token. [`join_head_changes`][cpnx.Place.join_head_changes]
         then reports a key only while it holds at least that many tokens. Changing it rebuilds
         the index.
+
+        Raises:
+            ValueError: If *depth* is not an `int` of at least 1.
         """
+        _check_join_depth(depth)
         with self._lock:
             self._store.register_join_index(index_id, key_fn, depth)
 

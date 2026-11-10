@@ -7,6 +7,8 @@ tokens apart: the head-only path, the product search (eager and lazy), the `join
 search, and the `consume_all` count-only path.
 """
 
+import itertools
+
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -108,15 +110,68 @@ def test_lazy_search_over_a_deep_place(arcs):
     assert len(net.marking["out"]) == 40
 
 
-def test_rejected_candidates_count_toward_the_search_limit():
+def test_a_reused_token_is_never_a_candidate_so_it_spends_none_of_the_search_limit():
+    # The later arc's options are the tokens the earlier arc left, so with a limit of 1 the
+    # one candidate examined is (0, 1), not (0, 0).
     exhausted = []
     net = _net_moving([InputArc("jobs"), InputArc("jobs")], n_tokens=2, guard=lambda tokens: True)
     net.binding_search_limit = 1
     net.on_binding_search_exhausted = exhausted.append
-    # The first candidate hands token 0 to both arcs; with a limit of 1 the search stops there.
-    assert net._resolve_binding(net.transitions["t"], net.model_time) is None
-    net.binding_search_limit = 2
-    assert net._resolve_binding(net.transitions["t"], net.model_time) is not None
+    binding = net._resolve_binding(net.transitions["t"], net.model_time)
+    assert [tokens[0].payload["n"] for _, tokens in binding] == [0, 1]
+    assert exhausted == []
+
+
+@pytest.mark.parametrize("counts", [(1, 2), (2, 2), (2, 1)])
+@pytest.mark.parametrize("policy", [BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY])
+def test_a_guarded_shared_place_deeper_than_the_search_limit_binds(counts, policy):
+    # The second arc's first `limit + 1` pairs all hold token 0, which the first arc takes. Its
+    # options must be cut to the limit after leaving out that token, not before.
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("jobs", count=counts[0]), InputArc("jobs", count=counts[1])],
+            outputs=[OutputArc("out", count=sum(counts))],
+            action=_passthrough,
+            guard=lambda tokens: True,
+            binding_policy=policy,
+        )
+    )
+    net.binding_search_limit = 20
+    for n in range(net.binding_search_limit + 10):
+        net.deposit("jobs", Token(payload={"n": n}))
+    t = net.transitions["t"]
+    assert net._binding_exists(t, net.model_time)
+    _assert_distinct(net)
+
+
+@pytest.mark.parametrize("counts", [(1, 1, 1), (2, 1), (1, 3)])
+def test_a_head_only_shared_place_reads_its_whole_demand_past_a_small_search_limit(counts):
+    # The head-only path hands out the place's demand from one read, which must not be
+    # clamped to `binding_search_limit + 1`.
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("jobs", count=count) for count in counts],
+            outputs=[OutputArc("out", count=sum(counts))],
+            action=_passthrough,
+        )
+    )
+    net.binding_search_limit = 1
+    for n in range(5):
+        net.deposit("jobs", Token(payload={"n": n}))
+    t = net.transitions["t"]
+    assert net._is_head_only(t, net._effective_policy(t))
+    assert net._binding_exists(t, net.model_time)
+    _assert_distinct(net)
+    net.drive_to_quiescence()
+    assert len(net.marking["out"]) == sum(counts)
 
 
 # -- arc shapes --------------------------------------------------------------------------------
@@ -564,3 +619,127 @@ def test_a_self_join_binds_exactly_when_hall_condition_holds(functions, payloads
         flat = [token for _, tokens in binding for token in tokens]
         assert len({id(token) for token in flat}) == len(flat)
         assert len({_FUNCTIONS[name](token) for name, token in zip(functions, flat, strict=True)}) == 1
+
+
+_ARC_SHAPES = {
+    "plain": {},
+    "even": {"filter": lambda t: t.payload["n"] % 2 == 0},
+    "odd": {"filter": lambda t: t.payload["n"] % 2 == 1},
+    "desc": {"key": NEG_N},
+}
+
+
+def _product_binding_exists(arcs: list[tuple[str, int]], ns: list[int], guard) -> bool:
+    """Brute force: pairwise-distinct tokens per arc, each accepted by its arc, and the guard holds."""
+
+    def accepts(shape: str, n: int) -> bool:
+        return shape not in ("even", "odd") or (n % 2 == 0) == (shape == "even")
+
+    def go(i: int, used: frozenset[int], chosen: list[int]) -> bool:
+        if i == len(arcs):
+            return guard([Token(payload={"n": ns[j]}) for j in chosen])
+        shape, count = arcs[i]
+        free = [j for j in range(len(ns)) if j not in used and accepts(shape, ns[j])]
+        return any(go(i + 1, used | set(group), chosen + list(group)) for group in itertools.combinations(free, count))
+
+    return go(0, frozenset(), [])
+
+
+@settings(max_examples=150, deadline=None)
+@given(
+    arcs=st.lists(st.tuples(st.sampled_from(sorted(_ARC_SHAPES)), st.integers(1, 2)), min_size=2, max_size=3),
+    ns=st.lists(st.integers(0, 9), max_size=7),
+    limit=st.integers(1, 4),
+    guarded=st.booleans(),
+)
+def test_a_shared_place_search_finds_a_distinct_binding_when_one_exists(arcs, ns, limit, guarded):
+    # The search never returns a binding that reuses a token, returns one whenever it finds
+    # none to be impossible, and misses one only by exhausting `binding_search_limit`, which
+    # it signals. A guarded transition (accepting only an even sum) runs with a limit large
+    # enough to be exact; a guard-free one runs with a small limit, where an arc's option that
+    # leaves a later filtered arc no token counts toward it.
+    guard = (lambda tokens: sum(t.payload["n"] for t in tokens) % 2 == 0) if guarded else None
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("jobs", count=count, **_ARC_SHAPES[shape]) for shape, count in arcs],
+            outputs=[OutputArc("out", count=sum(count for _, count in arcs))],
+            action=_passthrough,
+            **({"guard": guard} if guard else {}),
+        )
+    )
+    net.binding_search_limit = 10_000 if guarded else limit
+    exhausted = []
+    signal = net._signal_search_exhausted
+    net._signal_search_exhausted = lambda name: (exhausted.append(name), signal(name))  # type: ignore[method-assign]
+    for n in ns:
+        net.deposit("jobs", Token(payload={"n": n}))
+    t = net.transitions["t"]
+    expected = _product_binding_exists(arcs, ns, guard or (lambda tokens: True))
+    binding = net._resolve_binding(t, net.model_time)
+    assert net._binding_exists(t, net.model_time) is (binding is not None)
+    if binding is None and expected:
+        assert not guarded and exhausted, "a binding exists, yet the search neither found it nor ran out"
+    assert binding is None or expected
+    if binding is not None:
+        flat = [token for _, tokens in binding for token in tokens]
+        assert len({id(token) for token in flat}) == len(flat)
+
+
+@pytest.mark.parametrize("guarded", [False, True])
+def test_a_timed_self_join_waits_for_its_second_token(guarded):
+    # The self-join's index keys availability on each key's second token (its depth), so one
+    # ready and one cooling token of a key leave the transition disabled until the cooling one
+    # is ready, and the drive then advances to that time and fires.
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    same = InputArc("jobs", join_key=WID)
+    guard = {"guard": lambda tokens: True} if guarded else {}
+    net.add_transition(
+        Transition(name="t", inputs=[same, same], outputs=[OutputArc("out", count=2)], action=_passthrough, **guard)
+    )
+    net.advance_time(1.0)
+    ready_at = net.model_time + 5.0
+    net.deposit("jobs", Token(payload={"wid": 7}))
+    net.deposit("jobs", Token(payload={"wid": 8}))
+    net.deposit("jobs", Token(payload={"wid": 7}, available_at=ready_at))
+    t = net.transitions["t"]
+    assert not net._binding_exists(t, net.model_time)
+    assert net._resolve_binding(t, net.model_time) is None
+    assert net._binding_exists(t, net.model_time, ignore_timing=True)
+    net.drive_to_quiescence()
+    assert net.model_time >= ready_at
+    assert [token.payload["wid"] for token in net.marking["out"]] == [7, 7]
+    assert [token.payload["wid"] for token in net.marking["jobs"]] == [8]
+
+
+def test_a_timed_self_join_binds_on_its_first_two_ready_tokens_while_a_third_cools():
+    # The key's head is its first `depth` tokens, not all of them: a cooling third token must
+    # not hide the pair that is ready now from the match's one-key probe.
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    same = InputArc("jobs", join_key=WID)
+    net.add_transition(
+        Transition(name="t", inputs=[same, same], outputs=[OutputArc("out", count=2)], action=_passthrough)
+    )
+    net.advance_time(1.0)
+    net.deposit("jobs", Token(payload={"wid": 7, "n": 0}))
+    net.deposit("jobs", Token(payload={"wid": 7, "n": 1}))
+    net.deposit("jobs", Token(payload={"wid": 7, "n": 2}, available_at=net.model_time + 5.0))
+    t = net.transitions["t"]
+    assert [net._binding_exists(t, net.model_time) for _ in range(2)] == [True, True]
+    binding = net._resolve_binding(t, net.model_time)
+    assert sorted(tokens[0].payload["n"] for _, tokens in binding) == [0, 1]
+
+
+@pytest.mark.parametrize("depth", [0, -1, 1.5, True, "2"])
+def test_a_join_index_depth_must_be_a_positive_int(depth):
+    with pytest.raises(ValueError, match="depth"):
+        Place("jobs").register_join_index(1, WID, depth)
+    with pytest.raises(ValueError, match="depth"):
+        _TokenStore().register_join_index(1, WID, depth)
