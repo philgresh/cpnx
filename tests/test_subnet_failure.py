@@ -2437,7 +2437,7 @@ def test_parent_max_ticks_bounds_a_logical_subnet():
 
 def test_parent_drive_limits_reach_the_subnet_drive():
     parent, subnet = _paced_kitchen()
-    seen: list[dict[str, int]] = []
+    seen: list[dict[str, int | bool]] = []
     drive = subnet.drive_to_quiescence
 
     def recording_drive(**limits: int):
@@ -2447,7 +2447,23 @@ def test_parent_drive_limits_reach_the_subnet_drive():
     subnet.drive_to_quiescence = recording_drive
     with parent:
         parent.drive_to_quiescence(max_ticks=50, max_spins=5_000_000)
-    assert seen == [{"max_ticks": 50, "max_spins": 5_000_000}]
+    assert seen == [{"max_ticks": 50, "max_spins": 5_000_000, "inline_actions": False}]
+    assert len(_served(parent)) == 5
+
+
+def test_parent_inline_actions_reach_the_subnet_drive():
+    parent, subnet = _paced_kitchen()
+    seen: list[dict[str, int | bool]] = []
+    drive = subnet.drive_to_quiescence
+
+    def recording_drive(**limits: int | bool):
+        seen.append(limits)
+        return drive(**limits)
+
+    subnet.drive_to_quiescence = recording_drive
+    with parent:
+        parent.drive_to_quiescence(inline_actions=True)
+    assert [limits["inline_actions"] for limits in seen] == [True]
     assert len(_served(parent)) == 5
 
 
