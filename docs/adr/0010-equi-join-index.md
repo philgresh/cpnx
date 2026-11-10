@@ -59,7 +59,9 @@ The one deliberate difference is the search limit. `binding_search_limit` counts
 candidates, and the join search examines only agreeing ones, so a join can find a binding that
 the guard-only search would have given up on. Join arcs are also not truncated to
 `binding_search_limit + 1` options as other arcs are, since their groups hold only matching
-tokens. Arcs without a `join_key` on the same transition keep their usual options and cap.
+tokens. Arcs without a `join_key` on the same transition keep their usual options and cap,
+unless they share a place with another arc: then each draws its options from the tokens the
+earlier arcs left there, as ADR 0011 §4a describes, so no candidate hands one token to two arcs.
 
 A transition with a `join_key` arc is never head-only, even with no guard. The heads of its
 places need not share a key.

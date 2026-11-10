@@ -167,8 +167,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reading the place's whole demand even past `binding_search_limit`. The product search
   draws a later arc's options from the tokens the earlier arcs left and only then cuts them to
   the limit, so a guarded `[p, p×2]` on a deep place still binds; an option that leaves a
-  later arc nothing counts toward the limit. The `join_key` search skips a candidate that
-  reuses a token, which counts toward the limit too. One token no longer enables two arcs.
+  later arc nothing counts toward the limit. The `join_key` search builds no candidate that
+  reuses a token either (below). One token no longer enables two arcs.
   A guard-free `FIRST` transition whose `filter` arc shares its place now searches (see
   below), so it can exhaust `binding_search_limit` and call `on_binding_search_exhausted`,
   which guard-free `FIRST` transitions without a `join_key` never did before.
@@ -194,8 +194,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   join arc on its place, which a plain arc read first could do by taking a key's only token. A
   choice that leaves a later arc nothing counts toward `binding_search_limit`, so the search
   stays bounded, and arcs without a `join_key` on a place deeper than the limit still bind.
-  The existence probe keeps its one-key and first-binding-key shortcuts unless an arc without
-  a `join_key` reads a join place or reads a shared place before the last join arc.
+  A plain arc taking several tokens steps over the combinations it may not take rather than
+  reading them, so its cost stays with the options it yields. Each key's walk costs O(1) to
+  start, and plain arcs after every join arc, off the key's places, are walked once for all
+  keys. The existence probe keeps its one-key and first-binding-key shortcuts unless an arc
+  without a `join_key` reads a join place.
   Draining 200 pairs past 16 000
   one-token keys took 1 690 ms and now takes about 170 ms, level with a two-place join.
   A guard-free `FIRST` transition whose `filter` arc shares its place

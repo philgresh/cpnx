@@ -146,8 +146,9 @@ binding fires. Any other choice that leaves a later arc nothing counts toward
 `binding_search_limit`, which keeps the search bounded. The one-key probe and its doubling
 variant need every key to show the same pattern of candidates and such dead ends, so they do
 not apply when an arc without a `join_key` reads a join place (its `filter` may accept only the
-matched key's token, so another key would be needed) or reads a shared place before the last
-join arc. Such a probe asks for every key, in firing's order.
+matched key's token, so another key would be needed). An arc without a `join_key` on any other
+shared place makes the same choices under every key, wherever it sits among the join arcs, so
+it keeps them. Such a probe asks for every key, in firing's order.
 
 ### 5. Concurrent changes
 

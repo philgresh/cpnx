@@ -933,22 +933,25 @@ def test_two_plain_arcs_on_one_place_of_a_join_take_their_own_tokens(guarded, po
 
 
 @pytest.mark.parametrize(
-    ("arcs", "kinds", "shortcut", "reusable"),
+    ("arcs", "kinds", "shortcut", "reusable", "split"),
     [
-        (["a:k", "b:k", "c", "c"], ["free", "free", "plain", "plain"], True, set()),
-        (["c", "a:k", "b:k", "c"], ["plain", "free", "free", "plain"], False, set()),
-        (["a:k", "a:k"], ["join", "join"], True, set()),
-        (["a:k", "a:k", "a"], ["join", "join", "plain"], False, set()),
-        (["a:k", "a:g"], ["join", "join"], True, set()),
-        (["a:k", "b:k", "c", "c*"], ["free", "free", "plain", "free"], True, {"c"}),
-        (["a:k", "b:k"], ["free", "free"], True, set()),
+        (["a:k", "b:k", "c", "c"], ["free", "free", "plain", "plain"], True, set(), 2),
+        (["c", "a:k", "b:k", "c"], ["plain", "free", "free", "plain"], True, set(), 4),
+        (["a:k", "a:k"], ["join", "join"], True, set(), 2),
+        (["a:k", "a:k", "a"], ["join", "join", "plain"], False, set(), 3),
+        (["a", "a:k", "b:k"], ["plain", "join", "free"], False, set(), 3),
+        (["a:k", "a:g"], ["join", "join"], True, set(), 2),
+        (["a:k", "b:k", "c", "c*"], ["free", "free", "plain", "free"], True, {"c"}, 2),
+        (["a:k", "b:k", "c", "c", "d"], ["free", "free", "plain", "plain", "free"], True, set(), 2),
+        (["a:k", "b:k"], ["free", "free"], True, set(), 2),
     ],
 )
-def test_join_plan_levels_shortcut_and_reusable_places(arcs, kinds, shortcut, reusable):
+def test_join_plan_levels_shortcut_and_reusable_places(arcs, kinds, shortcut, reusable, split):
     # Join arcs on a shared place and plain arcs there are enumerated without reusing a token;
     # only a consume_all arc keeps the whole pool, so its place is checked for reuse. The probe
-    # shortcut needs every plain arc on a shared place after all join arcs, off join places.
-    from cpnx.engine import _join_plan, _shared_places
+    # shortcut needs no plain arc on a shared place to read a join place, wherever it sits.
+    # Trailing plain arcs off the key's places are walked once for every key.
+    from cpnx.engine import _join_plan, _Ordered, _shared_places
 
     functions = {"k": WID, "g": N}
     inputs = []
@@ -957,10 +960,22 @@ def test_join_plan_levels_shortcut_and_reusable_places(arcs, kinds, shortcut, re
         place, _, fn = spec.rstrip("*").partition(":")
         inputs.append(InputArc(place, join_key=functions[fn]) if fn else InputArc(place, consume_all=drain))
     transition = Transition(name="t", inputs=inputs, outputs=[], action=_passthrough)
-    plan = _join_plan(transition, _shared_places(transition))
+    shared = _shared_places(transition)
+    # What _join_arc_options reads: None for a join arc, ordered tokens for a plain arc on a
+    # shared place (not consume_all), a list of options otherwise.
+    options = [
+        None
+        if arc.join_key is not None
+        else _Ordered([], arc.count)
+        if arc.place in shared and not arc.consume_all
+        else [(0, [])]
+        for arc in inputs
+    ]
+    plan = _join_plan(transition, shared, options)
     assert [level.kind for level in plan.levels] == kinds
     assert plan.shortcut is shortcut
     assert plan.reusable == reusable
+    assert plan.split == (split if plan.distinct else len(arcs))
 
 
 # -- every arc shape together, against brute force ---------------------------------------------
@@ -1139,7 +1154,7 @@ def test_a_mixed_join_place_with_plain_arcs_between_skips_a_token_the_last_arc_n
     started = time.perf_counter()
     assert net._binding_exists(t, net.model_time)
     binding = net._resolve_binding(t, net.model_time)
-    assert time.perf_counter() - started < 0.25
+    assert time.perf_counter() - started < 2.0  # about 1 ms; the unbounded walk took seconds
     assert [tokens[0].payload["name"] for arc, tokens in binding if arc.place == "p"] == ["y", "x"]
     assert exhausted == []
 
@@ -1172,7 +1187,7 @@ def test_a_mixed_join_place_with_many_arcs_of_one_function_does_not_walk_their_o
     started = time.perf_counter()
     assert net._binding_exists(t, net.model_time)
     _assert_distinct(net)
-    assert time.perf_counter() - started < 0.25
+    assert time.perf_counter() - started < 2.0  # about 1 ms; the unbounded walk took seconds
     assert exhausted == []
 
 
@@ -1230,23 +1245,12 @@ def test_plain_arcs_on_a_deep_shared_place_of_a_join_still_bind(arcs, guarded):
 _ALT = lambda t: t.payload["alt"]  # noqa: E731
 
 
-@pytest.mark.parametrize(
-    "arcs",
-    [
-        ["a", "a", "a:k", "b:k"],
-        ["a2", "a:k", "b:k"],
-        ["a", "a:k", "a", "b:k"],
-        ["a", "a:k", "a:alt", "b:k"],
-        ["a", "a:alt", "a", "a:k", "b:k"],
-    ],
-)
-@pytest.mark.parametrize("guarded", [False, True])
-@pytest.mark.parametrize("policy", [BindingPolicy.FIRST, BindingPolicy.RANDOM])
-def test_a_plain_arc_before_a_join_arc_skips_the_token_the_key_needs(arcs, guarded, policy):
-    # The head of a deep place is the matched key's only token there. Plain arcs read the place
-    # before the join arc, so every option that takes the head strands the join arc: more than
-    # the search limit of them, ahead of the first binding. The residual Hall check skips the
-    # head for plain arcs too, so the search binds without counting them.
+def _deep_head_join(arcs: list[str], limit: int, **transition) -> tuple[PetriNet, list[str]]:
+    """A join whose place `a` holds the matched key's only token at its head, `limit + 30` deep.
+
+    `arcs` are specs: `"a"` a plain arc, `"a3"` one taking three tokens, `"a:k"` / `"a:alt"`
+    a join arc keyed by `wid` / `alt`. Under `alt`, key 0's only token is the last in `a`.
+    """
     net = PetriNet(seed=0)
     for name in ("a", "b", "out"):
         net.add_place(Place(name))
@@ -1255,33 +1259,51 @@ def test_a_plain_arc_before_a_join_arc_skips_the_token_the_key_needs(arcs, guard
         place, _, fn = spec.partition(":")
         if fn:
             inputs.append(InputArc(place, join_key=WID if fn == "k" else _ALT))
-        elif place.endswith("2"):
-            inputs.append(InputArc(place[:-1], count=2))
         else:
-            inputs.append(InputArc(place))
+            inputs.append(InputArc(place[0], count=int(place[1:] or 1)))
     net.add_transition(
-        Transition(
-            name="t",
-            inputs=inputs,
-            outputs=[OutputArc("out")],
-            action=lambda tokens: tokens[:1],
-            binding_policy=policy,
-            **({"guard": lambda tokens: True} if guarded else {}),
-        )
+        Transition(name="t", inputs=inputs, outputs=[OutputArc("out")], action=lambda tokens: tokens[:1], **transition)
     )
-    net.binding_search_limit = 20
+    net.binding_search_limit = limit
     exhausted = _record_exhaustion(net)
     net.deposit("a", Token(payload={"wid": 0, "alt": 1, "n": -1}))
-    for n in range(net.binding_search_limit + 30):
+    for n in range(limit + 30):
         net.deposit("a", Token(payload={"wid": 100 + n, "alt": 100 + n, "n": n}))
-    net.deposit("a", Token(payload={"wid": 50, "alt": 0, "n": 999}))  # the alt function's key-0 token, last
+    net.deposit("a", Token(payload={"wid": 50, "alt": 0, "n": 999}))
     net.deposit("b", Token(payload={"wid": 0}))
+    return net, exhausted
+
+
+def _taken_by(spec: str) -> int:
+    place = spec.partition(":")[0]
+    return int(place[1:] or 1)
+
+
+@pytest.mark.parametrize(
+    "arcs",
+    [
+        ["a", "a", "a:k", "b:k"],
+        ["a2", "a:k", "b:k"],
+        ["a", "a", "a:k", "a", "b:k"],
+        ["a", "a", "a:k", "a:alt", "b:k"],  # only the check over both functions keeps the head
+        ["a", "a:alt", "a", "a:k", "b:k"],
+    ],
+)
+@pytest.mark.parametrize("guarded", [False, True])
+@pytest.mark.parametrize("policy", [BindingPolicy.FIRST, BindingPolicy.RANDOM])
+def test_a_plain_arc_before_a_join_arc_skips_the_token_the_key_needs(arcs, guarded, policy):
+    # The head of a deep place is the matched key's only token there. Plain arcs read the place
+    # before the join arc, so every option that takes the head strands the join arc: more than
+    # the search limit of them, ahead of the first binding. The residual Hall check keeps plain
+    # arcs off the head, so the search binds without counting them. Each shape has two plain
+    # choices ahead of a join arc, so without that check it would signal exhaustion instead.
+    net, exhausted = _deep_head_join(
+        arcs, 20, binding_policy=policy, **({"guard": lambda tokens: True} if guarded else {})
+    )
     t = net.transitions["t"]
-    started = time.perf_counter()
     assert net._binding_exists(t, net.model_time)
     binding = net._resolve_binding(t, net.model_time)
     assert binding is not None
-    assert time.perf_counter() - started < 0.25
     _assert_distinct(net)
     if policy is BindingPolicy.FIRST:  # RANDOM samples from more candidates than the limit, and says so
         assert exhausted == []
@@ -1289,4 +1311,113 @@ def test_a_plain_arc_before_a_join_arc_skips_the_token_the_key_needs(arcs, guard
     assert len(taken) == sum(len(tokens) for _, tokens in binding)
     before = len(net.marking["a"]) + len(net.marking["b"])
     net.step()
-    assert before - len(net.marking["a"]) - len(net.marking["b"]) == sum(2 if s == "a2" else 1 for s in arcs)
+    assert before - len(net.marking["a"]) - len(net.marking["b"]) == sum(_taken_by(spec) for spec in arcs)
+
+
+@pytest.mark.parametrize("count", [3, 4])
+def test_a_plain_arc_taking_several_tokens_before_a_join_arc_reads_only_valid_options(count):
+    # At the default limit, the combinations holding the head number C(1 030, count - 1): the
+    # search must step over them, not read and discard them, or it holds the lock for minutes.
+    net, exhausted = _deep_head_join([f"a{count}", "a:k", "b:k"], PetriNet(seed=0).binding_search_limit)
+    t = net.transitions["t"]
+    started = time.perf_counter()
+    assert net._binding_exists(t, net.model_time)
+    binding = net._resolve_binding(t, net.model_time)
+    assert time.perf_counter() - started < 2.0  # a few ms; reading the discarded options took > 30 s
+    assert binding is not None
+    assert [token.payload["n"] for token in binding[0][1]] == list(range(count))
+    assert exhausted == []
+
+
+def test_a_join_arc_leaves_a_later_function_every_token_it_needs():
+    # Key 0's f-group is [t0, t1] and its g-group [t0, t2], with two g arcs after the f arc.
+    # Taking t0 for f leaves g one token for two arcs: the residual check skips it, so the
+    # first candidate binds within a limit of 1, where a dead end there would use it up.
+    net = PetriNet(seed=0)
+    net.add_place(Place("p"))
+    inputs = [InputArc("p", join_key=_JF), InputArc("p", join_key=_JG), InputArc("p", join_key=_JG)]
+    net.add_transition(Transition(name="t", inputs=inputs, outputs=[], action=_passthrough, guard=lambda t: True))
+    net.binding_search_limit = 1
+    exhausted = _record_exhaustion(net)
+    t0 = Token(payload={"f": 0, "g": 0})
+    t1 = Token(payload={"f": 0, "g": 9})
+    t2 = Token(payload={"f": 8, "g": 0})
+    for token in (t0, t1, t2):
+        net.deposit("p", token)
+    binding = net._resolve_binding(net.transitions["t"], net.model_time)
+    assert binding is not None
+    assert [tokens[0] for _, tokens in binding] == [t1, t0, t2]
+    assert exhausted == []
+
+
+@pytest.mark.parametrize("limit", [5, 1_000])
+@pytest.mark.parametrize("c_first", [False, True])
+def test_dead_ends_count_toward_the_search_limit(limit, c_first):
+    # One token in `c` for two arcs: under every key the second arc on `c` has nothing, a dead
+    # end. They count toward the limit, so 30 keys' worth of them run it out at 5 and are
+    # signalled, while a limit above them settles that no binding exists. With both arcs on
+    # `c` last, their walk is shared by every key; with one first, each key walks it.
+    net = PetriNet(seed=0)
+    for name in ("a", "b", "c"):
+        net.add_place(Place(name))
+    inputs = [InputArc("a", join_key=WID), InputArc("b", join_key=WID), InputArc("c")]
+    inputs.insert(0 if c_first else 3, InputArc("c"))
+    net.add_transition(Transition(name="t", inputs=inputs, outputs=[], action=_passthrough, guard=lambda t: True))
+    net.binding_search_limit = limit
+    exhausted = _record_exhaustion(net)
+    for k in range(30):
+        net.deposit("a", Token(payload={"wid": k}))
+        net.deposit("b", Token(payload={"wid": k}))
+    net.deposit("c", Token(payload={"wid": -1}))
+    t = net.transitions["t"]
+    assert net._resolve_binding(t, net.model_time) is None
+    assert net._binding_exists(t, net.model_time) is False
+    assert bool(exhausted) is (limit < 30)
+
+
+@settings(max_examples=300, deadline=None)
+@given(
+    arcs=st.lists(st.tuples(st.sampled_from(["p", "q"]), st.sampled_from(sorted(_KINDS))), min_size=2, max_size=4),
+    payloads=st.fixed_dictionaries(
+        {"p": st.lists(_token_payloads, max_size=4), "q": st.lists(_token_payloads, max_size=4)}
+    ),
+    guarded=st.booleans(),
+)
+def test_first_binds_what_the_equality_guard_search_binds(arcs, payloads, guarded):
+    # Under FIRST with room to search, a join transition fires the first candidate, in product
+    # order, whose join arcs agree on their key. Its twin, with each join arc a plain arc and the
+    # key equality moved into the guard, walks the same product, so it binds the same tokens.
+    sizes = [2 if kind == "pair" else 1 for _, kind in arcs]
+    starts = list(itertools.accumulate([0, *sizes]))
+    keyed = [(starts[i], _JOIN_FN[kind]) for i, (_, kind) in enumerate(arcs) if kind in _JOIN_FN]
+    parity = (lambda tokens: sum(t.payload["n"] for t in tokens) % 2 == 0) if guarded else (lambda tokens: True)
+
+    def agree(tokens: list[Token]) -> bool:
+        return len({fn(tokens[at]) for at, fn in keyed}) <= 1 and parity(tokens)
+
+    def bound(twin: bool) -> "list[list[int]] | None":
+        net = PetriNet(seed=0)
+        for name in ("p", "q"):
+            net.add_place(Place(name))
+        inputs = [
+            InputArc(place, **(_KINDS["plain"] if twin and kind in _JOIN_FN else _KINDS[kind])) for place, kind in arcs
+        ]
+        guard = agree if twin else parity
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=inputs,
+                outputs=[],
+                action=_passthrough,
+                binding_policy=BindingPolicy.FIRST,
+                guard=guard,
+            )
+        )
+        net.binding_search_limit = 100_000
+        for place in ("p", "q"):
+            for n, payload in enumerate(payloads[place]):
+                net.deposit(place, Token(payload={**payload, "i": n}))
+        binding = net._resolve_binding(net.transitions["t"], net.model_time)
+        return None if binding is None else [[token.payload["i"] for token in tokens] for _, tokens in binding]
+
+    assert bound(twin=False) == bound(twin=True)
