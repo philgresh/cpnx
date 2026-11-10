@@ -183,15 +183,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail Hall's condition (some set of its functions reaches fewer distinct tokens than arcs),
   so a backlog of tokens carrying one key under both functions can't hide a pair either
   ([#78](https://github.com/philgresh/cpnx/issues/78)). Its guard-free existence probe reads the
-  matched keys in doubling batches and stops at the first that binds, so it stays O(1) in the
-  number of keys; firing and guarded probes, linear in keys as before, cost about 1.2× `main`
-  on a 4 000-key `manager == id` chain. Draining 200 pairs past 16 000
+  matched keys in doubling batches and stops at the first that binds, so it pays only for the
+  keys before the first that binds: 0.015 ms on a 4 000-key `manager == id` chain, but linear
+  in a backlog of keys that all fail Hall's condition. Firing and guarded probes, linear in
+  keys as before, cost about 1.2× `main` on that chain. A self-join of three or more arcs with
+  one function skips a key's self-pairings unbuilt, so a key deeper than the limit still binds.
+  Draining 200 pairs past 16 000
   one-token keys took 1 690 ms and now takes about 170 ms, level with a two-place join.
   A guard-free `FIRST` transition whose `filter` arc shares its place
   with another arc now searches instead of taking heads greedily, which could leave the
   filtered arc without the one token it accepts and report the transition dead.
   A `consume_all` arc that shares its place with another input arc is never enabled, since
-  draining the place leaves nothing for the other arc. The shared places are found once per
+  draining the place leaves nothing for the other arc. Before, `[q, q(consume_all)]` fired and
+  drained the place, the plain arc's token included, and `[q(consume_all), q]` raised
+  `ValueError`. The shared places are found once per
   resolution: a guard-free two-arc probe costs 3.16 µs against 3.04 µs on `main`.
 - **`drive_to_quiescence` no longer stops before a later cooling token matures**
   ([#68](https://github.com/philgresh/cpnx/issues/68)). When a place already held two or more

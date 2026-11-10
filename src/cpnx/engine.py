@@ -2,6 +2,7 @@
 
 import bisect
 import concurrent.futures
+import enum
 import heapq
 import itertools
 import math
@@ -109,17 +110,19 @@ _T = TypeVar("_T")
 _EXHAUSTED = object()
 
 
-class _DeadEnd:
+class _DeadEnd(enum.Enum):
     """A `_distinct_candidates` item for an arc's option that leaves a later arc no tokens.
 
     Not a binding: `_satisfying` counts it toward `binding_search_limit` and skips it. Its own
-    type, so a type checker makes every consumer of `_distinct_candidates` handle it.
+    type, so a type checker makes every consumer of `_distinct_candidates` handle it; a
+    one-member enum, so the checks are identity tests (`is _DEAD_END`), which narrow the type
+    as `isinstance` would at a fraction of the cost per candidate.
     """
 
-    __slots__ = ()
+    DEAD_END = enum.auto()
 
 
-_DEAD_END = _DeadEnd()
+_DEAD_END = _DeadEnd.DEAD_END
 
 #: Widest product `_lazy_product` enumerates lazily. Its recursion is one generator frame per
 #: stream, so a transition with hundreds of input arcs would hit `RecursionError`.
@@ -232,7 +235,7 @@ class _JoinMatch:
         if limit is not None:
             end = min(end, limit)
         key_by_uid = self._key_by_uid
-        return [key_by_uid[uid] for _, uid in itertools.islice(self._order, start, end)]
+        return [key_by_uid[uid] for _, uid in self._order[start:end]]
 
     def _rebuild(self) -> None:
         """Recompute every key from the mirrors, walking the smallest one."""
@@ -411,24 +414,50 @@ class _JoinShape:
       (`_has_distinct_tokens`) decides: a token whose key is the same under two functions lists
       that key under each, though its only candidate hands it to both arcs.
     - `plain_on_join_place`: whether an arc without a `join_key` reads a join arc's place.
+    - `self_join`: whether some depth exceeds 1, so `_self_join_classes` has classes to mark.
     """
 
     depths: dict[int, int]
     mixed: list[list[tuple[int, list[int]]]]
     plain_on_join_place: bool
+    self_join: bool = False
+
+
+_PLAIN_JOIN_SHAPES: dict[tuple[int, ...], _JoinShape] = {}
+"""`_JoinShape`s of joins with no shared place, by join arc positions: fixed by those alone.
+
+Shapes are never mutated, so one per position tuple serves every transition and probe. The
+tuples are small, and few distinct ones occur.
+"""
+
+
+def _plain_join_shape(positions: tuple[int, ...]) -> _JoinShape:
+    """The cached `_JoinShape` of a join with no shared place and join arcs at `positions`."""
+    shape = _PLAIN_JOIN_SHAPES.get(positions)
+    if shape is None:
+        shape = _PLAIN_JOIN_SHAPES[positions] = _JoinShape(dict.fromkeys(positions, 1), [], False)
+    return shape
 
 
 def _join_shape(
     transition: Transition, joins: "list[tuple[int, InputArc, Place]]", shared: frozenset[str]
 ) -> _JoinShape:
     """Build the `_JoinShape` of `transition`, whose join arcs are `joins` and shared places `shared`."""
+    if not shared:  # the usual join: one arc per place, so every depth is 1
+        return _plain_join_shape(tuple([i for i, _, _ in joins]))
+    classes_by_place = _join_classes_by_place(joins)
+    depths = {i: len(positions) for classes in classes_by_place for positions in classes for i in positions}
+    mixed = [[(len(positions), positions) for positions in classes] for classes in classes_by_place if len(classes) > 1]
+    self_join = any(depth > 1 for depth in depths.values())
+    return _JoinShape(depths, mixed, _plain_arc_on_join_place(transition, joins), self_join)
+
+
+def _join_classes_by_place(joins: "list[tuple[int, InputArc, Place]]") -> list[list[list[int]]]:
+    """Per place read by `joins`, the input positions of its join arcs, grouped by `join_key` identity."""
     by_place: dict[int, dict[int, list[int]]] = {}
     for i, arc, place in joins:
         by_place.setdefault(id(place), {}).setdefault(id(arc.join_key), []).append(i)
-    classes_by_place = [list(classes.values()) for classes in by_place.values()]
-    depths = {i: len(positions) for classes in classes_by_place for positions in classes for i in positions}
-    mixed = [[(len(positions), positions) for positions in classes] for classes in classes_by_place if len(classes) > 1]
-    return _JoinShape(depths, mixed, bool(shared) and _plain_arc_on_join_place(transition, joins))
+    return [list(classes.values()) for classes in by_place.values()]
 
 
 def _plain_arc_on_join_place(transition: Transition, joins: "list[tuple[int, InputArc, Place]]") -> bool:
@@ -448,25 +477,60 @@ def _has_distinct_tokens(groups: "list[tuple[int, Iterable[tuple[object, Token]]
     checking every set of *functions* with their full arc counts is exact.
 
     Single functions are already checked: `_join_key_groups` keeps a group only if it holds
-    the arcs' depth. So only sets of two or more are checked, one for the usual two functions.
+    the arcs' depth. So only sets of two or more are checked. The usual two functions leave one
+    set, which `_pair_has_distinct_tokens` checks: the one implementation of that check.
     Each is settled by group sizes when it can: a set passes when one of its groups alone holds
     enough tokens, and fails when all of them together hold too few. Only otherwise are tokens
     read, at most `need` per group, and told apart by identity as `_reuses_a_token` does.
     """
-    for size in range(2, len(groups) + 1):
-        for chosen in itertools.combinations(groups, size):
-            need = sum(arcs for arcs, _ in chosen)
-            sizes = [len(group) for _, group in chosen]  # type: ignore[arg-type]
-            if max(sizes) >= need:
-                continue
-            if sum(sizes) < need:
-                return False
-            seen: set[int] = set()
-            for _, group in chosen:
-                seen.update(id(token) for _, token in group)
-            if len(seen) < need:
-                return False
-    return True
+    if len(groups) == 2:
+        (arcs_a, group_a), (arcs_b, group_b) = groups
+        return _pair_has_distinct_tokens(arcs_a, group_a, arcs_b, group_b)
+    return all(
+        _set_has_distinct_tokens(chosen)
+        for size in range(2, len(groups) + 1)
+        for chosen in itertools.combinations(groups, size)
+    )
+
+
+def _set_has_distinct_tokens(chosen: "tuple[tuple[int, Iterable[tuple[object, Token]]], ...]") -> bool:
+    """Hall's condition for one set of functions: its groups hold a token per arc between them."""
+    need = sum(arcs for arcs, _ in chosen)
+    sizes = [len(group) for _, group in chosen]  # type: ignore[arg-type]
+    if max(sizes) >= need:
+        return True
+    if sum(sizes) < need:
+        return False
+    seen: set[int] = set()
+    for _, group in chosen:
+        seen.update(id(token) for _, token in group)
+    return len(seen) >= need
+
+
+def _join_reusable_places(shape: "_JoinShape", shared: frozenset[str]) -> frozenset[str]:
+    """The places where `_join_candidates` can still build a candidate that reuses a token.
+
+    Join arcs sharing a place and a `join_key` take distinct tokens by construction
+    (`_distinct_product`). Arcs on one place with different functions, or a join arc beside an
+    arc without a `join_key`, can still pick one token twice, so their candidates are checked.
+    Without either, nothing is, and `_satisfying` skips the check on every candidate.
+    """
+    return shared if shape.mixed or shape.plain_on_join_place else frozenset()
+
+
+def _self_join_classes(
+    n_arcs: int, joins: "list[tuple[int, InputArc, Place]]", shape: "_JoinShape"
+) -> "list[int | None]":
+    """Per input position, a class shared by the join arcs reading one place with one `join_key`.
+
+    `None` for an arc alone in its class (depth 1) and for an arc without a `join_key`.
+    """
+    classes: list[int | None] = [None] * n_arcs
+    labels: dict[tuple[int, int], int] = {}
+    for i, arc, place in joins:
+        if shape.depths[i] > 1:
+            classes[i] = labels.setdefault((id(place), id(arc.join_key)), len(labels))
+    return classes
 
 
 def _pair_has_distinct_tokens(
@@ -485,7 +549,11 @@ def _pair_has_distinct_tokens(
     if size_a + size_b < need:
         return False
     if size_a == 1 == size_b:  # one arc each, one token each: they must differ
-        return next(iter(group_a))[1] is not next(iter(group_b))[1]
+        # A group's length can outrun its tokens if the place was changed without the engine
+        # lock (see `_JoinGroup`); a token found missing fails the check, as reading it would.
+        first_a = next(iter(group_a), None)
+        first_b = next(iter(group_b), None)
+        return first_a is not None and first_b is not None and first_a[1] is not first_b[1]
     in_a = {id(token) for _, token in group_a}
     overlap = sum(1 for _, token in group_b if id(token) in in_a)
     return size_a + size_b - overlap >= need
@@ -494,12 +562,6 @@ def _pair_has_distinct_tokens(
 def _keys_with_distinct_pair(place: "list[tuple[int, dict]]", keys: list[object]) -> list[object]:
     """`_keys_with_distinct_tokens` for one place read with two `join_key` functions, the usual case."""
     (arcs_a, groups_a), (arcs_b, groups_b) = place
-    if arcs_a == 1 == arcs_b:  # inlined `_pair_has_distinct_tokens`: it runs once per key
-        return [
-            key
-            for key in keys
-            if len(a := groups_a[key]) > 1 or len(b := groups_b[key]) > 1 or next(iter(a))[1] is not next(iter(b))[1]
-        ]
     return [key for key in keys if _pair_has_distinct_tokens(arcs_a, groups_a[key], arcs_b, groups_b[key])]
 
 
@@ -637,6 +699,47 @@ def _join_candidate_count(per_key: list[list]) -> int:
     for lists in per_key:
         total += math.prod(map(len, lists))
     return total
+
+
+def _earlier_of_class(classes: "list[int | None]") -> list[tuple[int, ...]]:
+    """Per level, the earlier levels of its class: whose tokens it must not take again."""
+    return [
+        tuple(j for j in range(level) if classes[j] == cls) if cls is not None else ()
+        for level, cls in enumerate(classes)
+    ]
+
+
+def _distinct_product(lists: list, classes: "list[int | None]") -> Iterator[tuple]:
+    """`_lazy_product` of `lists` less the tuples in which two arcs of one class take one token.
+
+    For a key's per-arc lists in `_join_combos`. Arcs of one class (`classes[i]`, `None` for
+    none) are join arcs reading one place with one `join_key`, so they read the same group, and
+    the product would pair a token with itself: with three such arcs and `G` tokens, its first
+    `G` tuples all reuse the first token, and the search would spend `binding_search_limit` on
+    them (issue #75). A depth-first walk with an explicit stack skips a token an earlier arc of
+    its class took, which keeps the product's order, so `heapq.merge` still interleaves keys.
+    Each class holds at least as many tokens as arcs (`_join_key_groups` drops smaller
+    groups), so every prefix has a completion and no option of another arc goes unexamined.
+    """
+    last = len(lists) - 1
+    earlier = _earlier_of_class(classes)
+    stack: list[Iterator] = [iter(lists[0])]
+    chosen: list = []
+    while stack:
+        level = len(stack) - 1
+        del chosen[level:]
+        item = next(stack[level], None)
+        if item is None:
+            stack.pop()
+            continue
+        token = item[1]
+        if any(chosen[j][1] is token for j in earlier[level]) if earlier[level] else False:
+            continue
+        chosen.append(item)
+        if level == last:
+            yield tuple(chosen)
+        else:
+            stack.append(iter(lists[level + 1]))
 
 
 def _read_positions(combo: tuple) -> tuple:
@@ -2916,7 +3019,8 @@ class PetriNet:
             joined = self._join_candidates(transition, m_time, ignore_timing, shared=shared)
             if joined is None:
                 return None
-            return self._pick_binding(transition, self._satisfying(transition, joined, shared=shared), policy)
+            candidates, reusable = joined
+            return self._pick_binding(transition, self._satisfying(transition, candidates, reusable=reusable), policy)
         head_only, lazy = self._search_mode(transition, policy, probe=False, shared=shared)
         pools = self._gather_arc_pools(transition, m_time, ignore_timing, head_only=head_only, lazy=lazy, shared=shared)
         if pools is None:
@@ -2942,7 +3046,10 @@ class PetriNet:
             return fast is not None
         if _has_join(transition):
             joined = self._join_candidates(transition, m_time, ignore_timing, shared=shared, unordered=True)
-            return joined is not None and next(self._satisfying(transition, joined, shared=shared), None) is not None
+            if joined is None:
+                return False
+            candidates, reusable = joined
+            return next(self._satisfying(transition, candidates, reusable=reusable), None) is not None
         head_only, lazy = self._search_mode(transition, self._effective_policy(transition), probe=True, shared=shared)
         pools = self._gather_arc_pools(transition, m_time, ignore_timing, head_only=head_only, lazy=lazy, shared=shared)
         if pools is None:
@@ -3025,10 +3132,11 @@ class PetriNet:
         `_shared_places(transition)`, from the caller.
         """
         candidates = self._iter_candidate_bindings(pools, transition_name=transition.name, lazy=lazy, shared=shared)
-        return self._satisfying(transition, candidates, shared=shared)
+        reusable = frozenset(arc.place for arc in transition.inputs if arc.consume_all and arc.place in shared)
+        return self._satisfying(transition, candidates, reusable=reusable)
 
     def _satisfying(
-        self, transition: Transition, candidates: "Iterator[_Binding | _DeadEnd]", *, shared: frozenset[str]
+        self, transition: Transition, candidates: "Iterator[_Binding | _DeadEnd]", *, reusable: frozenset[str]
     ) -> Iterator[tuple[_Binding, list[Token]]]:
         """Yield each `(binding, flat_tokens)` of `candidates` whose guard holds, bounded by the limit.
 
@@ -3037,16 +3145,18 @@ class PetriNet:
         signals exhaustion.
 
         When two arcs read one place, a candidate that hands one token to both is skipped
-        before the guard sees it (issue #75). The product search never builds one, except
-        around a `consume_all` arc (see `_distinct_candidates`); the join search can, and such a
-        candidate counts toward the limit there. So does a `_DeadEnd`, which is skipped too.
-        `shared` is `_shared_places(transition)`, from the caller.
+        before the guard sees it (issue #75), and counts toward the limit. `reusable` names the
+        places where the enumeration can still build one, so the check runs only there: the
+        product search builds one only around a `consume_all` arc (see `_distinct_candidates`),
+        and the join search only where a place is read with several `join_key` functions or
+        also by an arc without one (see `_join_reusable_places`). A `_DeadEnd` counts toward
+        the limit and is skipped too.
         """
         for examined, binding in enumerate(candidates, start=1):
             if examined > self.binding_search_limit:
                 self._signal_search_exhausted(transition.name)
                 return
-            if isinstance(binding, _DeadEnd) or (shared and _reuses_a_token(binding, shared)):
+            if binding is _DEAD_END or (reusable and _reuses_a_token(binding, reusable)):
                 continue
             flat = _flatten_binding(binding)
             if self._check_transition_guard(transition, flat):
@@ -3221,7 +3331,7 @@ class PetriNet:
             return
         arcs = [arc for arc, _ in pools]
         for combo in self._distinct_combos(arcs, sources, dependent, shared, cap):
-            yield combo if isinstance(combo, _DeadEnd) else list(zip(arcs, combo, strict=True))
+            yield _DEAD_END if combo is _DEAD_END else list(zip(arcs, combo, strict=True))
 
     def _distinct_sources(
         self, pools: list[tuple[InputArc, _Pool]], shared: frozenset[str], transition_name: str, cap: int
@@ -3311,8 +3421,11 @@ class PetriNet:
         *,
         shared: frozenset[str],
         unordered: bool = False,
-    ) -> Iterator[_Binding] | None:
+    ) -> "tuple[Iterator[_Binding], frozenset[str]] | None":
         """Return the candidate bindings of a transition with `join_key` arcs, or `None` if there are none.
+
+        Returned with the places where a candidate can still hand one token to two arcs (see
+        `_join_reusable_places`), for `_satisfying`.
 
         The candidates are exactly the product search's candidates whose `join_key` arcs all
         agree on their key, in the same lexicographic order (arc order, the last arc varying
@@ -3354,7 +3467,9 @@ class PetriNet:
             [groups_by_arc[i][key] if arc_options is None else arc_options for i, arc_options in enumerate(options)]
             for key in keys
         ]
-        return self._join_bindings(transition.inputs, options, self._join_combos(per_key, unordered=unordered))
+        classes = _self_join_classes(len(options), joins, shape) if shape.self_join else None
+        combos = self._join_combos(per_key, classes, unordered=unordered)
+        return self._join_bindings(transition.inputs, options, combos), _join_reusable_places(shape, shared)
 
     def _probe_join_groups(
         self,
@@ -3552,9 +3667,19 @@ class PetriNet:
             options.append(list(enumerate(arc_options)))
         return options, joins
 
-    def _join_combos(self, per_key: list[list], *, unordered: bool) -> Iterator[tuple]:
-        """Enumerate the per-key products of `_join_candidates`, merged into product order unless `unordered` allows."""
-        products = (_lazy_product([iter(group) for group in lists]) for lists in per_key)
+    def _join_combos(
+        self, per_key: list[list], classes: "list[int | None] | None", *, unordered: bool
+    ) -> Iterator[tuple]:
+        """Enumerate the per-key products of `_join_candidates`, merged into product order unless `unordered` allows.
+
+        `classes` marks the join arcs that share a place and a `join_key` (see
+        `_self_join_classes`), `None` when there are none; their products skip reused tokens
+        (`_distinct_product`).
+        """
+        if classes is not None:
+            products: Iterator[Iterator[tuple]] = (_distinct_product(lists, classes) for lists in per_key)
+        else:
+            products = (_lazy_product([iter(group) for group in lists]) for lists in per_key)
         if len(per_key) == 1:
             return next(products)
         if unordered and _join_candidate_count(per_key) <= self.binding_search_limit:

@@ -826,3 +826,50 @@ def test_a_wide_shared_place_search_does_not_recurse_per_arc():
         net.deposit("jobs", Token(payload={"n": n}))
     t = net.transitions["t"]
     assert net._binding_exists(t, net.model_time)
+
+
+@pytest.mark.parametrize("arcs", [2, 3, 4])
+@pytest.mark.parametrize("guarded", [False, True])
+@pytest.mark.parametrize("policy", [BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY])
+def test_a_self_join_with_a_deep_key_binds_whatever_its_width(arcs, guarded, policy):
+    # One key holds more tokens than the search limit. A key's product repeats its group once
+    # per arc, so its first tokens' self-pairings would use up the limit unless skipped unbuilt.
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    same = InputArc("jobs", join_key=WID)
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[same] * arcs,
+            outputs=[OutputArc("out", count=arcs)],
+            action=_passthrough,
+            binding_policy=policy,
+            **({"guard": lambda tokens: True} if guarded else {}),
+        )
+    )
+    net.binding_search_limit = 20
+    exhausted = []
+    net.on_binding_search_exhausted = exhausted.append
+    for n in range(net.binding_search_limit + 30):
+        net.deposit("jobs", Token(payload={"wid": 1, "n": n}))
+    t = net.transitions["t"]
+    assert net._binding_exists(t, net.model_time)
+    _assert_distinct(net)
+    net.drive_to_quiescence()
+    assert len(net.marking["out"]) == arcs * ((net.binding_search_limit + 30) // arcs)
+
+
+def test_hall_pair_check_fails_a_group_whose_length_outruns_its_tokens():
+    # An index group read while the place changed without the engine lock can report a
+    # length its iteration does not reach. The check must fail that key, not raise.
+    from cpnx.engine import _pair_has_distinct_tokens
+
+    class Stale(list):
+        def __len__(self):
+            return 1
+
+    token = Token(payload={})
+    assert not _pair_has_distinct_tokens(1, Stale(), 1, [(0, token)])
+    assert not _pair_has_distinct_tokens(1, [(0, token)], 1, [(1, token)])
+    assert _pair_has_distinct_tokens(1, [(0, token)], 1, [(1, Token(payload={}))])
