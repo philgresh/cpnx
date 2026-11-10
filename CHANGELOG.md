@@ -173,8 +173,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   different functions gives up that probe and reads every key, since a token whose key is
   the same under both functions lists a key that only it holds. Without the index, keys with
   fewer tokens are dropped before building candidates, so a backlog of them can't use up
-  `binding_search_limit` ahead of a key that holds a pair. Draining 200 pairs past 16 000
-  one-token keys took 1 690 ms and now takes about 170 ms, level with a two-place join. A guard-free `FIRST` transition whose `filter` arc shares its place
+  `binding_search_limit` ahead of a key that holds a pair. Such a place also drops keys that
+  fail Hall's condition (some set of its functions reaches fewer distinct tokens than arcs),
+  so a backlog of tokens carrying one key under both functions can't hide a pair either
+  ([#78](https://github.com/philgresh/cpnx/issues/78)). Draining 200 pairs past 16 000
+  one-token keys took 1 690 ms and now takes about 170 ms, level with a two-place join.
+  A guard-free `FIRST` transition whose `filter` arc shares its place
   with another arc now searches instead of taking heads greedily, which could leave the
   filtered arc without the one token it accepts and report the transition dead.
   A `consume_all` arc that shares its place with another input arc is never enabled, since

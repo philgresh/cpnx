@@ -419,6 +419,67 @@ def _join_depths(joins: "list[tuple[int, InputArc, Place]]") -> dict[int, int]:
     return {i: counts[(id(place), id(arc.join_key))] for i, arc, place in joins}
 
 
+def _mixed_join_classes(joins: "list[tuple[int, InputArc, Place]]") -> list[list[tuple[int, list[int]]]]:
+    """For each place read by join arcs with different `join_key` functions, its arcs by function.
+
+    Each entry lists one such place's function classes as `(arcs, positions)`: how many join
+    arcs read the place with that function, and their input positions. Places read with a
+    single function are left out; `_join_depths` already decides those.
+    """
+    by_place: dict[int, dict[int, list[int]]] = {}
+    for i, arc, place in joins:
+        by_place.setdefault(id(place), {}).setdefault(id(arc.join_key), []).append(i)
+    return [
+        [(len(positions), positions) for positions in classes.values()]
+        for classes in by_place.values()
+        if len(classes) > 1
+    ]
+
+
+def _has_distinct_tokens(groups: "list[tuple[int, Iterable[tuple[object, Token]]]]") -> bool:
+    """Hall's condition for one place and key: whether each join arc can take a token of its own.
+
+    `groups` holds one `(arcs, group)` per `join_key` function reading the place: the key's
+    group under that function and how many arcs take from it. Arcs are the slots and a group's
+    tokens are what its arcs may take, so by Hall's theorem a distinct choice exists iff every
+    set of slots can reach at least as many tokens as it has slots. Arcs sharing a function
+    share their group, so a set holding one of them is hardest to fill with all of them, and
+    checking every set of *functions* with their full arc counts is exact: 2^c - 1 checks for
+    c functions, usually 3. Each count stops at its target, and each group holds distinct
+    tokens, so a check reads at most `need` tokens per group. Tokens are told apart by
+    identity, as `_reuses_a_token` does.
+    """
+    for size in range(1, len(groups) + 1):
+        for chosen in itertools.combinations(groups, size):
+            need = sum(arcs for arcs, _ in chosen)
+            seen: set[int] = set()
+            for _, group in chosen:
+                for _, token in itertools.islice(group, need):
+                    seen.add(id(token))
+                if len(seen) >= need:
+                    break
+            if len(seen) < need:
+                return False
+    return True
+
+
+def _keys_with_distinct_tokens(
+    joins: "list[tuple[int, InputArc, Place]]", groups_by_arc: "dict[int, dict]", keys: list[object]
+) -> list[object]:
+    """`keys` without those failing Hall's condition at a place read with several `join_key` functions."""
+    mixed = _mixed_join_classes(joins)
+    if not mixed:
+        return keys
+    return [
+        key
+        for key in keys
+        if all(
+            _has_distinct_tokens([(arcs, groups_by_arc[positions[0]][key]) for arcs, positions in classes])
+            for classes in mixed
+        )
+    ]
+
+
 def _has_join(transition: Transition) -> bool:
     """Whether any input arc of `transition` declares a `join_key` (read per call: arcs are mutable)."""
     return any(arc.join_key is not None for arc in transition.inputs)
@@ -3075,6 +3136,10 @@ class PetriNet:
         Its candidates would all reuse a token, and each would spend one of the
         `binding_search_limit` candidates `_satisfying` examines: a backlog of keys holding one
         token each could then hide a key that holds a pair.
+        A place read with *different* `join_key` functions is checked the same way, through
+        Hall's condition (`_has_distinct_tokens`): one token can carry a key under both
+        functions, so per-function depths alone would keep keys whose every candidate reuses
+        that token (issue #78).
         """
         if keys is not None and not keys:
             return None
@@ -3088,7 +3153,8 @@ class PetriNet:
             groups_by_arc[i] = groups
             keys = list(groups)
         assert keys is not None
-        return groups_by_arc, keys
+        keys = _keys_with_distinct_tokens(joins, groups_by_arc, keys)
+        return (groups_by_arc, keys) if keys else None
 
     def _matched_join_keys(
         self, transition_name: str, joins: list[tuple[int, InputArc, Place]], t_limit: float | None, limit: int | None

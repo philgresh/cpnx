@@ -8,6 +8,8 @@ search, and the `consume_all` count-only path.
 """
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from cpnx import BindingPolicy, InputArc, OutputArc, PetriNet, Place, Token, Transition
 from cpnx.places import _TokenStore
@@ -458,3 +460,107 @@ def test_a_token_matching_a_key_under_both_join_keys_does_not_end_the_probe(over
     net.drive_to_quiescence()
     assert sorted(token.payload["f"] for token in net.marking["out"]) == [2, 8]
     assert [token.payload["f"] for token in net.marking["jobs"]] == [1]
+
+
+# -- Hall's condition for mixed join_key functions (issue #78) ---------------------------------
+
+
+@pytest.mark.parametrize("certified", [True, False])
+@pytest.mark.parametrize("guarded", [False, True])
+def test_keys_whose_only_token_matches_under_both_functions_do_not_use_up_the_search_limit(certified, guarded):
+    # More keys than the search limit hold one token that carries the key under both functions,
+    # so their only candidate reuses it: they fail Hall's condition (two arcs, one token) and
+    # must not spend the limit. The pair after them binds key -1 through two tokens.
+    table = {}
+    f = _f if certified else (lambda t: table.get("x", t.payload["f"]))
+    guard = {"guard": lambda tokens: True} if guarded else {}
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("jobs", join_key=f), InputArc("jobs", join_key=_g)],
+            outputs=[OutputArc("out", count=2)],
+            action=_passthrough,
+            **guard,
+        )
+    )
+    net.binding_search_limit = 10
+    exhausted = []
+    net.on_binding_search_exhausted = exhausted.append
+    for k in range(net.binding_search_limit + 1):
+        net.deposit("jobs", Token(payload={"f": k, "g": k}))
+    net.deposit("jobs", Token(payload={"f": -1, "g": -9}))
+    net.deposit("jobs", Token(payload={"f": -8, "g": -1}))
+    t = net.transitions["t"]
+    assert [net._binding_exists(t, net.model_time) for _ in range(3)] == [True, True, True]
+    _assert_distinct(net)
+    net.drive_to_quiescence()
+    assert sorted(token.payload["f"] for token in net.marking["out"]) == [-8, -1]
+    assert exhausted == []
+
+
+def _h(token: Token) -> object:
+    return token.payload["h"]
+
+
+_FUNCTIONS = {"f": _f, "g": _g, "h": _h}
+
+
+def _distinct_assignment_exists(functions: list[str], payloads: list[dict]) -> bool:
+    """Brute force: some key and pairwise-distinct tokens, one per arc, each carrying the key."""
+    for key in {payload[name] for payload in payloads for name in functions}:
+        if _assign(functions, payloads, key, set()):
+            return True
+    return False
+
+
+def _assign(functions: list[str], payloads: list[dict], key: object, used: set[int]) -> bool:
+    if not functions:
+        return True
+    first, rest = functions[0], functions[1:]
+    for i, payload in enumerate(payloads):
+        if i not in used and payload[first] == key and _assign(rest, payloads, key, used | {i}):
+            return True
+    return False
+
+
+_values = st.integers(min_value=0, max_value=2)
+
+
+@settings(max_examples=150, deadline=None)
+@given(
+    functions=st.lists(st.sampled_from(sorted(_FUNCTIONS)), min_size=2, max_size=4),
+    payloads=st.lists(st.fixed_dictionaries({"f": _values, "g": _values, "h": _values}), max_size=6),
+    guarded=st.booleans(),
+)
+def test_a_self_join_binds_exactly_when_hall_condition_holds(functions, payloads, guarded):
+    # The engine's existence probe and firing path must agree with each other and with a
+    # brute-force search for distinct tokens (Hall's theorem: one exists iff every set of arcs
+    # reaches at least as many tokens as it has arcs), whatever mix of join_key functions the
+    # arcs on the place use.
+    guard = {"guard": lambda tokens: True} if guarded else {}
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("jobs", join_key=_FUNCTIONS[name]) for name in functions],
+            outputs=[OutputArc("out", count=len(functions))],
+            action=_passthrough,
+            **guard,
+        )
+    )
+    for payload in payloads:
+        net.deposit("jobs", Token(payload=dict(payload)))
+    t = net.transitions["t"]
+    expected = _distinct_assignment_exists(functions, payloads)
+    assert net._binding_exists(t, net.model_time) is expected
+    binding = net._resolve_binding(t, net.model_time)
+    assert (binding is not None) is expected
+    if binding is not None:
+        flat = [token for _, tokens in binding for token in tokens]
+        assert len({id(token) for token in flat}) == len(flat)
+        assert len({_FUNCTIONS[name](token) for name, token in zip(functions, flat, strict=True)}) == 1

@@ -107,9 +107,32 @@ available, only once its `depth`-th token is in the group. Where all of a place'
 share one function, the match then lists only keys that bind, and the one-key probe of §3
 still holds. Where they do not, the depth is only a necessary condition: a token whose key is
 the same under two functions lists that key under each, though its only candidate hands it to
-both arcs. Such a probe asks for every key. A key whose tokens all sit in a backlog of one-token keys costs nothing to probe past,
-as for an ordinary join. Changing the depth (an arc moved onto or off the place) replaces the
-index.
+both arcs. Such a probe asks for every key, and `_join_key_groups` keeps only the keys that
+pass **Hall's condition** for that place: for every set of the place's functions, the key's
+groups under them hold at least as many distinct tokens as there are arcs using them. By
+Hall's theorem (P. Hall, 1935, on systems of distinct representatives) that is exactly when
+each arc can take a token of its own. Arcs sharing a function share a group, so checking sets
+of functions, with their full arc counts, is exact, and costs `2^c - 1` small checks for `c`
+functions. With one function it is the depth check above. A key that fails it has no
+candidate that does not reuse a token, so dropping it changes no binding, only keeps a backlog
+of such keys from using up `binding_search_limit`
+([#78](https://github.com/philgresh/cpnx/issues/78)). Changing the depth (an arc moved onto or
+off the place) replaces the index.
+
+The invariants this section relies on, and the tests that hold the engine to them:
+
+- **Distinct tokens.** No binding hands one token to two arcs. The CPN enabling rule asks
+  that what all of a transition's arcs take from a place fits within its marking (Jensen,
+  Kristensen and Wells 2007, §2.2–2.3); with token identity that is a choice of distinct
+  representatives.
+- **Hall-exactness.** A join transition with no guard is enabled iff some key passes Hall's
+  condition at every join place. `test_a_self_join_binds_exactly_when_hall_condition_holds`
+  checks this against a brute-force search.
+- **Probe and firing agree.** `_binding_exists` and `_resolve_binding` give the same answer
+  (ADR 0010 §3). The same property test checks it.
+- **Filters drop only keys that cannot bind.** Depth and Hall filtering may only shrink the
+  candidates to those that do not reuse a token, never change which binding fires (ADR 0010
+  §4).
 
 The one-key probe does not apply when a join place is also read by an arc *without* a
 `join_key`. That arc's options are the place's tokens, and when its `filter` accepts only the
