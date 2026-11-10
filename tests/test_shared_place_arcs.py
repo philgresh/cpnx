@@ -629,35 +629,63 @@ _ARC_SHAPES = {
 }
 
 
-def _product_binding_exists(arcs: list[tuple[str, int]], ns: list[int], guard) -> bool:
-    """Brute force: pairwise-distinct tokens per arc, each accepted by its arc, and the guard holds."""
+_DEAD = "dead end"
 
-    def accepts(shape: str, n: int) -> bool:
-        return shape not in ("even", "odd") or (n % 2 == 0) == (shape == "even")
 
-    def go(i: int, used: frozenset[int], chosen: list[int]) -> bool:
-        if i == len(arcs):
-            return guard([Token(payload={"n": ns[j]}) for j in chosen])
+def _oracle_units(arcs: list[tuple[str, int]], ns: list[int]) -> list:
+    """The distinct search's items, by brute force: candidates (lists of token indexes) and dead ends.
+
+    Arcs in order, each option in its arc's order (`plain` and filters FIFO, `desc` by
+    descending n, ties FIFO), the last arc varying fastest. An arc after the first on the place
+    chooses among the tokens the earlier arcs left; an option of an arc under which the next arc
+    has no option is one dead end. An arc with no option even on the full pool empties the
+    product. No truncation: the engine's truncation must be loss-free.
+    """
+
+    def order(shape: str, free: list[int]) -> list[int]:
+        if shape == "desc":
+            return sorted(free, key=lambda j: -ns[j])
+        if shape in ("even", "odd"):
+            return [j for j in free if (ns[j] % 2 == 0) == (shape == "even")]
+        return free
+
+    def options(i: int, used: frozenset[int]) -> list[tuple[int, ...]]:
         shape, count = arcs[i]
-        free = [j for j in range(len(ns)) if j not in used and accepts(shape, ns[j])]
-        return any(go(i + 1, used | set(group), chosen + list(group)) for group in itertools.combinations(free, count))
+        free = [j for j in range(len(ns)) if j not in used]
+        return list(itertools.combinations(order(shape, free), count))
 
-    return go(0, frozenset(), [])
+    units: list = []
+    if any(not options(i, frozenset()) for i in range(len(arcs))):
+        return units  # an arc with no option at all: the product is empty, as in `_lazy_product`
+
+    def walk(i: int, used: frozenset[int], chosen: list[tuple[int, ...]]) -> None:
+        for option in options(i, used):
+            if i == len(arcs) - 1:
+                units.append([j for group in [*chosen, option] for j in group])
+                continue
+            after = used | set(option)
+            if not options(i + 1, after):
+                units.append(_DEAD)
+                continue
+            walk(i + 1, after, [*chosen, option])
+
+    walk(0, frozenset(), [])
+    return units
 
 
-@settings(max_examples=150, deadline=None)
+@settings(max_examples=300, deadline=None)
 @given(
     arcs=st.lists(st.tuples(st.sampled_from(sorted(_ARC_SHAPES)), st.integers(1, 2)), min_size=2, max_size=3),
-    ns=st.lists(st.integers(0, 9), max_size=7),
-    limit=st.integers(1, 4),
+    ns=st.lists(st.integers(0, 9), max_size=6),
+    limit=st.integers(1, 6),
     guarded=st.booleans(),
 )
-def test_a_shared_place_search_finds_a_distinct_binding_when_one_exists(arcs, ns, limit, guarded):
-    # The search never returns a binding that reuses a token, returns one whenever it finds
-    # none to be impossible, and misses one only by exhausting `binding_search_limit`, which
-    # it signals. A guarded transition (accepting only an even sum) runs with a limit large
-    # enough to be exact; a guard-free one runs with a small limit, where an arc's option that
-    # leaves a later filtered arc no token counts toward it.
+def test_a_shared_place_search_matches_a_brute_force_oracle(arcs, ns, limit, guarded):
+    # The search examines the oracle's items in order, `binding_search_limit` at most: FIRST
+    # fires the first satisfying candidate among them, and with none it fires nothing and
+    # signals exhaustion exactly when the oracle holds more items than the limit. Small limits,
+    # `count=2`, `key` and `filter` make the per-arc truncation matter, so cutting options
+    # before leaving out the taken tokens fails this.
     guard = (lambda tokens: sum(t.payload["n"] for t in tokens) % 2 == 0) if guarded else None
     net = PetriNet(seed=0)
     for name in ("jobs", "out"):
@@ -671,22 +699,28 @@ def test_a_shared_place_search_finds_a_distinct_binding_when_one_exists(arcs, ns
             **({"guard": guard} if guard else {}),
         )
     )
-    net.binding_search_limit = 10_000 if guarded else limit
+    net.binding_search_limit = limit
     exhausted = []
     signal = net._signal_search_exhausted
     net._signal_search_exhausted = lambda name: (exhausted.append(name), signal(name))  # type: ignore[method-assign]
-    for n in ns:
-        net.deposit("jobs", Token(payload={"n": n}))
+    tokens = [Token(payload={"n": n, "j": j}) for j, n in enumerate(ns)]
+    for token in tokens:
+        net.deposit("jobs", token)
     t = net.transitions["t"]
-    expected = _product_binding_exists(arcs, ns, guard or (lambda tokens: True))
+    units = _oracle_units(arcs, ns)
+    accept = guard or (lambda tokens: True)
+    within = units[:limit]
+    expected = next((unit for unit in within if unit is not _DEAD and accept([tokens[j] for j in unit])), None)
+    head_only = net._is_head_only(t, net._effective_policy(t))
     binding = net._resolve_binding(t, net.model_time)
-    assert net._binding_exists(t, net.model_time) is (binding is not None)
-    if binding is None and expected:
-        assert not guarded and exhausted, "a binding exists, yet the search neither found it nor ran out"
-    assert binding is None or expected
-    if binding is not None:
-        flat = [token for _, tokens in binding for token in tokens]
-        assert len({id(token) for token in flat}) == len(flat)
+    if head_only:
+        # Greedy heads, no search and no limit: binds whenever any distinct binding exists.
+        assert (binding is not None) is any(unit is not _DEAD for unit in units)
+        return
+    got = None if binding is None else [token.payload["j"] for _, toks in binding for token in toks]
+    assert got == expected
+    assert exhausted == (["t"] if expected is None and len(units) > limit else [])
+    assert net._binding_exists(t, net.model_time) is (expected is not None)
 
 
 @pytest.mark.parametrize("guarded", [False, True])
@@ -743,3 +777,52 @@ def test_a_join_index_depth_must_be_a_positive_int(depth):
         Place("jobs").register_join_index(1, WID, depth)
     with pytest.raises(ValueError, match="depth"):
         _TokenStore().register_join_index(1, WID, depth)
+
+
+@pytest.mark.parametrize("guarded", [False, True])
+def test_one_token_instance_in_two_shared_places_is_told_apart_per_place(guarded):
+    # The same Token object sits in p and in q. Taking it from p must not hide it in q: the
+    # binding p:(x, a), q:(b, x) exists.
+    net = PetriNet(seed=0)
+    for name in ("p", "q", "out"):
+        net.add_place(Place(name))
+    x = Token(payload={"n": 0})
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("p"), InputArc("p"), InputArc("q", filter=lambda t: t is not x), InputArc("q")],
+            outputs=[OutputArc("out")],
+            action=lambda tokens: tokens[:1],
+            **({"guard": lambda tokens: True} if guarded else {}),
+        )
+    )
+    net.deposit("p", x)
+    net.deposit("p", Token(payload={"n": 1}))
+    net.deposit("q", Token(payload={"n": 2}))
+    net.deposit("q", x)
+    t = net.transitions["t"]
+    assert net._binding_exists(t, net.model_time)
+    binding = net._resolve_binding(t, net.model_time)
+    assert [tokens[0].payload["n"] for _, tokens in binding] == [0, 1, 2, 0]
+
+
+def test_a_wide_shared_place_search_does_not_recurse_per_arc():
+    # 1 200 arcs on one place with a guard: one stack frame per arc would pass Python's
+    # recursion limit.
+    width = 1_200
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("jobs") for _ in range(width)],
+            outputs=[OutputArc("out")],
+            action=lambda tokens: tokens[:1],
+            guard=lambda tokens: True,
+        )
+    )
+    for n in range(width):
+        net.deposit("jobs", Token(payload={"n": n}))
+    t = net.transitions["t"]
+    assert net._binding_exists(t, net.model_time)

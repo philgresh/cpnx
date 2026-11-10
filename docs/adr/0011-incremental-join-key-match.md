@@ -107,13 +107,16 @@ available, only once its `depth`-th token is in the group. Where all of a place'
 share one function, the match then lists only keys that bind, and the one-key probe of §3
 still holds. Where they do not, the depth is only a necessary condition: a token whose key is
 the same under two functions lists that key under each, though its only candidate hands it to
-both arcs. Such a probe asks for every key, and `_join_key_groups` keeps only the keys that
-pass **Hall's condition** for that place: for every set of the place's functions, the key's
+both arcs. `_join_key_groups` keeps only the keys that pass **Hall's condition** for that
+place, and the guard-free existence probe reads the matched keys in doubling batches and stops
+at the first batch holding one that passes, so it pays only for the keys before the first that
+binds. Hall's condition for a place and key: for every set of the place's functions, the key's
 groups under them hold at least as many distinct tokens as there are arcs using them. By
 Hall's theorem (P. Hall, 1935, on systems of distinct representatives) that is exactly when
 each arc can take a token of its own. Arcs sharing a function share a group, so checking sets
-of functions, with their full arc counts, is exact, and costs `2^c - 1` small checks for `c`
-functions. With one function it is the depth check above. A key that fails it has no
+of functions, with their full arc counts, is exact. Single functions are the depth check
+above, so `c` functions leave `2^c - c - 1` sets to check: one for the usual two, which group
+sizes settle without reading a token unless both groups are small. A key that fails it has no
 candidate that does not reuse a token, so dropping it changes no binding, only keeps a backlog
 of such keys from using up `binding_search_limit`
 ([#78](https://github.com/philgresh/cpnx/issues/78)). Changing the depth (an arc moved onto or

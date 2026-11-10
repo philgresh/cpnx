@@ -169,6 +169,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the limit, so a guarded `[p, p×2]` on a deep place still binds; an option that leaves a
   later arc nothing counts toward the limit. The `join_key` search skips a candidate that
   reuses a token, which counts toward the limit too. One token no longer enables two arcs.
+  A guard-free `FIRST` transition whose `filter` arc shares its place now searches (see
+  below), so it can exhaust `binding_search_limit` and call `on_binding_search_exhausted`,
+  which guard-free `FIRST` transitions without a `join_key` never did before.
   In a self-join (N join arcs on one place with one `join_key` function), a key binds only
   once the place holds N of its tokens; arcs with different functions need one token each.
   Its join indexes now track each key's first N tokens, so ADR 0011's match lists only keys
@@ -179,7 +182,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `binding_search_limit` ahead of a key that holds a pair. Such a place also drops keys that
   fail Hall's condition (some set of its functions reaches fewer distinct tokens than arcs),
   so a backlog of tokens carrying one key under both functions can't hide a pair either
-  ([#78](https://github.com/philgresh/cpnx/issues/78)). Draining 200 pairs past 16 000
+  ([#78](https://github.com/philgresh/cpnx/issues/78)). Its guard-free existence probe reads the
+  matched keys in doubling batches and stops at the first that binds, so it stays O(1) in the
+  number of keys; firing and guarded probes, linear in keys as before, cost about 1.2× `main`
+  on a 4 000-key `manager == id` chain. Draining 200 pairs past 16 000
   one-token keys took 1 690 ms and now takes about 170 ms, level with a two-place join.
   A guard-free `FIRST` transition whose `filter` arc shares its place
   with another arc now searches instead of taking heads greedily, which could leave the

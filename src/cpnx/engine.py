@@ -107,11 +107,19 @@ def _flatten_binding(binding: _Binding) -> list[Token]:
 
 _T = TypeVar("_T")
 _EXHAUSTED = object()
-_DEAD_END: "_Binding" = cast("_Binding", object())
-"""A `_distinct_candidates` item for an arc's option that leaves the later arcs no tokens.
 
-Not a binding: `_satisfying` counts it toward `binding_search_limit` and skips it.
-"""
+
+class _DeadEnd:
+    """A `_distinct_candidates` item for an arc's option that leaves a later arc no tokens.
+
+    Not a binding: `_satisfying` counts it toward `binding_search_limit` and skips it. Its own
+    type, so a type checker makes every consumer of `_distinct_candidates` handle it.
+    """
+
+    __slots__ = ()
+
+
+_DEAD_END = _DeadEnd()
 
 #: Widest product `_lazy_product` enumerates lazily. Its recursion is one generator frame per
 #: stream, so a transition with hundreds of input arcs would hit `RecursionError`.
@@ -217,14 +225,14 @@ class _JoinMatch:
                 self._update(key)
         return serving
 
-    def keys_at(self, t_limit: float, limit: int | None = None) -> list[object]:
-        """The keys every place has a token of available at `t_limit`, at most `limit` of them."""
+    def keys_at(self, t_limit: float, limit: int | None = None, *, start: int = 0) -> list[object]:
+        """The keys every place has a token of available at `t_limit`, from the `start`-th up to the `limit`-th."""
         # Every uid is a finite int, so `(t_limit, inf)` sorts after every entry at `t_limit`.
         end = bisect.bisect_right(self._order, (t_limit, math.inf))
         if limit is not None:
             end = min(end, limit)
         key_by_uid = self._key_by_uid
-        return [key_by_uid[uid] for _, uid in itertools.islice(self._order, end)]
+        return [key_by_uid[uid] for _, uid in itertools.islice(self._order, start, end)]
 
     def _rebuild(self) -> None:
         """Recompute every key from the mirrors, walking the smallest one."""
@@ -383,62 +391,50 @@ def _registration_matches(
     return entry[0] is arc and entry[1] is place and entry[2] is join_key and entry[4] == depth
 
 
-def _join_place_has_plain_arc(transition: Transition) -> bool:
-    """Whether an input arc without a `join_key` reads a place that a join arc of `transition` reads."""
-    shared = _shared_places(transition)
-    if not shared:
-        return False
-    join_places = {arc.place for arc in transition.inputs if arc.join_key is not None}
-    return any(arc.join_key is None and arc.place in join_places for arc in transition.inputs)
+@dataclass(frozen=True)
+class _JoinShape:
+    """How a join transition's arcs share places, read once per probe from its `joins`.
 
+    One structure for every question the join search asks of it, so the one-key shortcut, the
+    index depths and the Hall filter cannot disagree about which arcs share a place:
 
-def _join_place_has_mixed_keys(transition: Transition) -> bool:
-    """Whether join arcs with different `join_key` functions (by identity) read one place of `transition`.
-
-    Their depths (`_join_depths`) are then a necessary condition only: a token whose key is the
-    same under both functions lists that key under each, though its only candidate hands it to
-    both arcs.
+    - `depths`: each join arc's depth, by input position: how many join arcs read its place
+      with its `join_key`. A self-join's arcs that read one place with one function each take
+      a different token of the key (issue #75), so a key binds there only once the place holds
+      that many of its tokens under that function: the depth the arc's join index is
+      registered with, and the group size `_join_key_groups` requires. Arcs on one place with
+      *different* functions match a key through different tokens, so they do not add to each
+      other's depth. Functions are told apart by identity, as `_registration_matches` does;
+      two equal but distinct functions only cost the shortcut, never a binding.
+    - `mixed`: for each place read by join arcs with different functions, its function classes
+      as `(arcs, positions)`. Depths are then a necessary condition only, and Hall's condition
+      (`_has_distinct_tokens`) decides: a token whose key is the same under two functions lists
+      that key under each, though its only candidate hands it to both arcs.
+    - `plain_on_join_place`: whether an arc without a `join_key` reads a join arc's place.
     """
-    functions: dict[str, set[int]] = {}
-    for arc in transition.inputs:
-        if arc.join_key is not None:
-            functions.setdefault(arc.place, set()).add(id(arc.join_key))
-    return any(len(ids) > 1 for ids in functions.values())
+
+    depths: dict[int, int]
+    mixed: list[list[tuple[int, list[int]]]]
+    plain_on_join_place: bool
 
 
-def _join_depths(joins: "list[tuple[int, InputArc, Place]]") -> dict[int, int]:
-    """Each join arc's depth, by input position: how many join arcs read its place with its `join_key`.
-
-    A self-join's arcs that read one place with one `join_key` function each take a different
-    token of the key (issue #75), so a key binds there only once the place holds that many of
-    its tokens under that function: the depth the arc's join index is registered with, and the
-    group size `_join_key_groups` requires. Arcs on one place with *different* functions match
-    a key through different tokens, one each, so they do not add to each other's depth.
-    Functions are told apart by identity, as `_registration_matches` does; two equal but
-    distinct functions only cost the shortcut, never a binding.
-    """
-    counts: dict[tuple[int, int], int] = {}
-    for _, arc, place in joins:
-        group = (id(place), id(arc.join_key))
-        counts[group] = counts.get(group, 0) + 1
-    return {i: counts[(id(place), id(arc.join_key))] for i, arc, place in joins}
-
-
-def _mixed_join_classes(joins: "list[tuple[int, InputArc, Place]]") -> list[list[tuple[int, list[int]]]]:
-    """For each place read by join arcs with different `join_key` functions, its arcs by function.
-
-    Each entry lists one such place's function classes as `(arcs, positions)`: how many join
-    arcs read the place with that function, and their input positions. Places read with a
-    single function are left out; `_join_depths` already decides those.
-    """
+def _join_shape(
+    transition: Transition, joins: "list[tuple[int, InputArc, Place]]", shared: frozenset[str]
+) -> _JoinShape:
+    """Build the `_JoinShape` of `transition`, whose join arcs are `joins` and shared places `shared`."""
     by_place: dict[int, dict[int, list[int]]] = {}
     for i, arc, place in joins:
         by_place.setdefault(id(place), {}).setdefault(id(arc.join_key), []).append(i)
-    return [
-        [(len(positions), positions) for positions in classes.values()]
-        for classes in by_place.values()
-        if len(classes) > 1
-    ]
+    classes_by_place = [list(classes.values()) for classes in by_place.values()]
+    depths = {i: len(positions) for classes in classes_by_place for positions in classes for i in positions}
+    mixed = [[(len(positions), positions) for positions in classes] for classes in classes_by_place if len(classes) > 1]
+    return _JoinShape(depths, mixed, bool(shared) and _plain_arc_on_join_place(transition, joins))
+
+
+def _plain_arc_on_join_place(transition: Transition, joins: "list[tuple[int, InputArc, Place]]") -> bool:
+    """Whether an input arc without a `join_key` reads a place that one of `joins` reads."""
+    join_places = {arc.place for _, arc, _ in joins}
+    return any(arc.join_key is None and arc.place in join_places for arc in transition.inputs)
 
 
 def _has_distinct_tokens(groups: "list[tuple[int, Iterable[tuple[object, Token]]]]") -> bool:
@@ -449,39 +445,75 @@ def _has_distinct_tokens(groups: "list[tuple[int, Iterable[tuple[object, Token]]
     tokens are what its arcs may take, so by Hall's theorem a distinct choice exists iff every
     set of slots can reach at least as many tokens as it has slots. Arcs sharing a function
     share their group, so a set holding one of them is hardest to fill with all of them, and
-    checking every set of *functions* with their full arc counts is exact: 2^c - 1 checks for
-    c functions, usually 3. Each count stops at its target, and each group holds distinct
-    tokens, so a check reads at most `need` tokens per group. Tokens are told apart by
-    identity, as `_reuses_a_token` does.
+    checking every set of *functions* with their full arc counts is exact.
+
+    Single functions are already checked: `_join_key_groups` keeps a group only if it holds
+    the arcs' depth. So only sets of two or more are checked, one for the usual two functions.
+    Each is settled by group sizes when it can: a set passes when one of its groups alone holds
+    enough tokens, and fails when all of them together hold too few. Only otherwise are tokens
+    read, at most `need` per group, and told apart by identity as `_reuses_a_token` does.
     """
-    for size in range(1, len(groups) + 1):
+    for size in range(2, len(groups) + 1):
         for chosen in itertools.combinations(groups, size):
             need = sum(arcs for arcs, _ in chosen)
+            sizes = [len(group) for _, group in chosen]  # type: ignore[arg-type]
+            if max(sizes) >= need:
+                continue
+            if sum(sizes) < need:
+                return False
             seen: set[int] = set()
             for _, group in chosen:
-                for _, token in itertools.islice(group, need):
-                    seen.add(id(token))
-                if len(seen) >= need:
-                    break
+                seen.update(id(token) for _, token in group)
             if len(seen) < need:
                 return False
     return True
 
 
-def _keys_with_distinct_tokens(
-    joins: "list[tuple[int, InputArc, Place]]", groups_by_arc: "dict[int, dict]", keys: list[object]
-) -> list[object]:
+def _pair_has_distinct_tokens(
+    arcs_a: int, group_a: "Iterable[tuple[object, Token]]", arcs_b: int, group_b: "Iterable[tuple[object, Token]]"
+) -> bool:
+    """`_has_distinct_tokens` for the usual two functions: one check, of both together.
+
+    Passes when either group alone holds every arc a token, fails when both together hold too
+    few, and otherwise counts the tokens the groups share.
+    """
+    need = arcs_a + arcs_b
+    size_a = len(group_a)  # type: ignore[arg-type]
+    size_b = len(group_b)  # type: ignore[arg-type]
+    if size_a >= need or size_b >= need:
+        return True
+    if size_a + size_b < need:
+        return False
+    if size_a == 1 == size_b:  # one arc each, one token each: they must differ
+        return next(iter(group_a))[1] is not next(iter(group_b))[1]
+    in_a = {id(token) for _, token in group_a}
+    overlap = sum(1 for _, token in group_b if id(token) in in_a)
+    return size_a + size_b - overlap >= need
+
+
+def _keys_with_distinct_pair(place: "list[tuple[int, dict]]", keys: list[object]) -> list[object]:
+    """`_keys_with_distinct_tokens` for one place read with two `join_key` functions, the usual case."""
+    (arcs_a, groups_a), (arcs_b, groups_b) = place
+    if arcs_a == 1 == arcs_b:  # inlined `_pair_has_distinct_tokens`: it runs once per key
+        return [
+            key
+            for key in keys
+            if len(a := groups_a[key]) > 1 or len(b := groups_b[key]) > 1 or next(iter(a))[1] is not next(iter(b))[1]
+        ]
+    return [key for key in keys if _pair_has_distinct_tokens(arcs_a, groups_a[key], arcs_b, groups_b[key])]
+
+
+def _keys_with_distinct_tokens(shape: _JoinShape, groups_by_arc: "dict[int, dict]", keys: list[object]) -> list[object]:
     """`keys` without those failing Hall's condition at a place read with several `join_key` functions."""
-    mixed = _mixed_join_classes(joins)
-    if not mixed:
+    if not shape.mixed:
         return keys
+    places = [[(arcs, groups_by_arc[positions[0]]) for arcs, positions in classes] for classes in shape.mixed]
+    if len(places) == 1 and len(places[0]) == 2:
+        return _keys_with_distinct_pair(places[0], keys)
     return [
         key
         for key in keys
-        if all(
-            _has_distinct_tokens([(arcs, groups_by_arc[positions[0]][key]) for arcs, positions in classes])
-            for classes in mixed
-        )
+        if all(_has_distinct_tokens([(arcs, groups[key]) for arcs, groups in place]) for place in places)
     ]
 
 
@@ -503,13 +535,13 @@ class _Replay(Generic[_T]):
         self._source = source
         self._seen: list[_T] = []
 
-    def has_first(self) -> bool:
-        """Read the first item if it is not read yet; whether there is one."""
-        if not self._seen:
-            first = next(self._source, _EXHAUSTED)
-            if first is _EXHAUSTED:
+    def has_at_least(self, n: int) -> bool:
+        """Read up to the `n`-th item if it is not read yet; whether there are that many."""
+        while len(self._seen) < n:
+            item = next(self._source, _EXHAUSTED)
+            if item is _EXHAUSTED:
                 return False
-            self._seen.append(cast("_T", first))
+            self._seen.append(cast("_T", item))
         return True
 
     def __iter__(self) -> Iterator[_T]:
@@ -525,15 +557,18 @@ class _Replay(Generic[_T]):
 
 
 def _untaken_options(
-    ordered: Iterable[Token], taken: frozenset[int], count: int, depth: int, cap: int
+    ordered: Iterable[Token], place: str, taken: frozenset[tuple[str, int]], count: int, depth: int, cap: int
 ) -> Iterator[list[Token]]:
-    """The first `cap` `count`-sized groups of the tokens of `ordered` whose ids are not in `taken`.
+    """The first `cap` `count`-sized groups of the tokens of `ordered` that `taken` does not hold.
+
+    `taken` holds `(place, id(token))` pairs, as `_reuses_a_token` and `_head_binding` key
+    them, so a `Token` instance deposited in two places is told apart in each.
 
     Groups come in `_arc_options`' order. The `cap`-th group of a `count`-sized combination
     reaches index `cap + count - 2`, so `depth` (`binding_search_limit + count`) tokens hold
     every group the cap keeps.
     """
-    untaken = (token for token in ordered if id(token) not in taken)
+    untaken = (token for token in ordered if (place, id(token)) not in taken)
     if count == 1:
         return itertools.islice(([token] for token in untaken), cap)
     groups = itertools.combinations(list(itertools.islice(untaken, depth)), count)
@@ -981,7 +1016,12 @@ class PetriNet:
                          quiescence — and [`run`][cpnx.PetriNet.run] can return — with that
                          work still pending, signalled only via the callback; raise the limit
                          if this is a concern. Must be `>= 1`. Ignored for guard-free `FIRST`
-                         transitions, which never search. Under
+                         transitions, which take each arc's head without searching, except
+                         those that search anyway: one with a `join_key` arc, and one whose
+                         `filter` arc shares its place with another input arc. When several arcs
+                         read one place, a candidate that would hand one token to two arcs is
+                         never built, but an arc's choice that leaves a later arc on that place
+                         no tokens counts toward the limit as a candidate. Under
                          `BindingPolicy.RANDOM`/`PRIORITY` the search cannot short-circuit
                          (it must scan every candidate to sample or rank),
                          so the limit truncates the selection space to the first `limit`
@@ -1103,6 +1143,8 @@ class PetriNet:
         #: pass: a busy `run()` loop re-checks each transition on every `step()`/
         #: `is_quiescent()` iteration, so an over-limit transition signals repeatedly while
         #: the loop runs. Keep the callback cheap, and debounce on your side if needed.
+        #: Guard-free `FIRST` transitions signal it too when they search: a `join_key`
+        #: transition, and one whose `filter` arc shares its place with another arc.
         self.on_binding_search_exhausted: Callable[[str], None] | None = None
         #: Transition names whose binding search exhausted the limit during the current
         #: lock-holding enabling pass; drained and dispatched (de-duplicated) after the lock
@@ -2871,16 +2913,16 @@ class PetriNet:
             return cast("_Binding | None", fast)
         policy = self._effective_policy(transition)
         if _has_join(transition):
-            joined = self._join_candidates(transition, m_time, ignore_timing)
+            joined = self._join_candidates(transition, m_time, ignore_timing, shared=shared)
             if joined is None:
                 return None
-            return self._pick_binding(transition, self._satisfying(transition, joined, shared), policy)
+            return self._pick_binding(transition, self._satisfying(transition, joined, shared=shared), policy)
         head_only, lazy = self._search_mode(transition, policy, probe=False, shared=shared)
         pools = self._gather_arc_pools(transition, m_time, ignore_timing, head_only=head_only, lazy=lazy, shared=shared)
         if pools is None:
             return None
         if head_only:
-            return self._head_binding(transition, pools, shared)
+            return self._head_binding(transition, pools, shared=shared)
         return self._select_binding(transition, pools, policy, lazy=lazy, shared=shared)
 
     def _binding_exists(self, transition: Transition, m_time: float | None, *, ignore_timing: bool = False) -> bool:
@@ -2899,18 +2941,18 @@ class PetriNet:
         if fast is not _NO_FAST_PATH:
             return fast is not None
         if _has_join(transition):
-            joined = self._join_candidates(transition, m_time, ignore_timing, unordered=True)
-            return joined is not None and next(self._satisfying(transition, joined, shared), None) is not None
+            joined = self._join_candidates(transition, m_time, ignore_timing, shared=shared, unordered=True)
+            return joined is not None and next(self._satisfying(transition, joined, shared=shared), None) is not None
         head_only, lazy = self._search_mode(transition, self._effective_policy(transition), probe=True, shared=shared)
         pools = self._gather_arc_pools(transition, m_time, ignore_timing, head_only=head_only, lazy=lazy, shared=shared)
         if pools is None:
             return False
         if head_only:
-            return self._head_binding(transition, pools, shared) is not None
+            return self._head_binding(transition, pools, shared=shared) is not None
         return next(self._iter_satisfying_bindings(transition, pools, lazy=lazy, shared=shared), None) is not None
 
     def _head_binding(
-        self, transition: Transition, pools: list[tuple[InputArc, _Pool]], shared: frozenset[str] | None = None
+        self, transition: Transition, pools: list[tuple[InputArc, _Pool]], *, shared: frozenset[str]
     ) -> _Binding | None:
         """Build the head binding: the first `count` tokens per arc, in the arc's own order.
 
@@ -2929,11 +2971,8 @@ class PetriNet:
         When several arcs read one place, each takes its head from the tokens the earlier arcs
         left, so no token is bound twice (issue #75). A `consume_all` arc on such a place is
         never satisfied, as in the search, where its option is the whole pool and so always
-        overlaps the other arcs' tokens. `shared` is `_shared_places(transition)` when the caller
-        already has it.
+        overlaps the other arcs' tokens. `shared` is `_shared_places(transition)`, from the caller.
         """
-        if shared is None:
-            shared = _shared_places(transition)
         taken: set[tuple[str, int]] = set()
         binding: _Binding = []
         for arc, available in pools:
@@ -2970,7 +3009,7 @@ class PetriNet:
         pools: list[tuple[InputArc, _Pool]],
         *,
         lazy: bool = False,
-        shared: frozenset[str] | None = None,
+        shared: frozenset[str],
     ) -> Iterator[tuple[_Binding, list[Token]]]:
         """Yield each guard-satisfying `(binding, flat_tokens)` in insertion order, bounded by the limit.
 
@@ -2983,15 +3022,13 @@ class PetriNet:
 
         `lazy` selects how candidates are enumerated (see `_iter_candidate_bindings` and
         `_search_mode`). Both settings yield the same bindings in the same order. `shared` is
-        `_shared_places(transition)` when the caller already has it.
+        `_shared_places(transition)`, from the caller.
         """
-        if shared is None:
-            shared = _shared_places(transition)
         candidates = self._iter_candidate_bindings(pools, transition_name=transition.name, lazy=lazy, shared=shared)
-        return self._satisfying(transition, candidates, shared)
+        return self._satisfying(transition, candidates, shared=shared)
 
     def _satisfying(
-        self, transition: Transition, candidates: Iterator[_Binding], shared: frozenset[str] | None = None
+        self, transition: Transition, candidates: "Iterator[_Binding | _DeadEnd]", *, shared: frozenset[str]
     ) -> Iterator[tuple[_Binding, list[Token]]]:
         """Yield each `(binding, flat_tokens)` of `candidates` whose guard holds, bounded by the limit.
 
@@ -3002,16 +3039,14 @@ class PetriNet:
         When two arcs read one place, a candidate that hands one token to both is skipped
         before the guard sees it (issue #75). The product search never builds one, except
         around a `consume_all` arc (see `_distinct_candidates`); the join search can, and such a
-        candidate counts toward the limit there. So does a `_DEAD_END`, which is skipped too.
-        `shared` is `_shared_places(transition)` when the caller already has it.
+        candidate counts toward the limit there. So does a `_DeadEnd`, which is skipped too.
+        `shared` is `_shared_places(transition)`, from the caller.
         """
-        if shared is None:
-            shared = _shared_places(transition)
         for examined, binding in enumerate(candidates, start=1):
             if examined > self.binding_search_limit:
                 self._signal_search_exhausted(transition.name)
                 return
-            if binding is _DEAD_END or (shared and _reuses_a_token(binding, shared)):
+            if isinstance(binding, _DeadEnd) or (shared and _reuses_a_token(binding, shared)):
                 continue
             flat = _flatten_binding(binding)
             if self._check_transition_guard(transition, flat):
@@ -3024,7 +3059,7 @@ class PetriNet:
         policy: BindingPolicy,
         *,
         lazy: bool = False,
-        shared: frozenset[str] | None = None,
+        shared: frozenset[str],
     ) -> _Binding | None:
         """Pick one satisfying binding under a search policy (`FIRST`/`RANDOM`/`PRIORITY`)."""
         satisfying = self._iter_satisfying_bindings(transition, pools, lazy=lazy, shared=shared)
@@ -3110,8 +3145,8 @@ class PetriNet:
         *,
         transition_name: str = "",
         lazy: bool = False,
-        shared: frozenset[str] = frozenset(),
-    ) -> Iterator[_Binding]:
+        shared: frozenset[str],
+    ) -> "Iterator[_Binding | _DeadEnd]":
         """Yield candidate bindings as the Cartesian product of each arc's token-group options.
 
         Options are generated in insertion order, so the first binding yielded is the head
@@ -3135,7 +3170,8 @@ class PetriNet:
           list before yielding, but iterates in C, which is cheaper for a caller that will
           drain the whole bounded product anyway.
 
-        When several arcs read one place (`shared`), `_distinct_candidates` enumerates instead.
+        When several arcs read one place (`shared`, required so that no caller gets the
+        token-reusing product by leaving it out), `_distinct_candidates` enumerates instead.
         """
         if shared:
             yield from self._distinct_candidates(pools, shared, transition_name)
@@ -3152,7 +3188,7 @@ class PetriNet:
 
     def _distinct_candidates(
         self, pools: list[tuple[InputArc, _Pool]], shared: frozenset[str], transition_name: str
-    ) -> Iterator[_Binding]:
+    ) -> "Iterator[_Binding | _DeadEnd]":
         """`_iter_candidate_bindings` for a transition with several arcs on one place (issue #75).
 
         Yields the product's candidates in the product's order, less those that hand one
@@ -3177,12 +3213,15 @@ class PetriNet:
         """
         cap = self.binding_search_limit + 1
         sources, dependent = self._distinct_sources(pools, shared, transition_name, cap)
-        # As in `_lazy_product`: read every arc's first option or token before giving up.
-        if not all([source.has_first() for source in sources]):
+        # As in `_lazy_product`, an arc with no option empties the product, and every arc's
+        # first option is read before giving up. A later arc on a place has an option on the
+        # full pool iff it accepts `count` tokens.
+        needs = [arc.count if later else 1 for (arc, _), later in zip(pools, dependent, strict=True)]
+        if not all([source.has_at_least(need) for source, need in zip(sources, needs, strict=True)]):
             return
         arcs = [arc for arc, _ in pools]
-        for combo in self._distinct_from(arcs, sources, dependent, shared, 0, frozenset(), cap):
-            yield _DEAD_END if combo is _DEAD_END else list(zip(arcs, combo, strict=True))
+        for combo in self._distinct_combos(arcs, sources, dependent, shared, cap):
+            yield combo if isinstance(combo, _DeadEnd) else list(zip(arcs, combo, strict=True))
 
     def _distinct_sources(
         self, pools: list[tuple[InputArc, _Pool]], shared: frozenset[str], transition_name: str, cap: int
@@ -3213,40 +3252,65 @@ class PetriNet:
             sources.append(_Replay(iter(ordered if ordered is not None else ())))
         return sources, dependent
 
-    def _distinct_from(
+    def _distinct_combos(
+        self, arcs: list[InputArc], sources: list[_Replay], dependent: list[bool], shared: frozenset[str], cap: int
+    ) -> "Iterator[tuple[list[Token], ...] | _DeadEnd]":
+        """Yield each arc's option, in product order, for `_distinct_candidates`.
+
+        A depth-first walk with an explicit stack, one level per arc, so a wide transition
+        cannot run out of recursion. `taken[i]` holds the `(place, id(token))` pairs the first
+        `i` arcs' choices took from shared places. An option of an arc whose next arc then has
+        no option yields one `_DEAD_END`.
+        """
+        last = len(arcs) - 1
+        taken: list[frozenset[tuple[str, int]]] = [frozenset()]
+        stack: list[Iterator[list[Token]]] = [self._level_options(arcs, sources, dependent, 0, taken[0], cap)]
+        chosen: list[list[Token]] = []
+        while stack:
+            level = len(stack) - 1
+            del chosen[level:]
+            option = next(stack[level], None)
+            if option is None:
+                stack.pop()
+                taken.pop()
+                continue
+            chosen.append(option)
+            if level == last:
+                yield tuple(chosen)
+                continue
+            place = arcs[level].place
+            after = taken[level] | {(place, id(token)) for token in option} if place in shared else taken[level]
+            following = self._level_options(arcs, sources, dependent, level + 1, after, cap)
+            first = next(following, None)
+            if first is None:
+                yield _DEAD_END
+                continue
+            stack.append(itertools.chain((first,), following))
+            taken.append(after)
+
+    def _level_options(
         self,
         arcs: list[InputArc],
-        sources: list,
+        sources: list[_Replay],
         dependent: list[bool],
-        shared: frozenset[str],
         i: int,
-        taken: frozenset[int],
+        taken: frozenset[tuple[str, int]],
         cap: int,
-    ) -> Iterator[tuple[list[Token], ...] | object]:
-        """Yield the options of `arcs[i:]` for `_distinct_candidates`, given the tokens `taken` so far.
-
-        An option of `arcs[i]` under which the later arcs yield nothing yields `_DEAD_END` once.
-        """
-        if i == len(arcs):
-            yield ()
-            return
+    ) -> Iterator[list[Token]]:
+        """Arc `i`'s options for `_distinct_combos`, given what the earlier arcs took."""
         arc = arcs[i]
-        options = (
-            _untaken_options(sources[i], taken, arc.count, self.binding_search_limit + arc.count, cap)
-            if dependent[i]
-            else iter(sources[i])
-        )
-        for option in options:
-            after = taken | {id(token) for token in option} if arc.place in shared else taken
-            reached = False
-            for rest in self._distinct_from(arcs, sources, dependent, shared, i + 1, after, cap):
-                reached = True
-                yield _DEAD_END if rest is _DEAD_END else (option, *cast("tuple[list[Token], ...]", rest))
-            if not reached:
-                yield _DEAD_END
+        if not dependent[i]:
+            return iter(sources[i])
+        return _untaken_options(sources[i], arc.place, taken, arc.count, self.binding_search_limit + arc.count, cap)
 
     def _join_candidates(
-        self, transition: Transition, m_time: float | None, ignore_timing: bool, *, unordered: bool = False
+        self,
+        transition: Transition,
+        m_time: float | None,
+        ignore_timing: bool,
+        *,
+        shared: frozenset[str],
+        unordered: bool = False,
     ) -> Iterator[_Binding] | None:
         """Return the candidate bindings of a transition with `join_key` arcs, or `None` if there are none.
 
@@ -3273,15 +3337,16 @@ class PetriNet:
         cannot change that answer, so the per-key products are chained instead of merged. With
         more candidates than that, the limit decides which are examined, and the probe keeps
         the firing path's order so the two agree.
+
+        `shared` is `_shared_places(transition)`, from the caller.
         """
         t_limit = _LAST_FINITE_TIME if ignore_timing else m_time
         gathered = self._join_arc_options(transition, t_limit, ignore_timing)
         if gathered is None:
             return None
         options, joins = gathered
-        grouped = self._join_key_groups(
-            transition.name, joins, self._join_probe_keys(transition, joins, t_limit, unordered), t_limit
-        )
+        shape = _join_shape(transition, joins, shared)
+        grouped = self._probe_join_groups(transition, joins, shape, t_limit, unordered)
         if grouped is None:
             return None
         groups_by_arc, keys = grouped
@@ -3291,41 +3356,70 @@ class PetriNet:
         ]
         return self._join_bindings(transition.inputs, options, self._join_combos(per_key, unordered=unordered))
 
-    def _join_probe_keys(
-        self, transition: Transition, joins: list[tuple[int, InputArc, Place]], t_limit: float | None, unordered: bool
-    ) -> list[object] | None:
-        """The keys `_join_candidates` should look up: the match's available keys, or `None` for all.
+    def _probe_join_groups(
+        self,
+        transition: Transition,
+        joins: list[tuple[int, InputArc, Place]],
+        shape: _JoinShape,
+        t_limit: float | None,
+        unordered: bool,
+    ) -> "tuple[dict[int, dict], list[object]] | None":
+        """`_join_key_groups` for the keys `_join_candidates` should look up.
 
-        With no guard, any candidate satisfies, so an existence probe (`unordered`) needs only
-        one matched key. That holds because a join arc takes exactly one token and has no
-        `key` or `filter` (ADR 0010 §1), so every token of an available group is a valid choice
-        for its arc. The assertion keeps a future relaxation of that rule from breaking this
-        silently.
+        Those are the match's available keys, or every key when no match serves (see
+        `_matched_join_keys`). With no guard, any candidate satisfies, so an existence probe
+        (`unordered`) needs only one key that binds. That holds because a join arc takes exactly
+        one token and has no `key` or `filter` (ADR 0010 §1), so every token of an available
+        group is a valid choice for its arc. The assertion keeps a future relaxation of that rule
+        from breaking this silently.
 
-        A self-join, several join arcs on one place, keeps the shortcut: each join index is
-        registered with the number of join arcs reading its place with its `join_key` as its
-        depth (`_join_depths`), so the match lists a key only once the place holds enough of its
-        tokens for each arc to take its own (issue #75).
-        A place that a join arc shares with an arc *without* a `join_key` does not: that arc's
-        options are the place's tokens, and when it may take only the matched key's token, as
-        its `filter` can make it, another key would be needed. Such a probe reads every key.
-        So does a place read by join arcs with different `join_key` functions: a token whose key
-        is the same under both lists that key once per function, so the match lists it, yet its
-        only candidate hands that token to both arcs (`_join_place_has_mixed_keys`).
+        Where every join place is read with one `join_key` function, every key the match lists
+        binds: each join index is registered with its arcs' depth (see `_JoinShape`), so the
+        match lists a key only once the place holds a token for each arc (issue #75). The probe
+        then asks for one key. Where a place is read with several functions, a listed key may
+        still fail Hall's condition, so the probe reads the listed keys in doubling batches and
+        stops at the first batch with a key that passes (`_first_binding_key_groups`): it pays
+        for the keys before the first that binds, not for all of them.
+
+        A place that a join arc shares with an arc *without* a `join_key` gives up the shortcut:
+        that arc's options are the place's tokens, and when it may take only the matched key's
+        token, as its `filter` can make it, another key would be needed. Such a probe reads
+        every key.
         """
         assert all(arc.count == 1 and arc.key is None and arc.filter is None for _, arc, _ in joins)
-        one_key = (
-            unordered
-            and transition.guard is None
-            and not _join_place_has_plain_arc(transition)
-            and not _join_place_has_mixed_keys(transition)
-        )
-        return self._matched_join_keys(transition.name, joins, t_limit, 1 if one_key else None)
+        name = transition.name
+        first_only = unordered and transition.guard is None and not shape.plain_on_join_place
+        if first_only and shape.mixed:
+            return self._first_binding_key_groups(name, joins, shape, t_limit)
+        keys = self._matched_join_keys(name, joins, shape, t_limit, 1 if first_only else None)
+        return self._join_key_groups(name, joins, shape, keys, t_limit)
+
+    def _first_binding_key_groups(
+        self, transition_name: str, joins: list[tuple[int, InputArc, Place]], shape: _JoinShape, t_limit: float | None
+    ) -> "tuple[dict[int, dict], list[object]] | None":
+        """The groups of the first matched key that binds, reading the match in doubling batches.
+
+        For the guard-free existence probe of a transition with a place read by several
+        `join_key` functions (see `_probe_join_groups`). Falls back to every key when no match
+        serves.
+        """
+        match = self._serving_join_match(transition_name, joins, shape, t_limit)
+        if match is None:
+            return self._join_key_groups(transition_name, joins, shape, None, t_limit)
+        assert t_limit is not None
+        start, size = 0, 1
+        while keys := match.keys_at(t_limit, start + size, start=start):
+            grouped = self._join_key_groups(transition_name, joins, shape, keys, t_limit)
+            if grouped is not None:
+                return grouped[0], grouped[1][:1]
+            start, size = start + size, size * 2
+        return None
 
     def _join_key_groups(
         self,
         transition_name: str,
         joins: list[tuple[int, InputArc, Place]],
+        shape: _JoinShape,
         keys: list[object] | None,
         t_limit: float | None,
     ) -> "tuple[dict[int, dict], list[object]] | None":
@@ -3338,7 +3432,7 @@ class PetriNet:
 
         In a self-join, where several join arcs read one place with one `join_key` function, each
         takes a different token of the key's group (issue #75), so a group smaller than that
-        number of arcs is dropped (`_join_depths`).
+        number of arcs is dropped (`_JoinShape.depths`).
         Its candidates would all reuse a token, and each would spend one of the
         `binding_search_limit` candidates `_satisfying` examines: a backlog of keys holding one
         token each could then hide a key that holds a pair.
@@ -3349,10 +3443,9 @@ class PetriNet:
         """
         if keys is not None and not keys:
             return None
-        depths = _join_depths(joins)
         groups_by_arc: dict[int, dict] = {}
         for i, arc, place in sorted(joins, key=lambda join: len(join[2])):
-            depth = depths[i]
+            depth = shape.depths[i]
             groups = _with_enough_tokens(
                 self._join_groups(i, arc, place, keys, t_limit, transition_name, depth=depth), depth
             )
@@ -3361,11 +3454,16 @@ class PetriNet:
             groups_by_arc[i] = groups
             keys = list(groups)
         assert keys is not None
-        keys = _keys_with_distinct_tokens(joins, groups_by_arc, keys)
+        keys = _keys_with_distinct_tokens(shape, groups_by_arc, keys)
         return (groups_by_arc, keys) if keys else None
 
     def _matched_join_keys(
-        self, transition_name: str, joins: list[tuple[int, InputArc, Place]], t_limit: float | None, limit: int | None
+        self,
+        transition_name: str,
+        joins: list[tuple[int, InputArc, Place]],
+        shape: _JoinShape,
+        t_limit: float | None,
+        limit: int | None,
     ) -> list[object] | None:
         """The join keys that every join place holds an available token of, or `None` if unknown.
 
@@ -3375,16 +3473,31 @@ class PetriNet:
         served by a join index (an uncertified key, a `Place` subclass, a disabled index), or
         on the wall clock (`t_limit` is `None`), where the place picks the time it reads at.
         """
-        match = self._join_match(transition_name, joins) if t_limit is not None else None
+        match = self._serving_join_match(transition_name, joins, shape, t_limit)
+        if match is None:
+            return None
+        assert t_limit is not None
+        return match.keys_at(t_limit, limit)
+
+    def _serving_join_match(
+        self,
+        transition_name: str,
+        joins: list[tuple[int, InputArc, Place]],
+        shape: _JoinShape,
+        t_limit: float | None,
+    ) -> _JoinMatch | None:
+        """The transition's `_JoinMatch`, refreshed, or `None` when it cannot serve this probe."""
+        match = self._join_match(transition_name, joins, shape) if t_limit is not None else None
         if match is None:
             self._join_matches.pop(transition_name, None)
             return None
-        assert t_limit is not None
         # A place whose index is not serving makes this probe fall back, but the match is kept:
         # it absorbed the other places' changes, and that place's next report is a full one.
-        return match.keys_at(t_limit, limit) if match.refresh() else None
+        return match if match.refresh() else None
 
-    def _join_match(self, transition_name: str, joins: list[tuple[int, InputArc, Place]]) -> _JoinMatch | None:
+    def _join_match(
+        self, transition_name: str, joins: list[tuple[int, InputArc, Place]], shape: _JoinShape
+    ) -> _JoinMatch | None:
         """The transition's `_JoinMatch` for `joins`, made anew if they changed; `None` if one is not indexed.
 
         Each join arc must be read through a place join index: a certified key on a plain
@@ -3394,7 +3507,7 @@ class PetriNet:
         hold one token would leave its later arcs unregistered, and fall back on every probe.
         """
         index_ids: list[int] = []
-        depths = _join_depths(joins)
+        depths = shape.depths
         for i, arc, place in joins:
             certified: bool = arc._join_key_inline_safe  # type: ignore[attr-defined]
             join_key = arc.join_key
@@ -3475,7 +3588,7 @@ class PetriNet:
         """Return `arc`'s available tokens grouped by `join_key`, restricted to `keys` unless `None`.
 
         `depth` is how many join arcs of the transition read `place` with this arc's `join_key`
-        (see `_join_depths`).
+        (see `_JoinShape.depths`).
 
         Each group yields `(position, token)` in the place's read order, where positions order
         the tokens the same way, and has a `len`. A certified `join_key` on a plain
