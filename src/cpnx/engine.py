@@ -507,15 +507,26 @@ def _set_has_distinct_tokens(chosen: "tuple[tuple[int, Iterable[tuple[object, To
     return len(seen) >= need
 
 
-def _join_reusable_places(shape: "_JoinShape", shared: frozenset[str]) -> frozenset[str]:
+def _join_reusable_places(transition: Transition, shared: frozenset[str]) -> frozenset[str]:
     """The places where `_join_candidates` can still build a candidate that reuses a token.
 
-    Join arcs sharing a place and a `join_key` take distinct tokens by construction
-    (`_distinct_product`). Arcs on one place with different functions, or a join arc beside an
-    arc without a `join_key`, can still pick one token twice, so their candidates are checked.
-    Without either, nothing is, and `_satisfying` skips the check on every candidate.
+    Only one kind of shared place is safe: one whose every reader is a join arc with one and
+    the same `join_key`, since those arcs take distinct tokens by construction
+    (`_distinct_product`). Every other shared place is checked: arcs without a `join_key`
+    there, which `_join_bindings` gives options independently of each other (issue #75), and
+    join arcs with different functions or beside a plain arc, which can pick one token twice.
     """
-    return shared if shape.mixed or shape.plain_on_join_place else frozenset()
+    if not shared:
+        return shared
+    readers: dict[str, set[object]] = {}
+    for arc in transition.inputs:
+        if arc.place in shared:
+            readers.setdefault(arc.place, set()).add(_PLAIN_READER if arc.join_key is None else id(arc.join_key))
+    return frozenset(place for place, kinds in readers.items() if len(kinds) > 1 or _PLAIN_READER in kinds)
+
+
+_PLAIN_READER = object()
+"""`_join_reusable_places`' marker for an arc without a `join_key`."""
 
 
 def _self_join_classes(
@@ -3469,7 +3480,7 @@ class PetriNet:
         ]
         classes = _self_join_classes(len(options), joins, shape) if shape.self_join else None
         combos = self._join_combos(per_key, classes, unordered=unordered)
-        return self._join_bindings(transition.inputs, options, combos), _join_reusable_places(shape, shared)
+        return self._join_bindings(transition.inputs, options, combos), _join_reusable_places(transition, shared)
 
     def _probe_join_groups(
         self,

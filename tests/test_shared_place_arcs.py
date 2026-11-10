@@ -873,3 +873,60 @@ def test_hall_pair_check_fails_a_group_whose_length_outruns_its_tokens():
     assert not _pair_has_distinct_tokens(1, Stale(), 1, [(0, token)])
     assert not _pair_has_distinct_tokens(1, [(0, token)], 1, [(1, token)])
     assert _pair_has_distinct_tokens(1, [(0, token)], 1, [(1, Token(payload={}))])
+
+
+@pytest.mark.parametrize("guarded", [False, True])
+@pytest.mark.parametrize("policy", [BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY])
+@pytest.mark.parametrize("in_c", [1, 2, 3])
+def test_two_plain_arcs_on_one_place_of_a_join_take_their_own_tokens(guarded, policy, in_c):
+    # The join reads a and b; c is read by two arcs without a `join_key`. Their options are
+    # built independently, so a candidate handing c's one token to both must be skipped.
+    net = PetriNet(seed=0)
+    for name in ("a", "b", "c", "out"):
+        net.add_place(Place(name))
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("a", join_key=WID), InputArc("b", join_key=WID), InputArc("c"), InputArc("c")],
+            outputs=[OutputArc("out", count=4)],
+            action=_passthrough,
+            binding_policy=policy,
+            **({"guard": lambda tokens: True} if guarded else {}),
+        )
+    )
+    net.deposit("a", Token(payload={"wid": 1}))
+    net.deposit("b", Token(payload={"wid": 1}))
+    for n in range(in_c):
+        net.deposit("c", Token(payload={"n": n}))
+    t = net.transitions["t"]
+    enabled = in_c >= 2
+    assert net._binding_exists(t, net.model_time) is enabled
+    if enabled:
+        _assert_distinct(net)
+    else:
+        assert net._resolve_binding(t, net.model_time) is None
+    net.drive_to_quiescence()
+    assert len(net.marking["out"]) == (4 if enabled else 0)
+    assert len(net.marking["c"]) == in_c - (2 if enabled else 0)
+
+
+@pytest.mark.parametrize(
+    ("arcs", "expected"),
+    [
+        (["a:k", "b:k", "c", "c"], {"c"}),
+        (["a:k", "a:k"], set()),
+        (["a:k", "a:k", "a"], {"a"}),
+        (["a:k", "a:g"], {"a"}),
+        (["a:k", "b:k"], set()),
+    ],
+)
+def test_join_reusable_places_skips_only_same_function_join_places(arcs, expected):
+    from cpnx.engine import _join_reusable_places, _shared_places
+
+    functions = {"k": WID, "g": N}
+    inputs = []
+    for spec in arcs:
+        place, _, fn = spec.partition(":")
+        inputs.append(InputArc(place, join_key=functions[fn]) if fn else InputArc(place))
+    transition = Transition(name="t", inputs=inputs, outputs=[], action=_passthrough)
+    assert _join_reusable_places(transition, _shared_places(transition)) == expected
