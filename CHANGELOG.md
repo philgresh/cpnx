@@ -187,7 +187,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys before the first that binds: 0.015 ms on a 4 000-key `manager == id` chain, but linear
   in a backlog of keys that all fail Hall's condition. Firing and guarded probes, linear in
   keys as before, cost about 1.2× `main` on that chain. A self-join of three or more arcs with
-  one function skips a key's self-pairings unbuilt, so a key deeper than the limit still binds.
+  one function skips a key's self-pairings unbuilt, so a key deeper than the limit still binds;
+  so do join arcs with different functions on one place. The existence probe takes its
+  one-key and first-binding-key shortcuts only when no arc without a `join_key` shares a
+  place, so it examines what firing examines whenever a candidate could reuse a token.
   Draining 200 pairs past 16 000
   one-token keys took 1 690 ms and now takes about 170 ms, level with a two-place join.
   A guard-free `FIRST` transition whose `filter` arc shares its place

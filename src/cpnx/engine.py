@@ -413,14 +413,13 @@ class _JoinShape:
       as `(arcs, positions)`. Depths are then a necessary condition only, and Hall's condition
       (`_has_distinct_tokens`) decides: a token whose key is the same under two functions lists
       that key under each, though its only candidate hands it to both arcs.
-    - `plain_on_join_place`: whether an arc without a `join_key` reads a join arc's place.
-    - `self_join`: whether some depth exceeds 1, so `_self_join_classes` has classes to mark.
+    - `self_join`: whether some place is read by two or more join arcs, so
+      `_self_join_classes` has classes to mark.
     """
 
     depths: dict[int, int]
     mixed: list[list[tuple[int, list[int]]]]
-    plain_on_join_place: bool
-    self_join: bool = False
+    self_join: bool
 
 
 _PLAIN_JOIN_SHAPES: dict[tuple[int, ...], _JoinShape] = {}
@@ -435,7 +434,7 @@ def _plain_join_shape(positions: tuple[int, ...]) -> _JoinShape:
     """The cached `_JoinShape` of a join with no shared place and join arcs at `positions`."""
     shape = _PLAIN_JOIN_SHAPES.get(positions)
     if shape is None:
-        shape = _PLAIN_JOIN_SHAPES[positions] = _JoinShape(dict.fromkeys(positions, 1), [], False)
+        shape = _PLAIN_JOIN_SHAPES[positions] = _JoinShape(dict.fromkeys(positions, 1), [], self_join=False)
     return shape
 
 
@@ -448,8 +447,12 @@ def _join_shape(
     classes_by_place = _join_classes_by_place(joins)
     depths = {i: len(positions) for classes in classes_by_place for positions in classes for i in positions}
     mixed = [[(len(positions), positions) for positions in classes] for classes in classes_by_place if len(classes) > 1]
-    self_join = any(depth > 1 for depth in depths.values())
-    return _JoinShape(depths, mixed, _plain_arc_on_join_place(transition, joins), self_join)
+    return _JoinShape(depths, mixed, self_join=_has_self_join(classes_by_place))
+
+
+def _has_self_join(classes_by_place: list[list[list[int]]]) -> bool:
+    """Whether some place is read by two or more join arcs, with one `join_key` or several."""
+    return any(sum(len(positions) for positions in classes) > 1 for classes in classes_by_place)
 
 
 def _join_classes_by_place(joins: "list[tuple[int, InputArc, Place]]") -> list[list[list[int]]]:
@@ -458,12 +461,6 @@ def _join_classes_by_place(joins: "list[tuple[int, InputArc, Place]]") -> list[l
     for i, arc, place in joins:
         by_place.setdefault(id(place), {}).setdefault(id(arc.join_key), []).append(i)
     return [list(classes.values()) for classes in by_place.values()]
-
-
-def _plain_arc_on_join_place(transition: Transition, joins: "list[tuple[int, InputArc, Place]]") -> bool:
-    """Whether an input arc without a `join_key` reads a place that one of `joins` reads."""
-    join_places = {arc.place for _, arc, _ in joins}
-    return any(arc.join_key is None and arc.place in join_places for arc in transition.inputs)
 
 
 def _has_distinct_tokens(groups: "list[tuple[int, Iterable[tuple[object, Token]]]]") -> bool:
@@ -510,37 +507,32 @@ def _set_has_distinct_tokens(chosen: "tuple[tuple[int, Iterable[tuple[object, To
 def _join_reusable_places(transition: Transition, shared: frozenset[str]) -> frozenset[str]:
     """The places where `_join_candidates` can still build a candidate that reuses a token.
 
-    Only one kind of shared place is safe: one whose every reader is a join arc with one and
-    the same `join_key`, since those arcs take distinct tokens by construction
-    (`_distinct_product`). Every other shared place is checked: arcs without a `join_key`
-    there, which `_join_bindings` gives options independently of each other (issue #75), and
-    join arcs with different functions or beside a plain arc, which can pick one token twice.
+    Join arcs on one place take distinct tokens by construction (`_distinct_product`), with one
+    `join_key` or several. An arc *without* a `join_key` gets its options independently of
+    the other arcs (`_join_bindings`), so a shared place it reads can still see one token
+    picked twice (issue #75): those places are the ones `_satisfying` checks. Where there
+    are none, every candidate is a distinct binding, which is what lets the existence probe
+    take its shortcuts (`_probe_join_groups`).
     """
     if not shared:
         return shared
-    readers: dict[str, set[object]] = {}
-    for arc in transition.inputs:
-        if arc.place in shared:
-            readers.setdefault(arc.place, set()).add(_PLAIN_READER if arc.join_key is None else id(arc.join_key))
-    return frozenset(place for place, kinds in readers.items() if len(kinds) > 1 or _PLAIN_READER in kinds)
-
-
-_PLAIN_READER = object()
-"""`_join_reusable_places`' marker for an arc without a `join_key`."""
+    return frozenset(arc.place for arc in transition.inputs if arc.join_key is None and arc.place in shared)
 
 
 def _self_join_classes(
     n_arcs: int, joins: "list[tuple[int, InputArc, Place]]", shape: "_JoinShape"
 ) -> "list[int | None]":
-    """Per input position, a class shared by the join arcs reading one place with one `join_key`.
+    """Per input position, a class shared by the join arcs reading one place, whatever their `join_key`.
 
-    `None` for an arc alone in its class (depth 1) and for an arc without a `join_key`.
+    `None` for a join arc alone on its place and for an arc without a `join_key`.
     """
+    counts: dict[int, int] = {}
+    for _, _, place in joins:
+        counts[id(place)] = counts.get(id(place), 0) + 1
     classes: list[int | None] = [None] * n_arcs
-    labels: dict[tuple[int, int], int] = {}
-    for i, arc, place in joins:
-        if shape.depths[i] > 1:
-            classes[i] = labels.setdefault((id(place), id(arc.join_key)), len(labels))
+    for i, _, place in joins:
+        if counts[id(place)] > 1:
+            classes[i] = id(place)
     return classes
 
 
@@ -724,13 +716,20 @@ def _distinct_product(lists: list, classes: "list[int | None]") -> Iterator[tupl
     """`_lazy_product` of `lists` less the tuples in which two arcs of one class take one token.
 
     For a key's per-arc lists in `_join_combos`. Arcs of one class (`classes[i]`, `None` for
-    none) are join arcs reading one place with one `join_key`, so they read the same group, and
-    the product would pair a token with itself: with three such arcs and `G` tokens, its first
-    `G` tuples all reuse the first token, and the search would spend `binding_search_limit` on
-    them (issue #75). A depth-first walk with an explicit stack skips a token an earlier arc of
-    its class took, which keeps the product's order, so `heapq.merge` still interleaves keys.
-    Each class holds at least as many tokens as arcs (`_join_key_groups` drops smaller
-    groups), so every prefix has a completion and no option of another arc goes unexamined.
+    none) are join arcs reading one place, and the product would pair a token with itself:
+    with three such arcs and `G` tokens, its first `G` tuples all reuse the first token, and the
+    search would spend `binding_search_limit` on them (issue #75). With different `join_key`
+    functions, a token carrying the key under both is in both arcs' lists. A depth-first walk
+    with an explicit stack skips a token an earlier arc of its class took, which keeps the
+    product's order, so `heapq.merge` still interleaves keys.
+
+    No candidate that reuses a token is built, so none counts toward the limit, and a probe
+    that looks at fewer keys sees a key's candidates in the order firing does. Truncating an
+    arc without a `join_key` to `binding_search_limit + 1` options stays loss-free: its options
+    are on another place (`_join_reusable_places` keeps it otherwise), so whether a class's
+    later arcs still have a token does not depend on which option it chose, and every option
+    before a candidate's yields a candidate too. Each key holds a distinct choice for each
+    class (`_join_key_groups`' depth and Hall filters), so every key yields one.
     """
     last = len(lists) - 1
     earlier = _earlier_of_class(classes)
@@ -3470,7 +3469,8 @@ class PetriNet:
             return None
         options, joins = gathered
         shape = _join_shape(transition, joins, shared)
-        grouped = self._probe_join_groups(transition, joins, shape, t_limit, unordered)
+        reusable = _join_reusable_places(transition, shared)
+        grouped = self._probe_join_groups(transition, joins, shape, t_limit, unordered and not reusable)
         if grouped is None:
             return None
         groups_by_arc, keys = grouped
@@ -3480,7 +3480,7 @@ class PetriNet:
         ]
         classes = _self_join_classes(len(options), joins, shape) if shape.self_join else None
         combos = self._join_combos(per_key, classes, unordered=unordered)
-        return self._join_bindings(transition.inputs, options, combos), _join_reusable_places(transition, shared)
+        return self._join_bindings(transition.inputs, options, combos), reusable
 
     def _probe_join_groups(
         self,
@@ -3507,14 +3507,17 @@ class PetriNet:
         stops at the first batch with a key that passes (`_first_binding_key_groups`): it pays
         for the keys before the first that binds, not for all of them.
 
-        A place that a join arc shares with an arc *without* a `join_key` gives up the shortcut:
-        that arc's options are the place's tokens, and when it may take only the matched key's
-        token, as its `filter` can make it, another key would be needed. Such a probe reads
-        every key.
+        A transition with a shared place read by an arc *without* a `join_key` gives up the
+        shortcuts: `_join_candidates` passes `unordered` as false (see `_join_reusable_places`).
+        There a candidate can hand one token to two arcs, and it counts toward the limit, so a
+        probe that looked at fewer keys than firing, which merges every key in product order,
+        could find a binding that firing runs out of limit before reaching; and where that arc
+        shares a join arc's place and its `filter` accepts only the matched key's token,
+        another key would be needed. Such a probe reads every key, in firing's order.
         """
         assert all(arc.count == 1 and arc.key is None and arc.filter is None for _, arc, _ in joins)
         name = transition.name
-        first_only = unordered and transition.guard is None and not shape.plain_on_join_place
+        first_only = unordered and transition.guard is None
         if first_only and shape.mixed:
             return self._first_binding_key_groups(name, joins, shape, t_limit)
         keys = self._matched_join_keys(name, joins, shape, t_limit, 1 if first_only else None)

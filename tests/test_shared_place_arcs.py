@@ -10,7 +10,7 @@ search, and the `consume_all` count-only path.
 import itertools
 
 import pytest
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from cpnx import BindingPolicy, InputArc, OutputArc, PetriNet, Place, Token, Transition
@@ -916,11 +916,14 @@ def test_two_plain_arcs_on_one_place_of_a_join_take_their_own_tokens(guarded, po
         (["a:k", "b:k", "c", "c"], {"c"}),
         (["a:k", "a:k"], set()),
         (["a:k", "a:k", "a"], {"a"}),
-        (["a:k", "a:g"], {"a"}),
+        (["a:k", "a:g"], set()),
+        (["a:k", "a:g", "c", "c", "d"], {"c"}),
         (["a:k", "b:k"], set()),
     ],
 )
-def test_join_reusable_places_skips_only_same_function_join_places(arcs, expected):
+def test_join_reusable_places_are_the_shared_places_a_plain_arc_reads(arcs, expected):
+    # Join arcs on one place take distinct tokens by construction, whatever their join_key;
+    # only an arc without one can still be handed a token another arc took.
     from cpnx.engine import _join_reusable_places, _shared_places
 
     functions = {"k": WID, "g": N}
@@ -930,3 +933,150 @@ def test_join_reusable_places_skips_only_same_function_join_places(arcs, expecte
         inputs.append(InputArc(place, join_key=functions[fn]) if fn else InputArc(place))
     transition = Transition(name="t", inputs=inputs, outputs=[], action=_passthrough)
     assert _join_reusable_places(transition, _shared_places(transition)) == expected
+
+
+# -- every arc shape together, against brute force ---------------------------------------------
+
+_JF = lambda t: t.payload["f"]  # noqa: E731
+_JG = lambda t: t.payload["g"]  # noqa: E731
+_EVEN = lambda t: t.payload["n"] % 2 == 0  # noqa: E731
+
+_KINDS = {
+    "plain": {},
+    "even": {"filter": _EVEN},
+    "desc": {"key": NEG_N},
+    "pair": {"count": 2},
+    "join_f": {"join_key": _JF},
+    "join_g": {"join_key": _JG},
+}
+_JOIN_FN = {"join_f": _JF, "join_g": _JG}
+
+
+def _arc_accepts(kind: str, token: Token) -> bool:
+    return kind != "even" or _EVEN(token)
+
+
+def _distinct_binding_exists(arcs: list[tuple[str, str]], marking: dict[str, list[Token]], guard) -> bool:
+    """Brute force: tokens per arc, none taken twice from one place, filters and the join key agreeing."""
+
+    def go(i: int, used: frozenset[tuple[str, int]], join_value: object, chosen: list[Token]) -> bool:
+        if i == len(arcs):
+            return guard(chosen)
+        place, kind = arcs[i]
+        free = [t for t in marking[place] if (place, id(t)) not in used and _arc_accepts(kind, t)]
+        for group in itertools.combinations(free, 2 if kind == "pair" else 1):
+            value = join_value
+            if kind in _JOIN_FN:
+                value = _JOIN_FN[kind](group[0])
+                if join_value is not _UNSET and value != join_value:
+                    continue
+            if go(i + 1, used | {(place, id(t)) for t in group}, value, chosen + list(group)):
+                return True
+        return False
+
+    return go(0, frozenset(), _UNSET, [])
+
+
+_UNSET = object()
+
+
+def _assert_valid_binding(binding, arcs, marking, guard) -> None:
+    taken: set[tuple[str, int]] = set()
+    join_values = set()
+    flat = []
+    for (arc, tokens), (place, kind) in zip(binding, arcs, strict=True):
+        assert arc.place == place
+        assert len(tokens) == (2 if kind == "pair" else 1)
+        for token in tokens:
+            assert any(token is t for t in marking[place])
+            assert _arc_accepts(kind, token)
+            assert (place, id(token)) not in taken, "a token handed to two arcs"
+            taken.add((place, id(token)))
+        if kind in _JOIN_FN:
+            join_values.add(_JOIN_FN[kind](tokens[0]))
+        flat.extend(tokens)
+    assert len(join_values) <= 1
+    assert guard(flat)
+
+
+_token_payloads = st.fixed_dictionaries({"n": st.integers(0, 3), "f": st.integers(0, 2), "g": st.integers(0, 2)})
+
+
+@settings(max_examples=400, deadline=None)
+@example(  # two plain arcs on one place of a join: the probe's one-key shortcut and firing disagreed
+    arcs=[("p", "desc"), ("p", "desc"), ("q", "join_f")],
+    payloads={"p": [{"n": 0, "f": 0, "g": 0}] * 3, "q": [{"n": 0, "f": 0, "g": 0}, {"n": 0, "f": 1, "g": 0}]},
+    guarded=False,
+    policy=BindingPolicy.FIRST,
+    small_limit=2,
+)
+@example(  # one token for two plain arcs beside a join: it was handed to both (issue #75 reopened)
+    arcs=[("p", "join_f"), ("q", "plain"), ("q", "plain")],
+    payloads={"p": [{"n": 0, "f": 0, "g": 0}], "q": [{"n": 0, "f": 0, "g": 0}]},
+    guarded=False,
+    policy=BindingPolicy.FIRST,
+    small_limit=4,
+)
+@given(
+    arcs=st.lists(st.tuples(st.sampled_from(["p", "q"]), st.sampled_from(sorted(_KINDS))), min_size=2, max_size=4),
+    payloads=st.fixed_dictionaries(
+        {"p": st.lists(_token_payloads, max_size=4), "q": st.lists(_token_payloads, max_size=4)}
+    ),
+    guarded=st.booleans(),
+    policy=st.sampled_from([BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY]),
+    small_limit=st.integers(1, 4),
+)
+def test_every_arc_shape_binds_exactly_when_distinct_tokens_exist(arcs, payloads, guarded, policy, small_limit):
+    # Plain, filtered, keyed, count=2 and join arcs (two join_key functions) over two places,
+    # with a guard or not, under every policy. With a limit too large to run out, the engine
+    # binds exactly when brute force finds distinct tokens, its binding is valid, and firing
+    # it moves those tokens. With a small limit, a miss must be signalled as exhaustion.
+    guard = (lambda tokens: sum(t.payload["n"] for t in tokens) % 2 == 0) if guarded else (lambda tokens: True)
+
+    def build(limit: int) -> tuple[PetriNet, dict[str, list[Token]], list]:
+        net = PetriNet(seed=0)
+        for name in ("p", "q", "out"):
+            net.add_place(Place(name))
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[InputArc(place, **_KINDS[kind]) for place, kind in arcs],
+                outputs=[OutputArc("out", count=sum(2 if kind == "pair" else 1 for _, kind in arcs))],
+                action=_passthrough,
+                binding_policy=policy,
+                **({"guard": guard} if guarded else {}),
+            )
+        )
+        net.binding_search_limit = limit
+        exhausted: list[str] = []
+        signal = net._signal_search_exhausted
+        net._signal_search_exhausted = lambda name: (exhausted.append(name), signal(name))  # type: ignore[method-assign]
+        marking = {place: [Token(payload=dict(p)) for p in payloads[place]] for place in ("p", "q")}
+        for place, tokens in marking.items():
+            for token in tokens:
+                net.deposit(place, token)
+        return net, marking, exhausted
+
+    expected = None
+    net, marking, _ = build(100_000)
+    expected = _distinct_binding_exists(arcs, marking, guard)
+    t = net.transitions["t"]
+    assert net._binding_exists(t, net.model_time) is expected
+    binding = net._resolve_binding(t, net.model_time)
+    assert (binding is not None) is expected
+    if binding is not None:
+        _assert_valid_binding(binding, arcs, marking, guard)
+        before = {place: len(net.marking[place]) for place in ("p", "q")}
+        net.step()
+        moved = sum(before.values()) - len(net.marking["p"]) - len(net.marking["q"])
+        assert moved == sum(2 if kind == "pair" else 1 for _, kind in arcs)
+
+    net, marking, exhausted = build(small_limit)
+    t = net.transitions["t"]
+    binding = net._resolve_binding(t, net.model_time)
+    assert net._binding_exists(t, net.model_time) is (binding is not None)
+    if binding is not None:
+        _assert_valid_binding(binding, arcs, marking, guard)
+        net.step()
+    elif expected:
+        assert exhausted, "a distinct binding exists, yet the search neither found it nor ran out"
