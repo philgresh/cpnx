@@ -175,9 +175,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   In a self-join (N join arcs on one place with one `join_key` function), a key binds only
   once the place holds N of its tokens; arcs with different functions need one token each.
   Its join indexes now track each key's first N tokens, so ADR 0011's match lists only keys
-  that bind and the one-key existence probe stays correct. A place read by join arcs with
-  different functions gives up that probe and reads every key, since a token whose key is
-  the same under both functions lists a key that only it holds. Without the index, keys with
+  that bind and the one-key existence probe stays correct. On a place read by join arcs with
+  different functions, a token whose key is the same under both lists a key that only it
+  holds, so such keys are filtered by Hall's condition (below). Without the index, keys with
   fewer tokens are dropped before building candidates, so a backlog of them can't use up
   `binding_search_limit` ahead of a key that holds a pair. Such a place also drops keys that
   fail Hall's condition (some set of its functions reaches fewer distinct tokens than arcs),
@@ -187,10 +187,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys before the first that binds: 0.015 ms on a 4 000-key `manager == id` chain, but linear
   in a backlog of keys that all fail Hall's condition. Firing and guarded probes, linear in
   keys as before, cost about 1.2× `main` on that chain. A self-join of three or more arcs with
-  one function skips a key's self-pairings unbuilt, so a key deeper than the limit still binds;
-  so do join arcs with different functions on one place. The existence probe takes its
-  one-key and first-binding-key shortcuts only when no arc without a `join_key` shares a
-  place, so it examines what firing examines whenever a candidate could reuse a token.
+  one function skips a key's self-pairings unbuilt, so a key deeper than the limit still binds.
+  Every arc on a shared place of a join transition takes tokens the earlier arcs left: join
+  arcs with any `join_key`, pruned by a residual Hall check so they never strand a later join
+  arc, and arcs without one, drawn from the remaining tokens as in the product search. A
+  choice that leaves a later arc nothing counts toward `binding_search_limit`, so the search
+  stays bounded, and arcs without a `join_key` on a place deeper than the limit still bind.
+  The existence probe keeps its one-key and first-binding-key shortcuts unless an arc without
+  a `join_key` reads a join place or reads a shared place before the last join arc.
   Draining 200 pairs past 16 000
   one-token keys took 1 690 ms and now takes about 170 ms, level with a two-place join.
   A guard-free `FIRST` transition whose `filter` arc shares its place
