@@ -1240,10 +1240,10 @@ class Place:
         present. Like the key index, this is a pure optimisation: [`peek_join`][cpnx.Place.peek_join]
         may decline, and the engine then computes the same groups itself.
 
-        *depth* is how many join arcs of the registering transition read this place, each
-        taking a different token. [`join_head_changes`][cpnx.Place.join_head_changes] then
-        reports a key only while it holds at least that many tokens. Changing it rebuilds the
-        index.
+        *depth* is how many join arcs of the registering transition read this place with
+        *key_fn*, each taking a different token. [`join_head_changes`][cpnx.Place.join_head_changes]
+        then reports a key only while it holds at least that many tokens. Changing it rebuilds
+        the index.
         """
         with self._lock:
             self._store.register_join_index(index_id, key_fn, depth)
