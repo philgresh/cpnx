@@ -189,8 +189,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys as before, cost about 1.2× `main` on that chain. A self-join of three or more arcs with
   one function skips a key's self-pairings unbuilt, so a key deeper than the limit still binds.
   Every arc on a shared place of a join transition takes tokens the earlier arcs left: join
-  arcs with any `join_key`, pruned by a residual Hall check so they never strand a later join
-  arc, and arcs without one, drawn from the remaining tokens as in the product search. A
+  arcs with any `join_key`, and arcs without one, drawn from the remaining tokens as in the
+  product search. Both are pruned by a residual Hall check so that neither strands a later
+  join arc on its place, which a plain arc read first could do by taking a key's only token. A
   choice that leaves a later arc nothing counts toward `binding_search_limit`, so the search
   stays bounded, and arcs without a `join_key` on a place deeper than the limit still bind.
   The existence probe keeps its one-key and first-binding-key shortcuts unless an arc without

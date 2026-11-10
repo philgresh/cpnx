@@ -680,7 +680,8 @@ class _JoinLevel:
       join arcs on it as `(arcs, level)` per function, for the residual Hall check that keeps
       this arc from taking a token they need.
     - `_PLAIN`: an arc without a `join_key` on a shared place: options drawn from its ordered
-      tokens less those earlier arcs took there (`_untaken_indexed`).
+      tokens less those earlier arcs took there (`_untaken_indexed`). `rest` lists the join
+      arcs that follow it on its place, whatever their functions, for the same residual check.
     """
 
     kind: str
@@ -761,15 +762,20 @@ def _join_level(inputs: list[InputArc], i: int, shared: frozenset[str]) -> _Join
     if arc.place not in shared or (arc.join_key is None and arc.consume_all):
         return _JoinLevel(_FREE, arc.place, arc.count)
     if arc.join_key is None:
-        return _JoinLevel(_PLAIN, arc.place, arc.count)
+        return _JoinLevel(_PLAIN, arc.place, arc.count, _later_join_arcs(inputs, i))
     return _JoinLevel(_JOIN, arc.place, 1, _later_join_arcs(inputs, i))
 
 
 def _later_join_arcs(inputs: list[InputArc], i: int) -> tuple[tuple[int, int], ...]:
-    """`_JoinLevel.rest` of join arc `i`: the later join arcs on its place by function, if it has several."""
+    """`_JoinLevel.rest` of arc `i`: the later join arcs on its place by function, as `(arcs, level)`.
+
+    A join arc needs it only where its place has several functions: with one, the depth filter
+    already keeps a token for each later arc. An arc without a `join_key` needs it whenever a
+    join arc follows it on its place, since it may take the token a key's group needs.
+    """
     place = inputs[i].place
     on_place = [j for j, other in enumerate(inputs) if other.place == place and other.join_key is not None]
-    if len({id(inputs[j].join_key) for j in on_place}) < 2:
+    if inputs[i].join_key is not None and len({id(inputs[j].join_key) for j in on_place}) < 2:
         return ()
     later: dict[int, list[int]] = {}
     for j in on_place:
@@ -799,7 +805,7 @@ class _DeadPrefix(tuple):
 
 
 def _untaken_indexed(
-    ordered: list[Token], place: str, taken: frozenset[tuple[str, int]], count: int, depth: int, cap: int
+    ordered: list[Token], place: str, taken: frozenset[tuple[str, int]], count: int, depth: int, cap: int | None
 ) -> Iterator[tuple[tuple[int, ...], list[Token]]]:
     """`_untaken_options` with each group's indexes in `ordered` as its position, for `heapq.merge`."""
     untaken = ((j, token) for j, token in enumerate(ordered) if (place, id(token)) not in taken)
@@ -871,7 +877,8 @@ def _key_combos(lists: list, plan: _JoinPlan, cap: int, limit: int) -> Iterator[
     the walk bounded by the limit and the truncation of each arc's options to `cap`
     loss-free, as in `_distinct_combos`. A join arc's options are not truncated: a residual
     Hall check prunes those that would leave a later join arc on the place without a token,
-    so join arcs alone on a place never dead-end.
+    so join arcs alone on a place never dead-end. The same check prunes an arc without a
+    `join_key` that join arcs follow on its place (`_plain_level_options`).
     """
     levels = plan.levels
     last = len(lists) - 1
@@ -917,8 +924,78 @@ def _level_options(
     if level.kind == _FREE:
         return iter(lists[i])
     if level.kind == _PLAIN:
-        return _untaken_indexed(lists[i], level.place, taken, level.count, limit + level.count, cap)
+        if not level.rest:
+            return _untaken_indexed(lists[i], level.place, taken, level.count, limit + level.count, cap)
+        return _plain_level_options(lists, level, i, taken, cap, limit)
     return _join_level_options(lists, level, i, taken)
+
+
+def _plain_level_options(
+    lists: list, level: _JoinLevel, i: int, taken: frozenset[tuple[str, int]], cap: int, limit: int
+) -> Iterator[tuple]:
+    """A `_PLAIN` arc's options when join arcs follow it on its place, residual-Hall pruned.
+
+    An option that leaves those join arcs without distinct tokens could only dead-end, so it is
+    dropped before the options are capped, and the walk never counts it. The tokens such an
+    option could not take all lie in groups where Hall's condition is tight, at most one per
+    later join arc, so reading that many more untaken tokens keeps the cap loss-free.
+    `_Ordered` lists are read `binding_search_limit` plus the place's demand deep, enough for it.
+    """
+    place = level.place
+    here = {token_id for taken_place, token_id in taken if taken_place == place} if taken else set()
+    if len(level.rest) == 1:
+        return _one_group_plain_options(lists, level, i, taken, here, cap, limit)
+    return _many_groups_plain_options(lists, level, i, taken, here, cap, limit)
+
+
+def _many_groups_plain_options(
+    lists: list,
+    level: _JoinLevel,
+    i: int,
+    taken: frozenset[tuple[str, int]],
+    here: set[int],
+    cap: int,
+    limit: int,
+) -> Iterator[tuple]:
+    """`_plain_level_options` where join arcs of several functions follow: the full residual check."""
+    place, count = level.place, level.count
+    groups = [(arcs, lists[j]) for arcs, j in level.rest]
+    need = sum(arcs for arcs, _ in groups)
+    if min(len(group) for _, group in groups) - len(here) - count >= need:
+        return _untaken_indexed(lists[i], place, taken, count, limit + count, cap)
+    options = _untaken_options_to(lists[i], place, taken, count, limit + count + need)
+    kept = (option for option in options if _residual_has_distinct(groups, here | {id(t) for t in option[1]}))
+    return itertools.islice(kept, cap)
+
+
+def _one_group_plain_options(
+    lists: list,
+    level: _JoinLevel,
+    i: int,
+    taken: frozenset[tuple[str, int]],
+    here: set[int],
+    cap: int,
+    limit: int,
+) -> Iterator[tuple]:
+    """`_plain_level_options` where one function's join arcs follow: an option takes only spare tokens of its group."""
+    place, count = level.place, level.count
+    need, j = level.rest[0]
+    group = lists[j]
+    if len(group) - len(here) - count < need:
+        free = {id(token) for _, token in group}.difference(here)
+        spare = len(free) - need
+        if spare < count:
+            options = _untaken_options_to(lists[i], place, taken, count, limit + count + need)
+            kept = (option for option in options if sum(id(token) in free for token in option[1]) <= spare)
+            return itertools.islice(kept, cap)
+    return _untaken_indexed(lists[i], place, taken, count, limit + count, cap)
+
+
+def _untaken_options_to(
+    ordered: list[Token], place: str, taken: frozenset[tuple[str, int]], count: int, depth: int
+) -> Iterator[tuple[tuple[int, ...], list[Token]]]:
+    """`_untaken_indexed` uncapped, for pruning before the cap: `depth` untaken tokens' worth of options."""
+    return _untaken_indexed(ordered, place, taken, count, depth, depth if count == 1 else None)
 
 
 def _join_level_options(lists: list, level: _JoinLevel, i: int, taken: frozenset[tuple[str, int]]) -> Iterator[tuple]:

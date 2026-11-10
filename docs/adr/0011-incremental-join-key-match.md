@@ -138,9 +138,11 @@ The invariants this section relies on, and the tests that hold the engine to the
   §4).
 
 Every arc on a shared place takes tokens the earlier arcs left there, so no candidate reuses a
-token: join arcs with any `join_key`, pruned by a residual Hall check so that a choice never
-strands a later join arc on the place, and arcs *without* a `join_key`, whose options are drawn
-from the remaining tokens. A choice that leaves a later arc nothing counts toward
+token: join arcs with any `join_key`, and arcs *without* a `join_key`, whose options are drawn
+from the remaining tokens. A residual Hall check prunes either kind's choice when it would strand
+a later join arc on the place, such as an arc without a `join_key` read first taking a key's
+only token there. Pruning drops only choices no binding extends, so it never changes which
+binding fires. Any other choice that leaves a later arc nothing counts toward
 `binding_search_limit`, which keeps the search bounded. The one-key probe and its doubling
 variant need every key to show the same pattern of candidates and such dead ends, so they do
 not apply when an arc without a `join_key` reads a join place (its `filter` may accept only the

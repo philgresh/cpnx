@@ -1225,3 +1225,68 @@ def test_plain_arcs_on_a_deep_shared_place_of_a_join_still_bind(arcs, guarded):
     net.step()
     taken = sum(2 if spec == "p2" else 1 for spec in arcs)
     assert before - sum(len(net.marking[name]) for name in ("a", "b", "p")) == taken
+
+
+_ALT = lambda t: t.payload["alt"]  # noqa: E731
+
+
+@pytest.mark.parametrize(
+    "arcs",
+    [
+        ["a", "a", "a:k", "b:k"],
+        ["a2", "a:k", "b:k"],
+        ["a", "a:k", "a", "b:k"],
+        ["a", "a:k", "a:alt", "b:k"],
+        ["a", "a:alt", "a", "a:k", "b:k"],
+    ],
+)
+@pytest.mark.parametrize("guarded", [False, True])
+@pytest.mark.parametrize("policy", [BindingPolicy.FIRST, BindingPolicy.RANDOM])
+def test_a_plain_arc_before_a_join_arc_skips_the_token_the_key_needs(arcs, guarded, policy):
+    # The head of a deep place is the matched key's only token there. Plain arcs read the place
+    # before the join arc, so every option that takes the head strands the join arc: more than
+    # the search limit of them, ahead of the first binding. The residual Hall check skips the
+    # head for plain arcs too, so the search binds without counting them.
+    net = PetriNet(seed=0)
+    for name in ("a", "b", "out"):
+        net.add_place(Place(name))
+    inputs = []
+    for spec in arcs:
+        place, _, fn = spec.partition(":")
+        if fn:
+            inputs.append(InputArc(place, join_key=WID if fn == "k" else _ALT))
+        elif place.endswith("2"):
+            inputs.append(InputArc(place[:-1], count=2))
+        else:
+            inputs.append(InputArc(place))
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=inputs,
+            outputs=[OutputArc("out")],
+            action=lambda tokens: tokens[:1],
+            binding_policy=policy,
+            **({"guard": lambda tokens: True} if guarded else {}),
+        )
+    )
+    net.binding_search_limit = 20
+    exhausted = _record_exhaustion(net)
+    net.deposit("a", Token(payload={"wid": 0, "alt": 1, "n": -1}))
+    for n in range(net.binding_search_limit + 30):
+        net.deposit("a", Token(payload={"wid": 100 + n, "alt": 100 + n, "n": n}))
+    net.deposit("a", Token(payload={"wid": 50, "alt": 0, "n": 999}))  # the alt function's key-0 token, last
+    net.deposit("b", Token(payload={"wid": 0}))
+    t = net.transitions["t"]
+    started = time.perf_counter()
+    assert net._binding_exists(t, net.model_time)
+    binding = net._resolve_binding(t, net.model_time)
+    assert binding is not None
+    assert time.perf_counter() - started < 0.25
+    _assert_distinct(net)
+    if policy is BindingPolicy.FIRST:  # RANDOM samples from more candidates than the limit, and says so
+        assert exhausted == []
+    taken = {id(token) for _, tokens in binding for token in tokens}
+    assert len(taken) == sum(len(tokens) for _, tokens in binding)
+    before = len(net.marking["a"]) + len(net.marking["b"])
+    net.step()
+    assert before - len(net.marking["a"]) - len(net.marking["b"]) == sum(2 if s == "a2" else 1 for s in arcs)
