@@ -26,6 +26,7 @@ from cpnx.retries import (
     _validated_retry_number,
     validated_jitter_rng,
 )
+from cpnx.selection import BindingView, InvalidSelection, KeyCertifications, normalize_choice, selector_conflict
 from cpnx.tokens import ERROR_COLOR, Token
 from cpnx.transitions import (
     BindingPolicy,
@@ -117,6 +118,9 @@ _LAST_FINITE_TIME = sys.float_info.max
 _MIN_SUBNET_SLICE_SECS = 0.05
 
 _JOIN_INDEX_IDS = itertools.count(1)
+
+_SELECTOR_INDEXES_PER_ARC = 4
+"""How many `BindingView.groups` key functions one selector arc keeps a place index for."""
 """Ids for place join indexes, one per (transition, input position). Module-wide, because a place
 object may be shared by two nets and its indexes are keyed by id alone."""
 
@@ -828,6 +832,7 @@ class PetriNet:
             raise ValueError(f"binding_search_limit must be >= 1, got {binding_search_limit}.")
         self.binding_search_limit = binding_search_limit
         self._rng = random.Random(seed)
+        self._init_selectors(seed)
         self._has_timed_features = False
         self._model_time: float | None = None
         self.places: dict[str, Place] = {}
@@ -1119,6 +1124,21 @@ class PetriNet:
             return fut.result(timeout=t)
         except FuturesTimeout as exc:
             raise RuntimeError(f"Expression {fn!r} exceeded {t}s — possible I/O call") from exc
+
+    def _init_selectors(self, seed: object) -> None:
+        """Set up the state behind `Transition.binding_selector` (ADR 0013)."""
+        #: Seeds each `BindingView.random` together with the transition and its firing count.
+        #: An unseeded net draws one at construction, so its selectors vary run to run.
+        self._selector_seed = repr(seed) if seed is not None else str(random.SystemRandom().getrandbits(64))
+        #: Transition name -> how many of its selector bindings have been consumed.
+        self._selector_firings: dict[str, int] = {}
+        #: ``(transition, input position)`` -> ``{id(key): (key, place, index_id)}`` for the place
+        #: join indexes `BindingView.groups` reads, at most `_SELECTOR_INDEXES_PER_ARC` each.
+        self._selector_indexes: dict[tuple[str, int], dict[int, tuple[Callable[[Token], object], Place, int]]] = {}
+        self._selector_keys = KeyCertifications()
+        #: Transition name -> the first error its selector raised or returned this pass,
+        #: dispatched via `on_error` off the lock by `_flush_selection_failures`.
+        self._pending_selector_failures: dict[str, Exception] = {}
 
     def _get_model_time_under_lock(self) -> float:
         """Internal helper to get the model time without acquiring the engine lock."""
@@ -1466,7 +1486,7 @@ class PetriNet:
         """
         if not transition.inputs:
             return True
-        if transition.guard is not None:
+        if transition.guard is not None or transition.binding_selector is not None:
             return True
         return any(
             arc.key is not None or arc.filter is not None or arc.join_key is not None for arc in transition.inputs
@@ -1696,6 +1716,8 @@ class PetriNet:
                     transition, binding = selected
                     m_time = self._get_model_time_under_lock()
                     consumed_tokens, token_sources = self._consume_binding(binding, m_time)
+                    if transition.binding_selector is not None:
+                        self._selector_firings[transition.name] = self._selector_firings.get(transition.name, 0) + 1
 
                     self._running_count += 1
                     try:
@@ -2602,6 +2624,8 @@ class PetriNet:
             The resolved binding (each arc paired with the tokens it will consume), or `None`
             if no guard-satisfying binding exists within the search limit.
         """
+        if transition.binding_selector is not None:
+            return self._selector_binding(transition, m_time, ignore_timing)
         if self._join_registrations:
             self._release_stale_join_indexes(transition)
         fast = self._try_count_only_binding(transition, m_time, ignore_timing)
@@ -2630,6 +2654,8 @@ class PetriNet:
         which must not perturb the seeded RNG — otherwise a timing-dependent number of probe
         calls would make `RANDOM` runs non-reproducible.
         """
+        if transition.binding_selector is not None:
+            return self._selector_binding(transition, m_time, ignore_timing) is not None
         if self._join_registrations:
             self._release_stale_join_indexes(transition)
         fast = self._try_count_only_binding(transition, m_time, ignore_timing)
@@ -3401,6 +3427,7 @@ class PetriNet:
         majority of reports — so making it unconditional buried the real error under advice
         about a mechanism that was not in play.
         """
+        self._flush_selector_failures()
         with self._lock:
             if not self._pending_selection_failures:
                 return
@@ -3428,6 +3455,140 @@ class PetriNet:
                 callback(name, err, None)
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # External binding selection (ADR 0013)
+    # ------------------------------------------------------------------
+
+    def _selector_binding(self, transition: Transition, m_time: float | None, ignore_timing: bool) -> _Binding | None:
+        """Ask `transition.binding_selector` for a binding and check it, or `None` if it fires nothing.
+
+        Resolution and probes both land here, so each enablement check calls the selector once.
+        A raising selector, or a choice that fails a check, is buffered for `on_error` and reads
+        as "not enabled". Caller holds the lock.
+        """
+        conflict = selector_conflict(transition)
+        if conflict is not None:
+            return self._reject_selection(transition, InvalidSelection(conflict))
+        t_limit = _LAST_FINITE_TIME if ignore_timing else m_time
+        places = self._selector_places(transition, t_limit, ignore_timing)
+        if places is None:
+            return None
+        name = transition.name
+        view = BindingView(
+            name,
+            transition.inputs,
+            places,
+            self._get_model_time_under_lock(),
+            t_limit if t_limit is not None else self._get_model_time_under_lock(),
+            f"{self._selector_seed}:{name}:{self._selector_firings.get(name, 0)}",
+            lambda arc, key, keys: self._selector_groups(name, places, arc, key, keys, t_limit),
+        )
+        selector = cast("Callable[[BindingView], object]", transition.binding_selector)
+        try:
+            choice = selector(view)
+            if choice is None:
+                return None
+            per_arc = normalize_choice(choice, transition.inputs)
+            self._check_selection(transition, places, per_arc, t_limit)
+        except Exception as exc:
+            return self._reject_selection(transition, exc)
+        return list(zip(transition.inputs, per_arc, strict=True))
+
+    def _selector_places(
+        self, transition: Transition, t_limit: float | None, ignore_timing: bool
+    ) -> list[Place] | None:
+        """Each input arc's place, or `None` when an arc cannot be met at all (so the selector is not asked)."""
+        places: list[Place] = []
+        for arc in transition.inputs:
+            place = self.places.get(arc.place)
+            if place is None or not place.can_retrieve(arc.count, model_time=t_limit):
+                return None
+            if not ignore_timing and not self._is_settle_time_met(place, arc):
+                return None
+            places.append(place)
+        return places
+
+    def _check_selection(
+        self, transition: Transition, places: list[Place], per_arc: list[list[Token]], t_limit: float | None
+    ) -> None:
+        """Raise `InvalidSelection` unless every chosen token is available in its place and the guard holds."""
+        for arc, place, tokens in zip(transition.inputs, places, per_arc, strict=True):
+            if not place.holds_available(tokens, model_time=t_limit):
+                ids = [t.id for t in tokens]
+                raise InvalidSelection(f"token(s) {ids} chosen for input arc on '{arc.place}' are not available there.")
+        if not self._check_transition_guard(transition, [t for tokens in per_arc for t in tokens]):
+            raise InvalidSelection("the guard rejects the selector's choice.")
+
+    def _reject_selection(self, transition: Transition, exc: Exception) -> None:
+        """Buffer `exc` for `on_error` (first one per pass) and report no binding. Caller holds the lock."""
+        self._pending_selector_failures.setdefault(transition.name, exc)
+        return None
+
+    def _flush_selector_failures(self) -> None:
+        """Dispatch buffered selector failures via `on_error`, off the lock, one per transition."""
+        with self._lock:
+            if not self._pending_selector_failures:
+                return
+            pending = self._pending_selector_failures
+            self._pending_selector_failures = {}
+        callback = self.on_error
+        if callback is None:
+            return
+        for name, first_exc in pending.items():
+            err = RuntimeError(
+                f"binding_selector of transition '{name}' gave no binding the engine can fire; the "
+                f"transition is treated as not enabled. {first_exc!r}"
+            )
+            err.__cause__ = first_exc
+            try:
+                callback(name, err, None)
+            except Exception:
+                pass
+
+    def _selector_groups(
+        self,
+        transition_name: str,
+        places: list[Place],
+        position: int,
+        key: Callable[[Token], object],
+        keys: Iterable[object] | None,
+        t_limit: float | None,
+    ) -> "dict[object, Iterable[tuple[object, Token]]]":
+        """`BindingView.groups`: from a place join index when *key* certifies, else by keying the pool."""
+        place = places[position]
+        if type(place) is Place and self._selector_keys.inline_safe(key):
+            index_id = self._selector_index(transition_name, position, key, place)
+            indexed = place.peek_join(index_id, keys, model_time=t_limit)
+            if indexed is not None:
+                return cast("dict[object, Iterable[tuple[object, Token]]]", indexed)
+        grouped: dict[object, list[tuple[object, Token]]] = {}
+        for token in place.peek(len(place), model_time=t_limit):
+            grouped.setdefault(key(token), []).append((None, token))
+        if keys is None:
+            return dict(grouped)
+        return {k: grouped[k] for k in keys if k in grouped}
+
+    def _selector_index(self, transition_name: str, position: int, key: Callable[[Token], object], place: Place) -> int:
+        """The id of the place join index for *key* at this selector arc, registering it if needed.
+
+        Keeps at most `_SELECTOR_INDEXES_PER_ARC` per arc, dropping the oldest, so a selector that
+        builds a new key function on every call pays a rebuild instead of leaking indexes.
+        """
+        registered = self._selector_indexes.setdefault((transition_name, position), {})
+        entry = registered.get(id(key))
+        if entry is not None and entry[0] is key and entry[1] is place:
+            return entry[2]
+        if entry is not None:
+            entry[1].unregister_join_index(entry[2])
+            del registered[id(key)]
+        while len(registered) >= _SELECTOR_INDEXES_PER_ARC:
+            _, old_place, old_id = registered.pop(next(iter(registered)))
+            old_place.unregister_join_index(old_id)
+        index_id = next(_JOIN_INDEX_IDS)
+        place.register_join_index(index_id, key)
+        registered[id(key)] = (key, place, index_id)
+        return index_id
 
     def _is_settle_time_met(self, place: Place, arc: InputArc) -> bool:
         if arc.settle_secs <= 0.0:

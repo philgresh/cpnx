@@ -9,6 +9,7 @@ from cpnx.linting import (
 )
 from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace, ThresholdPlace
 from cpnx.retries import RetryPolicy
+from cpnx.selection import BindingView, TokenGroup
 from cpnx.tokens import AVAILABLE_NOW, ERROR_COLOR, FrozenDict, Token
 from cpnx.transitions import (
     BindingPolicy,
@@ -38,6 +39,8 @@ __all__ = [
     "OutputArc",
     "BindingPolicy",
     "RetryPolicy",
+    "BindingView",
+    "TokenGroup",
     "snapshot",
     "to_dot",
     "lint_callable",

@@ -13,6 +13,7 @@ from cpnx.certification import is_inline_safe
 from cpnx.linting import lint_and_warn
 from cpnx.retries import RetryPolicy
 from cpnx.sandbox import verify_callable_purity
+from cpnx.selection import BindingSelector, selector_conflict
 from cpnx.tokens import Token
 
 if TYPE_CHECKING:
@@ -232,6 +233,11 @@ class BindingPolicy(enum.Enum):
           (a truncated prefix), firing `on_binding_search_exhausted`. If that prefix contains
           no satisfying binding, the transition is treated as disabled for that check — it can
           stall exactly like `FIRST`, not just fire over a smaller set.
+        - **That prefix is the first candidates in product order, so `RANDOM` is uniform over
+          it, not over every satisfying binding.** With 2 000 waiting jobs, 100 servers and an
+          always-true guard, a limit of 1 000 covers jobs 0–9 only, so `RANDOM` never picks a
+          later job until those are gone. For "random among all eligible", set a
+          [`binding_selector`][cpnx.Transition] that draws over indexed groups instead.
     """
 
     FIRST = "first"
@@ -677,6 +683,29 @@ class Transition:
                and structural invariants. Declaring your own `OutputArc(pool)`
                already suppresses synthesis for that pool; set this `False` to
                suppress it entirely and keep the raw implicit return.
+        binding_selector: Let outside logic choose the tokens this transition binds, in place
+               of the product search and `binding_policy`. A
+               `Callable[[BindingView], choice | None]` that receives a read-only
+               [`BindingView`][cpnx.BindingView] of the tokens each input arc could take now,
+               and returns `None` (nothing to fire) or one choice per input arc, as a sequence
+               in `inputs` order or a mapping from arc index: a `Token` for a `count=1` arc, or
+               a sequence of exactly `count` tokens. The engine checks that every chosen token
+               is available in its place, that none is chosen twice and that the `guard`
+               holds, then fires exactly those tokens. A choice that fails a check, or a
+               selector that raises, is reported through `on_error` and treated as "not
+               enabled". Made for dispatchers whose policy (shortest queue, skill match,
+               random among eligible) is the thing a simulation studies.
+
+               **Contract.** Like a guard, the selector runs under the engine lock, possibly
+               several times per firing (each enablement check asks it), so it must be cheap
+               and must not call back into the net. It must be a pure function of the view:
+               draw randomness only from `view.random`, which is seeded from the net's `seed`,
+               the transition and its firing count, so the same seed and selector give the same
+               firings across processes. Use [`BindingView.groups`][cpnx.BindingView.groups]
+               with a certified key for indexed lookups that stay O(keys) as places deepen.
+               Input arcs of a selector transition may not set `key`, `filter`, `join_key` or
+               `consume_all`, and `binding_priority_key` must be unset (`ValueError`). See
+               ADR 0013.
     """
 
     name: str
@@ -692,6 +721,7 @@ class Transition:
     binding_priority_key: Callable[[list[Token]], object] | None = None
     impacts_colors: frozenset[str] | None = None
     auto_return_resources: bool = True
+    binding_selector: "BindingSelector | None" = None
 
     def __setattr__(self, name, value):
         # Keep the inline-safe flag in sync with ``guard``, including post-construction
@@ -705,10 +735,8 @@ class Transition:
                 lint_and_warn(value, "guard")
                 _reject_non_bool_return("guard", value)
             super().__setattr__("_inline_safe", _inline_safe_for(value))
-        elif name == "binding_priority_key" and value is not None:
-            _reject_non_callable_priority_key(value)
-            verify_callable_purity(value)
-            lint_and_warn(value, "binding_priority_key")
+        elif name in ("binding_priority_key", "binding_selector"):
+            _check_binding_chooser(self, name, value)
         elif name == "binding_policy":
             _reject_non_binding_policy(value, name="Transition.binding_policy", allow_none=True)
         elif name == "retry_policy":
@@ -719,6 +747,29 @@ class Transition:
             # member. Consumed by the blast-radius tracer, never evaluated at run time.
             value = coerce_color_domain(value, field="Transition.impacts_colors")
         super().__setattr__(name, value)
+
+
+def _check_binding_chooser(transition: "Transition", name: str, value: object) -> None:
+    """Check a `binding_priority_key` or `binding_selector`: both run under the engine lock."""
+    if value is None:
+        return
+    if name == "binding_selector":
+        _check_binding_selector(transition, value)
+        return
+    _reject_non_callable_priority_key(value)
+    verify_callable_purity(value)
+    lint_and_warn(value, "binding_priority_key")
+
+
+def _check_binding_selector(transition: "Transition", value: object) -> None:
+    """Reject a selector that is not callable, or one this transition's arcs or settings conflict with."""
+    if not callable(value):
+        raise TypeError(f"binding_selector must be a callable or None, got {type(value).__name__}: {value!r}.")
+    verify_callable_purity(value)
+    lint_and_warn(value, "binding_selector")
+    conflict = selector_conflict(transition)
+    if conflict is not None:
+        raise ValueError(f"Transition '{transition.name}': {conflict}.")
 
 
 def _check_subnet_deadline(name: str, deadline: object) -> float | None:
