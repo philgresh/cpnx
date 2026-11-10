@@ -29,6 +29,10 @@ SEED = 20261110
 START = 1e7
 
 
+def _identity(toks: list[Token]) -> list[Token]:
+    return toks
+
+
 def _even(toks: list[Token]) -> bool:
     return toks[0].payload["i"] % 2 == 0
 
@@ -204,19 +208,136 @@ def test_step_and_the_default_drive_still_use_the_thread_pool():
     assert len(net.marking["went_right"]) == 3
 
 
-def _interrupt(toks: list[Token]) -> list[Token]:
-    raise KeyboardInterrupt
+class _InterruptOnce:
+    """An action that raises `interrupt` on its first call and passes tokens through after that."""
+
+    def __init__(self, interrupt: type[BaseException]) -> None:
+        self.interrupt = interrupt
+        self.calls = 0
+        self.threads: list[int] = []
+
+    def __call__(self, toks: list[Token]) -> list[Token]:
+        self.calls += 1
+        self.threads.append(threading.get_ident())
+        if self.calls == 1:
+            raise self.interrupt
+        return toks
 
 
-def test_inline_keyboard_interrupt_propagates_after_rollback():
-    net = PetriNet(places=[Place("in"), Place("out")])
-    net.add_transition(Transition("t", [InputArc("in")], [OutputArc("out")], _interrupt))
-    net.deposit("in", Token(payload={"i": 0}))
+def _watch(net: PetriNet) -> list[tuple]:
+    seen: list[tuple] = []
+    net.on_error = lambda name, error, _token: seen.append(("error", name, error))
+    net.on_token_dead_lettered = lambda name, token: seen.append(("dead", name, token))
+    return seen
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+def test_an_inline_interrupt_hands_the_tokens_back_unchanged(interrupt):
+    action = _InterruptOnce(interrupt)
+    net = PetriNet(places=[Place("in"), Place("out"), SinkPlace("failed", keep_last=10)])
+    net.add_transition(Transition("t", [InputArc("in")], [OutputArc("out")], action, max_retries=0))
+    token = Token(payload={"i": 0})
+    net.deposit("in", token)
+    seen = _watch(net)
     with net:
+        with pytest.raises(interrupt):
+            net.drive_to_quiescence(inline_actions=True)
+        assert net._running_count == 0 and net._drive_limits == {}
+        assert net.marking["in"] == (token,), "the same token, with no attempt counted"
+        assert net.marking["failed"] == () and seen == [], "nothing dead-lettered or reported"
+        net.drive_to_quiescence()
+    assert _payload_ids(net.marking["out"]) == [0]
+    assert action.threads[1] != threading.get_ident(), "the follow-up default drive ran on the pool"
+
+
+def _payload_ids(tokens) -> list[int]:
+    return [t.payload["i"] for t in tokens]
+
+
+def test_an_interrupt_in_an_inline_subnet_restores_both_nets():
+    action = _InterruptOnce(KeyboardInterrupt)
+    subnet = PetriNet(
+        places=[Place("Orders"), Place("Prepped"), Place("Ready")],
+        transitions=[
+            Transition("Prep", [InputArc("Orders")], [OutputArc("Prepped")], _identity),
+            Transition("Brew", [InputArc("Prepped")], [OutputArc("Ready")], action),
+        ],
+    )
+    parent = PetriNet(
+        places=[Place("Queue"), Place("Served"), SinkPlace("failed", keep_last=10)],
+        transitions=[
+            SubstitutionTransition(
+                name="Cafe",
+                inputs=[InputArc("Queue")],
+                outputs=[OutputArc("Served")],
+                action=lambda tokens: tokens,
+                subnet=subnet,
+                port_socket_map={"Orders": "Queue", "Ready": "Served"},
+                max_retries=0,
+            )
+        ],
+    )
+    token = Token(payload={"i": 0})
+    parent.deposit("Queue", token)
+    seen = _watch(parent)
+    with parent:
         with pytest.raises(KeyboardInterrupt):
+            parent.drive_to_quiescence(inline_actions=True)
+        for net in (parent, subnet):
+            assert net._running_count == 0 and net._drive_limits == {}
+            assert net._pending_restore is None
+        assert parent.marking["Queue"] == (token,)
+        assert all(tokens == () for tokens in subnet.marking.values()), "the subnet is back at its checkpoint"
+        assert parent.marking["failed"] == () and seen == []
+        parent.drive_to_quiescence()
+    assert _payload_ids(parent.marking["Served"]) == [0]
+    assert action.threads[1] != threading.get_ident()
+
+
+def _raising_filter(token: Token) -> bool:
+    return token.payload["missing"]
+
+
+def _exit(_name, _error, _token) -> None:
+    raise SystemExit
+
+
+def test_a_callback_that_exits_before_an_inline_firing_runs_returns_its_tokens():
+    """`on_error` reports a broken filter on one transition while another has just been consumed
+    to fire. If the report raises past the flush, that firing never runs, so it is undone."""
+    rec = _Recorder()
+    net = PetriNet(places=[Place("broken_in"), Place("in"), Place("out")])
+    net.add_transition(
+        Transition("broken", [InputArc("broken_in", filter=_raising_filter)], [OutputArc("out")], _identity)
+    )
+    net.add_transition(Transition("t", [InputArc("in")], [OutputArc("out")], rec.route("t")))
+    net.deposit("broken_in", Token(payload={"i": 9}))
+    token = Token(payload={"i": 0})
+    net.deposit("in", token)
+    net.on_error = _exit
+    with net:
+        with pytest.raises(SystemExit):
             net.drive_to_quiescence(inline_actions=True)
         assert net._running_count == 0
-        assert [t.attempts for t in net.marking["in"]] == [1], "the token was rolled back for a retry"
+        assert net.marking["in"] == (token,) and net.marking["out"] == ()
+        assert rec.log == [], "the firing never ran"
+        net.on_error = None
+        net.drive_to_quiescence(inline_actions=True)
+    assert _payload_ids(net.marking["out"]) == [0]
+
+
+def test_an_inline_drive_on_a_closed_net_raises_like_step():
+    net = PetriNet(places=[Place("in"), Place("out")])
+    net.add_transition(Transition("t", [InputArc("in")], [OutputArc("out")], _identity))
+    token = Token(payload={"i": 0})
+    net.deposit("in", token)
+    with net:
+        pass
+    with pytest.raises(RuntimeError):
+        net.step()
+    with pytest.raises(RuntimeError, match="shut down"):
+        net.drive_to_quiescence(inline_actions=True)
+    assert net.marking["in"] == (token,) and net._running_count == 0
 
 
 def _hang(toks: list[Token]) -> list[Token]:
