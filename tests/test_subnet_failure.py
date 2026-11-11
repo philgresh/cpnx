@@ -1950,14 +1950,13 @@ def test_unbounded_deadline_serves_on_both_clocks(logical):
 
 
 def test_logical_drive_raises_when_a_subnet_will_not_settle_in_time():
-    """The subnet's drive gives up at once (no spins), so the firing fails with a brew still
-    running. The brew is held until after the assertion, so the parent's settle wait always
-    runs out first, however fast a spin is on this platform.
+    """The subnet's drive gives up at once, so the firing fails with a brew still running. The
+    brew is held until after the assertion, so the parent's settle wait must run out.
 
-    The parent's one spin budget also covers waiting for that firing to fail, which takes the
-    subnet's thread some GIL time. On a busy machine the parent can spin far faster than the
-    subnet's thread is scheduled, so the subnet must not spend spins of its own and the parent's
-    budget must be large: otherwise the parent gives up first, with a different error."""
+    The drive's one `max_spins` also caps its wait for that firing to fail, which needs the
+    subnet's thread to be scheduled; on a loaded machine that can take any number of spins. That
+    wait is left at its default cap, so only the settle wait under test is held to 1,000 spins
+    and nothing here depends on how long a spin takes."""
     release = threading.Event()
 
     def slow(tokens: list[Token]) -> list[Token]:
@@ -1983,10 +1982,12 @@ def test_logical_drive_raises_when_a_subnet_will_not_settle_in_time():
             )
         ],
     )
+    await_inflight = parent._await_inflight
+    parent._await_inflight = lambda **_capped: await_inflight()
     parent.deposit("Queue", Token(payload={"order": 1}))
     try:
         with pytest.raises(RuntimeError, match="still settling"):
-            parent.drive_to_quiescence(max_spins=1_000_000)
+            parent.drive_to_quiescence(max_spins=1_000)
     finally:
         release.set()
     _wait_until_settled(subnet)
