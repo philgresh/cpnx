@@ -260,10 +260,14 @@ class InputArc:
         place: Name of the source place.
         count: Number of tokens to consume. Ignored when `consume_all=True`. Defaults to 1.
                Two arcs on the same place take different tokens, so `[InputArc("p"),
-               InputArc("p")]` needs two tokens in `p`, as `InputArc("p", count=2)` does. A
-               `consume_all` arc that shares its place with another input arc is never enabled.
+               InputArc("p")]` needs two tokens in `p`, as `InputArc("p", count=2)` does.
         consume_all: Drain the entire place atomically. Defaults to `False`. **Overrides
-                     `key` and `filter`** — see the warning below.
+                     `key` and `filter`** — see the warning below. Beside another input arc
+                     on its place it takes every token that arc leaves, which may be none,
+                     whatever the arc order: `[InputArc("batch", filter=is_flush),
+                     InputArc("batch", consume_all=True)]` takes the marker and drains the
+                     rest. Two `consume_all` arcs on one place are never enabled, and adding
+                     such a transition warns.
         settle_secs: Wait for no new arrivals for this many seconds before
                      consuming. Defaults to `0.0` (no wait).
         key: Per-token sort key — a pure `Callable[[Token], object]` mapping one token to a
@@ -295,6 +299,13 @@ class InputArc:
                   `count == 1` and no `key`, `filter` or `consume_all` (`ValueError`
                   otherwise). A join key that raises or returns an unhashable value makes the
                   arc unsatisfiable. `None` (default) means the arc takes no part in a join.
+                  Arcs that read **one place** and are meant to join on the same key (a
+                  self-join) must share **one function object**: functions are told apart
+                  by identity, so two equal lambdas count as two different keys. The
+                  bindings are the same, but the place's index can no longer tell which
+                  keys hold a token per arc, and a backlog of one-token keys makes each
+                  probe linear in keys. Every extra distinct function on a place also
+                  doubles the work of checking that each arc can get its own token.
                   **Make it closed-world (certified), or it can be far slower than the guard
                   it replaces:** an *uncertified* join key is never indexed, so every
                   resolution reads each join place's whole available pool (no

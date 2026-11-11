@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Two `consume_all` input arcs on one place are never enabled, and adding such a transition
+  warns** ([#75](https://github.com/philgresh/cpnx/issues/75)). Each would drain what the
+  other leaves. A guard-free `FIRST` transition of that shape used to fire, the first arc
+  draining the place and the second taking nothing; with a guard or another policy it raised
+  `ValueError`. Keep one of the two arcs.
+
 - **A [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing now fails loudly, runs one
   at a time, and keeps its parent busy until a failed firing has settled**
   ([#38](https://github.com/philgresh/cpnx/issues/38)). These come with the subnet restore
@@ -207,10 +213,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A guard-free `FIRST` transition whose `filter` arc shares its place
   with another arc now searches instead of taking heads greedily, which could leave the
   filtered arc without the one token it accepts and report the transition dead.
-  A `consume_all` arc that shares its place with another input arc is never enabled, since
-  draining the place leaves nothing for the other arc. Before, `[q, q(consume_all)]` fired and
-  drained the place, the plain arc's token included, and `[q(consume_all), q]` raised
-  `ValueError`. The shared places are found once per
+  A `consume_all` arc that shares its place with another input arc takes every token that arc
+  leaves, which may be none, so "marker + drain" (`[batch(filter=is_flush),
+  batch(consume_all)]`) takes the marker and drains the rest. Before, that held only for a
+  guard-free `FIRST` transition with the `consume_all` arc last: the other arc order, a
+  guard, `RANDOM`, `PRIORITY` or a `join_key` arc raised `ValueError`. The shared places are found once per
   resolution: a guard-free two-arc probe costs 3.16 µs against 3.04 µs on `main`.
 - **`drive_to_quiescence` no longer stops before a later cooling token matures**
   ([#68](https://github.com/philgresh/cpnx/issues/68)). When a place already held two or more

@@ -570,7 +570,10 @@ single messages (Karras 2025, on fair join pattern matching).
 
 **Invariants** ([#75](https://github.com/philgresh/cpnx/issues/75),
 [#78](https://github.com/philgresh/cpnx/issues/78)):
-- No binding hands one token to two arcs (`_reuses_a_token`).
+- No binding hands one token to two arcs. Both searches build no such candidate: each arc on
+  a shared place chooses among the tokens the earlier arcs left (`_distinct_combos`,
+  `_key_combos`, and `_head_binding` on the head-only path). A `consume_all` arc there takes
+  what the other arcs leave (`_draining_the_rest`).
 - A join transition binds a key at a place iff the key passes Hall's condition there.
   With one `join_key` function this is "the key holds N tokens" (the join index depth); with
   several it is checked over sets of functions (`_has_distinct_tokens`, ADR 0011 §4a).

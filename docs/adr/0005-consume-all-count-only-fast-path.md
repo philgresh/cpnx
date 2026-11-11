@@ -64,6 +64,12 @@ by count alone, defer materialization to firing.
    `_is_head_only`),
 4. at least one input arc has `consume_all=True`.
 
+Arcs that share a place qualify too ([#75](https://github.com/philgresh/cpnx/issues/75)). Each
+takes the head of what the earlier ones left. A `consume_all` arc among them takes what the
+others leave: `_consume_binding` removes every other arc's tokens first and drains last, so
+the drained place is still not read until the transition fires. Two `consume_all` arcs on one
+place are never enabled, which is settled before this path.
+
 The first three are the correctness- and determinism-critical exclusions. A `guard` and a
 `binding_priority_key` are the only things that *read* an arc's tokens between resolution and
 firing; a head-only transition with neither inspects no token before it fires. Crucially it

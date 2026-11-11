@@ -10,12 +10,14 @@ search, and the `consume_all` count-only path.
 import itertools
 import random
 import time
+import warnings
 
 import pytest
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from cpnx import BindingPolicy, InputArc, OutputArc, PetriNet, Place, Token, Transition
+from cpnx.engine import _DRAIN
 from cpnx.places import _TokenStore
 
 WID = lambda t: t.payload["wid"]  # noqa: E731
@@ -220,28 +222,201 @@ def test_counts_add_up_across_arcs_on_one_place(guarded):
     assert len(net.marking["out"]) == 3
 
 
-@pytest.mark.parametrize("guarded", [False, True])
-@pytest.mark.parametrize("policy", [BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY])
-def test_a_consume_all_arc_beside_another_arc_on_its_place_is_never_enabled(guarded, policy):
-    # Guard-free FIRST takes the head-only path; a guard or another policy searches, where only
-    # the reuse check on the drain's place keeps the two arcs apart.
+_POLICIES = [BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY]
+
+
+def _is_flush(token: Token) -> bool:
+    return token.payload.get("flush", False)
+
+
+def _drain_net(inputs: list[InputArc], batch: int, policy, guarded: bool, *, flush: bool = True):
+    """A net whose `t` reads `batch` (a flush marker, then `batch` jobs) and records what it fired with."""
+    net = PetriNet(seed=0)
+    for name in ("batch", "a", "b"):
+        net.add_place(Place(name))
+    fired: list[list[object]] = []
+
+    def record(tokens: list[Token]) -> list[Token]:
+        fired.append([token.payload.get("n", "flush") for token in tokens])
+        return []
+
     guard = {"guard": lambda tokens: True} if guarded else {}
-    for inputs in (
-        [InputArc("jobs", consume_all=True), InputArc("jobs")],
-        [InputArc("jobs"), InputArc("jobs", consume_all=True)],
-    ):
-        net = _net_moving(inputs, n_tokens=3, binding_policy=policy, **guard)
-        net.transitions["t"].outputs[0].count = 1
-        t = net.transitions["t"]
-        assert net._resolve_binding(t, net.model_time) is None
-        assert not net._binding_exists(t, net.model_time)
-        net.drive_to_quiescence()
-        assert len(net.marking["jobs"]) == 3
+    net.add_transition(Transition(name="t", inputs=inputs, outputs=[], action=record, binding_policy=policy, **guard))
+    exhausted = _record_exhaustion(net)
+    if flush:
+        net.deposit("batch", Token(payload={"flush": True}))
+    for n in range(batch):
+        net.deposit("batch", Token(payload={"n": n}))
+    for name in ("a", "b"):
+        net.deposit(name, Token(payload={"wid": 1, "n": name}))
+    return net, fired, exhausted
+
+
+@pytest.mark.parametrize("guarded", [False, True])
+@pytest.mark.parametrize("policy", _POLICIES)
+@pytest.mark.parametrize("drain_first", [False, True])
+@pytest.mark.parametrize("batch", [0, 4])
+def test_a_consume_all_arc_takes_what_the_other_arcs_on_its_place_leave(guarded, policy, drain_first, batch):
+    # "Marker + drain": one arc takes the flush marker, the other drains the place. The drain's
+    # option is the whole pool, marker included, so it takes the rest instead, in either arc
+    # order and on every path. One firing empties the place, and no token is taken twice. With
+    # nothing but the marker the drain takes nothing: the place still holds its one token.
+    inputs = [InputArc("batch", filter=_is_flush), InputArc("batch", consume_all=True)]
+    if drain_first:
+        inputs.reverse()
+    net, fired, exhausted = _drain_net(inputs, batch, policy, guarded)
+    t = net.transitions["t"]
+    assert net._binding_exists(t, net.model_time)
+    net.drive_to_quiescence()
+    jobs = list(range(batch))
+    assert fired == [[*jobs, "flush"] if drain_first else ["flush", *jobs]]
+    assert len(net.marking["batch"]) == 0
+    assert exhausted == []
+
+
+@pytest.mark.parametrize("guarded", [False, True])
+@pytest.mark.parametrize("policy", _POLICIES)
+@pytest.mark.parametrize("drain_first", [False, True])
+def test_a_consume_all_arc_beside_a_plain_arc_takes_the_rest(guarded, policy, drain_first):
+    # No filter: the plain arc takes one token, the drain every other one. Under FIRST the
+    # plain arc takes the head; the other policies choose among the tokens.
+    inputs = [InputArc("batch"), InputArc("batch", consume_all=True)]
+    if drain_first:
+        inputs.reverse()
+    net, fired, exhausted = _drain_net(inputs, 4, policy, guarded, flush=False)
+    if policy is BindingPolicy.FIRST and not guarded:  # the count-only path: the place is not read to bind
+        assert net._resolve_binding(net.transitions["t"], net.model_time)[drain_first ^ 1][1] is _DRAIN
+    net.drive_to_quiescence()
+    assert len(fired) == 1
+    assert sorted(fired[0]) == [0, 1, 2, 3]
+    if policy is BindingPolicy.FIRST:
+        assert fired[0] == ([1, 2, 3, 0] if drain_first else [0, 1, 2, 3])
+    assert len(net.marking["batch"]) == 0
+    assert exhausted == []
+
+
+@pytest.mark.parametrize("guarded", [False, True])
+@pytest.mark.parametrize("policy", _POLICIES)
+@pytest.mark.parametrize("order", ["join first", "drain first", "drain between"])
+def test_a_consume_all_arc_in_a_join_takes_what_the_other_arcs_leave(guarded, policy, order):
+    # The same in a transition with join arcs, where the drain's place is checked through the
+    # join plan: the plain arc on `batch` and the drain never hold one token.
+    join = [InputArc("a", join_key=WID), InputArc("b", join_key=WID)]
+    plain, drain = InputArc("batch", filter=_is_flush), InputArc("batch", consume_all=True)
+    inputs = {
+        "join first": [*join, plain, drain],
+        "drain first": [drain, *join, plain],
+        "drain between": [join[0], drain, plain, join[1]],
+    }[order]
+    net, fired, exhausted = _drain_net(inputs, 3, policy, guarded)
+    t = net.transitions["t"]
+    assert net._binding_exists(t, net.model_time)
+    net.drive_to_quiescence()
+    assert len(fired) == 1
+    assert sorted(map(str, fired[0])) == ["0", "1", "2", "a", "b", "flush"]
+    assert len(net.marking["batch"]) == 0
+    assert exhausted == []
+
+
+@pytest.mark.parametrize("guarded", [False, True])
+@pytest.mark.parametrize("policy", _POLICIES)
+@pytest.mark.parametrize("joined", [False, True])
+def test_two_consume_all_arcs_on_one_place_warn_and_never_enable(guarded, policy, joined):
+    # Each would drain what the other leaves. The shape is reported when the transition is
+    # added, and it is settled before any search: the plain arc's 31 choices, all of them
+    # useless, would otherwise run a limit of 5 out on every probe.
+    inputs = [InputArc("batch"), InputArc("batch", consume_all=True), InputArc("batch", consume_all=True)]
+    if joined:
+        inputs += [InputArc("a", join_key=WID), InputArc("b", join_key=WID)]
+    with pytest.warns(UserWarning, match="two consume_all input arcs on one place"):
+        net, fired, exhausted = _drain_net(inputs, 30, policy, guarded)
+    net.binding_search_limit = 5
+    t = net.transitions["t"]
+    assert not net._binding_exists(t, net.model_time)
+    assert net._resolve_binding(t, net.model_time) is None
+    net.drive_to_quiescence()
+    assert fired == []
+    assert len(net.marking["batch"]) == 31
+    assert exhausted == []
+
+
+@pytest.mark.parametrize("drain_first", [False, True])
+def test_a_drain_on_a_shared_place_takes_the_rest_on_the_head_only_path(drain_first):
+    # A `binding_priority_key` keeps a guard-free FIRST transition off the count-only path, so
+    # `_head_binding` resolves it: the plain arc takes the head and the drain the rest.
+    inputs = [InputArc("batch"), InputArc("batch", consume_all=True)]
+    if drain_first:
+        inputs.reverse()
+    net = PetriNet(seed=0)
+    net.add_place(Place("batch"))
+    net.add_transition(
+        Transition(name="t", inputs=inputs, outputs=[], action=lambda t: [], binding_priority_key=lambda t: 0)
+    )
+    for n in range(4):
+        net.deposit("batch", Token(payload={"n": n}))
+    binding = net._resolve_binding(net.transitions["t"], net.model_time)
+    taken = [[token.payload["n"] for token in tokens] for _, tokens in binding]
+    assert taken == ([[1, 2, 3], [0]] if drain_first else [[0], [1, 2, 3]])
+    net.drive_to_quiescence()
+    assert len(net.marking["batch"]) == 0
+
+
+def test_draining_a_full_place_lets_the_transition_feeding_it_fire_again():
+    # `q` holds one token at most, so `fill` waits while it is full. `flush` drains it at
+    # firing time; that must flag `q` as changed, or `fill` is never looked at again.
+    net = PetriNet(seed=0)
+    net.add_place(Place("src"))
+    net.add_place(Place("q", bound=1))
+    net.add_place(Place("go"))
+    net.add_transition(Transition(name="fill", inputs=[InputArc("src")], outputs=[OutputArc("q")], action=_passthrough))
+    net.add_transition(
+        Transition(
+            name="flush", inputs=[InputArc("q", consume_all=True), InputArc("go")], outputs=[], action=lambda t: []
+        )
+    )
+    for n in range(2):
+        net.deposit("src", Token(payload={"n": n}))
+    net.drive_to_quiescence()
+    assert (len(net.marking["src"]), len(net.marking["q"])) == (1, 1)
+    net.deposit("go", Token(payload={}))
+    net.drive_to_quiescence()
+    assert (len(net.marking["src"]), len(net.marking["q"])) == (0, 1)
+
+
+@pytest.mark.parametrize("drain_first", [False, True])
+def test_a_failed_action_returns_every_token_of_a_drained_shared_place(drain_first):
+    # The drain is read only when the transition fires, after the plain arc's token is taken.
+    # Both arcs' tokens must be on record, so a failing action puts all of them back.
+    def fail(tokens: list[Token]) -> list[Token]:
+        raise RuntimeError("no")
+
+    inputs = [InputArc("batch"), InputArc("batch", consume_all=True)]
+    if drain_first:
+        inputs.reverse()
+    net = PetriNet(seed=0)
+    net.add_place(Place("batch"))
+    net.add_transition(Transition(name="t", inputs=inputs, outputs=[], action=fail))
+    for n in range(4):
+        net.deposit("batch", Token(payload={"n": n}))
+    assert net.step() is True
+    deadline = time.monotonic() + 5.0
+    while len(net.marking["batch"]) < 4 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert sorted(token.payload["n"] for token in net.marking["batch"]) == [0, 1, 2, 3]
+
+
+def test_draining_the_rest_gives_one_drain_the_leftovers_and_refuses_two():
+    from cpnx.engine import _draining_the_rest
+
+    x, y, z = pool = [Token(payload={"n": n}) for n in range(3)]
+    plain, drain = InputArc("p"), InputArc("p", consume_all=True)
+    assert _draining_the_rest([(drain, pool), (plain, [y])], frozenset({"p"})) == [(drain, [x, z]), (plain, [y])]
+    assert _draining_the_rest([(plain, [y]), (drain, pool), (drain, pool)], frozenset({"p"})) is None
 
 
 def test_the_consume_all_fast_path_keeps_shared_arcs_apart():
-    # A drain on another place sends the transition down the count-only path, which resolves
-    # each arc on its own; the two `jobs` arcs must still take different tokens.
+    # A drain on a place of its own keeps the transition on the count-only path, which never
+    # reads the drained place on a probe; the two `jobs` arcs must still take different tokens.
     net = PetriNet(seed=0)
     for name in ("jobs", "other", "out"):
         net.add_place(Place(name))
@@ -256,7 +431,9 @@ def test_the_consume_all_fast_path_keeps_shared_arcs_apart():
     net.deposit("jobs", Token(payload={"n": 0}))
     net.deposit("jobs", Token(payload={"n": 1}))
     net.deposit("other", Token(payload={"n": 2}))
-    _assert_distinct(net)
+    binding = net._resolve_binding(net.transitions["t"], net.model_time)
+    assert [[token.payload["n"] for token in tokens] for _, tokens in binding[:2]] == [[0], [1]]
+    assert binding[2][1] is _DRAIN  # still the count-only path: `other` is not read until it fires
     net.drive_to_quiescence()
     assert len(net.marking["jobs"]) == 0
     assert len(net.marking["out"]) == 2
@@ -773,6 +950,29 @@ def test_a_timed_self_join_waits_for_its_second_token(guarded):
     assert [token.payload["wid"] for token in net.marking["jobs"]] == [8]
 
 
+@pytest.mark.parametrize("guarded", [False, True])
+@pytest.mark.parametrize("policy", _POLICIES)
+def test_two_plain_arcs_on_one_place_wait_for_a_cooling_second_token(guarded, policy):
+    # One ready and one cooling token do not enable `[p, p]`: only ready tokens are consumed,
+    # on the head-only path (guard-free FIRST) and in the search alike. Ignoring timing it is
+    # enabled, and the drive advances to the cooling token's time and fires then.
+    guard = {"guard": lambda tokens: True} if guarded else {}
+    net = _net_moving([InputArc("jobs"), InputArc("jobs")], n_tokens=0, binding_policy=policy, **guard)
+    net.advance_time(1.0)
+    ready_at = net.model_time + 5.0
+    net.deposit("jobs", Token(payload={"n": 0}))
+    net.deposit("jobs", Token(payload={"n": 1}, available_at=ready_at))
+    t = net.transitions["t"]
+    assert not net._binding_exists(t, net.model_time)
+    assert net._resolve_binding(t, net.model_time) is None
+    assert net._binding_exists(t, net.model_time, ignore_timing=True)
+    assert net.step() is False
+    net.drive_to_quiescence()
+    assert net.model_time == ready_at
+    assert sorted(token.payload["n"] for token in net.marking["out"]) == [0, 1]
+    assert len(net.marking["jobs"]) == 0
+
+
 def test_a_timed_self_join_binds_on_its_first_two_ready_tokens_while_a_third_cools():
     # The key's head is its first `depth` tokens, not all of them: a cooling third token must
     # not hide the pair that is ready now from the match's one-key probe.
@@ -898,6 +1098,22 @@ def test_hall_pair_check_fails_a_group_whose_length_outruns_its_tokens():
     assert _pair_has_distinct_tokens(1, [(0, token)], 1, [(1, Token(payload={}))])
 
 
+def test_a_join_group_that_empties_mid_walk_is_a_dead_end_not_an_error():
+    # `[p, p(filter), a:k, b:k]`: the first arc takes the token the filter needs, a dead end,
+    # padded with each later arc's first position. A group emptied by a change to its place
+    # outside the engine has no first position; the walk must still report the dead end.
+    from cpnx.engine import _DeadPrefix, _join_plan, _key_combos, _Ordered, _shared_places
+
+    x, y = Token(payload={"n": 0}), Token(payload={"n": 1})
+    inputs = [InputArc("p"), InputArc("p", filter=_is_zero), InputArc("a", join_key=WID), InputArc("b", join_key=WID)]
+    transition = Transition(name="t", inputs=inputs, outputs=[], action=_passthrough)
+    plan = _join_plan(transition, _shared_places(transition), [_Ordered([], 1), _Ordered([], 1), None, None])
+    lists = [_Ordered([x, y], 1), _Ordered([x], 1), [], [(0, Token(payload={"wid": 1}))]]
+    walked = list(_key_combos(lists, plan.levels, 5))
+    assert type(walked[0]) is _DeadPrefix  # x for the first arc leaves the filtered arc nothing
+    assert [type(item) for item in walked] == [_DeadPrefix]  # y then x reaches the emptied group: no candidate
+
+
 @pytest.mark.parametrize("guarded", [False, True])
 @pytest.mark.parametrize("policy", [BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY])
 @pytest.mark.parametrize("in_c", [1, 2, 3])
@@ -934,7 +1150,7 @@ def test_two_plain_arcs_on_one_place_of_a_join_take_their_own_tokens(guarded, po
 
 
 @pytest.mark.parametrize(
-    ("arcs", "kinds", "shortcut", "reusable", "split"),
+    ("arcs", "kinds", "shortcut", "drained", "split"),
     [
         (["a:k", "b:k", "c", "c"], ["free", "free", "plain", "plain"], True, set(), 2),
         (["c", "a:k", "b:k", "c"], ["plain", "free", "free", "plain"], True, set(), 4),
@@ -952,7 +1168,7 @@ def test_two_plain_arcs_on_one_place_of_a_join_take_their_own_tokens(guarded, po
         (["a:k", "b:k"], ["free", "free"], True, set(), 2),
     ],
 )
-def test_join_plan_levels_shortcut_and_reusable_places(arcs, kinds, shortcut, reusable, split):
+def test_join_plan_levels_shortcut_and_reusable_places(arcs, kinds, shortcut, drained, split):
     # Join arcs on a shared place and plain arcs there are enumerated without reusing a token;
     # only a consume_all arc keeps the whole pool, so its place is checked for reuse. The probe
     # shortcut needs no plain arc on a shared place to read a join place, and none ahead of a
@@ -984,7 +1200,7 @@ def test_join_plan_levels_shortcut_and_reusable_places(arcs, kinds, shortcut, re
     plan = _join_plan(transition, shared, options)
     assert [level.kind for level in plan.levels] == kinds
     assert plan.shortcut is shortcut
-    assert plan.reusable == reusable
+    assert plan.drained == drained
     assert plan.split == (split if plan.distinct else len(arcs))
 
 
@@ -1001,8 +1217,17 @@ _KINDS = {
     "pair": {"count": 2},
     "join_f": {"join_key": _JF},
     "join_g": {"join_key": _JG},
+    "all": {"consume_all": True},
 }
 _JOIN_FN = {"join_f": _JF, "join_g": _JG}
+_SIZED_KINDS = sorted(kind for kind in _KINDS if kind != "all")  # each takes a fixed number of tokens
+
+
+def _moved_by(arcs: list[tuple[str, str]], marking: dict[str, list[Token]]) -> int:
+    """How many tokens a firing of `arcs` removes: a drained place empties, the others lose their demand."""
+    drained = {place for place, kind in arcs if kind == "all"}
+    fixed = sum(2 if kind == "pair" else 1 for place, kind in arcs if place not in drained)
+    return fixed + sum(len(marking[place]) for place in drained)
 
 
 def _arc_accepts(kind: str, token: Token) -> bool:
@@ -1010,12 +1235,27 @@ def _arc_accepts(kind: str, token: Token) -> bool:
 
 
 def _distinct_binding_exists(arcs: list[tuple[str, str]], marking: dict[str, list[Token]], guard) -> bool:
-    """Brute force: tokens per arc, none taken twice from one place, filters and the join key agreeing."""
+    """Brute force: tokens per arc, none taken twice from one place, filters and the join key agreeing.
 
-    def go(i: int, used: frozenset[tuple[str, int]], join_value: object, chosen: list[Token]) -> bool:
+    A draining arc needs a token in its place, takes what the other arcs leave there, and
+    cannot share its place with another draining arc.
+    """
+    drains = [place for place, kind in arcs if kind == "all"]
+    if len(set(drains)) < len(drains) or any(not marking[place] for place in drains):
+        return False
+
+    def flat(chosen: list, used: frozenset[tuple[str, int]]) -> list[Token]:
+        tokens: list[Token] = []
+        for (place, _), group in zip(arcs, chosen, strict=True):
+            tokens += [t for t in marking[place] if (place, id(t)) not in used] if group is None else group
+        return tokens
+
+    def go(i: int, used: frozenset[tuple[str, int]], join_value: object, chosen: list) -> bool:
         if i == len(arcs):
-            return guard(chosen)
+            return guard(flat(chosen, used))
         place, kind = arcs[i]
+        if kind == "all":
+            return go(i + 1, used, join_value, [*chosen, None])
         free = [t for t in marking[place] if (place, id(t)) not in used and _arc_accepts(kind, t)]
         for group in itertools.combinations(free, 2 if kind == "pair" else 1):
             value = join_value
@@ -1023,7 +1263,7 @@ def _distinct_binding_exists(arcs: list[tuple[str, str]], marking: dict[str, lis
                 value = _JOIN_FN[kind](group[0])
                 if join_value is not _UNSET and value != join_value:
                     continue
-            if go(i + 1, used | {(place, id(t)) for t in group}, value, chosen + list(group)):
+            if go(i + 1, used | {(place, id(t)) for t in group}, value, [*chosen, list(group)]):
                 return True
         return False
 
@@ -1039,7 +1279,11 @@ def _assert_valid_binding(binding, arcs, marking, guard) -> None:
     flat = []
     for (arc, tokens), (place, kind) in zip(binding, arcs, strict=True):
         assert arc.place == place
-        assert len(tokens) == (2 if kind == "pair" else 1)
+        if tokens is _DRAIN:  # the count-only path: what the others leave, read when it fires
+            others = {id(t) for a, ts in binding if a.place == place and ts is not _DRAIN for t in ts}
+            tokens = [t for t in marking[place] if id(t) not in others]
+        if kind != "all":
+            assert len(tokens) == (2 if kind == "pair" else 1)
         for token in tokens:
             assert any(token is t for t in marking[place])
             assert _arc_accepts(kind, token)
@@ -1049,6 +1293,8 @@ def _assert_valid_binding(binding, arcs, marking, guard) -> None:
             join_values.add(_JOIN_FN[kind](tokens[0]))
         flat.extend(tokens)
     assert len(join_values) <= 1
+    for place in {place for place, kind in arcs if kind == "all"}:  # a drained place is emptied
+        assert sum(1 for taken_place, _ in taken if taken_place == place) == len(marking[place])
     assert guard(flat)
 
 
@@ -1080,7 +1326,7 @@ _token_payloads = st.fixed_dictionaries({"n": st.integers(0, 3), "f": st.integer
     small_limit=st.integers(1, 4),
 )
 def test_every_arc_shape_binds_exactly_when_distinct_tokens_exist(arcs, payloads, guarded, policy, small_limit):
-    # Plain, filtered, keyed, count=2 and join arcs (two join_key functions) over two places,
+    # Plain, filtered, keyed, count=2, draining and join arcs (two join_key functions) over two places,
     # with a guard or not, under every policy. With a limit too large to run out, the engine
     # binds exactly when brute force finds distinct tokens, its binding is valid, and firing
     # it moves those tokens. With a small limit, a miss must be signalled as exhaustion.
@@ -1090,16 +1336,17 @@ def test_every_arc_shape_binds_exactly_when_distinct_tokens_exist(arcs, payloads
         net = PetriNet(seed=0)
         for name in ("p", "q", "out"):
             net.add_place(Place(name))
-        net.add_transition(
-            Transition(
-                name="t",
-                inputs=[InputArc(place, **_KINDS[kind]) for place, kind in arcs],
-                outputs=[OutputArc("out", count=sum(2 if kind == "pair" else 1 for _, kind in arcs))],
-                action=_passthrough,
-                binding_policy=policy,
-                **({"guard": guard} if guarded else {}),
-            )
+        transition = Transition(
+            name="t",
+            inputs=[InputArc(place, **_KINDS[kind]) for place, kind in arcs],
+            outputs=[],
+            action=lambda tokens: [],
+            binding_policy=policy,
+            **({"guard": guard} if guarded else {}),
         )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # two draining arcs on one place warn; here they are a case
+            net.add_transition(transition)
         net.binding_search_limit = limit
         exhausted: list[str] = []
         signal = net._signal_search_exhausted
@@ -1122,7 +1369,7 @@ def test_every_arc_shape_binds_exactly_when_distinct_tokens_exist(arcs, payloads
         before = {place: len(net.marking[place]) for place in ("p", "q")}
         net.step()
         moved = sum(before.values()) - len(net.marking["p"]) - len(net.marking["q"])
-        assert moved == sum(2 if kind == "pair" else 1 for _, kind in arcs)
+        assert moved == _moved_by(arcs, marking)
 
     net, marking, exhausted = build(small_limit)
     t = net.transitions["t"]
@@ -1405,7 +1652,7 @@ def test_dead_ends_count_toward_the_search_limit(limit, c_first, then_d):
 
 @settings(max_examples=300, deadline=None)
 @given(
-    arcs=st.lists(st.tuples(st.sampled_from(["p", "q"]), st.sampled_from(sorted(_KINDS))), min_size=2, max_size=4),
+    arcs=st.lists(st.tuples(st.sampled_from(["p", "q"]), st.sampled_from(_SIZED_KINDS)), min_size=2, max_size=4),
     payloads=st.fixed_dictionaries(
         {"p": st.lists(_token_payloads, max_size=4), "q": st.lists(_token_payloads, max_size=4)}
     ),
@@ -1658,7 +1905,9 @@ def test_the_guard_free_probe_agrees_with_firing_past_the_search_limit(arcs, key
     for name in ("a", "b", "c"):
         net.add_place(Place(name))
     inputs = [InputArc(place, **_PROBE_ARCS[kind]) for place, kind in arcs]
-    net.add_transition(Transition(name="t", inputs=inputs, outputs=[], action=_passthrough))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # two draining arcs on one place warn; here they are a case
+        net.add_transition(Transition(name="t", inputs=inputs, outputs=[], action=_passthrough))
     net.binding_search_limit = limit
     for wid in range(keys):
         net.deposit("a", Token(payload={"wid": wid, "alt": wid // 2, "n": wid}))

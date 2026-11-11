@@ -11,6 +11,7 @@ import random
 import sys
 import threading
 import time
+import warnings
 import weakref
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -229,7 +230,7 @@ class _JoinMatch:
         return serving
 
     def keys_at(self, t_limit: float, limit: int | None = None, *, start: int = 0) -> list[object]:
-        """The keys every place has a token of available at `t_limit`, from the `start`-th up to the `limit`-th."""
+        """The keys every place holds its depth of tokens of at `t_limit`, from the `start`-th up to the `limit`-th."""
         # Every uid is a finite int, so `(t_limit, inf)` sorts after every entry at `t_limit`.
         end = bisect.bisect_right(self._order, (t_limit, math.inf))
         if limit is not None:
@@ -471,7 +472,7 @@ def _has_distinct_tokens(groups: "list[tuple[int, Iterable[tuple[object, Token]]
     set, which `_pair_has_distinct_tokens` checks: the one implementation of that check.
     Each is settled by group sizes when it can: a set passes when one of its groups alone holds
     enough tokens, and fails when all of them together hold too few. Only otherwise are tokens
-    read, at most `need` per group, and told apart by identity as `_reuses_a_token` does.
+    read, at most `need` per group, and told apart by identity.
     """
     if len(groups) == 2:
         (arcs_a, group_a), (arcs_b, group_b) = groups
@@ -589,8 +590,8 @@ def _untaken_options(
 ) -> Iterator[list[Token]]:
     """The first `cap` `count`-sized groups of the tokens of `ordered` that `taken` does not hold.
 
-    `taken` holds `(place, id(token))` pairs, as `_reuses_a_token` and `_head_binding` key
-    them, so a `Token` instance deposited in two places is told apart in each.
+    `taken` holds `(place, id(token))` pairs, as `_head_binding` keys them, so a `Token`
+    instance deposited in two places is told apart in each.
 
     Groups come in `_arc_options`' order. The `cap`-th group of a `count`-sized combination
     reaches index `cap + count - 2`, so `depth` (`binding_search_limit + count`) tokens hold
@@ -670,17 +671,60 @@ def _plain_read_depth(arc: InputArc, limit: int, demand: dict[str, int]) -> int:
     return limit + demand[arc.place]
 
 
-def _reuses_a_token(binding: _Binding, shared: frozenset[str]) -> bool:
-    """Whether `binding` hands one token of a `shared` place to more than one arc."""
-    taken: set[tuple[str, int]] = set()
+def _draining_the_rest(binding: _Binding, drained: frozenset[str]) -> "_Binding | None":
+    """`binding` with each `consume_all` arc on a `drained` place taking what the other arcs there leave.
+
+    A `consume_all` arc's option is its place's whole available pool, which overlaps whatever
+    another arc on the place takes. So it takes the rest, which may be nothing: no token is
+    bound twice (issue #75), and firing consumes exactly the pool, as a drain should. `None`
+    when two `consume_all` arcs read one place, since both cannot take the rest.
+
+    `drained` holds the shared places a `consume_all` arc reads.
+    """
+    taken: dict[str, set[int]] = {}
+    drains: set[str] = set()
     for arc, tokens in binding:
-        if arc.place not in shared:
+        place = arc.place
+        if place not in drained:
             continue
-        for token in tokens:
-            entry = (arc.place, id(token))
-            if entry in taken:
+        if not arc.consume_all:
+            taken.setdefault(place, set()).update(map(id, cast("list[Token]", tokens)))
+        elif place in drains:
+            return None
+        else:
+            drains.add(place)
+    return [
+        (arc, [token for token in cast("list[Token]", tokens) if id(token) not in taken[arc.place]])
+        if arc.consume_all and arc.place in taken
+        else (arc, tokens)
+        for arc, tokens in binding
+    ]
+
+
+def _drained_places(transition: Transition, shared: frozenset[str]) -> frozenset[str]:
+    """The `shared` places of `transition` that a `consume_all` arc reads."""
+    return frozenset(arc.place for arc in transition.inputs if arc.consume_all and arc.place in shared)
+
+
+def _warn_if_drained_twice(transition: Transition) -> None:
+    """Warn that `transition` can never fire if two of its `consume_all` arcs read one place."""
+    if _drains_a_place_twice(transition, _shared_places(transition)):
+        warnings.warn(
+            f"Transition {transition.name!r} has two consume_all input arcs on one place. Each would "
+            "drain what the other leaves, so the transition is never enabled. Keep one of them.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
+def _drains_a_place_twice(transition: Transition, shared: frozenset[str]) -> bool:
+    """Whether two `consume_all` arcs of `transition` read one place: it can then never fire."""
+    seen: set[str] = set()
+    for arc in transition.inputs:
+        if arc.consume_all and arc.place in shared:
+            if arc.place in seen:
                 return True
-            taken.add(entry)
+            seen.add(arc.place)
     return False
 
 
@@ -702,7 +746,7 @@ class _JoinLevel:
     """How `_key_combos` chooses one input arc's option for each key.
 
     - `_FREE`: the arc's list as it stands. An arc alone on its place, or a `consume_all` arc,
-      whose single option is the whole pool and which `_satisfying` checks for reuse instead.
+      whose single option is the whole pool: `_satisfying` cuts it to what the other arcs leave.
     - `_JOIN`: a `join_key` arc on a shared place: its key's group less the tokens earlier arcs
       took there. `rest` lists, for a place read with several `join_key` functions, the later
       join arcs on it as `(arcs, level)` per function, for the residual Hall check that keeps
@@ -723,10 +767,10 @@ class _JoinPlan:
     """How `_join_candidates` enumerates a transition's candidates, built once per probe or firing.
 
     `distinct` is whether any level is constrained, so each key's candidates come from
-    `_key_combos` rather than a plain product. `reusable` holds the places where a candidate
-    can still hand one token to two arcs (a `consume_all` arc beside another), which
-    `_satisfying` checks. `shortcut` is whether the guard-free existence probe may look at one
-    key, or stop at the first that binds, and still agree with firing (see `_join_plan`).
+    `_key_combos` rather than a plain product. `drained` holds the shared places a
+    `consume_all` arc reads, where `_satisfying` gives that arc what the other arcs leave.
+    `shortcut` is whether the guard-free existence probe may look at one key, or stop at the
+    first that binds, and still agree with firing (see `_join_plan`).
     `pair` marks the usual self-join, exactly two join arcs on one place, which
     `_pair_key_combos` enumerates directly. Levels from `split` on read no place the earlier
     levels read and no join place, so their options are the same for every key: their walk is
@@ -736,7 +780,7 @@ class _JoinPlan:
     levels: tuple[_JoinLevel, ...]
     distinct: bool
     shortcut: bool
-    reusable: frozenset[str]
+    drained: frozenset[str]
     pair: bool = False
     split: int = 0
 
@@ -763,13 +807,13 @@ def _join_plan(transition: Transition, shared: frozenset[str], options: list) ->
     joined = [option is None for option in options]
     levels = tuple(_join_level(inputs, joined, options, i, shared) for i in range(len(inputs)))
     kinds = [level.kind for level in levels]
-    reusable = frozenset(
+    drained = frozenset(
         level.place for level, join in zip(levels, joined, strict=True) if level.kind == _FREE and not join
     ).intersection(shared)
     distinct = kinds.count(_FREE) < len(kinds)
     split = _key_free_split(levels, joined) if distinct else len(levels)
     pair = kinds == [_JOIN, _JOIN]
-    return _JoinPlan(levels, distinct, _join_shortcut(inputs, joined, shared), reusable, pair, split)
+    return _JoinPlan(levels, distinct, _join_shortcut(inputs, joined, shared), drained, pair, split)
 
 
 def _free_join_plan(inputs: list[InputArc]) -> _JoinPlan:
@@ -1001,6 +1045,9 @@ def _key_combos(lists: list, levels: tuple[_JoinLevel, ...], cap: int) -> Iterat
     so join arcs alone on a place never dead-end. The same check prunes an arc without a
     `join_key` that join arcs follow on its place (`_plain_level_options`).
 
+    `PetriNet._distinct_combos` is the same walk for a transition without `join_key` arcs, and
+    lists how the two differ: a change to the distinct-token rule in one must be made in the other.
+
     `taken` holds the tokens the chosen items take on shared places, and is restored as the
     walk backs up, so a level's options are only ever advanced while it holds exactly the
     earlier levels' tokens, which their lazy filters read. Trailing `_FREE` levels take nothing
@@ -1192,7 +1239,8 @@ def _dead_prefix(chosen: list, lists: list, levels: tuple[_JoinLevel, ...]) -> _
         if levels[j].kind == _PLAIN:
             items.append((tuple(range(levels[j].count)), None))
         else:
-            items.append((next(iter(lists[j]))[0], None))
+            first = next(iter(lists[j]), None)  # a group can empty under a change outside the engine
+            items.append((first[0] if first is not None else 0, None))
     return _DeadPrefix(items)
 
 
@@ -1712,7 +1760,7 @@ class PetriNet:
         #: Lets `_ensure_key_index` skip re-registering on the hot path, while still
         #: rebuilding when an arc's ``key`` is reassigned after construction.
         self._key_index_arcs: dict[int, Callable[[Token], object]] = {}
-        #: Transition name -> ``{input position: (arc, place, join_key, index_id)}`` for each
+        #: Transition name -> ``{input position: (arc, place, join_key, index_id, depth)}`` for each
         #: place join index registered for one of its arcs (see `_ensure_join_index`). Each
         #: (transition, input position) gets its own index id, so an `InputArc` object shared by
         #: two transitions is read through two indexes, each with one reader (ADR 0011 §2).
@@ -2055,6 +2103,7 @@ class PetriNet:
             TypeError: If one of the transition's arcs targets another transition's name
                 instead of a place.
         """
+        _warn_if_drained_twice(transition)
         with self._lock:
             self._validate_new_transition(transition)
             if isinstance(transition, SubstitutionTransition):
@@ -2452,16 +2501,15 @@ class PetriNet:
         """
         consumed_tokens: list[Token] = []
         token_sources: list[tuple[str, Token]] = []
+        deferred: list[int] = []
         try:
-            for arc, tokens in binding:
-                place = self.places[arc.place]
+            for i, (arc, tokens) in enumerate(binding):
                 if isinstance(tokens, _DrainAll):
-                    # Lazily-resolved `consume_all` arc: materialize and remove the whole
-                    # available pool now, under the same lock that selected the binding, so it
-                    # is consistent with the `can_retrieve` check that enabled it.
-                    got = place.retrieve_all(model_time=m_time)
-                else:
-                    got = place.retrieve_specific(tokens, model_time=m_time)
+                    # Lazily-resolved `consume_all` arc: its place is drained after every other
+                    # arc has taken its tokens, so on a place it shares it takes what they leave.
+                    deferred.append(i)
+                    continue
+                got = self.places[arc.place].retrieve_specific(tokens, model_time=m_time)
                 if got:
                     # Removing tokens can release output back-pressure on this place, so flag
                     # it dirty for the output-side dependents too (see `_output_routing`).
@@ -2469,6 +2517,8 @@ class PetriNet:
                 consumed_tokens.extend(got)
                 for t in got:
                     token_sources.append((arc.place, t))
+            if deferred:
+                consumed_tokens = self._drain_deferred(binding, deferred, m_time, token_sources)
         except Exception:
             # A token vanished mid-loop — return already-consumed tokens to their
             # source places so they are not silently lost.
@@ -2476,6 +2526,29 @@ class PetriNet:
                 self._deposit_under_lock(src_name, t)
             raise
         return consumed_tokens, token_sources
+
+    def _drain_deferred(
+        self, binding: _Binding, deferred: list[int], m_time: float | None, token_sources: list[tuple[str, Token]]
+    ) -> list[Token]:
+        """Drain the `_DRAIN` arcs of `binding` (at positions `deferred`) and return every consumed token in arc order.
+
+        Each drained pool is materialized and removed now, under the same lock that selected
+        the binding, so it is consistent with the `can_retrieve` check that enabled it. The
+        other arcs' tokens are already in `token_sources`, in arc order; the drained ones are
+        added to it for rollback.
+        """
+        drained: dict[int, list[Token]] = {}
+        for i in deferred:
+            arc = binding[i][0]
+            got = self.places[arc.place].retrieve_all(model_time=m_time)
+            if got:
+                self._mark_dirty(arc.place)
+            drained[i] = got
+            token_sources.extend((arc.place, t) for t in got)
+        consumed: list[Token] = []
+        for i, (_, tokens) in enumerate(binding):
+            consumed.extend(drained[i] if i in drained else cast("list[Token]", tokens))
+        return consumed
 
     def step(self) -> bool:
         """Fire one enabled transition and return immediately, without waiting for it to finish.
@@ -3375,12 +3448,37 @@ class PetriNet:
             return _NO_FAST_PATH
 
         binding: _Binding = []
+        demand = _place_demand(transition) if shared else {}
+        taken: set[tuple[str, int]] = set()
         for arc in transition.inputs:
-            resolved = self._count_only_arc_binding(arc, transition.name, m_time, ignore_timing)
+            if arc.place in shared and not arc.consume_all:
+                resolved = self._count_only_shared_arc(arc, transition.name, m_time, ignore_timing, demand, taken)
+            else:
+                resolved = self._count_only_arc_binding(arc, transition.name, m_time, ignore_timing)
             if resolved is None:
                 return None
             binding.append(resolved)
         return binding
+
+    def _count_only_shared_arc(
+        self,
+        arc: InputArc,
+        transition_name: str,
+        m_time: float | None,
+        ignore_timing: bool,
+        demand: dict[str, int],
+        taken: set[tuple[str, int]],
+    ) -> "tuple[InputArc, list[Token]] | None":
+        """`_count_only_arc_binding` for an arc, not `consume_all`, whose place another arc reads.
+
+        It takes its head from the tokens the earlier arcs left, as in `_head_binding`, reading
+        as many tokens as all the arcs take from the place.
+        """
+        available = self._arc_available(arc, self.places.get(arc.place), m_time, ignore_timing, demand[arc.place])
+        if available is None:
+            return None
+        tokens = self._resolve_untaken(arc, available, taken, transition_name)
+        return None if tokens is None else (arc, tokens)
 
     def _qualifies_for_count_only(self, transition: Transition, shared: frozenset[str]) -> bool:
         """Whether `transition` may take the count-only `consume_all` fast path.
@@ -3391,13 +3489,13 @@ class PetriNet:
         whose ordinary resolution is unbounded. See `_try_count_only_binding` for why this
         exact set keeps the deferral behaviour- and RNG-identical.
 
-        Also excludes a transition with two arcs on one place (`shared`, its
-        `_shared_places`): this path resolves each arc on its own, so it would hand them the
-        same head tokens. `_head_binding` keeps them apart.
+        Arcs sharing a place qualify too (`shared` is the transition's `_shared_places`): each
+        takes the head of what the earlier ones left, and a `consume_all` arc among them drains
+        what they leave, since `_consume_binding` drains after every other arc has taken its
+        tokens.
         """
         return (
-            not shared
-            and transition.guard is None
+            transition.guard is None
             and transition.binding_priority_key is None
             and any(arc.consume_all for arc in transition.inputs)
             and self._is_head_only(transition, self._effective_policy(transition), shared)
@@ -3466,6 +3564,8 @@ class PetriNet:
         if self._join_registrations:
             self._release_stale_join_indexes(transition)
         shared = _shared_places(transition)
+        if shared and _drains_a_place_twice(transition, shared):
+            return None
         fast = self._try_count_only_binding(transition, m_time, ignore_timing, shared)
         if fast is not _NO_FAST_PATH:
             return cast("_Binding | None", fast)
@@ -3474,8 +3574,8 @@ class PetriNet:
             joined = self._join_candidates(transition, m_time, ignore_timing, shared=shared)
             if joined is None:
                 return None
-            candidates, reusable = joined
-            return self._pick_binding(transition, self._satisfying(transition, candidates, reusable=reusable), policy)
+            candidates, drained = joined
+            return self._pick_binding(transition, self._satisfying(transition, candidates, drained=drained), policy)
         head_only, lazy = self._search_mode(transition, policy, probe=False, shared=shared)
         pools = self._gather_arc_pools(transition, m_time, ignore_timing, head_only=head_only, lazy=lazy, shared=shared)
         if pools is None:
@@ -3496,6 +3596,8 @@ class PetriNet:
         if self._join_registrations:
             self._release_stale_join_indexes(transition)
         shared = _shared_places(transition)
+        if shared and _drains_a_place_twice(transition, shared):
+            return False
         fast = self._try_count_only_binding(transition, m_time, ignore_timing, shared)
         if fast is not _NO_FAST_PATH:
             return fast is not None
@@ -3503,8 +3605,8 @@ class PetriNet:
             joined = self._join_candidates(transition, m_time, ignore_timing, shared=shared, unordered=True)
             if joined is None:
                 return False
-            candidates, reusable = joined
-            return next(self._satisfying(transition, candidates, reusable=reusable), None) is not None
+            candidates, drained = joined
+            return next(self._satisfying(transition, candidates, drained=drained), None) is not None
         head_only, lazy = self._search_mode(transition, self._effective_policy(transition), probe=True, shared=shared)
         pools = self._gather_arc_pools(transition, m_time, ignore_timing, head_only=head_only, lazy=lazy, shared=shared)
         if pools is None:
@@ -3531,20 +3633,26 @@ class PetriNet:
         safety while paying nothing on the hot path.
 
         When several arcs read one place, each takes its head from the tokens the earlier arcs
-        left, so no token is bound twice (issue #75). A `consume_all` arc on such a place is
-        never satisfied, as in the search, where its option is the whole pool and so always
-        overlaps the other arcs' tokens. `shared` is `_shared_places(transition)`, from the caller.
+        left, so no token is bound twice (issue #75). A `consume_all` arc on such a place takes
+        what the other arcs there leave, whatever the arc order, as in the search
+        (`_draining_the_rest`). `shared` is `_shared_places(transition)`, from the caller.
         """
         taken: set[tuple[str, int]] = set()
-        binding: _Binding = []
+        binding: "_Binding | None" = []
+        drains = False
         for arc, available in pools:
-            if arc.place in shared:
+            if arc.place in shared and not arc.consume_all:
                 tokens = self._resolve_untaken(arc, available, taken, transition.name)
             else:
                 tokens = self._resolve_input_tokens(arc, _as_list(available), transition_name=transition.name)
+                drains = drains or arc.place in shared
             if tokens is None:
                 return None
             binding.append((arc, tokens))
+        if drains:
+            binding = _draining_the_rest(binding, shared)
+            if binding is None:
+                return None
         if transition.guard is not None and not self._check_transition_guard(transition, _flatten_binding(binding)):
             return None
         return binding
@@ -3554,11 +3662,9 @@ class PetriNet:
     ) -> list[Token] | None:
         """`_resolve_input_tokens` over the tokens of `available` not in `taken`, adding its pick to `taken`.
 
-        For an arc of `_head_binding` whose place another arc also reads. A `consume_all` arc
-        there is never satisfied (see `_head_binding`).
+        For an arc of `_head_binding` or `_try_count_only_binding` whose place another arc also
+        reads, and that is not `consume_all`.
         """
-        if arc.consume_all:
-            return None
         pool = [token for token in _as_list(available) if (arc.place, id(token)) not in taken]
         tokens = self._resolve_input_tokens(arc, pool, transition_name=transition_name)
         if tokens is not None:
@@ -3587,11 +3693,11 @@ class PetriNet:
         `_shared_places(transition)`, from the caller.
         """
         candidates = self._iter_candidate_bindings(pools, transition_name=transition.name, lazy=lazy, shared=shared)
-        reusable = frozenset(arc.place for arc in transition.inputs if arc.consume_all and arc.place in shared)
-        return self._satisfying(transition, candidates, reusable=reusable)
+        drained = _drained_places(transition, shared) if shared else shared
+        return self._satisfying(transition, candidates, drained=drained)
 
     def _satisfying(
-        self, transition: Transition, candidates: "Iterator[_Binding | _DeadEnd]", *, reusable: frozenset[str]
+        self, transition: Transition, candidates: "Iterator[_Binding | _DeadEnd]", *, drained: frozenset[str]
     ) -> Iterator[tuple[_Binding, list[Token]]]:
         """Yield each `(binding, flat_tokens)` of `candidates` whose guard holds, bounded by the limit.
 
@@ -3599,20 +3705,23 @@ class PetriNet:
         (`_join_candidates`): it examines at most `binding_search_limit` candidates, then
         signals exhaustion.
 
-        When two arcs read one place, a candidate that hands one token to both is skipped
-        before the guard sees it (issue #75), and counts toward the limit. `reusable` names the
-        places where the enumeration can still build one, so the check runs only there. Both
-        searches keep the arcs on a shared place apart by construction, join arcs with any
-        `join_key` and arcs without one alike (`_distinct_candidates`, `_key_combos`), except a
-        `consume_all` arc, whose single option is the whole pool: its place is the only kind
-        checked. A `_DeadEnd` counts toward the limit and is skipped too.
+        Both searches keep the arcs on a shared place apart by construction, join arcs with any
+        `join_key` and arcs without one alike (`_distinct_candidates`, `_key_combos`), so no
+        candidate hands one token to two arcs (issue #75). The exception is a `consume_all`
+        arc, whose single option is the whole pool. `drained` names the shared places such an
+        arc reads, and there it is given what the other arcs leave (`_draining_the_rest`)
+        before the guard sees the candidate. A `_DeadEnd` counts toward the limit and is skipped.
         """
         for examined, binding in enumerate(candidates, start=1):
             if examined > self.binding_search_limit:
                 self._signal_search_exhausted(transition.name)
                 return
-            if binding is _DEAD_END or (reusable and _reuses_a_token(binding, reusable)):
+            if binding is _DEAD_END:
                 continue
+            if drained:
+                binding = _draining_the_rest(binding, drained)
+                if binding is None:
+                    continue
             flat = _flatten_binding(binding)
             if self._check_transition_guard(transition, flat):
                 yield binding, flat
@@ -3826,10 +3935,17 @@ class PetriNet:
         cannot run out of recursion. `taken[i]` holds the `(place, id(token))` pairs the first
         `i` arcs' choices took from shared places. An option of an arc whose next arc then has
         no option yields one `_DEAD_END`.
+
+        `_key_combos` is the same walk for a transition with `join_key` arcs, one per key. The
+        two differ in more than their inputs, so a change to the distinct-token rule in one
+        must be made in the other: this one keeps an immutable `taken` per level and finds a
+        dead end by reading the next level's first option; `_key_combos` keeps one mutable
+        `taken`, yields a `_DeadPrefix` when a level turns out empty, and prunes with the
+        residual Hall check, which only join arcs need.
         """
         last = len(arcs) - 1
         taken: list[frozenset[tuple[str, int]]] = [frozenset()]
-        stack: list[Iterator[list[Token]]] = [self._level_options(arcs, sources, dependent, 0, taken[0], cap)]
+        stack: list[Iterator[list[Token]]] = [self._distinct_level_options(arcs, sources, dependent, 0, taken[0], cap)]
         chosen: list[list[Token]] = []
         while stack:
             level = len(stack) - 1
@@ -3843,9 +3959,13 @@ class PetriNet:
             if level == last:
                 yield tuple(chosen)
                 continue
-            place = arcs[level].place
-            after = taken[level] | {(place, id(token)) for token in option} if place in shared else taken[level]
-            following = self._level_options(arcs, sources, dependent, level + 1, after, cap)
+            arc = arcs[level]
+            place = arc.place
+            if place in shared and not arc.consume_all:  # a draining arc takes what the others leave
+                after = taken[level] | {(place, id(token)) for token in option}
+            else:
+                after = taken[level]
+            following = self._distinct_level_options(arcs, sources, dependent, level + 1, after, cap)
             first = next(following, None)
             if first is None:
                 yield _DEAD_END
@@ -3853,7 +3973,7 @@ class PetriNet:
             stack.append(itertools.chain((first,), following))
             taken.append(after)
 
-    def _level_options(
+    def _distinct_level_options(
         self,
         arcs: list[InputArc],
         sources: list[_Replay],
@@ -3880,7 +4000,7 @@ class PetriNet:
         """Return the candidate bindings of a transition with `join_key` arcs, or `None` if there are none.
 
         Returned with the places where a candidate can still hand one token to two arcs (see
-        `_JoinPlan.reusable`), for `_satisfying`.
+        `_JoinPlan.drained`), for `_satisfying`.
 
         The candidates are the product search's candidates whose `join_key` arcs all agree on
         their key, in the same lexicographic order (arc order, the last arc varying fastest),
@@ -3928,7 +4048,7 @@ class PetriNet:
             for key in keys
         ]
         combos = self._join_combos(per_key, plan, unordered=unordered)
-        return self._join_bindings(transition.inputs, options, combos), plan.reusable
+        return self._join_bindings(transition.inputs, options, combos), plan.drained
 
     def _probe_join_groups(
         self,

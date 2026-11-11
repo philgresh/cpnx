@@ -39,8 +39,9 @@ found with one bisection. `uid` stands in for the key, which need not be orderab
 
 ### 2. Fed by head changes, not by reading the places
 
-Each `_JoinIndex` notes the keys whose group head changed (`add` inserting at position 0,
-`discard` removing position 0) once a reader has asked for them. A deposit behind the head
+Each `_JoinIndex` notes the keys whose group head changed once a reader has asked for them.
+The head is the group's first `depth` entries (§4a; one entry for the usual join), so that is
+an `add` or `discard` at a position below `depth`. A deposit behind the head
 costs nothing extra. `Place.join_head_changes` hands the match those keys and their new head
 times, under the place's lock, and the match keeps a mirror of each place's heads and
 recomputes `when` for each key that changed. A probe therefore pays for what changed since
@@ -69,7 +70,7 @@ ADR 0010's, which `tests/test_join_key.py` checks under all three policies.
 An existence probe on a transition with no guard asks the match for **one** key. Any candidate
 satisfies such a transition, so one available key answers the probe. That relies on ADR 0010
 §1: a join arc takes exactly one token and has no `key` or `filter`, so every token of an
-available group is a valid choice for its arc. `_join_candidates` asserts it, so lifting that
+available group is a valid choice for its arc. `_probe_join_groups` asserts it, so lifting that
 restriction must revisit this. The timing-ignoring probe in the `shop` net drops from
 O(matched keys) to O(1).
 
