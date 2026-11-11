@@ -97,6 +97,12 @@ within `binding_search_limit` it chains the per-key products and skips the merge
 order cannot change the answer. With more candidates than that, the limit decides which are
 examined, so the probe keeps the firing path's order and the two always agree.
 
+> **Update:** where ADR 0011's match serves, the search no longer merges every key's product:
+> it sorts keys by a lower bound on their candidates and opens each only once the merge reaches
+> its bound (ADR 0011 §3), with the same candidates in the same order. The bound is not a key's
+> first candidate, so the merge may never stop at the first key it opens. The merge above
+> remains for the fallback.
+
 ### 4. Falling back
 
 The index is an optimisation, never the authority, as in ADR 0004. When it cannot serve,

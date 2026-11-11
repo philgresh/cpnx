@@ -576,7 +576,8 @@ single messages (Karras 2025, on fair join pattern matching).
   what the other arcs leave (`_draining_the_rest`).
 - A join transition binds a key at a place iff the key passes Hall's condition there.
   With one `join_key` function this is "the key holds N tokens" (the join index depth); with
-  several it is checked over sets of functions (`_has_distinct_tokens`, ADR 0011 §4a).
+  several it is checked over sets of functions, kept per key as the place changes
+  (`places._hall_time`, ADR 0011 §4a), or per probe when no join index serves (`_has_distinct_tokens`).
 - The existence probe and the firing path agree, and the filters that drop keys drop only
   keys that cannot bind (ADR 0010 §3–4).
 
