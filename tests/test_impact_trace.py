@@ -164,9 +164,7 @@ def test_none_declaration_is_universal_no_pruning():
     net.add_place(Place("a", color_set={"order"}))
     net.add_place(Place("b", color_set={"refund"}))
     # impacts_colors defaults to None -> universal, nothing pruned.
-    net.add_transition(
-        Transition("seed", [InputArc("src")], [OutputArc("a"), OutputArc("b")], action=_passthrough)
-    )
+    net.add_transition(Transition("seed", [InputArc("src")], [OutputArc("a"), OutputArc("b")], action=_passthrough))
     impact = net.trace_impact("seed")
     assert impact.colors is None
     assert impact.places == {"a", "b"}
