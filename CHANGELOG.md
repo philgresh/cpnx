@@ -188,12 +188,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `binding_search_limit` ahead of a key that holds a pair. Such a place also drops keys that
   fail Hall's condition (some set of its functions reaches fewer distinct tokens than arcs),
   so a backlog of tokens carrying one key under both functions can't hide a pair either
-  ([#78](https://github.com/philgresh/cpnx/issues/78)). Its guard-free existence probe reads the
-  matched keys in doubling batches and stops at the first that binds, so it pays only for the
-  keys before the first that binds: 0.015 ms on a 4 000-key `manager == id` chain, but linear
-  in a backlog of keys that all fail Hall's condition. Firing and guarded probes, linear in
-  keys as before, cost about 1.2× `main` on that chain. A self-join of three or more arcs with
-  one function skips a key's self-pairings unbuilt, so a key deeper than the limit still binds.
+  ([#78](https://github.com/philgresh/cpnx/issues/78)). The place reports when each key passes
+  Hall's condition as its tokens change, rechecking only the keys a deposit or removal touches
+  (ADR 0011 §4a), so the guard-free existence probe asks for one key again and a backlog of
+  keys that fail costs nothing per probe. Firing and guarded probes no longer merge every key's
+  candidates: they sort keys by a lower bound on their candidates and open each only once the
+  search reaches that bound (ADR 0011 §3), with the same candidates in the same order. On a `manager == id` chain (`benchmarks/bench_self_join_chain.py`) a `FIRST`
+  firing takes about 14 µs at 1 000, 4 000 and 16 000 keys, where `main` takes 1.9, 7.7 and
+  34.7 ms. A self-join of three or more arcs with one function skips a key's self-pairings
+  unbuilt, so a key deeper than the limit still binds.
   Every arc on a shared place of a join transition takes tokens the earlier arcs left: join
   arcs with any `join_key`, and arcs without one, drawn from the remaining tokens as in the
   product search. Both are pruned by a residual Hall check so that neither strands a later
@@ -203,7 +206,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A plain arc taking several tokens steps over the combinations it may not take rather than
   reading them, so its cost stays with the options it yields. Each key's walk costs O(1) to
   start, and plain arcs after every join arc, off the key's places, are walked once for all
-  keys. The existence probe keeps its one-key and first-binding-key shortcuts unless an arc
+  keys. The existence probe keeps its one-key shortcut unless an arc
   without a `join_key` on a shared place reads a join place, or sits before a join arc on a
   place where some arc has a `filter`. Such an arc can run a later arc out of tokens once
   per key, so firing can use up `binding_search_limit` where one key alone would bind, and

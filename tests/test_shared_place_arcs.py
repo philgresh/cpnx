@@ -8,6 +8,7 @@ search, and the `consume_all` count-only path.
 """
 
 import itertools
+import math
 import random
 import time
 import warnings
@@ -16,7 +17,7 @@ import pytest
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
-from cpnx import BindingPolicy, InputArc, OutputArc, PetriNet, Place, Token, Transition
+from cpnx import BindingPolicy, InputArc, OutputArc, PetriNet, Place, Token, Transition, engine, places
 from cpnx.engine import _DRAIN
 from cpnx.places import _TokenStore
 
@@ -556,23 +557,36 @@ def test_one_token_keys_do_not_use_up_a_self_joins_search_limit(certified, guard
 def test_a_depth_two_join_index_reports_a_key_once_it_holds_two_tokens():
     store = _TokenStore()
     store.register_join_index(1, WID, depth=2)
+    source = ((1, 2),)
+
+    def times(generation):
+        got, every_head, changes = store.join_head_changes(source, generation)
+        assert got == generation and every_head is None
+        return {key: None if head is None else head[0] for key, head in changes.items()}
+
     first = Token(payload={"wid": 0, "n": 0})
     store.append(first)
-    generation, every_head, changes = store.join_head_changes(1, None)
+    generation, every_head, changes = store.join_head_changes(source, None)
     assert every_head == {} and changes == {}
     timed = Token(payload={"wid": 0, "n": 1}, available_at=4.0)
     store.append(timed)
-    assert store.join_head_changes(1, generation) == (generation, None, {0: 4.0})
+    assert times(generation) == {0: 4.0}
     # A third token behind the second changes nothing; one ahead of it does.
     store.append(Token(payload={"wid": 0, "n": 2}, available_at=9.0))
-    assert store.join_head_changes(1, generation) == (generation, None, {})
+    assert times(generation) == {}
     ready = Token(payload={"wid": 0, "n": 3})
     store.append(ready)
-    assert store.join_head_changes(1, generation) == (generation, None, {0: float("-inf")})
+    assert times(generation) == {0: float("-inf")}
     store.remove_identity([first, ready])
-    assert store.join_head_changes(1, generation) == (generation, None, {0: 9.0})
+    assert times(generation) == {0: 9.0}
     store.remove_identity([timed])
-    assert store.join_head_changes(1, generation) == (generation, None, {0: None})
+    assert times(generation) == {0: None}
+
+
+def _listed(net: PetriNet, t_limit: float) -> "tuple[list, list]":
+    """The keys `t`'s match lists at `t_limit`: by when they bind, and in the order firing reads."""
+    match = net._join_matches["t"]
+    return list(match.iter_keys_at(t_limit)), [match.key_of(uid) for _, uid in match.ordered_keys(t_limit)]
 
 
 def _self_join(n_single: int) -> PetriNet:
@@ -595,13 +609,13 @@ def test_a_self_joins_match_lists_only_keys_that_bind():
     t = net.transitions["t"]
     assert not net._binding_exists(t, net.model_time)  # registers the indexes
     assert not net._binding_exists(t, net.model_time)
-    assert net._join_matches["t"].keys_at(net.model_time) == []
+    assert _listed(net, net.model_time) == ([], [])
     net.deposit("jobs", Token(payload={"wid": 7}))
     assert net._binding_exists(t, net.model_time)
-    assert net._join_matches["t"].keys_at(net.model_time) == [7]
+    assert _listed(net, net.model_time) == ([7], [7])
     net.drive_to_quiescence()
     assert [token.payload["wid"] for token in net.marking["out"]] == [7, 7]
-    assert net._join_matches["t"].keys_at(net.model_time) == []
+    assert _listed(net, net.model_time) == ([], [])
 
 
 def test_a_self_join_index_is_rebuilt_when_its_depth_changes():
@@ -818,6 +832,510 @@ def test_a_self_join_binds_exactly_when_hall_condition_holds(functions, payloads
         flat = [token for _, tokens in binding for token in tokens]
         assert len({id(token) for token in flat}) == len(flat)
         assert len({_FUNCTIONS[name](token) for name, token in zip(functions, flat, strict=True)}) == 1
+
+
+# -- incremental Hall state and the lazy key merge ---------------------------------------------
+
+
+def _ident(token: Token) -> object:
+    return token.payload["id"]
+
+
+def _manager(token: Token) -> object:
+    return token.payload["manager"]
+
+
+def _org_chart(n_self_managed: int, *, guarded: bool = False) -> PetriNet:
+    """`t` pairs a manager (`id`) with a report (`manager`) on one place, which holds a self-managed backlog.
+
+    Each self-managed employee lists its key under both functions through one token, so every
+    such key fails Hall's condition.
+    """
+    net = PetriNet(seed=0)
+    for name in ("emp", "out"):
+        net.add_place(Place(name))
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("emp", join_key=_ident), InputArc("emp", join_key=_manager)],
+            outputs=[OutputArc("out", count=2)],
+            action=_passthrough,
+            **({"guard": lambda tokens: True} if guarded else {}),
+        )
+    )
+    for i in range(n_self_managed):
+        net.deposit("emp", Token(payload={"id": i, "manager": i}))
+    return net
+
+
+def _spy_reads(monkeypatch) -> "tuple[list[int], list[int]]":
+    """Record each Hall check and the number of keys each join-group lookup reads."""
+    halls: list[int] = []
+    looked_up: list[int] = []
+    hall_time = places._hall_time
+    available_groups = places._JoinIndex.available_groups
+
+    def counting_hall_time(classes):
+        halls.append(1)
+        return hall_time(classes)
+
+    def counting_available_groups(self, keys, *args):
+        keys = None if keys is None else list(keys)
+        looked_up.append(-1 if keys is None else len(keys))
+        return available_groups(self, keys, *args)
+
+    monkeypatch.setattr(places, "_hall_time", counting_hall_time)
+    monkeypatch.setattr(places._JoinIndex, "available_groups", counting_available_groups)
+    return halls, looked_up
+
+
+@pytest.mark.parametrize("guarded", [False, True])
+def test_a_backlog_of_keys_failing_hall_is_not_scanned(monkeypatch, guarded):
+    # 2 000 self-managed employees: no key binds. Once the match is built, a probe pays for the
+    # changes since the last one, not for the backlog, and a deposit rechecks only its own keys.
+    net = _org_chart(2_000, guarded=guarded)
+    t = net.transitions["t"]
+    now = net.model_time
+    assert not net._binding_exists(t, now)  # registers the indexes and builds the match
+    halls, looked_up = _spy_reads(monkeypatch)
+    for _ in range(3):
+        assert not net._binding_exists(t, now)
+        assert net._resolve_binding(t, now) is None
+    assert halls == [] and looked_up == []
+    assert _listed(net, now) == ([], [])
+    boss = Token(payload={"id": 9_000, "manager": -1})
+    report = Token(payload={"id": 9_001, "manager": 9_000})
+    net.deposit("emp", boss)
+    net.deposit("emp", report)
+    assert net._binding_exists(t, now)
+    assert len(halls) <= 4  # keys 9 000, 9 001 and -1, each read once at most
+    assert _listed(net, now) == ([9_000], [9_000])
+    binding = net._resolve_binding(t, now)
+    assert [tokens[0] for _, tokens in binding] == [boss, report]
+    assert sum(looked_up) <= 4 and min(looked_up) >= 1  # one key per arc and call, never a scan
+
+
+@pytest.mark.parametrize("policy", [BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY])
+def test_firing_a_chain_opens_only_the_keys_it_reaches(monkeypatch, policy):
+    # A `manager == id` chain of 2 000: every key but the last binds. A guarded firing opens the
+    # keys in order of their candidates' lower bounds as the merge reaches them, so FIRST reads two keys
+    # and RANDOM and PRIORITY about one per candidate examined, not every key.
+    net = _org_chart(0, guarded=True)
+    net.binding_policy = policy
+    net.binding_search_limit = 10
+    for i in range(2_000):
+        net.deposit("emp", Token(payload={"id": i, "manager": i - 1}))
+    t = net.transitions["t"]
+    assert net._resolve_binding(t, net.model_time) is not None
+    _, looked_up = _spy_reads(monkeypatch)
+    binding = net._resolve_binding(t, net.model_time)
+    assert min(looked_up) == 1
+    # The search pulls one candidate past the limit to learn it is exhausted, and each pull opens
+    # at most one key ahead of the merge.
+    bound = 2 if policy is BindingPolicy.FIRST else net.binding_search_limit + 2
+    assert len(looked_up) <= 2 * bound
+    if policy is BindingPolicy.FIRST:
+        assert [tokens[0].payload["id"] for _, tokens in binding] == [0, 1]
+
+
+def _two_function_store() -> _TokenStore:
+    """A store with join indexes 1 (`f`) and 2 (`g`), each watching both arcs of an `[f, g]` place."""
+    store = _TokenStore()
+    store.register_join_index(1, _f, depth=2)
+    store.register_join_index(2, _g, depth=2)
+    return store
+
+
+_F_AND_G = ((1, 1), (2, 1))
+
+
+def test_a_mixed_report_times_hall_from_timed_entries():
+    store = _two_function_store()
+    x = Token(payload={"f": 1, "g": 1})
+    store.append(x)
+    generations, every_head, changes = store.join_head_changes(_F_AND_G, None)
+    assert every_head == {} and changes == {}  # key 1's only token would serve both arcs
+    store.append(Token(payload={"f": 1, "g": 9}, available_at=4.0))
+    got, every_head, changes = store.join_head_changes(_F_AND_G, generations)
+    assert got == generations and every_head is None
+    # From 4.0 the `f` arc takes the timed token and the `g` arc takes x. Key 9 has no `f` token.
+    assert changes == {1: (4.0, (0, 0.0, 0)), 9: None}
+    store.append(Token(payload={"f": 7, "g": 1}, available_at=2.0))
+    assert store.join_head_changes(_F_AND_G, generations)[2] == {1: (2.0, (0, 0.0, 0)), 7: None}
+
+
+def test_a_mixed_report_drains_nothing_while_one_index_is_down():
+    store = _two_function_store()
+    generations, _, _ = store.join_head_changes(_F_AND_G, None)
+    store.append(Token(payload={"f": 5}))  # keys under `f`, raises under `g`
+    assert store.join_head_changes(_F_AND_G, generations) is None
+    assert 5 in store.join_index(1)._dirty, "the serving index keeps its changes for the next report"
+
+
+def test_a_mixed_report_is_full_when_one_index_is_replaced():
+    store = _two_function_store()
+    store.append(Token(payload={"f": 1, "g": 2}))
+    store.append(Token(payload={"f": 2, "g": 1}))
+    generations, every_head, _ = store.join_head_changes(_F_AND_G, None)
+    assert set(every_head) == {1, 2}
+    store.register_join_index(2, lambda token: token.payload["g"], depth=2)  # a new `g` index
+    got, every_head, changes = store.join_head_changes(_F_AND_G, generations)
+    assert got[0] == generations[0] and got[1] != generations[1]
+    assert every_head is not None and set(every_head) == {1, 2} and changes == {}
+
+
+def _registered_ids(net: PetriNet) -> set[int]:
+    return {entry[3] for entry in net._join_registrations["t"].values()}
+
+
+def _drained_ids(net: PetriNet) -> set[int]:
+    return {index_id for _, pairs in net._join_matches["t"].sources for index_id, _ in pairs}
+
+
+@pytest.mark.parametrize("arcs", [2, 3, 5])
+def test_a_self_join_keys_each_deposit_once(arcs):
+    # Join arcs reading one place with one function share an index, and the match drains it.
+    net = _self_join(0)
+    net.transitions["t"].inputs[:] = [InputArc("jobs", join_key=WID) for _ in range(arcs)]
+    net.transitions["t"].outputs[0].count = arcs
+    for _ in range(arcs):
+        net.deposit("jobs", Token(payload={"wid": 1}))
+    t = net.transitions["t"]
+    assert net._binding_exists(t, net.model_time)
+    assert len(net.places["jobs"]._store._join_indexes) == 1
+    assert _registered_ids(net) == _drained_ids(net)
+
+
+def test_a_reassigned_join_key_leaves_no_index_unread():
+    # Arcs [f, g, g] read through one index per function. Setting arc 0's key to g moves it onto
+    # the g index and unregisters the f one: every registered index is one the match drains, so
+    # none collects changed keys that nothing reads.
+    arcs = [InputArc("jobs", join_key=_f), InputArc("jobs", join_key=_g), InputArc("jobs", join_key=_g)]
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    net.add_transition(Transition(name="t", inputs=arcs, outputs=[OutputArc("out", count=3)], action=_passthrough))
+    t = net.transitions["t"]
+    store = net.places["jobs"]._store
+    net.deposit("jobs", Token(payload={"f": 0, "g": 0}))
+    assert not net._binding_exists(t, net.model_time)
+    assert len(_registered_ids(net)) == 2 and _registered_ids(net) == _drained_ids(net)
+    arcs[0].join_key = _g
+    assert not net._binding_exists(t, net.model_time)
+    assert len(_registered_ids(net)) == 1 and _registered_ids(net) == _drained_ids(net)
+    assert set(store._join_indexes) == _registered_ids(net)
+    for n in range(2_000):
+        net.deposit("jobs", Token(payload={"f": -1, "g": 1_000 + n}))
+    assert not net._binding_exists(t, net.model_time)
+    assert all(not index._dirty for index in store._join_indexes.values())
+    for _ in range(2):
+        net.deposit("jobs", Token(payload={"f": -1, "g": 1_000}))
+    assert net._binding_exists(t, net.model_time)  # key 1000 now holds three tokens
+
+
+# The shared-head case: x is key 1's head under `f` and its only token under `g`, and y likewise
+# for key 2, so the search keeps the first arc off each head and those keys' first candidates
+# start late: (5, 0) and (6, 1). Key 3's candidate (z, w) = (2, 3) comes first in product
+# order, though the match sorts it after keys 1 and 2 by their heads. The filler makes the
+# property test's guard (n sum not 1 mod 3) accept (5, 0), so firing it first shows.
+_CHANGES = st.one_of(
+    st.none(),
+    st.tuples(
+        st.just("add"),
+        st.fixed_dictionaries({"f": _values, "g": _values, "h": _values}),
+        st.sampled_from([None, 1.0, 4.0]),
+    ),
+    st.tuples(st.just("remove"), st.integers(0, 9)),
+)
+"""A change to `jobs` before a probe: deposit a token, remove the token tagged `n`, or nothing."""
+
+
+def _apply_change(change, nets: "list[PetriNet]", added) -> None:
+    """Apply one `_CHANGES` draw to every net alike, so the match's views update between probes."""
+    if change is None:
+        return
+    if change[0] == "add":
+        _, payload, at = change
+        n = next(added)
+        for net in nets:
+            net.deposit("jobs", Token(payload={**payload, "n": n}, **({} if at is None else {"available_at": at})))
+        return
+    for net in nets:
+        place = net.places["jobs"]
+        doomed = [token for token in place.peek(len(place), model_time=math.inf) if token.payload["n"] == change[1]]
+        if doomed:
+            place.retrieve_specific(doomed)
+
+
+_SHARED_HEAD = [
+    {"f": 1, "g": 1, "h": 0},  # x
+    {"f": 2, "g": 2, "h": 0},  # y
+    {"f": 3, "g": 0, "h": 0},  # z
+    {"f": 9, "g": 3, "h": 0},  # w
+    {"f": 6, "g": 6, "h": 0},  # a filler whose key fails Hall's condition, so n lines up below
+    {"f": 1, "g": 8, "h": 0},  # key 1's second f-token
+    {"f": 2, "g": 7, "h": 0},  # key 2's second f-token
+]
+
+
+def _shared_head_net(certified: bool, guard, limit: int) -> "tuple[PetriNet, list[str]]":
+    """Arcs `[f, g]` on one place holding `_SHARED_HEAD`, each token tagged with its deposit index `n`."""
+    f, g = (_f, _g) if certified else (_uncertified(_f), _uncertified(_g))
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("jobs", join_key=f), InputArc("jobs", join_key=g)],
+            outputs=[OutputArc("out", count=2)],
+            action=_passthrough,
+            **({} if guard is None else {"guard": guard}),
+        )
+    )
+    net.binding_search_limit = limit
+    exhausted = _record_exhaustion(net)
+    for n, payload in enumerate(_SHARED_HEAD):
+        net.deposit("jobs", Token(payload={**payload, "n": n}))
+    return net, exhausted
+
+
+@pytest.mark.parametrize(
+    ("guard", "limit", "expected"),
+    [
+        (None, 8, [2, 3]),
+        (lambda tokens: True, 8, [2, 3]),
+        # Product order examines (z, w) first: with a limit of one, rejecting it ends the search.
+        (lambda tokens: tokens[0].payload["n"] != 2, 1, None),
+        (lambda tokens: tokens[0].payload["n"] != 2, 2, [5, 0]),
+    ],
+)
+def test_a_key_whose_head_the_search_skips_does_not_hide_an_earlier_key(guard, limit, expected):
+    # Keys 1 and 2 sort first by their heads (x, y), but each head is also the key's only token
+    # under `g`, so the first arc must skip it and their first candidates start at their second
+    # `f` tokens (n=5, n=6). Key 3's (z, w) = (2, 3) comes first in product order. The merge must
+    # treat the heads as lower bounds and open key 3 before yielding key 1's candidate.
+    results = []
+    for certified in (True, False):
+        net, exhausted = _shared_head_net(certified, guard, limit)
+        t = net.transitions["t"]
+        binding = net._resolve_binding(t, net.model_time)
+        got = None if binding is None else [tokens[0].payload["n"] for _, tokens in binding]
+        results.append((got, net._binding_exists(t, net.model_time), len(exhausted) > 0))
+    assert results[0] == results[1]
+    assert results[0][0] == expected
+
+
+def test_a_self_join_whose_index_is_down_falls_back_and_binds():
+    # Both arcs of a self-join read one index. With it disabled behind its rebuild rate limit the
+    # match does not serve, and the fallback must still find the pair (a declined index never
+    # reads as "key gone").
+    net = _self_join(10)
+    net.deposit("jobs", Token(payload={"wid": 3}))
+    t = net.transitions["t"]
+    assert net._binding_exists(t, net.model_time)
+    (index_id,) = _registered_ids(net)
+    index = net.places["jobs"]._store._join_indexes[index_id]
+    index.disable()
+    index._last_build = net.places["jobs"]._store._next_seq  # rate-limited: no rebuild for now
+    assert net.places["jobs"].peek_join(index_id, None, model_time=net.model_time) is None
+    assert net._binding_exists(t, net.model_time)
+    binding = net._resolve_binding(t, net.model_time)
+    assert binding is not None and [tokens[0].payload["wid"] for _, tokens in binding] == [3, 3]
+    assert binding[0][1][0] is not binding[1][1][0]
+
+
+def _uncertified(fn):
+    """`fn` behind a closure over a mutable table, so certification refuses it and the engine falls back."""
+    table: dict = {}
+    return lambda token: table.get("never", fn(token))
+
+
+@settings(max_examples=150, deadline=None)
+@given(
+    functions=st.lists(st.sampled_from(sorted(_FUNCTIONS)), min_size=2, max_size=3),
+    payloads=st.lists(
+        st.tuples(
+            st.fixed_dictionaries({"f": _values, "g": _values, "h": _values}),
+            st.sampled_from([None, 1.0, 2.0, 4.0]),
+        ),
+        max_size=7,
+    ),
+    probes=st.lists(
+        st.tuples(st.sampled_from([0.0, 1.0, 2.0, 3.0, 5.0]), st.booleans(), _CHANGES), min_size=1, max_size=6
+    ),
+    policy=st.sampled_from([BindingPolicy.FIRST, BindingPolicy.RANDOM, BindingPolicy.PRIORITY]),
+    limit=st.integers(1, 8),
+    lead=st.lists(st.tuples(st.sampled_from(["jobs", "side"]), st.integers(1, 2)), max_size=2),
+    side=st.integers(0, 3),
+)
+@example(
+    functions=["f", "g"],
+    payloads=[(payload, None) for payload in _SHARED_HEAD],
+    probes=[(0.0, False, None)],
+    policy=BindingPolicy.FIRST,
+    limit=8,
+    lead=[],
+    side=0,
+)
+@example(
+    functions=["f", "g"],
+    payloads=[(payload, None) for payload in _SHARED_HEAD],
+    probes=[(0.0, False, None)],
+    policy=BindingPolicy.FIRST,
+    limit=2,
+    lead=[],
+    side=0,
+)
+@example(
+    functions=["f", "g"],
+    payloads=[(payload, None) for payload in _SHARED_HEAD],
+    probes=[(0.0, False, None)],
+    policy=BindingPolicy.FIRST,
+    limit=8,
+    lead=[("side", 1), ("jobs", 2)],
+    side=2,
+)
+def test_the_key_match_searches_exactly_as_the_fallback_does(functions, payloads, probes, policy, limit, lead, side):
+    # The match (certified keys) lists keys by Hall's condition as it tracks it, and the firing
+    # path opens them lazily, sorted by a lower bound on their candidates. The fallback (uncertified keys)
+    # reads every key and merges every product. Probes and firings at any time, moving back and
+    # forth, and with the timing ignored, must pick the same bindings and report the same
+    # exhaustion, under every policy and a small search limit. Arcs without a `join_key` may come
+    # first, on another place (`side`) or on the join place, with `count` 1 or 2: the merge bounds
+    # every key's candidates by those arcs' least positions, which must stay a lower bound.
+    fallback = {name: _uncertified(fn) for name, fn in _FUNCTIONS.items()}
+
+    def build(by_name):
+        net = PetriNet(seed=3, binding_policy=policy)
+        for name in ("jobs", "side", "out"):
+            net.add_place(Place(name))
+        net.add_transition(
+            Transition(
+                name="t",
+                inputs=[InputArc(place, count=count) for place, count in lead]
+                + [InputArc("jobs", join_key=by_name[name]) for name in functions],
+                outputs=[OutputArc("out", count=len(functions) + sum(count for _, count in lead))],
+                action=_passthrough,
+                guard=lambda tokens: sum(token.payload["n"] for token in tokens) % 3 != 1,
+            )
+        )
+        net.binding_search_limit = limit
+        exhausted = _record_exhaustion(net)
+        for n, (payload, at) in enumerate(payloads):
+            net.deposit("jobs", Token(payload={**payload, "n": n}, **({} if at is None else {"available_at": at})))
+        for n in range(side):
+            net.deposit("side", Token(payload={"f": 0, "g": 0, "h": 0, "n": 100 + n}))
+        return net, exhausted
+
+    def ns(binding):
+        return None if binding is None else [token.payload["n"] for _, tokens in binding for token in tokens]
+
+    nets = [build(_FUNCTIONS), build(fallback)]
+    added = itertools.count(len(payloads))
+    for at, ignore_timing, change in probes:
+        _apply_change(change, [net for net, _ in nets], added)
+        seen = []
+        for net, exhausted in nets:
+            t = net.transitions["t"]
+            exists = net._binding_exists(t, at, ignore_timing=ignore_timing)
+            binding = ns(net._resolve_binding(t, at, ignore_timing=ignore_timing))
+            seen.append((exists, binding, len(exhausted)))
+        assert seen[0] == seen[1]
+        # The certified net searches through the match, the other through the fallback.
+        assert "t" not in nets[1][0]._join_matches
+        if seen[0][0]:
+            assert "t" in nets[0][0]._join_matches
+    for net, _ in nets:
+        net.drive_to_quiescence()
+    assert [token.payload["n"] for token in nets[0][0].marking["out"]] == [
+        token.payload["n"] for token in nets[1][0].marking["out"]
+    ]
+    assert len(nets[0][1]) == len(nets[1][1])
+
+
+_STEPS = st.lists(
+    st.one_of(
+        st.tuples(
+            st.just("add"),
+            st.fixed_dictionaries({"f": _values, "g": _values, "h": _values}),
+            st.sampled_from([None, 1.0, 3.0]),
+        ),
+        st.tuples(st.just("remove"), st.integers(0, 50)),
+        st.tuples(st.just("probe"), st.sampled_from([0.0, 1.0, 2.0, 3.0, 5.0, None])),
+    ),
+    max_size=30,
+)
+
+
+def _expected_keys(functions: list[str], tokens: list[Token], t_limit: float) -> set:
+    """By brute force: the keys for which the tokens available at `t_limit` give each arc its own."""
+    available = [token.payload for token in tokens if token.available_at <= t_limit]
+    keys = {payload[name] for payload in available for name in functions}
+    return {key for key in keys if _assign(functions, available, key, set())}
+
+
+def _expected_bound(net: PetriNet, function: str, key: object) -> tuple:
+    """By brute force: the first entry of `key`'s group under `function`, in the index's read order."""
+    store = net.places["jobs"]._store
+    entries = [
+        (0, 0.0, store._seq_of[id(token)])
+        if token.available_at == 0.0
+        else (1, token.available_at, store._seq_of[id(token)])
+        for token in net.places["jobs"].peek(len(net.places["jobs"]), model_time=math.inf)
+        if _FUNCTIONS[function](token) == key
+    ]
+    return min(entries)
+
+
+@settings(max_examples=300, deadline=None)
+@given(functions=st.lists(st.sampled_from(sorted(_FUNCTIONS)), min_size=2, max_size=3), steps=_STEPS)
+def test_the_match_lists_exactly_the_keys_that_bind_by_their_bound(functions, steps):
+    # Fuzz the match's own state as tokens come and go between probes, at times that move back
+    # and forth and at the timing-ignoring horizon: after each probe, the keys listed by when
+    # they bind (`iter_keys_at`) and the view firing reads (`ordered_keys`) must hold exactly the
+    # keys that bind by brute force, the view sorted by each key's first entry under the first
+    # arc's function.
+    net = PetriNet(seed=0)
+    for name in ("jobs", "out"):
+        net.add_place(Place(name))
+    net.add_transition(
+        Transition(
+            name="t",
+            inputs=[InputArc("jobs", join_key=_FUNCTIONS[name]) for name in functions],
+            outputs=[OutputArc("out", count=len(functions))],
+            action=_passthrough,
+        )
+    )
+    t = net.transitions["t"]
+    for i in range(len(functions)):  # enough tokens that the first probe builds the match, no key shared
+        net.deposit("jobs", Token(payload={"f": 10 + i, "g": 20 + i, "h": 30 + i}))
+    assert not net._binding_exists(t, 0.0)
+    match = net._join_matches["t"]
+    tokens = list(net.places["jobs"].peek(len(net.places["jobs"]), model_time=math.inf))
+    for step in steps:
+        if step[0] == "add":
+            token = Token(payload=dict(step[1]), **({} if step[2] is None else {"available_at": step[2]}))
+            net.deposit("jobs", token)
+            tokens.append(token)
+            continue
+        if step[0] == "remove":
+            if tokens:
+                net.places["jobs"].retrieve_specific([tokens.pop(step[1] % len(tokens))])
+            continue
+        horizon = step[1] is None
+        at = engine._LAST_FINITE_TIME if horizon else step[1]
+        net._binding_exists(t, 0.0 if horizon else at, ignore_timing=horizon)
+        assert net._join_matches.get("t") is match
+        assert match.refresh()
+        expected = _expected_keys(functions, tokens, at)
+        assert set(match.iter_keys_at(at)) == expected
+        ordered = match.ordered_keys(at)
+        assert ordered == sorted(ordered)
+        listed = {match.key_of(uid): first for first, uid in ordered}
+        assert set(listed) == expected and len(listed) == len(ordered)
+        for key, first in listed.items():
+            assert first == _expected_bound(net, functions[0], key)
 
 
 _ARC_SHAPES = {
