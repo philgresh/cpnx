@@ -1,5 +1,7 @@
 import ast
 import inspect
+import os
+import threading
 from typing import Callable
 
 
@@ -56,14 +58,90 @@ def _is_more_specific_node(new_node: ast.AST, current_target: ast.AST) -> bool:
     return new_node.lineno >= target_start and new_end <= target_end
 
 
-def _find_target_node(tree: ast.AST, start_line: int) -> ast.AST | None:
+def _function_nodes(tree: ast.AST) -> list[ast.AST]:
+    """Every `def`, `async def` and `lambda` node of `tree`, in `ast.walk` order."""
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and hasattr(node, "lineno")
+    ]
+
+
+def _most_specific_node(nodes: list[ast.AST], start_line: int) -> ast.AST | None:
     target_node = None
-    for node in ast.walk(tree):
+    for node in nodes:
         if not _node_contains_line(node, start_line):
             continue
         if target_node is None or _is_more_specific_node(node, target_node):
             target_node = node
     return target_node
+
+
+def _find_target_node(tree: ast.AST, start_line: int) -> ast.AST | None:
+    return _most_specific_node(_function_nodes(tree), start_line)
+
+
+class _ParsedSource:
+    """One parsed source file: its function nodes, and the lookups made among them so far.
+
+    Attributes:
+        stamp: The file's `(st_mtime_ns, st_size)` when it was read.
+        functions: Its `def`, `async def` and `lambda` nodes, from one walk of the tree.
+        by_line: The node `_find_target_node` gives for each start line asked for so far.
+    """
+
+    __slots__ = ("stamp", "functions", "by_line")
+
+    def __init__(self, stamp: tuple[int, int], tree: ast.AST) -> None:
+        self.stamp = stamp
+        self.functions = _function_nodes(tree)
+        self.by_line: dict[int, ast.AST | None] = {}
+
+
+#: Parsed source files by path. Building many arcs and transitions from the same functions
+#: checks each callable again on every construction, three times over (the purity blocklist
+#: here, `cpnx.linting`, `cpnx.certification`), and each check needs the callable's node. A
+#: file is parsed and walked once, until its modification time or size changes. It holds
+#: syntax trees only, never the callables, so it keeps no function alive; it grows by one
+#: entry per source file that defines a checked callable.
+_SOURCE_CACHE: dict[str, _ParsedSource] = {}
+_SOURCE_CACHE_LOCK = threading.Lock()
+
+
+def _source_node(func: Callable) -> ast.AST | None:
+    """Return the `def`/`lambda` node of `func` in its source file, or `None` if there is none.
+
+    The node is the one `_find_target_node` finds for the line `func` starts on, in the file
+    as it is on disk now. It is shared between callers and threads: read it, and copy it
+    before changing it.
+
+    Args:
+        func: The callable to locate.
+
+    Returns:
+        The node, or `None` when `func` has no source file or no function node spans its
+        first line.
+
+    Raises:
+        OSError: If the source cannot be found or read.
+        TypeError: If `func` is not an object `inspect` can locate (a builtin, a partial).
+        SyntaxError: If the file does not parse.
+    """
+    _, start_line = inspect.getsourcelines(func)
+    source_file = inspect.getsourcefile(func)
+    if not source_file:
+        return None
+    status = os.stat(source_file)
+    stamp = (status.st_mtime_ns, status.st_size)
+    with _SOURCE_CACHE_LOCK:
+        parsed = _SOURCE_CACHE.get(source_file)
+        if parsed is None or parsed.stamp != stamp:
+            with open(source_file, encoding="utf-8") as handle:
+                tree = ast.parse(handle.read(), filename=source_file)
+            parsed = _SOURCE_CACHE[source_file] = _ParsedSource(stamp, tree)
+        if start_line not in parsed.by_line:
+            parsed.by_line[start_line] = _most_specific_node(parsed.functions, start_line)
+        return parsed.by_line[start_line]
 
 
 _FORBIDDEN_FUNCS = frozenset({"open", "print", "eval", "exec", "__import__", "sleep"})
@@ -110,17 +188,10 @@ def _verify_ast_purity(tree: ast.AST, is_fallback: bool = False) -> None:
 
 def _try_verify_via_sourcefile(func: Callable) -> bool:
     try:
-        file_path = inspect.getsourcefile(func)
-        lines, start_line = inspect.getsourcelines(func)
-        if file_path:
-            with open(file_path, "r", encoding="utf-8") as f:
-                file_content = f.read()
-            tree = ast.parse(file_content, filename=file_path)
-
-            target_node = _find_target_node(tree, start_line)
-            if target_node is not None:
-                _verify_ast_purity(target_node)
-                return True
+        target_node = _source_node(func)
+        if target_node is not None:
+            _verify_ast_purity(target_node)
+            return True
     except PermissionError:
         raise
     except Exception:

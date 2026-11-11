@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Building arcs and transitions no longer parses a callable's source file on every
+  construction.** The purity check, the side-effect lint and inline-safety certification each
+  found a callable's node by parsing its file and walking the whole tree, every time an
+  `InputArc`, `OutputArc` or `Transition` was built. A file is now parsed and walked once, and
+  again only when its modification time or size changes. A transition with four arc callables
+  and a guard, defined in a 1 900-line module, took 163 ms to build and now takes 0.6 ms.
+  Verdicts, warnings and errors are unchanged.
+
 - **Two `consume_all` input arcs on one place are never enabled, and adding such a transition
   warns** ([#75](https://github.com/philgresh/cpnx/issues/75)). Each would drain what the
   other leaves. A guard-free `FIRST` transition of that shape used to fire, the first arc

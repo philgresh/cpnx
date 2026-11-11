@@ -52,12 +52,13 @@ a compiled string expression, both of which are frozen at construction.
 
 import ast
 import builtins
+import copy
 import inspect
 import types
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .sandbox import SandboxEvaluator, _find_target_node
+from .sandbox import SandboxEvaluator, _source_node
 from .tokens import FrozenDict
 
 #: Builtins that iterate/reduce a finite iterable. Added on top of the string
@@ -148,17 +149,16 @@ def _get_ast_node(func: Callable) -> ast.AST | None:
     Returns ``None`` when the source cannot be located (compiled builtins, REPL
     lambdas, ``exec``-created code) — which certification treats as *not
     certified*, never as *allowed*.
+
+    The node is a private copy of the one in the shared per-file parse
+    (:func:`cpnx.sandbox._source_node`), because :func:`_strip_annotations` changes it in
+    place and the purity and lint checks read the shared one.
     """
     try:
-        _, start_line = inspect.getsourcelines(func)
-        source_file = inspect.getsourcefile(func)
-        if not source_file:
-            return None
-        with open(source_file, encoding="utf-8") as handle:
-            tree = ast.parse(handle.read(), filename=source_file)
+        node = _source_node(func)
     except (OSError, TypeError, SyntaxError):
         return None
-    return _find_target_node(tree, start_line)
+    return copy.deepcopy(node)
 
 
 def _param_names(node: ast.AST) -> frozenset[str]:
@@ -421,8 +421,8 @@ def _strip_annotations(node: ast.AST) -> None:
     Parameter/return/variable annotations (``tokens: list[Token]``, ``-> bool``)
     reference *types* that are never evaluated when the callable is *called*, so
     they must not disqualify it — otherwise every type-annotated guard would fail
-    on the class name in its own signature. The node comes from a fresh per-call
-    parse (:func:`_get_ast_node`), so mutating it is safe.
+    on the class name in its own signature. The node is a private copy
+    (:func:`_get_ast_node`), so mutating it is safe.
     """
     for child in ast.walk(node):
         if isinstance(child, ast.arg):
