@@ -242,7 +242,7 @@ The keys' sort order is a lower bound computed from the mirrors (§3), so it is 
 as they are. A token inserted ahead of a key's first entry by such a change, between the refresh
 and the moment the merge opens that key, can give the key a candidate below its listed bound,
 and the merge can then yield candidates out of product order. Under the engine lock the mirrors
-are current and the order is exact; this is the same stale read, not a weaker guarantee.
+are current and every bound holds; this is the same stale read, not a weaker guarantee.
 
 ## Consequences
 
