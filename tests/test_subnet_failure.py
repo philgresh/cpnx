@@ -1950,20 +1950,25 @@ def test_unbounded_deadline_serves_on_both_clocks(logical):
 
 
 def test_logical_drive_raises_when_a_subnet_will_not_settle_in_time():
-    """The subnet's drive gives up after 2,000 spins, so the firing fails with a brew still
-    running. The brew is held until after the assertion, so the parent's 50,000-spin settle
-    wait always runs out first, however fast a spin is on this platform."""
+    """The subnet's drive gives up at once (no spins), so the firing fails with a brew still
+    running. The brew is held until after the assertion, so the parent's settle wait always
+    runs out first, however fast a spin is on this platform.
+
+    The parent's one spin budget also covers waiting for that firing to fail, which takes the
+    subnet's thread some GIL time. On a busy machine the parent can spin far faster than the
+    subnet's thread is scheduled, so the subnet must not spend spins of its own and the parent's
+    budget must be large: otherwise the parent gives up first, with a different error."""
     release = threading.Event()
 
     def slow(tokens: list[Token]) -> list[Token]:
-        release.wait(10.0)
+        release.wait(60.0)
         return tokens
 
     subnet = PetriNet(
         places=[Place("Orders"), Place("Ready")],
         transitions=[Transition("Brew", [InputArc("Orders")], [OutputArc("Ready")], slow)],
     )
-    _cap_drive(subnet, max_spins=2000)
+    _cap_drive(subnet, max_spins=0)
     parent = PetriNet(
         places=[Place("Queue"), Place("Served")],
         transitions=[
@@ -1981,7 +1986,7 @@ def test_logical_drive_raises_when_a_subnet_will_not_settle_in_time():
     parent.deposit("Queue", Token(payload={"order": 1}))
     try:
         with pytest.raises(RuntimeError, match="still settling"):
-            parent.drive_to_quiescence(max_spins=50_000)
+            parent.drive_to_quiescence(max_spins=1_000_000)
     finally:
         release.set()
     _wait_until_settled(subnet)
