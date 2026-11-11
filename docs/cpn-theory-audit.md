@@ -97,6 +97,9 @@ M'(p) = (M(p) —— E(p,t)⟨b⟩) ++ E(t,p)⟨b⟩   ∀p ∈ P
 A **step** `Y` is a non-empty finite multiset of binding elements.  `Y` is enabled
 iff every `(t,b) ∈ Y` satisfies the guard and ∀p: ∑_{(t,b)∈Y} E(p,t)⟨b⟩ ≪= M(p).
 
+With token identity (Finding 5), condition 2 for a place read by several arcs is a
+*distinct-representatives* problem: each arc must take tokens of its own. See Finding 15.
+
 ### 1.3 Hierarchical CPN (Defs 6.1–6.2)
 
 - Each **module** is a non-hierarchical CPN with a designated set of port places and a
@@ -551,6 +554,39 @@ No semantic error, but users should be aware this guard is hidden inside the pla
 
 ---
 
+### Finding 15 — Several Arcs on One Place Need Distinct Tokens (Hall's Condition)
+
+**Theory:** `E(p,t)⟨b⟩ ≪= M(p)` sums every arc's demand on `p`; two arcs from one place take
+two tokens, as one arc with multiplicity 2 does (Jensen, Kristensen & Wells 2007, §2.2–2.3).
+
+**cpnx:** tokens have identity and each arc selects its own (by `key`, `filter` or
+`join_key`), so "the sum fits" becomes: choose a different token for every arc, each from the
+tokens that arc accepts. That is a system of distinct representatives. By **Hall's theorem**
+(P. Hall 1935), one exists iff every set of arcs accepts, between them, at least as many
+tokens as the set has arcs. Hopcroft & Karp (1973) construct one in `O((m+n)√n)`. Join-pattern
+matchers face the same problem when a pattern names one message type twice: they must also
+choose which message fills which slot, and a guard over such a type cannot be pushed down to
+single messages (Karras 2025, on fair join pattern matching).
+
+**Invariants** ([#75](https://github.com/philgresh/cpnx/issues/75),
+[#78](https://github.com/philgresh/cpnx/issues/78)):
+- No binding hands one token to two arcs. Both searches build no such candidate: each arc on
+  a shared place chooses among the tokens the earlier arcs left (`_distinct_combos`,
+  `_key_combos`, and `_head_binding` on the head-only path). A `consume_all` arc there takes
+  what the other arcs leave (`_draining_the_rest`).
+- A join transition binds a key at a place iff the key passes Hall's condition there.
+  With one `join_key` function this is "the key holds N tokens" (the join index depth); with
+  several it is checked over sets of functions (`_has_distinct_tokens`, ADR 0011 §4a).
+- The existence probe and the firing path agree, and the filters that drop keys drop only
+  keys that cannot bind (ADR 0010 §3–4).
+
+Tested by `tests/test_shared_place_arcs.py`, including a Hypothesis property that compares
+the engine against a brute-force distinct assignment.
+
+**Status:** Addressed.
+
+---
+
 ## 3. Summary Table
 
 | # | Area | Severity | Status |
@@ -569,6 +605,7 @@ No semantic error, but users should be aware this guard is hidden inside the pla
 | 12 | SinkPlace.peek raises instead of returning [] | Minor interface inconsistency | Fix peek |
 | 13 | step() fires one transition at a time | Simplification | Justified by Theorem 4.7 |
 | 14 | ThresholdPlace encodes guard on place | Extension | Documented shorthand |
+| 15 | Several arcs on one place need distinct tokens | Correctness | **Addressed** — Hall's condition (#75, #78) |
 
 ---
 

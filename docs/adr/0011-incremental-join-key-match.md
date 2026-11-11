@@ -39,8 +39,9 @@ found with one bisection. `uid` stands in for the key, which need not be orderab
 
 ### 2. Fed by head changes, not by reading the places
 
-Each `_JoinIndex` notes the keys whose group head changed (`add` inserting at position 0,
-`discard` removing position 0) once a reader has asked for them. A deposit behind the head
+Each `_JoinIndex` notes the keys whose group head changed once a reader has asked for them.
+The head is the group's first `depth` entries (§4a; one entry for the usual join), so that is
+an `add` or `discard` at a position below `depth`. A deposit behind the head
 costs nothing extra. `Place.join_head_changes` hands the match those keys and their new head
 times, under the place's lock, and the match keeps a mirror of each place's heads and
 recomputes `when` for each key that changed. A probe therefore pays for what changed since
@@ -69,7 +70,7 @@ ADR 0010's, which `tests/test_join_key.py` checks under all three policies.
 An existence probe on a transition with no guard asks the match for **one** key. Any candidate
 satisfies such a transition, so one available key answers the probe. That relies on ADR 0010
 §1: a join arc takes exactly one token and has no `key` or `filter`, so every token of an
-available group is a valid choice for its arc. `_join_candidates` asserts it, so lifting that
+available group is a valid choice for its arc. `_probe_join_groups` asserts it, so lifting that
 restriction must revisit this. The timing-ignoring probe in the `shop` net drops from
 O(matched keys) to O(1).
 
@@ -81,8 +82,10 @@ index enabled) and the probe has a definite time. Otherwise `_join_candidates` r
 itself as before. The engine drops the match when the cause is structural or a matter of clock:
 
 - an uncertified `join_key`, or a join place that is a `Place` subclass;
-- the wall clock (`model_time=None`), where the place, not the engine, picks the read time;
-- the transition's first probe, before `_join_groups` has registered the indexes.
+- the wall clock (`model_time=None`), where the place, not the engine, picks the read time.
+
+The match registers any index it needs that is not registered yet, so it serves from a
+transition's first probe.
 
 A disabled index (a key that raised or was unhashable) is different: it is expected to come
 back, and `rearm` is rate-limited, so it can stay down for many probes. The match is kept.
@@ -92,6 +95,76 @@ rebuild. When the index re-enables, its new generation makes the match rebuild o
 
 A match is replaced when its transition's join arcs, their index ids or their places change,
 which it checks on every probe.
+
+### 4a. Self-joins ([#75](https://github.com/philgresh/cpnx/issues/75))
+
+Two or more join arcs can read one place. Each takes a different token, so where they share a
+`join_key` function, a key binds there only once the place holds as many of its tokens under
+that function as there are such arcs. Arcs with different functions match a key through
+different tokens, one each, so each counts only the arcs that share its function (functions
+compared by identity). Each index is registered with that number as its **depth**, and its
+"head" is its group's first `depth` entries: it reports a key, and the time it becomes
+available, only once its `depth`-th token is in the group. Where all of a place's join arcs
+share one function, the match then lists only keys that bind, and the one-key probe of §3
+still holds. Where they do not, the depth is only a necessary condition: a token whose key is
+the same under two functions lists that key under each, though its only candidate hands it to
+both arcs. `_join_key_groups` keeps only the keys that pass **Hall's condition** for that
+place, and the guard-free existence probe reads the matched keys in doubling batches and stops
+at the first batch holding one that passes, so it pays only for the keys before the first that
+binds. Hall's condition for a place and key: for every set of the place's functions, the key's
+groups under them hold at least as many distinct tokens as there are arcs using them. By
+Hall's theorem (P. Hall, 1935, on systems of distinct representatives) that is exactly when
+each arc can take a token of its own. Arcs sharing a function share a group, so checking sets
+of functions, with their full arc counts, is exact. Single functions are the depth check
+above, so `c` functions leave `2^c - c - 1` sets to check: one for the usual two, which group
+sizes settle without reading a token unless both groups are small. A key that fails it has no
+candidate that does not reuse a token, so dropping it changes no binding, only keeps a backlog
+of such keys from using up `binding_search_limit`
+([#78](https://github.com/philgresh/cpnx/issues/78)). Changing the depth (an arc moved onto or
+off the place) replaces the index.
+
+The invariants this section relies on, and the tests that hold the engine to them:
+
+- **Distinct tokens.** No binding hands one token to two arcs. The CPN enabling rule asks
+  that what all of a transition's arcs take from a place fits within its marking (Jensen,
+  Kristensen and Wells 2007, §2.2–2.3); with token identity that is a choice of distinct
+  representatives.
+- **Hall-exactness.** A join transition with no guard is enabled iff some key passes Hall's
+  condition at every join place. `test_a_self_join_binds_exactly_when_hall_condition_holds`
+  checks this against a brute-force search.
+- **Probe and firing agree.** `_binding_exists` and `_resolve_binding` give the same answer
+  (ADR 0010 §3). The same property test checks it, and
+  `test_the_guard_free_probe_agrees_with_firing_past_the_search_limit` checks it with more
+  keys than `binding_search_limit`, where the probe's shortcuts could differ from firing.
+- **Filters drop only keys that cannot bind.** Depth and Hall filtering may only shrink the
+  candidates to those that do not reuse a token, never change which binding fires (ADR 0010
+  §4).
+
+Every arc on a shared place takes tokens the earlier arcs left there, so no candidate reuses a
+token: join arcs with any `join_key`, and arcs *without* a `join_key`, whose options are drawn
+from the remaining tokens. A residual Hall check prunes either kind's choice when it would strand
+a later join arc on the place, such as an arc without a `join_key` read first taking a key's
+only token there. Pruning drops only choices no binding extends, so it never changes which
+binding fires. Any other choice that leaves a later arc nothing counts toward
+`binding_search_limit`, which keeps the search bounded.
+
+The one-key probe and its doubling variant must answer as firing does, and firing merges every
+key's candidates and dead ends in product order and stops at the limit. So they apply only
+when no dead end can repeat once per key ahead of the first candidate. Two kinds of arc
+without a `join_key` on a shared place rule them out:
+
+- One that reads a join place. Its choices depend on the key, and its `filter` may accept only
+  the matched key's token, so another key would be needed.
+- One that sits before a join arc, on a place where some arc has a `filter`. If it takes the
+  token a filtered arc needs, that is a dead end, and in product order it comes once for every
+  key before the arc moves to its next token. With more keys than the limit, firing runs out
+  where one key alone would bind: `[c, a:k, b:k, c(filter)]`.
+
+An arc after the last join arc keeps the shortcuts, since its dead ends fall inside one choice
+of the join arcs and the first key meets them once. So does one before a join arc on a place
+with no `filter`: the arcs there all choose among the same tokens, so none runs out while
+another has an option. When the shortcuts do not apply, the probe asks for every key, in
+firing's order.
 
 ### 5. Concurrent changes
 
