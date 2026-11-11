@@ -363,7 +363,7 @@ def test_a_drain_on_a_shared_place_takes_the_rest_on_the_head_only_path(drain_fi
 
 def test_draining_a_full_place_lets_the_transition_feeding_it_fire_again():
     # `q` holds one token at most, so `fill` waits while it is full. `flush` drains it at
-    # firing time; that must flag `q` as changed, or `fill` is never looked at again.
+    # firing time, which makes room for `fill` to fire again.
     net = PetriNet(seed=0)
     net.add_place(Place("src"))
     net.add_place(Place("q", bound=1))
@@ -1168,12 +1168,13 @@ def test_two_plain_arcs_on_one_place_of_a_join_take_their_own_tokens(guarded, po
         (["a:k", "b:k"], ["free", "free"], True, set(), 2),
     ],
 )
-def test_join_plan_levels_shortcut_and_reusable_places(arcs, kinds, shortcut, drained, split):
+def test_join_plan_levels_shortcut_and_drained_places(arcs, kinds, shortcut, drained, split):
     # Join arcs on a shared place and plain arcs there are enumerated without reusing a token;
-    # only a consume_all arc keeps the whole pool, so its place is checked for reuse. The probe
-    # shortcut needs no plain arc on a shared place to read a join place, and none ahead of a
-    # join arc on a place with a filter (`c?`), where its dead ends would repeat per key.
-    # Trailing plain arcs off the key's places are walked once for every key.
+    # only a consume_all arc keeps the whole pool, so its place is listed as drained, where it
+    # is later given what the other arcs leave. The probe shortcut needs no plain arc on a
+    # shared place to read a join place, and none ahead of a join arc on a place with a filter
+    # (`c?`), where its dead ends would repeat per key. Trailing plain arcs off the key's
+    # places are walked once for every key.
     from cpnx.engine import _join_plan, _Ordered, _shared_places
 
     functions = {"k": WID, "g": N}

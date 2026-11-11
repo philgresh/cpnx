@@ -3883,7 +3883,8 @@ class PetriNet:
 
         Every arc's selection (`filter`, `key`) runs once, up front, as in the product. A
         `consume_all` arc keeps its single option, the whole pool, which overlaps any other
-        arc's tokens on its place; `_satisfying` skips those candidates.
+        arc's tokens on its place; `_satisfying` trims it to what those arcs leave
+        (`_draining_the_rest`).
         """
         cap = self.binding_search_limit + 1
         sources, dependent = self._distinct_sources(pools, shared, transition_name, cap)
@@ -3999,12 +4000,14 @@ class PetriNet:
     ) -> "tuple[Iterator[_Binding | _DeadEnd], frozenset[str]] | None":
         """Return the candidate bindings of a transition with `join_key` arcs, or `None` if there are none.
 
-        Returned with the places where a candidate can still hand one token to two arcs (see
-        `_JoinPlan.drained`), for `_satisfying`.
+        Returned with the shared places a `consume_all` arc reads (see `_JoinPlan.drained`),
+        where `_satisfying` gives that arc what the other arcs leave.
 
         The candidates are the product search's candidates whose `join_key` arcs all agree on
         their key, in the same lexicographic order (arc order, the last arc varying fastest),
-        less any that would hand one token to two arcs. See `docs/adr/0010-equi-join-index.md`.
+        less any that would hand one token to two arcs. A `consume_all` arc on a shared place
+        is the exception: its option is still the whole pool, until `_satisfying` trims it.
+        See `docs/adr/0010-equi-join-index.md`.
 
         Each `join_key` arc is read as groups of tokens by key (`_join_groups`), served from
         the place's persistent join index when the key is certified. When every join arc is
