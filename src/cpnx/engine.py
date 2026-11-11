@@ -1699,12 +1699,12 @@ class PetriNet:
         firing: tuple[Transition, list[Token], list[tuple[str, Token]]] | None = None
         try:
             with self._lock:
-                if inline and self._shut_down:
-                    # Match `step()`, whose submit raises once the pool is shut down: refuse
-                    # before consuming, so no token is touched.
-                    raise RuntimeError("cannot fire inline after the net's thread pools were shut down")
                 selected = self._select_transition_to_fire()
                 if selected:
+                    if inline and self._shut_down:
+                        # Match `step()`, whose submit raises once the pool is shut down, only
+                        # when something would fire: refuse before consuming, so no token is touched.
+                        raise RuntimeError("cannot fire inline after the net's thread pools were shut down")
                     # The binding was resolved during selection (guard evaluated once); consume
                     # exactly those tokens. Under BindingPolicy.FIRST the chosen tokens may not
                     # be at the head of their places, so consumption is by token id, not FIFO.
@@ -2004,13 +2004,17 @@ class PetriNet:
                 blocks blocks the drive, and `max_spins` cannot cut it short. Set
                 `action_timeout_secs` on a transition whose action can hang; that action still
                 runs on its own worker under the timeout. `SubstitutionTransition` firings run
-                inline too, and their subnet drives inherit the setting. A `BaseException` that
-                is not an `Exception` (such as `KeyboardInterrupt`) raised by an inline action
-                hands the firing's tokens back unchanged, with no attempt counted and nothing
-                dead-lettered, and propagates out of the drive; on the thread pool it is lost
-                with the worker and the firing fails. That holds for an interrupt raised inside
-                the action body. One that lands while the engine is committing or rolling back
-                can leave that firing half done. An inline drive on a net whose `with` block
+                inline too, and their subnet drives inherit the setting. A `KeyboardInterrupt` or
+                `SystemExit` raised by an inline action hands the firing's tokens back exactly
+                as they were taken (a paced permit starts no cooldown), with no attempt counted
+                and nothing dead-lettered, and propagates out of the drive; on the thread pool
+                it is lost with the worker and the firing fails. Any other `BaseException` that
+                is not an `Exception` fails the firing as usual, then propagates. That holds for
+                an interrupt raised inside the action body. One that lands while the engine is
+                committing or rolling back can leave that firing half done. With
+                `action_timeout_secs`, the interrupt reaches the drive while it waits for the
+                action, which keeps running on its worker and may still have side effects after
+                its tokens are back. An inline drive that would fire on a net whose `with` block
                 has exited raises `RuntimeError`, as `step()` does. See ADR 0012.
 
         Returns:
@@ -3788,11 +3792,14 @@ class PetriNet:
         hands its tokens back without retrying, dead-lettering or calling back, and the restore
         resets the net.
 
-        On an *inline* firing, an action that raises a `BaseException` that is not an `Exception`
-        (`KeyboardInterrupt`, `SystemExit`) is the caller interrupting the drive, not the firing
-        failing: its tokens go back the same way, with no attempt counted, and the interrupt is
-        re-raised. On the pool nothing would receive the re-raise, and returning the tokens would
-        re-fire the same action forever, so a worker keeps rolling the firing back as a failure.
+        On an *inline* firing, an action that raises `KeyboardInterrupt` or `SystemExit` is the
+        caller stopping the drive, not the firing failing: its tokens go back exactly as they were
+        taken (`_return_unstarted`, so a paced permit keeps its availability), with no attempt
+        counted, and the interrupt is re-raised. Any other `BaseException` (`CancelledError`,
+        `GeneratorExit`) fails the firing like an `Exception` and is re-raised after the rollback
+        by `_execute_transition`, so a caller that catches it and drives again cannot re-fire the
+        same token forever. On the pool nothing would receive the re-raise, so a worker rolls
+        every interrupt back as a failure.
         """
         if self._aborted():
             self._return_unstarted(token_sources)
@@ -3804,8 +3811,8 @@ class PetriNet:
         if isinstance(error, _EnclosingFiringFailed):
             self._return_interrupted(token_sources)
             return None
-        if inline and error is not None and not isinstance(error, Exception):
-            self._return_interrupted(token_sources)
+        if inline and isinstance(error, (KeyboardInterrupt, SystemExit)):
+            self._return_unstarted(token_sources)
             raise error
         with self._lock:
             duration = time.monotonic() - start_time

@@ -47,16 +47,21 @@ before it returns, so the following `_await_inflight` finds nothing in flight.
 - **Failure paths are the same code.** `_execute_transition` already catches what an action
   raises, so rollback, `RetryPolicy` scheduling, dead-lettering, `on_error` and the
   settle-then-restore logic run unchanged for every `Exception`.
-- **An interrupt is not a failed firing.** Inline, a `BaseException` that is not an `Exception`
-  (`KeyboardInterrupt`, `SystemExit`) raised by the action is the caller stopping the drive.
-  The firing's tokens go back unchanged, as for a firing an enclosing failure cuts short
-  (`_return_interrupted`: no attempt counted, no retry delay, nothing dead-lettered, no
-  callbacks), and the interrupt propagates out of the drive. For a substitution firing the
-  subnet's own firing does the same, and the parent's firing then restores the subnet to its
-  checkpoint before re-raising. On the pool the interrupt has nowhere to go, and handing the
-  tokens back would re-fire the same action forever, so a worker still rolls the firing back
-  as a failure. This holds for an interrupt raised inside the action body; one that lands
-  while the engine is committing or rolling back can leave that firing half done.
+- **An interrupt is not a failed firing.** Inline, a `KeyboardInterrupt` or `SystemExit`
+  raised by the action is the caller stopping the drive. The firing's tokens go back exactly as
+  they were taken (`_return_unstarted`: a paced permit keeps its availability, no attempt is
+  counted, no retry delay, nothing dead-lettered, no callbacks), and the interrupt propagates
+  out of the drive. For a substitution firing the subnet's own firing does the same, and the
+  parent's firing then restores the subnet to its checkpoint before re-raising. Any other
+  `BaseException` that is not an `Exception` (`asyncio.CancelledError` escaping an action,
+  `GeneratorExit`) fails the firing as usual and then propagates, so a caller that catches it and
+  drives again cannot re-fire the same token forever. On the pool the interrupt has nowhere to
+  go, and handing the tokens back would re-fire the same action forever, so a worker still rolls
+  the firing back as a failure. This holds for an interrupt raised inside the action body; one
+  that lands while the engine is committing or rolling back can leave that firing half done.
+  With `action_timeout_secs`, the interrupt reaches the drive while it waits on the action's
+  future: the action keeps running on its worker and may still have side effects after its
+  tokens are back.
 - **A firing that never starts is undone.** Between consuming a firing and running it, the
   drive dispatches the callbacks deferred during selection (`on_error`,
   `on_binding_search_exhausted`). If one of them raises a `BaseException` they do not catch,
@@ -64,8 +69,9 @@ before it returns, so the following `_await_inflight` finds nothing in flight.
   its tokens as they were taken and drops the count before re-raising. On the pool the firing
   is already submitted by then, so this window did not exist.
 - **A closed net refuses to fire.** An inline drive never submits to the pool, so after the
-  net's `with` block exits it checks a flag set by `__exit__` and raises `RuntimeError` before
-  consuming anything, as `step()` does when its submit fails.
+  net's `with` block exits it checks a flag set by `__exit__` once it has selected a firing, and
+  raises `RuntimeError` before consuming anything, as `step()` does when its submit fails. With
+  nothing enabled it returns normally, as the default drive does.
 - **`step()` and `run()` keep the thread pool.** They exist to overlap actions.
 
 ## Why opt-in

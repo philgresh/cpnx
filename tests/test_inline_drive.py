@@ -6,6 +6,7 @@ advances, and the same seeded random streams afterwards. These tests drive ident
 ways and compare everything observable.
 """
 
+import asyncio
 import threading
 
 import pytest
@@ -234,20 +235,51 @@ def _watch(net: PetriNet) -> list[tuple]:
 @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
 def test_an_inline_interrupt_hands_the_tokens_back_unchanged(interrupt):
     action = _InterruptOnce(interrupt)
-    net = PetriNet(places=[Place("in"), Place("out"), SinkPlace("failed", keep_last=10)])
-    net.add_transition(Transition("t", [InputArc("in")], [OutputArc("out")], action, max_retries=0))
+    net = PetriNet(
+        places=[
+            Place("in"),
+            PacedResourcePlace("R", capacity=1, pacing_secs=5.0),
+            Place("out"),
+            SinkPlace("failed", keep_last=10),
+        ]
+    )
+    net.add_transition(Transition("t", [InputArc("in"), InputArc("R")], [OutputArc("out")], action, max_retries=0))
+    net.advance_time(START)
     token = Token(payload={"i": 0})
     net.deposit("in", token)
+    permits = [(t, t.available_at) for t in net.marking["R"]]
     seen = _watch(net)
     with net:
         with pytest.raises(interrupt):
             net.drive_to_quiescence(inline_actions=True)
         assert net._running_count == 0 and net._drive_limits == {}
         assert net.marking["in"] == (token,), "the same token, with no attempt counted"
+        assert [(t, t.available_at) for t in net.marking["R"]] == permits, "the permit starts no cooldown"
         assert net.marking["failed"] == () and seen == [], "nothing dead-lettered or reported"
         net.drive_to_quiescence()
     assert _payload_ids(net.marking["out"]) == [0]
     assert action.threads[1] != threading.get_ident(), "the follow-up default drive ran on the pool"
+
+
+def _cancel(toks: list[Token]) -> list[Token]:
+    raise asyncio.CancelledError
+
+
+def test_another_base_exception_fails_the_inline_firing_before_propagating():
+    """Only Ctrl-C and SystemExit stop the drive cleanly. A `CancelledError` escaping an action
+    is a failure: retried and finally dead-lettered, so catching it and driving again ends."""
+    net = PetriNet(places=[Place("in"), Place("out"), SinkPlace("failed", keep_last=10)])
+    net.add_transition(Transition("t", [InputArc("in")], [OutputArc("out")], _cancel, max_retries=1))
+    net.deposit("in", Token(payload={"i": 0}))
+    with net:
+        with pytest.raises(asyncio.CancelledError):
+            net.drive_to_quiescence(inline_actions=True)
+        assert net._running_count == 0
+        assert [t.attempts for t in net.marking["in"]] == [1]
+        with pytest.raises(asyncio.CancelledError):
+            net.drive_to_quiescence(inline_actions=True)
+        assert net.marking["in"] == () and len(net.marking["failed"]) == 1
+        net.drive_to_quiescence(inline_actions=True)
 
 
 def _payload_ids(tokens) -> list[int]:
@@ -257,12 +289,19 @@ def _payload_ids(tokens) -> list[int]:
 def test_an_interrupt_in_an_inline_subnet_restores_both_nets():
     action = _InterruptOnce(KeyboardInterrupt)
     subnet = PetriNet(
-        places=[Place("Orders"), Place("Prepped"), Place("Ready")],
+        places=[
+            Place("Orders"),
+            Place("Prepped"),
+            PacedResourcePlace("Grinder", capacity=1, pacing_secs=5.0),
+            Place("Ready"),
+        ],
         transitions=[
             Transition("Prep", [InputArc("Orders")], [OutputArc("Prepped")], _identity),
-            Transition("Brew", [InputArc("Prepped")], [OutputArc("Ready")], action),
+            Transition("Brew", [InputArc("Prepped"), InputArc("Grinder")], [OutputArc("Ready")], action),
         ],
     )
+    subnet.advance_time(START)
+    permits = [(t, t.available_at) for t in subnet.marking["Grinder"]]
     parent = PetriNet(
         places=[Place("Queue"), Place("Served"), SinkPlace("failed", keep_last=10)],
         transitions=[
@@ -287,7 +326,10 @@ def test_an_interrupt_in_an_inline_subnet_restores_both_nets():
             assert net._running_count == 0 and net._drive_limits == {}
             assert net._pending_restore is None
         assert parent.marking["Queue"] == (token,)
-        assert all(tokens == () for tokens in subnet.marking.values()), "the subnet is back at its checkpoint"
+        assert all(tokens == () for name, tokens in subnet.marking.items() if name != "Grinder"), (
+            "the subnet is back at its checkpoint"
+        )
+        assert [(t, t.available_at) for t in subnet.marking["Grinder"]] == permits, "the permit starts no cooldown"
         assert parent.marking["failed"] == () and seen == []
         parent.drive_to_quiescence()
     assert _payload_ids(parent.marking["Served"]) == [0]
@@ -338,6 +380,15 @@ def test_an_inline_drive_on_a_closed_net_raises_like_step():
     with pytest.raises(RuntimeError, match="shut down"):
         net.drive_to_quiescence(inline_actions=True)
     assert net.marking["in"] == (token,) and net._running_count == 0
+
+
+def test_an_inline_drive_on_a_closed_quiescent_net_returns_like_the_default_drive():
+    net = PetriNet(places=[Place("in"), Place("out")])
+    net.add_transition(Transition("t", [InputArc("in")], [OutputArc("out")], _identity))
+    with net:
+        pass
+    assert net.drive_to_quiescence().steps == 0
+    assert net.drive_to_quiescence(inline_actions=True).steps == 0
 
 
 def _hang(toks: list[Token]) -> list[Token]:
