@@ -1670,12 +1670,16 @@ def test_the_guard_free_probe_agrees_with_firing_past_the_search_limit(arcs, key
     assert net._binding_exists(t, net.model_time) is fires
 
 
-def test_a_token_in_two_tight_sets_counts_toward_both():
+@pytest.mark.parametrize("swap", [False, True])
+def test_a_token_in_two_tight_sets_counts_toward_both(swap):
     # b belongs to both sets, each with room for one token: an option may hold b alone of
-    # either set, so [a, b] and [b, c] are out and every other pair stays, in order.
+    # either set, so [a, b] and [b, c] are out and every other pair stays, in order. Either
+    # set may be the one that has run out when b comes up, so both orders are checked.
     from cpnx.engine import _walk_options
 
     a, b, c, d = tokens = [Token(payload={"n": n}) for n in range(4)]
     constraints = [({id(a), id(b)}, 1), ({id(b), id(c)}, 1)]
+    if swap:
+        constraints.reverse()
     options = [indexes for indexes, _ in _walk_options(tokens, set(), 2, constraints)]
     assert options == [(0, 2), (0, 3), (1, 3), (2, 3)]

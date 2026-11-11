@@ -664,7 +664,8 @@ def _plain_read_depth(arc: InputArc, limit: int, demand: dict[str, int]) -> int:
       under union (Hall's condition is submodular), and a tight set's free tokens number its
       arcs, so there are at most as many as later join arcs.
 
-    So `p < limit + count - 1 + demand - count`, and `limit + demand` tokens hold the option.
+    So at most `limit + (count - 1) + (demand - count)` tokens come before `p`: `p` is at most
+    `limit + demand - 1`, and `limit + demand` tokens hold the option, with none to trim.
     """
     return limit + demand[arc.place]
 
