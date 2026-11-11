@@ -1725,8 +1725,9 @@ class PetriNet:
         if inline:
             # Off the lock, as on a worker thread. `_execute_transition` catches the action's
             # exceptions, commits or rolls back, runs the callbacks and decrements
-            # `_running_count`. A non-`Exception` `BaseException` from the action (e.g.
-            # `KeyboardInterrupt`) hands the tokens back unchanged and propagates.
+            # `_running_count`. A `KeyboardInterrupt` or `SystemExit` from the action hands the
+            # tokens back as taken and propagates; any other `BaseException` fails the firing,
+            # then propagates (see `_fire_and_commit`).
             self._execute_transition(*firing, inline=True)
         return True
 

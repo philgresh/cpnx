@@ -94,7 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   action that can hang. A `KeyboardInterrupt` or `SystemExit` raised by an inline action
   hands its tokens back exactly as they were taken (no attempt counted, nothing dead-lettered,
   no permit cooldown) and propagates out of the drive. With `action_timeout_secs`, the action
-  itself may still be running on its worker. `step()`, `run()` and the default drive are unchanged.
+  itself may still be running on its worker. Any other `BaseException` from an inline action,
+  such as `asyncio.CancelledError`, fails the firing as usual (an attempt is counted, and it
+  can dead-letter) and then propagates out of the drive. `step()`, `run()` and the default drive are unchanged.
 - **`InputArc.join_key` joins input arcs on equal keys, and a join with no match no longer
   walks every candidate** ([#64](https://github.com/philgresh/cpnx/issues/64),
   [ADR 0010](https://github.com/philgresh/cpnx/blob/main/docs/adr/0010-equi-join-index.md)).
