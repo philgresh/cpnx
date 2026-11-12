@@ -1,8 +1,36 @@
 name: CI
 
-on: [push, pull_request]
+# One run per commit: pushes to main, and pull requests (which cover pushes to their branches).
+# A bare `on: [push, pull_request]` ran every PR commit twice.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same branch or PR cancels the runs it supersedes. Pushes to main are
+# keyed by commit SHA instead, so every commit that lands on main still gets a full run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  lint:
+    name: Lint and complexity gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check src/ tests/
+      - name: Complexity gate (radon, rank A/B only)
+        run: |
+          radon cc src/cpnx -s -a
+          bad=$(radon cc src/cpnx --min C -s)
+          if [ -n "$bad" ]; then echo "Complexity gate FAILED — rank C or worse:"; echo "$bad"; exit 1; fi
+          echo "Complexity gate passed."
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -20,17 +48,13 @@ jobs:
           python-version: ${{ matrix.python-version }}
           allow-prereleases: true
       - run: pip install -e ".[dev]"
-      - run: ruff check src/ tests/
-      - name: Complexity gate (radon, rank A/B only)
-        run: |
-          radon cc src/cpnx -s -a
-          bad=$(radon cc src/cpnx --min C -s)
-          if [ -n "$bad" ]; then echo "Complexity gate FAILED — rank C or worse:"; echo "$bad"; exit 1; fi
-          echo "Complexity gate passed."
       # No entry sets `experimental`, so this is currently always false. It is kept as the
       # hook for the next prerelease; note it covers only pytest, so an experimental entry
-      # still fails the job on an install, ruff or radon error.
-      - run: pytest tests/ -v
+      # still fails the job on an install error.
+      # `-n auto` spreads the suite over the runner's cores with pytest-xdist; `worksteal` lets idle
+      # workers take queued tests from busy ones, so the few long Hypothesis tests don't pile up
+      # behind one worker. `--durations` keeps the slowest tests visible in the log.
+      - run: pytest tests/ -n auto --dist worksteal --durations=15
         continue-on-error: ${{ matrix.experimental == true }}
 
   docs:

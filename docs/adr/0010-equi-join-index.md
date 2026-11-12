@@ -59,7 +59,9 @@ The one deliberate difference is the search limit. `binding_search_limit` counts
 candidates, and the join search examines only agreeing ones, so a join can find a binding that
 the guard-only search would have given up on. Join arcs are also not truncated to
 `binding_search_limit + 1` options as other arcs are, since their groups hold only matching
-tokens. Arcs without a `join_key` on the same transition keep their usual options and cap.
+tokens. Arcs without a `join_key` on the same transition keep their usual options and cap,
+unless they share a place with another arc: then each draws its options from the tokens the
+earlier arcs left there, as ADR 0011 §4a describes, so no candidate hands one token to two arcs.
 
 A transition with a `join_key` arc is never head-only, even with no guard. The heads of its
 places need not share a key.
@@ -94,6 +96,12 @@ The existence probe only asks whether *some* candidate satisfies. When all candi
 within `binding_search_limit` it chains the per-key products and skips the merge, because the
 order cannot change the answer. With more candidates than that, the limit decides which are
 examined, so the probe keeps the firing path's order and the two always agree.
+
+> **Update:** where ADR 0011's match serves, the search no longer merges every key's product:
+> it sorts keys by a lower bound on their candidates and opens each only once the merge reaches
+> its bound (ADR 0011 §3), with the same candidates in the same order. The bound is not a key's
+> first candidate, so the merge may never stop at the first key it opens. The merge above
+> remains for the fallback.
 
 ### 4. Falling back
 
