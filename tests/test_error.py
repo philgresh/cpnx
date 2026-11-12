@@ -8,7 +8,9 @@ from cpnx.transitions import InputArc, OutputArc, Transition
 
 class TestResourceReturnOnFailure:
     def test_resource_returned_after_action_raises(self):
-        net = PetriNet(max_workers=2, error_place="failed")
+        # A retry delay longer than the 1 s run: under load the action can fail before the run's
+        # deadline is read, so the default 1 s retry would fire, and fail again, inside the window.
+        net = PetriNet(max_workers=2, error_place="failed", retry_delay=60.0)
         net.add_place(Place("input"))
         net.add_place(Place("output"))
         net.add_place(ResourcePlace("gpu", capacity=1))
@@ -55,7 +57,9 @@ class TestResourceReturnOnFailure:
         assert len(net.places["output"].tokens) == 0
 
     def test_on_error_callback_fires(self):
-        net = PetriNet(max_workers=2)
+        # A retry delay longer than the 1 s run: under load the action can fail before the run's
+        # deadline is read, so the default 1 s retry would fire, and fail again, inside the window.
+        net = PetriNet(max_workers=2, retry_delay=60.0)
         net.add_place(Place("input"))
         net.add_place(Place("output"))
 
@@ -87,7 +91,9 @@ class TestResourceReturnOnFailure:
         assert error_info.get("token") == t
 
     def test_multiple_resources_all_returned_on_failure(self):
-        net = PetriNet(max_workers=2)
+        # A retry delay longer than the 1 s run: under load the action can fail before the run's
+        # deadline is read, so the default 1 s retry would fire, and fail again, inside the window.
+        net = PetriNet(max_workers=2, retry_delay=60.0)
         net.add_place(Place("input"))
         net.add_place(Place("output"))
         net.add_place(ResourcePlace("gpu", capacity=2))
