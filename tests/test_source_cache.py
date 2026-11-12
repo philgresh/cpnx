@@ -158,6 +158,35 @@ def test_a_walrus_in_a_default_value_does_not_hide_a_mutable_global(tmp_path):
     assert "STATE" in verdict.reason
 
 
+# Everything that runs when a guard is called must be walked, and only names the guard really
+# binds may hide a global. Each case runs `evil()` per call or reads the global STATE.
+RUNS_OR_READS_AT_CALL_TIME = {
+    "nested_decorator": "def guard(tokens):\n    @evil\n    def h(x):\n        return x\n\n    return True\n",
+    "nested_default": "def guard(tokens):\n    def h(x=evil()):\n        return x\n\n    return True\n",
+    "lambda_default": "def guard(tokens):\n    h = lambda x=evil(): x  # noqa: E731\n    return True\n",
+    "annotated_target": "def guard(tokens):\n    evil().x: int\n    return True\n",
+    "fstring": "def guard(tokens):\n    return f'{evil()}' != ''\n",
+    "except_name": (
+        "def guard(tokens):\n    try:\n        pass\n    except ValueError as STATE:\n        pass\n"
+        "    return len(STATE) > 0\n"
+    ),
+    "match_capture": (
+        "def guard(tokens):\n    match tokens:\n        case [STATE]:\n            pass\n    return len(STATE) > 0\n"
+    ),
+    "nested_walrus_default": (
+        "def guard(tokens):\n    h = lambda x=(STATE := 0): x  # noqa: E731\n    return len(STATE) > 0\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(RUNS_OR_READS_AT_CALL_TIME))
+def test_code_that_runs_at_call_time_is_checked(tmp_path, case):
+    path = tmp_path / f"runs_{case}.py"
+    path.write_text("STATE = [1]\nCALLS = []\n\n\ndef evil(*a):\n    CALLS.append(1)\n    return int\n\n\n")
+    path.write_text(path.read_text() + RUNS_OR_READS_AT_CALL_TIME[case])
+    assert not certify(_load(path, f"runs_{case}_guard").guard).certified
+
+
 @pytest.mark.parametrize("terms", [250, 400])
 def test_a_guard_with_a_long_expression_still_certifies(tmp_path, terms):
     # Copying the cached node recursed once per AST level and raised RecursionError here.
