@@ -191,6 +191,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Certification no longer admits three callables that run more than it checked.** A
+  certified guard, key or filter runs inline, so these were real gaps:
+
+  - **A nested `def`'s annotations are now checked before 3.14** (without
+    `from __future__ import annotations`). They run every time the `def` statement does, i.e.
+    on every call, but were skipped like the callable's own annotations. A side effect: on
+    3.10–3.13, a nested `def` annotated with a module class (`def key(t: Token) -> int`) now
+    uncertifies its callable, which then runs on the executor (a guard) or loses the place
+    index (a key or filter). Drop the annotations or add the future import to keep it inline.
+  - **A `class` statement inside a callable is rejected.** Its body runs on every call,
+    including its annotations before 3.14, and its names were counted as the callable's own,
+    hiding reads of same-named mutable globals.
+  - **A walrus in the callable's own default values no longer counts as a local binding.**
+    Defaults run once, at definition, so `def guard(t, _=(STATE := 0))` binds nothing when it
+    runs, and its read of a mutable global `STATE` is now rejected.
+
 - **Two input arcs on one place now take two different tokens**
   ([#75](https://github.com/philgresh/cpnx/issues/75)). A transition with two arcs reading the
   same place, whether the same `InputArc` twice or two separate ones, with or without

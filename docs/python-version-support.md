@@ -270,14 +270,16 @@ tripping a Python-level deprecation.
 * **Frame-walk attribution.** `linting._assignment_stacklevel()` returns the same value on
   3.13, 3.14 and 3.15 (`1` from a non-internal caller; `_FALLBACK_STACKLEVEL = 3`), and
   `_PACKAGE_ROOT` resolves identically. `tests/test_linting.py` passes on all three.
-* **PEP 649/749 deferred annotation evaluation (3.14).** No behaviour change, but the earlier
-  wording here ("cpnx strips annotations at the AST level, so lazy evaluation cannot change a
-  verdict") was too broad. Certification ignores annotations at the AST level only where they
-  never run at call time (`certification._inert_annotations`: the callable's own signature,
-  local variable annotations, and a nested `def`'s signature only when annotations are lazy,
-  i.e. on 3.14+ or under `from __future__ import annotations`). Before 3.14 a nested `def`'s
-  annotations run on every call, so they are checked like any other code. That wording also
-  overlooked that
+* **PEP 649/749 deferred annotation evaluation (3.14).** Certification verdicts differ by
+  version in one place, on purpose. Certification ignores an annotation only where it never
+  runs when the callable is called (`certification._inert_annotations`): the callable's own
+  signature, local variable annotations (all in function scope, since a nested `class` is
+  rejected), and a nested `def`'s signature only when annotations are lazy, i.e. on 3.14+ or
+  under `from __future__ import annotations`. Before 3.14 a nested `def`'s annotations run on
+  every call, so they are checked like any other code, and a nested `def` annotated with a
+  module class certifies on 3.14+ but not on 3.10–3.13. The earlier wording here ("cpnx strips
+  annotations at the AST level, so lazy evaluation cannot change a verdict") was wrong on that
+  point, and also overlooked that
   `transitions._reject_non_bool_return` calls `typing.get_type_hints(value)` at *runtime*, on
   every `Transition.guard`, `InputArc.filter` and `OutputArc.condition` assignment. Under PEP
   649 that call is now what triggers `value.__annotate__()`, so cpnx is the thing forcing

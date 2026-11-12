@@ -429,7 +429,10 @@ def _inert_annotations(root: ast.AST, func: Callable) -> frozenset[int]:
     before 3.14) never runs, so it must not hide a read of a same-named global. They are:
 
     * *root*'s own parameter and return annotations, evaluated once when it was defined;
-    * every local variable annotation (``AnnAssign``), never evaluated in function scope;
+    * every local variable annotation (``AnnAssign``), never evaluated in function scope.
+      That holds because every ``AnnAssign`` a certified callable can hold is in function
+      scope: :func:`_check_structural` rejects a nested ``class``, whose body would run its
+      annotations on every call before 3.14;
     * a nested ``def``'s parameter and return annotations **only** when annotations are
       lazy (3.14+, or ``from __future__ import annotations``). Before that they run each
       time the nested ``def`` statement does, i.e. on every call of *func*, so they are
@@ -477,12 +480,16 @@ def _check_structural(node: ast.AST) -> Verdict | None:
         return Verdict(False, "unbounded iteration (for/while)")
     if isinstance(node, (ast.Await, ast.Yield, ast.YieldFrom)):
         return Verdict(False, "await/yield")
+    if isinstance(node, ast.ClassDef):
+        # A class body runs on every call: its annotations are evaluated before 3.14, and its
+        # names would otherwise leak into the callable's bound names (see _bound_names).
+        return Verdict(False, "class definition")
     if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
         return Verdict(False, f"private/dunder attribute '{node.attr}'")
     return None
 
 
-def _bound_names(node: ast.AST, inert: frozenset[int] = frozenset()) -> frozenset[str]:
+def _bound_names(node: ast.AST, inert: frozenset[int]) -> frozenset[str]:
     """Names bound in *node*'s **own** scope — assignments/targets plus the names
     of nested functions defined here.
 
@@ -502,11 +509,19 @@ def _bound_names(node: ast.AST, inert: frozenset[int] = frozenset()) -> frozense
     conservatively rejected (the safe direction). Note ``bound`` is a
     false-*reject*-avoidance heuristic, not a soundness mechanism; other Python
     scope-introducers not reachable in a certifiable body today (e.g. a nested
-    ``class``) would share the same shadowing trait if they became reachable.
+    ``class``, which :func:`_check_structural` rejects) would share the same
+    shadowing trait if they became reachable.
+
+    *node*'s own ``arguments`` are left out: the parameter names come from
+    :func:`_param_names`, and the default values ran once, when *node* was defined,
+    so a walrus in one (``def guard(t, _=(STATE := 0))``) binds nothing when the
+    callable runs and must not hide a read of a same-named global.
     """
     names: set[str] = set()
+    signature = getattr(node, "args", None)
     for child in _live_children(node, inert):
-        _collect_scope_bindings(child, names, inert)
+        if child is not signature:
+            _collect_scope_bindings(child, names, inert)
     return frozenset(names)
 
 

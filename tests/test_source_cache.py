@@ -130,6 +130,34 @@ def test_a_nested_defs_annotations_are_skipped_under_the_future_import(tmp_path)
     assert certify(_load(path, "nested_future_guard").guard).certified
 
 
+CLASS_IN_GUARD = {
+    # Before 3.14 the class body runs its annotation, calling `evil()`, on every guard call.
+    "annotation": "def guard(tokens):\n    class C:\n        x: evil() = 1\n\n    return True\n",
+    # The class body's STATE would count as a local binding and hide the read of the global.
+    "binding": "def guard(tokens):\n    class C:\n        STATE = 0\n\n    return len(STATE) > 0\n",
+}
+
+
+@pytest.mark.parametrize("case", sorted(CLASS_IN_GUARD))
+def test_a_class_inside_a_guard_does_not_certify(tmp_path, case):
+    path = tmp_path / f"class_{case}.py"
+    path.write_text("STATE = [1]\n\n\ndef evil():\n    return int\n\n\n" + CLASS_IN_GUARD[case])
+    verdict = certify(_load(path, f"class_{case}_guard").guard)
+    assert not verdict.certified
+    assert verdict.reason == "class definition"
+
+
+def test_a_walrus_in_a_default_value_does_not_hide_a_mutable_global(tmp_path):
+    # The default ran once, at definition: inside the guard, STATE is still the module's list.
+    path = tmp_path / "walrus_default.py"
+    path.write_text("STATE = [1]\n\n\ndef guard(tokens, _=(STATE := 0)):\n    return len(STATE) > 0\n")
+    module = _load(path, "walrus_default_guard")
+    module.STATE = [1]
+    verdict = certify(module.guard)
+    assert not verdict.certified
+    assert "STATE" in verdict.reason
+
+
 @pytest.mark.parametrize("terms", [250, 400])
 def test_a_guard_with_a_long_expression_still_certifies(tmp_path, terms):
     # Copying the cached node recursed once per AST level and raised RecursionError here.
