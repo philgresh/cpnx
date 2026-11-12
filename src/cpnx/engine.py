@@ -929,6 +929,14 @@ def _warn_if_drained_twice(transition: Transition) -> None:
         )
 
 
+def _searchable_shared_places(transition: Transition) -> frozenset[str] | None:
+    """`_shared_places(transition)`, or `None` when its arcs drain one place twice (it can never bind)."""
+    shared = _shared_places(transition)
+    if shared and _drains_a_place_twice(transition, shared):
+        return None
+    return shared
+
+
 def _drains_a_place_twice(transition: Transition, shared: frozenset[str]) -> bool:
     """Whether two `consume_all` arcs of `transition` read one place: it can then never fire."""
     seen: set[str] = set()
@@ -3963,8 +3971,8 @@ class PetriNet:
             return self._selector_binding(transition, m_time, ignore_timing)
         if self._selector_transitions or self._join_registrations:
             self._release_stale_search_state(transition)
-        shared = _shared_places(transition)
-        if shared and _drains_a_place_twice(transition, shared):
+        shared = _searchable_shared_places(transition)
+        if shared is None:
             return None
         fast = self._try_count_only_binding(transition, m_time, ignore_timing, shared)
         if fast is not _NO_FAST_PATH:
@@ -3997,8 +4005,8 @@ class PetriNet:
             return self._selector_binding(transition, m_time, ignore_timing) is not None
         if self._selector_transitions or self._join_registrations:
             self._release_stale_search_state(transition)
-        shared = _shared_places(transition)
-        if shared and _drains_a_place_twice(transition, shared):
+        shared = _searchable_shared_places(transition)
+        if shared is None:
             return False
         fast = self._try_count_only_binding(transition, m_time, ignore_timing, shared)
         if fast is not _NO_FAST_PATH:
