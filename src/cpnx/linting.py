@@ -69,7 +69,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .certification import _UNRESOLVED, _resolve_name, _root_name
-from .sandbox import _callable_node
+from .sandbox import _callable_node_or_none
 
 #: Category label for findings whose root symbol is a network client/transport.
 NETWORK = "network"
@@ -347,17 +347,6 @@ def _classify_call(node: ast.Call, func: Callable) -> tuple[str, str] | None:
     return None
 
 
-def _get_cached_ast_node(func: Callable) -> ast.AST | None:
-    """Recover *func*'s ``Lambda``/``FunctionDef`` node from the shared source cache.
-
-    Returns ``None`` when the source cannot be located (compiled builtin, REPL lambda).
-    """
-    try:
-        return _callable_node(func)
-    except (OSError, TypeError, SyntaxError):
-        return None
-
-
 def lint_callable(func: Callable) -> list[LintFinding]:
     """Scan *func*'s body for network / database / clock / randomness trouble spots.
 
@@ -369,7 +358,7 @@ def lint_callable(func: Callable) -> list[LintFinding]:
     """
     if not callable(func):
         return []
-    node = _get_cached_ast_node(func)
+    node = _callable_node_or_none(func)
     if node is None:
         return []
 

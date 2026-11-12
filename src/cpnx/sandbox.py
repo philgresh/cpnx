@@ -82,9 +82,15 @@ class _ParsedSource:
 #: and the certifier each need the node of every guard, key and action they see, and all three
 #: used to parse the whole defining file and walk its whole tree once per callable, per
 #: transition built. Building nets in a loop (a test module of a few thousand lines, a
-#: generated model) then cost ~0.1 s per callable. The cached trees are shared, so callers
-#: must not mutate them: the certifier, which strips annotations in place, copies its node.
+#: generated model) then cost ~0.1 s per callable. The trees are shared, so nothing may
+#: mutate them: every consumer only walks its node (the certifier skips annotations as it
+#: walks instead of stripping them).
 _SOURCE_CACHE: dict[str, _ParsedSource] = {}
+
+#: What "the source cannot be found or parsed" looks like: no file (``OSError``), a builtin or
+#: C function (``TypeError``), unparsable source (``SyntaxError``), or undecodable bytes
+#: (``UnicodeDecodeError``, a ``ValueError``).
+_SOURCE_UNAVAILABLE = (OSError, TypeError, SyntaxError, ValueError)
 
 
 def _parsed_source(path: str) -> _ParsedSource:
@@ -92,7 +98,8 @@ def _parsed_source(path: str) -> _ParsedSource:
     stamp = (stat.st_mtime_ns, stat.st_size)
     cached = _SOURCE_CACHE.get(path)
     if cached is None or cached.stamp != stamp:
-        with open(path, encoding="utf-8") as handle:
+        with open(path, "rb") as handle:
+            # Bytes, so ast.parse honours a PEP 263 coding cookie.
             tree = ast.parse(handle.read(), filename=path)
         cached = _SOURCE_CACHE[path] = _ParsedSource(stamp, tree)
     return cached
@@ -101,8 +108,8 @@ def _parsed_source(path: str) -> _ParsedSource:
 def _callable_node(func: Callable) -> ast.AST | None:
     """Return the ``FunctionDef``/``Lambda`` node that defines *func*, from a shared parse.
 
-    The node belongs to a cached tree: read it, never mutate it. Raises ``OSError``,
-    ``TypeError`` or ``SyntaxError`` when the source cannot be found or parsed.
+    The node belongs to a cached tree: read it, never mutate it. Raises one of
+    :data:`_SOURCE_UNAVAILABLE` when the source cannot be found, read or parsed.
     """
     path = inspect.getsourcefile(func)
     _, start_line = inspect.getsourcelines(func)
@@ -112,6 +119,14 @@ def _callable_node(func: Callable) -> ast.AST | None:
     if start_line not in parsed.targets:
         parsed.targets[start_line] = _find_target_node(parsed.tree, start_line)
     return parsed.targets[start_line]
+
+
+def _callable_node_or_none(func: Callable) -> ast.AST | None:
+    """:func:`_callable_node`, with unavailable source reported as ``None``."""
+    try:
+        return _callable_node(func)
+    except _SOURCE_UNAVAILABLE:
+        return None
 
 
 _FORBIDDEN_FUNCS = frozenset({"open", "print", "eval", "exec", "__import__", "sleep"})

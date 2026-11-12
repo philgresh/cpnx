@@ -52,13 +52,13 @@ a compiled string expression, both of which are frozen at construction.
 
 import ast
 import builtins
-import copy
 import inspect
 import types
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from .sandbox import SandboxEvaluator, _callable_node
+from .sandbox import SandboxEvaluator, _callable_node_or_none
 from .tokens import FrozenDict
 
 #: Builtins that iterate/reduce a finite iterable. Added on top of the string
@@ -141,21 +141,6 @@ def _is_immutable(value: object) -> bool:
     if isinstance(value, _FROZEN_MAPPINGS):
         return all(_is_immutable(key) and _is_immutable(item) for key, item in value.items())
     return False
-
-
-def _get_ast_node(func: Callable) -> ast.AST | None:
-    """Recover a private copy of the ``Lambda``/``FunctionDef`` AST node for *func*, or ``None``.
-
-    Returns ``None`` when the source cannot be located (compiled builtins, REPL
-    lambdas, ``exec``-created code) — which certification treats as *not
-    certified*, never as *allowed*. The node is copied out of the shared source
-    cache because :func:`_strip_annotations` mutates it.
-    """
-    try:
-        node = _callable_node(func)
-    except (OSError, TypeError, SyntaxError):
-        return None
-    return None if node is None else copy.deepcopy(node)
 
 
 def _param_names(node: ast.AST) -> frozenset[str]:
@@ -266,7 +251,7 @@ class _Certifier:
     def _certify_uncached(self, func: Callable, stack: frozenset[Callable]) -> Verdict:
         if getattr(func, "__wrapped__", None) is not None:
             return Verdict(False, "decorated callable (wrapper hides certified body)")
-        node = _get_ast_node(func)
+        node = _callable_node_or_none(func)
         if node is None:
             return Verdict(False, "source unavailable")
         if isinstance(node, ast.AsyncFunctionDef):
@@ -284,10 +269,9 @@ class _Certifier:
         immutable or a certifying helper (see :meth:`_check_name`). This unified
         read check covers both closure cells and module globals.
         """
-        _strip_annotations(node)
         params = _param_names(node)
         bound = params | _bound_names(node)
-        for child in ast.walk(node):
+        for child in _walk_unannotated(node):
             verdict = self._check_node(child, func, params, bound, stack)
             if not verdict.certified:
                 return verdict
@@ -412,22 +396,37 @@ def _comp_target_names(target: ast.AST) -> list[str]:
     return []
 
 
-def _strip_annotations(node: ast.AST) -> None:
-    """Blank out type annotations in-place before the certification walk.
+#: The fields that hold a type annotation, per node type.
+_ANNOTATION_FIELDS: dict[type, str] = {
+    ast.arg: "annotation",
+    ast.FunctionDef: "returns",
+    ast.AsyncFunctionDef: "returns",
+    ast.AnnAssign: "annotation",
+}
+
+
+def _walk_unannotated(node: ast.AST) -> Iterator[ast.AST]:
+    """Walk *node* like :func:`ast.walk`, but skip every type annotation.
 
     Parameter/return/variable annotations (``tokens: list[Token]``, ``-> bool``)
     reference *types* that are never evaluated when the callable is *called*, so
     they must not disqualify it — otherwise every type-annotated guard would fail
-    on the class name in its own signature. The node is a private copy
-    (:func:`_get_ast_node`), so mutating it is safe.
+    on the class name in its own signature. They are skipped rather than stripped
+    because *node* belongs to the shared source cache (:mod:`cpnx.sandbox`), which
+    must never be mutated.
     """
-    for child in ast.walk(node):
-        if isinstance(child, ast.arg):
-            child.annotation = None
-        elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            child.returns = None
-        elif isinstance(child, ast.AnnAssign):
-            child.annotation = ast.Constant(value=None)
+    todo = deque([node])
+    while todo:
+        current = todo.popleft()
+        skip = _ANNOTATION_FIELDS.get(type(current))
+        for field, value in ast.iter_fields(current):
+            if field == skip:
+                continue
+            if isinstance(value, ast.AST):
+                todo.append(value)
+            elif isinstance(value, list):
+                todo.extend(item for item in value if isinstance(item, ast.AST))
+        yield current
 
 
 def _check_structural(node: ast.AST) -> Verdict | None:
