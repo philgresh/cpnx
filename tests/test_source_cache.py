@@ -107,6 +107,29 @@ def test_a_walrus_in_an_annotation_does_not_hide_a_mutable_global(tmp_path, wher
     assert "STATE" in verdict.reason
 
 
+NESTED_ANNOTATIONS = (
+    "def evil():\n    print('called')\n    return int\n\n\n"
+    "def guard(tokens):\n    def helper(x: evil()) -> evil():\n        return x\n\n    return True\n"
+)
+
+
+def test_a_nested_defs_annotations_are_checked_when_they_run_at_call_time(tmp_path):
+    # Before 3.14, a nested def's annotations run every time the guard runs, so `evil()`
+    # is called from the guard and it must not certify. From 3.14 they are lazy.
+    path = tmp_path / "nested_annotations.py"
+    path.write_text(NESTED_ANNOTATIONS)
+    verdict = certify(_load(path, "nested_annotations_guard").guard)
+    assert verdict.certified is (sys.version_info >= (3, 14))
+    if not verdict.certified:
+        assert "evil" in verdict.reason
+
+
+def test_a_nested_defs_annotations_are_skipped_under_the_future_import(tmp_path):
+    path = tmp_path / "nested_future.py"
+    path.write_text("from __future__ import annotations\n\n" + NESTED_ANNOTATIONS)
+    assert certify(_load(path, "nested_future_guard").guard).certified
+
+
 @pytest.mark.parametrize("terms", [250, 400])
 def test_a_guard_with_a_long_expression_still_certifies(tmp_path, terms):
     # Copying the cached node recursed once per AST level and raised RecursionError here.
@@ -138,7 +161,9 @@ def test_an_edited_file_is_parsed_again_by_every_check(tmp_path):
 
 def test_a_latin_1_source_file_is_decoded_by_its_coding_cookie(tmp_path):
     path = tmp_path / "latin.py"
-    path.write_bytes(b"# -*- coding: latin-1 -*-\ndef guard(tokens):\n    return 'caf\xe9' in tokens\n")
+    # `.get(...)` is rejected only by the stricter getsource fallback, so passing the purity
+    # check shows the precise path read this file.
+    path.write_bytes(b"# -*- coding: latin-1 -*-\ndef guard(tokens):\n    return tokens.get('caf\xe9')\n")
     guard = _load(path, "latin_guard").guard
     verify_callable_purity(guard)
     assert lint_callable(guard) == []

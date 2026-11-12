@@ -50,9 +50,12 @@ behaviour** — symmetric with the closure-cell immutability rule below and with
 a compiled string expression, both of which are frozen at construction.
 """
 
+import __future__
+
 import ast
 import builtins
 import inspect
+import sys
 import types
 from collections import deque
 from collections.abc import Callable, Iterator
@@ -269,9 +272,10 @@ class _Certifier:
         immutable or a certifying helper (see :meth:`_check_name`). This unified
         read check covers both closure cells and module globals.
         """
+        inert = _inert_annotations(node, func)
         params = _param_names(node)
-        bound = params | _bound_names(node)
-        for child in _walk_unannotated(node):
+        bound = params | _bound_names(node, inert)
+        for child in _walk_live(node, inert):
             verdict = self._check_node(child, func, params, bound, stack)
             if not verdict.certified:
                 return verdict
@@ -396,44 +400,65 @@ def _comp_target_names(target: ast.AST) -> list[str]:
     return []
 
 
-#: The fields that hold a type annotation, per node type.
-_ANNOTATION_FIELDS: dict[type, str] = {
-    ast.arg: "annotation",
-    ast.FunctionDef: "returns",
-    ast.AsyncFunctionDef: "returns",
-    ast.AnnAssign: "annotation",
-}
+#: Set in a code object's ``co_flags`` by ``from __future__ import annotations``.
+_FUTURE_ANNOTATIONS_FLAG = __future__.annotations.compiler_flag
 
 
-def _unannotated_children(node: ast.AST) -> Iterator[ast.AST]:
-    """Like :func:`ast.iter_child_nodes`, but leave out *node*'s type annotation, if any.
+def _signature_annotations(node: ast.AST) -> list[ast.AST]:
+    """The parameter and return annotations of a ``def`` node (none for a lambda)."""
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return []
+    args = node.args
+    params = [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]
+    found = [param.annotation for param in params if param is not None and param.annotation is not None]
+    return found if node.returns is None else [*found, node.returns]
 
-    Parameter/return/variable annotations (``tokens: list[Token]``, ``-> bool``)
-    reference *types* that are never evaluated when the callable is *called*, so
-    they must not disqualify it — otherwise every type-annotated guard would fail
-    on the class name in its own signature — and nothing inside one may count as a
-    binding either: a walrus in an annotation (``x: (STATE := int) = 1``, legal
-    before 3.14) never runs, so it must not hide a read of a same-named global.
-    Every certification walk goes through here. Annotations are skipped rather than
-    stripped because the node belongs to the shared source cache
-    (:mod:`cpnx.sandbox`), which must never be mutated.
+
+def _annotations_are_lazy(func: Callable) -> bool:
+    """True if a ``def`` nested in *func* would not evaluate its annotations when defined."""
+    code = getattr(func, "__code__", None)
+    return sys.version_info >= (3, 14) or bool(getattr(code, "co_flags", 0) & _FUTURE_ANNOTATIONS_FLAG)
+
+
+def _inert_annotations(root: ast.AST, func: Callable) -> frozenset[int]:
+    """The ``id()`` of every annotation under *root* that never runs when *func* is called.
+
+    These reference *types*, so they must not disqualify the callable — otherwise every
+    type-annotated guard would fail on the class name in its own signature — and nothing
+    inside one may count as a binding: a walrus in one (``x: (STATE := int) = 1``, legal
+    before 3.14) never runs, so it must not hide a read of a same-named global. They are:
+
+    * *root*'s own parameter and return annotations, evaluated once when it was defined;
+    * every local variable annotation (``AnnAssign``), never evaluated in function scope;
+    * a nested ``def``'s parameter and return annotations **only** when annotations are
+      lazy (3.14+, or ``from __future__ import annotations``). Before that they run each
+      time the nested ``def`` statement does, i.e. on every call of *func*, so they are
+      walked like any other code.
+
+    Annotations are skipped rather than stripped because *root* belongs to the shared
+    source cache (:mod:`cpnx.sandbox`), which must never be mutated.
     """
-    skip = _ANNOTATION_FIELDS.get(type(node))
-    for field, value in ast.iter_fields(node):
-        if field == skip:
-            continue
-        if isinstance(value, ast.AST):
-            yield value
-        elif isinstance(value, list):
-            yield from (item for item in value if isinstance(item, ast.AST))
+    inert = _signature_annotations(root)
+    lazy = _annotations_are_lazy(func)
+    for node in ast.walk(root):
+        if isinstance(node, ast.AnnAssign):
+            inert.append(node.annotation)
+        elif lazy and node is not root:
+            inert.extend(_signature_annotations(node))
+    return frozenset(id(node) for node in inert)
 
 
-def _walk_unannotated(node: ast.AST) -> Iterator[ast.AST]:
-    """Walk *node* breadth-first like :func:`ast.walk`, skipping every type annotation."""
+def _live_children(node: ast.AST, inert: frozenset[int]) -> Iterator[ast.AST]:
+    """Like :func:`ast.iter_child_nodes`, leaving out the annotations in *inert*."""
+    return (child for child in ast.iter_child_nodes(node) if id(child) not in inert)
+
+
+def _walk_live(node: ast.AST, inert: frozenset[int]) -> Iterator[ast.AST]:
+    """Walk *node* breadth-first like :func:`ast.walk`, leaving out the annotations in *inert*."""
     todo = deque([node])
     while todo:
         current = todo.popleft()
-        todo.extend(_unannotated_children(current))
+        todo.extend(_live_children(current, inert))
         yield current
 
 
@@ -457,7 +482,7 @@ def _check_structural(node: ast.AST) -> Verdict | None:
     return None
 
 
-def _bound_names(node: ast.AST) -> frozenset[str]:
+def _bound_names(node: ast.AST, inert: frozenset[int] = frozenset()) -> frozenset[str]:
     """Names bound in *node*'s **own** scope — assignments/targets plus the names
     of nested functions defined here.
 
@@ -480,8 +505,8 @@ def _bound_names(node: ast.AST) -> frozenset[str]:
     ``class``) would share the same shadowing trait if they became reachable.
     """
     names: set[str] = set()
-    for child in _unannotated_children(node):
-        _collect_scope_bindings(child, names)
+    for child in _live_children(node, inert):
+        _collect_scope_bindings(child, names, inert)
     return frozenset(names)
 
 
@@ -491,7 +516,7 @@ def _bound_names(node: ast.AST) -> frozenset[str]:
 _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
-def _collect_scope_bindings(node: ast.AST, names: set[str]) -> None:
+def _collect_scope_bindings(node: ast.AST, names: set[str], inert: frozenset[int]) -> None:
     """Accumulate the names *node* binds in the current scope, without recursing
     into scopes whose bindings do not belong to it.
 
@@ -512,13 +537,13 @@ def _collect_scope_bindings(node: ast.AST, names: set[str]) -> None:
     if isinstance(node, ast.Lambda):
         return
     if isinstance(node, _COMPREHENSIONS):
-        _leaked_walrus_targets(node, names)
+        _leaked_walrus_targets(node, names, inert)
         return
-    for child in _unannotated_children(node):
-        _collect_scope_bindings(child, names)
+    for child in _live_children(node, inert):
+        _collect_scope_bindings(child, names, inert)
 
 
-def _leaked_walrus_targets(node: ast.AST, names: set[str]) -> None:
+def _leaked_walrus_targets(node: ast.AST, names: set[str], inert: frozenset[int]) -> None:
     """Collect walrus (``NamedExpr``) target names that leak from *node* into the
     enclosing function scope.
 
@@ -531,5 +556,5 @@ def _leaked_walrus_targets(node: ast.AST, names: set[str]) -> None:
         return
     if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
         names.add(node.target.id)
-    for child in _unannotated_children(node):
-        _leaked_walrus_targets(child, names)
+    for child in _live_children(node, inert):
+        _leaked_walrus_targets(child, names, inert)

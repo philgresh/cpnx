@@ -16,7 +16,7 @@ release there was **no `sys.version_info` gating anywhere in `src/`**.
 
 | module | AST surface | other introspection |
 | --- | --- | --- |
-| `cpnx/certification.py` | 34 distinct `ast.*` names, 46 references | `inspect.getsourcelines`, `getsourcefile`, `func.__code__` |
+| `cpnx/certification.py` | 34 distinct `ast.*` names, 46 references | `func.__code__` (source comes from `sandbox._callable_node`) |
 | `cpnx/sandbox.py` | 17 distinct `ast.*` names | `inspect.getsource{,file,lines}` |
 | `cpnx/linting.py` | 7 distinct `ast.*` names | `inspect.currentframe` + `f_back` walk, `code.co_filename`, `ast.unparse` |
 
@@ -272,9 +272,12 @@ tripping a Python-level deprecation.
   `_PACKAGE_ROOT` resolves identically. `tests/test_linting.py` passes on all three.
 * **PEP 649/749 deferred annotation evaluation (3.14).** No behaviour change, but the earlier
   wording here ("cpnx strips annotations at the AST level, so lazy evaluation cannot change a
-  verdict") was too broad. Certification does ignore annotations at the AST level (today
-  `certification._unannotated_children` skips them in every walk, including the one that
-  collects bindings), but that wording overlooked that
+  verdict") was too broad. Certification ignores annotations at the AST level only where they
+  never run at call time (`certification._inert_annotations`: the callable's own signature,
+  local variable annotations, and a nested `def`'s signature only when annotations are lazy,
+  i.e. on 3.14+ or under `from __future__ import annotations`). Before 3.14 a nested `def`'s
+  annotations run on every call, so they are checked like any other code. That wording also
+  overlooked that
   `transitions._reject_non_bool_return` calls `typing.get_type_hints(value)` at *runtime*, on
   every `Transition.guard`, `InputArc.filter` and `OutputArc.condition` assignment. Under PEP
   649 that call is now what triggers `value.__annotate__()`, so cpnx is the thing forcing
