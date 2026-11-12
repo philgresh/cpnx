@@ -38,6 +38,11 @@ def impure_body(tokens, pick=lambda t: t.payload["n"]):
     return print(tokens) or len(tokens) > 0
 long_first, short_last = (lambda t: (t.payload["a"]
                                      + time.sleep(0))), (lambda t: t.payload["n"])
+def keep(*checks):
+    return lambda func: func
+@keep(lambda t: t.payload["n"])
+def decorated(tokens):
+    return print(tokens) or len(tokens) > 0
 """
 
 _names = itertools.count()
@@ -130,6 +135,18 @@ def test_a_def_is_not_taken_for_a_default_lambda_on_its_first_line(case):
 def test_a_lambda_ending_on_a_line_is_told_from_the_one_starting_there(case):
     assert not _is_pure(case.long_first)
     assert _is_pure(case.short_last)
+
+
+@has_columns
+def test_a_decorated_def_is_not_taken_for_a_lambda_in_its_decorator(case):
+    # The def's first line is its decorator's, and the only function node on that line is
+    # the lambda passed to the decorator. The def's code lies outside that lambda, so the
+    # def is not located at all, which is what a decorated def without such a lambda gets.
+    assert not _is_pure(case.decorated)
+    verdict = certify(case.decorated)
+    assert not verdict.certified
+    assert verdict.reason == "source unavailable"
+    assert lint_callable(case.decorated) == []
 
 
 # -- without columns: callables starting on one line share one verdict ---------------------------

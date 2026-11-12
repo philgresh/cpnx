@@ -128,6 +128,26 @@ def _body_holds(node: ast.AST, anchor: _Position) -> bool:
     return start <= (line, column) and (end_line, end_column) <= end
 
 
+def _node_holding(candidates: list[ast.AST], anchor: _Position) -> tuple[ast.AST, ...]:
+    """Return the candidate whose body holds `anchor`, innermost first, or nothing if none does.
+
+    Every function around a callable holds its code too; its own node is the one that starts
+    last. If none holds it, the callable's code lies in none of the candidates: reading one
+    of them anyway would judge some other function's body.
+    """
+    holding = [node for node in candidates if _body_holds(node, anchor)]
+    return (max(holding, key=lambda node: (node.lineno, node.col_offset)),) if holding else ()
+
+
+def _nodes_by_line(candidates: list[ast.AST], start_line: int) -> tuple[ast.AST, ...]:
+    """Return what the line alone tells: every candidate starting on it if several do, else the most specific."""
+    starting = [node for node in candidates if node.lineno == start_line]
+    if len(starting) > 1:
+        return tuple(starting)
+    node = _most_specific_node(candidates, start_line)
+    return () if node is None else (node,)
+
+
 class _ParsedSource:
     """One parsed source file: its function nodes, and the lookups made among them so far.
 
@@ -154,15 +174,8 @@ class _ParsedSource:
     def _locate(self, start_line: int, anchor: _Position | None) -> tuple[ast.AST, ...]:
         candidates = [node for node in self.functions if _node_contains_line(node, start_line)]
         if anchor is not None:
-            # Every function around the callable holds the anchor too; its own node starts last.
-            holding = [node for node in candidates if _body_holds(node, anchor)]
-            if holding:
-                return (max(holding, key=lambda node: (node.lineno, node.col_offset)),)
-        starting = [node for node in candidates if node.lineno == start_line]
-        if len(starting) > 1:
-            return tuple(starting)
-        node = _most_specific_node(candidates, start_line)
-        return () if node is None else (node,)
+            return _node_holding(candidates, anchor)
+        return _nodes_by_line(candidates, start_line)
 
 
 #: Parsed source files by path. Building many arcs and transitions from the same functions
@@ -183,12 +196,15 @@ def _source_nodes(func: Callable) -> tuple[ast.AST, ...]:
 
     - With column positions (`_body_anchor`), the result is the one node whose body holds
       `func`'s own code, so two lambdas on one line, a lambda and the lambda it returns, and
-      a `def` with a lambda default on its first line are each their own node.
-    - Without them, or when no body holds that position (the file changed since import), the
-      line is all there is. If several function nodes start on it they cannot be told apart
-      and all are returned: `func` is one of them, so a caller that holds `func` to what any
-      of them does is never more lenient than the truth. Otherwise the result is the most
-      specific node around the line (`_find_target_node`), as it always was.
+      a `def` with a lambda default on its first line are each their own node. If no body
+      holds it, there is no result: `func` is none of these nodes. That is a decorated `def`
+      outside any function, whose first line is its decorator's (a lambda among the
+      decorator's arguments is not it), or a file changed since import.
+    - Without them the line is all there is. If several function nodes start on it they
+      cannot be told apart and all are returned: `func` is one of them, so a caller that
+      holds `func` to what any of them does is never more lenient than the truth. Otherwise
+      the result is the most specific node around the line (`_find_target_node`), as it
+      always was.
 
     The nodes are shared between callers and threads: read them, and copy one before
     changing it.
