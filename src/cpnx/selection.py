@@ -7,6 +7,7 @@ ADR 0013.
 """
 
 import random
+import weakref
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 
@@ -41,8 +42,11 @@ class TokenGroup(Sequence[Token]):
     def __getitem__(self, position):  # type: ignore[override]
         if isinstance(position, slice):
             return [self[i] for i in range(*position.indices(len(self)))]
+        size = len(self)
         if position < 0:
-            position += len(self)
+            position += size
+        if not 0 <= position < size:
+            raise IndexError("TokenGroup index out of range")
         source = self._source
         if hasattr(source, "token_at"):
             return source.token_at(position)
@@ -192,14 +196,25 @@ def selector_conflict(transition: "Transition") -> str | None:
 
 
 class KeyCertifications:
-    """Remembers whether each `BindingView.groups` key function certifies, keyed by identity."""
+    """Remembers whether each `BindingView.groups` key function certifies, keyed by identity.
+
+    Entries are weak, so a key built inline on every selector call (a fresh lambda each time)
+    is forgotten once the selector drops it, and the cache stays as large as the set of key
+    functions still alive. A key that cannot be weakly referenced is certified on each call.
+    """
 
     def __init__(self) -> None:
-        self._known: dict[int, tuple[Callable[[Token], object], bool]] = {}
+        self._known: "weakref.WeakKeyDictionary[Callable[[Token], object], bool]" = weakref.WeakKeyDictionary()
+
+    def __len__(self) -> int:
+        return len(self._known)
 
     def inline_safe(self, key: Callable[[Token], object]) -> bool:
-        known = self._known.get(id(key))
-        if known is None or known[0] is not key:
-            known = (key, is_inline_safe(key))
-            self._known[id(key)] = known
-        return known[1]
+        try:
+            known = self._known.get(key)
+        except TypeError:  # not weakly referenceable (or unhashable): certify without caching
+            return is_inline_safe(key)
+        if known is None:
+            known = is_inline_safe(key)
+            self._known[key] = known
+        return known

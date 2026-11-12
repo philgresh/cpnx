@@ -113,7 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   available, distinct and pass the guard, then fires exactly those; an invalid choice is
   reported through `on_error` and does not fire. On #80's dispatcher (100 servers, 13 skills), a
   selector that picks uniformly among all eligible pairs costs about the same per firing at
-  1 000, 2 000 and 4 000 waiting jobs (×1.07, ×1.01), while `RANDOM`'s roughly doubles to
+  1 000, 2 000 and 4 000 waiting jobs (×0.96, ×1.01), while `RANDOM`'s roughly doubles to
   about 2.2× the selector's, and its
   first pick over 200 seeds ranges over the whole queue where `RANDOM`'s stays within the first
   10 jobs. `BindingPolicy` now documents that truncation. New benchmark:

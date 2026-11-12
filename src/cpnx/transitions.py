@@ -712,7 +712,8 @@ class Transition:
 
                **Contract.** Like a guard, the selector runs under the engine lock, possibly
                several times per firing (each enablement check asks it), so it must be cheap
-               and must not call back into the net. It must be a pure function of the view:
+               and must not call back into the net (doing so raises `RuntimeError`, which is
+               reported like any raising selector). It must be a pure function of the view:
                draw randomness only from `view.random`, which is seeded from the net's `seed`,
                the transition and its firing count, so the same seed and selector give the same
                firings across processes. Use [`BindingView.groups`][cpnx.BindingView.groups]
@@ -771,6 +772,11 @@ def _check_binding_chooser(transition: "Transition", name: str, value: object) -
         _check_binding_selector(transition, value)
         return
     _reject_non_callable_priority_key(value)
+    if getattr(transition, "binding_selector", None) is not None:
+        raise ValueError(
+            f"Transition '{transition.name}': binding_priority_key has no effect on a transition "
+            "with a binding_selector."
+        )
     verify_callable_purity(value)
     lint_and_warn(value, "binding_priority_key")
 

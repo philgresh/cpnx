@@ -275,6 +275,9 @@ def _selection_callables(transition: "Transition") -> Iterable[tuple[str, object
     key = getattr(transition, "binding_priority_key", None)
     if key is not None:
         yield "binding_priority_key", key
+    selector = getattr(transition, "binding_selector", None)
+    if selector is not None:
+        yield "binding_selector", selector
     for i, arc in enumerate(transition.inputs):
         if getattr(arc, "key", None) is not None:
             yield f"inputs[{i}({arc.place})].key", arc.key
@@ -288,7 +291,8 @@ def risk_report(net: "PetriNet") -> dict:
     """Fuse the side-effect linter with blast-radius tracing into one report.
 
     The verification / debugging entry point. For every transition it lints each
-    enabling inscription (guard, arc ``key``/``filter``/``join_key``, ``binding_priority_key``);
+    enabling inscription (guard, arc ``key``/``filter``/``join_key``, ``binding_priority_key``,
+    ``binding_selector``);
     for any transition that either **trips the linter** or carries an explicit
     :attr:`~cpnx.Transition.impacts_colors` declaration, it attaches that
     transition's :meth:`ImpactMap.to_dict`. The result answers, in one place, both

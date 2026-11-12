@@ -38,9 +38,9 @@ eligibility is membership (`job.skill in server.skills`):
 - **Validation.** The engine checks the shape, that no token is chosen twice, that every token
   is stored and available in its arc's place (`Place.holds_available`, O(tokens chosen)), and
   that the guard holds. It then consumes by identity, as every binding is. A failed check or a
-  raising selector is buffered and reported through `on_error` (first error per transition per
-  enabling pass, off the lock, like a failing `binding_priority_key`), and the transition reads
-  as not enabled.
+  raising selector is buffered and reported through `on_error` (off the lock, edge-triggered per
+  transition: the same failure reports once, then again when it changes or after the transition
+  fires), and the transition reads as not enabled.
 - **Enablement.** The selector is the probe: `_binding_exists` asks it too. A transition with a
   selector is volatile (ADR 0006), so every reconcile asks it again. Before asking, the engine
   checks each arc's count and settle window, so an arc that cannot be met never reaches the
@@ -55,14 +55,22 @@ eligibility is membership (`job.skill in server.skills`):
 - **Indexed lookups.** `groups(i, key)` with a certified `key` registers a place join index
   (ADR 0010) for that key on first use and reads it at O(keys) afterwards. At most four key
   functions per arc keep an index; a fifth evicts the oldest, so a selector that builds a new
-  lambda on every call pays a rebuild rather than leaking indexes. An uncertified key, or a
-  place type other than `Place`, is keyed on each call.
+  lambda on every call pays a rebuild rather than leaking indexes. The certification of each key
+  is cached weakly, so those lambdas are not kept alive either. A transition's indexes are
+  released when its arc moves to another place or its selector is cleared. An uncertified key,
+  or a place type other than `Place`, is keyed on each call.
+- **Scheduler.** A selector transition ignores its binding policy, so a `RANDOM` or `PRIORITY`
+  policy on it (or as the net default) does not turn off the incremental scheduler.
 
 ### Answers to #80's open questions
 
 - **Lock.** The selector runs under the engine lock, like guards and `binding_priority_key`.
   A snapshot would cost a copy of every input place per probe, which is what the view exists to
-  avoid. The contract: cheap, pure, and never calling back into the net.
+  avoid. The contract: cheap, pure, and never calling back into the net. The lock is not
+  re-entrant, so for the length of the call the engine swaps in a guard that raises
+  `RuntimeError` on the selector's own thread (reported like any raising selector) instead of
+  deadlocking. A failure is reported once, and again only when it changes or after the
+  transition fires, because a selector transition is re-asked on every enabling check.
 - **`join_key`, `key`, `filter`, `consume_all`, `binding_priority_key`.** Mutually exclusive
   with a selector, rejected with `ValueError` at assignment and reported if an arc is changed
   later. `groups` covers what a selector would want from `join_key`, and the selector can apply
@@ -74,10 +82,10 @@ eligibility is membership (`job.skill in server.skills`):
 ## Consequences
 
 - `benchmarks/bench_dispatch_selector.py` runs #80's dispatcher. With a selector that picks
-  uniformly among all eligible pairs from the jobs grouped by skill, cost per firing grows ×1.07
+  uniformly among all eligible pairs from the jobs grouped by skill, cost per firing changes ×0.96
   then ×1.01 as the backlog doubles from 1 000 to 4 000 jobs, and the first pick over 200 seeds
   spans indices up to 1 978 (191 distinct) where `RANDOM`'s stay within 0–9. Over the same
-  range `RANDOM`'s cost per firing roughly doubles, ending 2.2–2.4× above the selector's on a
+  range `RANDOM`'s cost per firing roughly doubles, ending about 2.2× above the selector's on a
   shared Linux container. The selector is still costlier than `FIRST`, because it scores all
   100 servers and is asked about five times per firing (each reconcile, plus the
   timing-ignoring quiescence probe).
