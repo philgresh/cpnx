@@ -245,11 +245,11 @@ user guards on those versions can still call it.
 **Deprecations: none triggered.** The one with cpnx's name on it is
 `ast.AST`/`ast.expr` instantiation (deprecated 3.15, an error in 3.20). Every such use in
 cpnx is a **type annotation** — `certification.py` (12 sites), `linting.py` (3),
-`sandbox.py` (6) — which is never evaluated at runtime. The only node cpnx *constructs* is
-`ast.Constant(value=None)` in `_strip_annotations` (`certification.py:326`), which is a
-concrete class with its required field supplied. This also covers the related 3.15 change
-that AST constructors now raise `TypeError` (was `DeprecationWarning` since 3.13) on a
-missing required argument or an unknown keyword.
+`sandbox.py` (6) — which is never evaluated at runtime. cpnx constructs no AST nodes: it
+only parses source and walks the result (certification skips annotations as it walks rather
+than replacing them). So the related 3.15 change that AST constructors now raise `TypeError`
+(was `DeprecationWarning` since 3.13) on a missing required argument or an unknown keyword
+cannot reach it either.
 
 Proven rather than argued: the full suite passes under
 `-W error::DeprecationWarning -W error::SyntaxWarning -W error::PendingDeprecationWarning
@@ -260,9 +260,10 @@ tripping a Python-level deprecation.
 
 **Behaviour changes: none reachable.**
 
-* **UTF-8 as the default encoding (PEP 686).** All three `open()` calls already pass
-  `encoding="utf-8"` explicitly (`certification.py:126`, `linting.py:373`,
-  `sandbox.py:116`), so cpnx's behaviour is identical with `PYTHONUTF8=0`. The suite is clean
+* **UTF-8 as the default encoding (PEP 686).** cpnx reads source in one place,
+  `sandbox._parsed_source`, and opens it in binary mode (`open(path, "rb")`), so no text
+  encoding is involved: `ast.parse` decodes the bytes by the file's PEP 263 coding cookie, or
+  UTF-8 without one. cpnx's behaviour is identical with `PYTHONUTF8=0`. The suite is clean
   under `-W error::EncodingWarning`.
 * **PEP 765 — control flow in `finally`** now raises `SyntaxWarning`. cpnx has one `finally`
   block (`places.py:135`) and its `return` is *after* the block, not inside it. No warning.
@@ -271,12 +272,14 @@ tripping a Python-level deprecation.
   `_PACKAGE_ROOT` resolves identically. `tests/test_linting.py` passes on all three.
 * **PEP 649/749 deferred annotation evaluation (3.14).** No behaviour change, but the earlier
   wording here ("cpnx strips annotations at the AST level, so lazy evaluation cannot change a
-  verdict") was too broad: it describes `certification._strip_annotations` and overlooked that
+  verdict") was too broad. Certification does ignore annotations at the AST level (today
+  `certification._unannotated_children` skips them in every walk, including the one that
+  collects bindings), but that wording overlooked that
   `transitions._reject_non_bool_return` calls `typing.get_type_hints(value)` at *runtime*, on
   every `Transition.guard`, `InputArc.filter` and `OutputArc.condition` assignment. Under PEP
   649 that call is now what triggers `value.__annotate__()`, so cpnx is the thing forcing
   evaluation rather than merely reading an already-evaluated `__annotations__`. `sandbox.py`
-  and `linting.py` do not strip annotations at all; they do not need to, since neither reads
+  and `linting.py` do not skip annotations at all; they do not need to, since neither reads
   an annotation's *value* — only certification walks names that an annotation could introduce.
 
   One consequence is worth stating because it looks like a bug: an unresolvable parameter

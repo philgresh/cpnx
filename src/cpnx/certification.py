@@ -405,27 +405,35 @@ _ANNOTATION_FIELDS: dict[type, str] = {
 }
 
 
-def _walk_unannotated(node: ast.AST) -> Iterator[ast.AST]:
-    """Walk *node* like :func:`ast.walk`, but skip every type annotation.
+def _unannotated_children(node: ast.AST) -> Iterator[ast.AST]:
+    """Like :func:`ast.iter_child_nodes`, but leave out *node*'s type annotation, if any.
 
     Parameter/return/variable annotations (``tokens: list[Token]``, ``-> bool``)
     reference *types* that are never evaluated when the callable is *called*, so
     they must not disqualify it — otherwise every type-annotated guard would fail
-    on the class name in its own signature. They are skipped rather than stripped
-    because *node* belongs to the shared source cache (:mod:`cpnx.sandbox`), which
-    must never be mutated.
+    on the class name in its own signature — and nothing inside one may count as a
+    binding either: a walrus in an annotation (``x: (STATE := int) = 1``, legal
+    before 3.14) never runs, so it must not hide a read of a same-named global.
+    Every certification walk goes through here. Annotations are skipped rather than
+    stripped because the node belongs to the shared source cache
+    (:mod:`cpnx.sandbox`), which must never be mutated.
     """
+    skip = _ANNOTATION_FIELDS.get(type(node))
+    for field, value in ast.iter_fields(node):
+        if field == skip:
+            continue
+        if isinstance(value, ast.AST):
+            yield value
+        elif isinstance(value, list):
+            yield from (item for item in value if isinstance(item, ast.AST))
+
+
+def _walk_unannotated(node: ast.AST) -> Iterator[ast.AST]:
+    """Walk *node* breadth-first like :func:`ast.walk`, skipping every type annotation."""
     todo = deque([node])
     while todo:
         current = todo.popleft()
-        skip = _ANNOTATION_FIELDS.get(type(current))
-        for field, value in ast.iter_fields(current):
-            if field == skip:
-                continue
-            if isinstance(value, ast.AST):
-                todo.append(value)
-            elif isinstance(value, list):
-                todo.extend(item for item in value if isinstance(item, ast.AST))
+        todo.extend(_unannotated_children(current))
         yield current
 
 
@@ -472,7 +480,7 @@ def _bound_names(node: ast.AST) -> frozenset[str]:
     ``class``) would share the same shadowing trait if they became reachable.
     """
     names: set[str] = set()
-    for child in ast.iter_child_nodes(node):
+    for child in _unannotated_children(node):
         _collect_scope_bindings(child, names)
     return frozenset(names)
 
@@ -506,7 +514,7 @@ def _collect_scope_bindings(node: ast.AST, names: set[str]) -> None:
     if isinstance(node, _COMPREHENSIONS):
         _leaked_walrus_targets(node, names)
         return
-    for child in ast.iter_child_nodes(node):
+    for child in _unannotated_children(node):
         _collect_scope_bindings(child, names)
 
 
@@ -523,5 +531,5 @@ def _leaked_walrus_targets(node: ast.AST, names: set[str]) -> None:
         return
     if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
         names.add(node.target.id)
-    for child in ast.iter_child_nodes(node):
+    for child in _unannotated_children(node):
         _leaked_walrus_targets(child, names)

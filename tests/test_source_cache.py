@@ -26,7 +26,7 @@ def _passthrough(tokens):
 
 
 def _load(path, name):
-    linecache.checkcache(str(path))
+    linecache.cache.pop(str(path), None)
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -35,13 +35,14 @@ def _load(path, name):
 
 
 def _rewrite_same_size(path, old, new):
-    # A same-size edit, so only the mtime tells the cache the file changed.
+    # Same size and same mtime: only the bytes tell the cache the file changed.
+    before = os.stat(path)
     text = path.read_text()
-    assert len(old) == len(new) and old in text
+    assert old in text
     path.write_text(text.replace(old, new))
-    stat = os.stat(path)
-    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
-    assert os.stat(path).st_size == stat.st_size
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = os.stat(path)
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
 
 
 def test_one_file_is_parsed_once_for_many_callables(tmp_path, monkeypatch):
@@ -73,6 +74,37 @@ def test_certifying_skips_annotations_without_changing_the_shared_tree(tmp_path)
     assert certify(guard).certified
     assert certify(guard).certified
     assert ast.dump(_callable_node(guard), include_attributes=True) == before
+
+
+def test_a_local_annotation_naming_a_module_class_is_skipped(tmp_path):
+    # `_Box` resolves to a class, which would not certify: only skipping the AnnAssign's
+    # annotation lets this guard through.
+    path = tmp_path / "local_annotation.py"
+    path.write_text(
+        "class _Box:\n    pass\n\n\ndef guard(tokens):\n    seen: _Box = len(tokens)\n    return seen > 0\n"
+    )
+    assert certify(_load(path, "local_annotation_guard").guard).certified
+
+
+WALRUS_IN_ANNOTATION = {
+    "local": "def guard(tokens):\n    x: (STATE := int) = 1\n    return len(STATE) > 0\n",
+    "parameter": "def guard(tokens: (STATE := list)):\n    return len(STATE) > 0\n",
+    "return": "def guard(tokens) -> (STATE := bool):\n    return len(STATE) > 0\n",
+}
+
+
+@pytest.mark.skipif(sys.version_info >= (3, 14), reason="a walrus in an annotation is a SyntaxError from 3.14")
+@pytest.mark.parametrize("where", sorted(WALRUS_IN_ANNOTATION))
+def test_a_walrus_in_an_annotation_does_not_hide_a_mutable_global(tmp_path, where):
+    # The annotation never binds STATE when the guard runs, so `len(STATE)` reads the
+    # module's live list and the guard must not certify.
+    path = tmp_path / f"walrus_{where}.py"
+    path.write_text("STATE = [1]\n\n\n" + WALRUS_IN_ANNOTATION[where])
+    module = _load(path, f"walrus_{where}_guard")
+    module.STATE = [1]
+    verdict = certify(module.guard)
+    assert not verdict.certified
+    assert "STATE" in verdict.reason
 
 
 @pytest.mark.parametrize("terms", [250, 400])

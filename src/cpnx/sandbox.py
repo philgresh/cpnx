@@ -1,6 +1,5 @@
 import ast
 import inspect
-import os
 from typing import Callable
 
 
@@ -70,21 +69,24 @@ def _find_target_node(tree: ast.AST, start_line: int) -> ast.AST | None:
 class _ParsedSource:
     """One source file's parse, plus the callable node found for each start line."""
 
-    __slots__ = ("stamp", "tree", "targets")
+    __slots__ = ("source", "tree", "targets")
 
-    def __init__(self, stamp: tuple[int, int], tree: ast.AST) -> None:
-        self.stamp = stamp
+    def __init__(self, source: bytes, tree: ast.AST) -> None:
+        self.source = source
         self.tree = tree
         self.targets: dict[int, ast.AST | None] = {}
 
 
-#: ``path -> _ParsedSource``, keyed on the file's mtime and size. The purity check, the linter
+#: ``path -> _ParsedSource``, keyed on the file's bytes. The purity check, the linter
 #: and the certifier each need the node of every guard, key and action they see, and all three
 #: used to parse the whole defining file and walk its whole tree once per callable, per
 #: transition built. Building nets in a loop (a test module of a few thousand lines, a
 #: generated model) then cost ~0.1 s per callable. The trees are shared, so nothing may
 #: mutate them: every consumer only walks its node (the certifier skips annotations as it
-#: walks instead of stripping them).
+#: walks instead of stripping them). The file is re-read on every lookup and compared with the
+#: bytes that were parsed: the read is cheap, the parse is the cost. An mtime-and-size stamp is
+#: not enough, since a same-size edit within one mtime tick would then be checked against the old
+#: code while the new code runs (with bytecode writing off, nothing else catches it).
 _SOURCE_CACHE: dict[str, _ParsedSource] = {}
 
 #: What "the source cannot be found or parsed" looks like: no file (``OSError``), a builtin or
@@ -94,14 +96,12 @@ _SOURCE_UNAVAILABLE = (OSError, TypeError, SyntaxError, ValueError)
 
 
 def _parsed_source(path: str) -> _ParsedSource:
-    stat = os.stat(path)
-    stamp = (stat.st_mtime_ns, stat.st_size)
+    with open(path, "rb") as handle:
+        source = handle.read()
     cached = _SOURCE_CACHE.get(path)
-    if cached is None or cached.stamp != stamp:
-        with open(path, "rb") as handle:
-            # Bytes, so ast.parse honours a PEP 263 coding cookie.
-            tree = ast.parse(handle.read(), filename=path)
-        cached = _SOURCE_CACHE[path] = _ParsedSource(stamp, tree)
+    if cached is None or cached.source != source:
+        # Bytes, so ast.parse honours a PEP 263 coding cookie.
+        cached = _SOURCE_CACHE[path] = _ParsedSource(source, ast.parse(source, filename=path))
     return cached
 
 
