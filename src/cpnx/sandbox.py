@@ -1,5 +1,6 @@
 import ast
 import inspect
+import os
 from typing import Callable
 
 
@@ -66,6 +67,53 @@ def _find_target_node(tree: ast.AST, start_line: int) -> ast.AST | None:
     return target_node
 
 
+class _ParsedSource:
+    """One source file's parse, plus the callable node found for each start line."""
+
+    __slots__ = ("stamp", "tree", "targets")
+
+    def __init__(self, stamp: tuple[int, int], tree: ast.AST) -> None:
+        self.stamp = stamp
+        self.tree = tree
+        self.targets: dict[int, ast.AST | None] = {}
+
+
+#: ``path -> _ParsedSource``, keyed on the file's mtime and size. The purity check, the linter
+#: and the certifier each need the node of every guard, key and action they see, and all three
+#: used to parse the whole defining file and walk its whole tree once per callable, per
+#: transition built. Building nets in a loop (a test module of a few thousand lines, a
+#: generated model) then cost ~0.1 s per callable. The cached trees are shared, so callers
+#: must not mutate them: the certifier, which strips annotations in place, copies its node.
+_SOURCE_CACHE: dict[str, _ParsedSource] = {}
+
+
+def _parsed_source(path: str) -> _ParsedSource:
+    stat = os.stat(path)
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    cached = _SOURCE_CACHE.get(path)
+    if cached is None or cached.stamp != stamp:
+        with open(path, encoding="utf-8") as handle:
+            tree = ast.parse(handle.read(), filename=path)
+        cached = _SOURCE_CACHE[path] = _ParsedSource(stamp, tree)
+    return cached
+
+
+def _callable_node(func: Callable) -> ast.AST | None:
+    """Return the ``FunctionDef``/``Lambda`` node that defines *func*, from a shared parse.
+
+    The node belongs to a cached tree: read it, never mutate it. Raises ``OSError``,
+    ``TypeError`` or ``SyntaxError`` when the source cannot be found or parsed.
+    """
+    path = inspect.getsourcefile(func)
+    _, start_line = inspect.getsourcelines(func)
+    if not path:
+        return None
+    parsed = _parsed_source(path)
+    if start_line not in parsed.targets:
+        parsed.targets[start_line] = _find_target_node(parsed.tree, start_line)
+    return parsed.targets[start_line]
+
+
 _FORBIDDEN_FUNCS = frozenset({"open", "print", "eval", "exec", "__import__", "sleep"})
 
 # Two deliberately different attribute denylists, keyed on how precisely we could
@@ -110,17 +158,10 @@ def _verify_ast_purity(tree: ast.AST, is_fallback: bool = False) -> None:
 
 def _try_verify_via_sourcefile(func: Callable) -> bool:
     try:
-        file_path = inspect.getsourcefile(func)
-        lines, start_line = inspect.getsourcelines(func)
-        if file_path:
-            with open(file_path, "r", encoding="utf-8") as f:
-                file_content = f.read()
-            tree = ast.parse(file_content, filename=file_path)
-
-            target_node = _find_target_node(tree, start_line)
-            if target_node is not None:
-                _verify_ast_purity(target_node)
-                return True
+        target_node = _callable_node(func)
+        if target_node is not None:
+            _verify_ast_purity(target_node)
+            return True
     except PermissionError:
         raise
     except Exception:

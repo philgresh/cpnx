@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Building a transition no longer re-parses the module that defines its callables.** The
+  purity check, the linter and the certifier each parsed the callable's whole source file and
+  walked its whole tree for every guard, key, filter and action, on every transition built.
+  They now share one parse per file (re-read when the file's mtime or size changes) and look
+  each callable's node up once. One shared-place property-test example (a net built from a
+  2,400-line test module) went from ~350 ms to ~1.3 ms, and the full test suite from ~5 min to
+  ~20 s on 4 cores.
+
 - **Two `consume_all` input arcs on one place are never enabled, and adding such a transition
   warns** ([#75](https://github.com/philgresh/cpnx/issues/75)). Each would drain what the
   other leaves. A guard-free `FIRST` transition of that shape used to fire, the first arc
