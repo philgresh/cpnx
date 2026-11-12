@@ -91,7 +91,9 @@ class TestResourceReturnOnFailure:
         assert error_info.get("token") == t
 
     def test_multiple_resources_all_returned_on_failure(self):
-        net = PetriNet(max_workers=2)
+        # A retry delay longer than the 1 s run: under load the action can fail before the run's
+        # deadline is read, so the default 1 s retry would fire, and fail again, inside the window.
+        net = PetriNet(max_workers=2, retry_delay=60.0)
         net.add_place(Place("input"))
         net.add_place(Place("output"))
         net.add_place(ResourcePlace("gpu", capacity=2))
