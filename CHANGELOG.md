@@ -180,7 +180,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `filter` is clean; with the two swapped, the clean one was rejected. The same held for a
   lambda and the lambda it returns, and for a `def` with a lambda default on its first line,
   which was read as that lambda. On Python 3.11 and later each callable is now found by where
-  its own code lies (`code.co_positions`). Python 3.10 records no columns, and neither does
+  its own code lies (`code.co_positions`). A `def` outside any function whose decorator takes
+  a lambda argument was read as that lambda too; it is now not found at all, like any other
+  decorated `def`, so it is not certified and the purity check reads its source as a whole. Python 3.10 records no columns, and neither does
   `-X no_debug_ranges`: there, callables that start on one line are held to what any of them
   does. One impure lambda fails the purity check for all of them, none is certified unless
   all certify, and each is reported with the lint findings of all. Put them on separate
