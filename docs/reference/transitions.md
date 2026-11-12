@@ -24,6 +24,10 @@ A [`binding_selector`][cpnx.Transition] lets outside logic choose the tokens a t
 
 ::: cpnx.TokenGroup
 
+::: cpnx.BindingSelector
+
+::: cpnx.InvalidSelection
+
 ## Retry scheduling
 
 `RetryPolicy` says how long a rolled-back data token waits before each retry: capped exponential backoff with optional full jitter, the shape recommended by the AWS Builders' Library's [Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/). Attach one per transition ([`Transition.retry_policy`][cpnx.Transition]) — retry behaviour belongs to the dependency a transition talks to, not to the net — and a transition that declares none inherits [`PetriNet.retry_policy`][cpnx.PetriNet]. How *many* times it retries before dead-lettering stays [`Transition.max_retries`][cpnx.Transition].

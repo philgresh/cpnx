@@ -125,10 +125,11 @@ class BindingView:
     def groups(self, arc: int, key: Callable[[Token], object]) -> Mapping[object, TokenGroup]:
         """Group the tokens input arc *arc* could take by `key(token)`; keys with none are left out.
 
-        When *key* certifies (see [`cpnx.certification`]), the place keeps an index for it from
-        the first call on, so later calls cost O(keys) however deep the place is. Otherwise the
-        tokens are keyed on each call. Pass the same function object each time, so the index is
-        reused.
+        When *key* certifies (see [`cpnx.certification`]) and the same function object is passed
+        again, the place keeps an index for it from then on, so later calls cost O(keys) however
+        deep the place is. Otherwise the tokens are keyed on each call, with no time limit, under
+        the engine lock. Pass the same function object each time (a module-level function, not a
+        lambda or bound method built per call), so the index is built once and reused.
         """
         return {k: TokenGroup(g) for k, g in self._groups(arc, key, None).items()}
 
@@ -139,7 +140,11 @@ class BindingView:
 
 
 class InvalidSelection(ValueError):
-    """A binding selector returned a choice the engine cannot fire."""
+    """A binding selector returned a choice the engine cannot fire.
+
+    The `__cause__` of the error `on_error` receives for a rejected choice, which tells a bad
+    choice apart from a selector that raised.
+    """
 
 
 def _as_tokens(item: object, arc: "InputArc", position: int) -> list[Token]:
@@ -195,26 +200,72 @@ def selector_conflict(transition: "Transition") -> str | None:
     return None
 
 
-class KeyCertifications:
-    """Remembers whether each `BindingView.groups` key function certifies, keyed by identity.
+def _shape(key: Callable[[Token], object]) -> "tuple[object, tuple[object, ...]] | None":
+    """What a key's certification depends on beyond its identity: its code, and what it closes over.
 
-    Entries are weak, so a key built inline on every selector call (a fresh lambda each time)
-    is forgotten once the selector drops it, and the cache stays as large as the set of key
-    functions still alive. A key that cannot be weakly referenced is certified on each call.
+    Two functions with the same code, defaults, bound `self` and closure contents certify alike,
+    which is what lets a key built inline on every call (a fresh lambda, or a bound method,
+    which is a new object on each attribute access) reuse a verdict. `None` for a callable
+    that is not a plain function or method.
+    """
+    func = getattr(key, "__func__", key)
+    code = getattr(func, "__code__", None)
+    if code is None:
+        return None
+    try:
+        cells = tuple(cell.cell_contents for cell in func.__closure__ or ())
+    except ValueError:  # an empty cell: not certifiable anyway, so don't share a verdict
+        return None
+    bound = getattr(key, "__self__", None) if func is not key else None
+    return code, (bound, func.__defaults__, func.__kwdefaults__, func.__globals__, *cells)
+
+
+def _same(left: tuple[object, ...], right: tuple[object, ...]) -> bool:
+    return len(left) == len(right) and all(a is b for a, b in zip(left, right, strict=True))
+
+
+class KeyCertifications:
+    """Remembers whether `BindingView.groups` key functions certify, and which were seen before.
+
+    A verdict is cached by the key's code object together with the identities of what it
+    closes over (see `_shape`), so a key built inline on every selector call, such as
+    `view.groups(0, lambda t: t.payload["skill"])` or a bound method, is certified once rather
+    than on every ask. Both caches are weak in the code object or key, so they stay as large as
+    the set of key functions still alive. Other callables are certified on each call.
     """
 
     def __init__(self) -> None:
-        self._known: "weakref.WeakKeyDictionary[Callable[[Token], object], bool]" = weakref.WeakKeyDictionary()
+        self._verdicts: "weakref.WeakKeyDictionary[object, tuple[tuple[object, ...], bool]]" = (
+            weakref.WeakKeyDictionary()
+        )
+        self._seen: "weakref.WeakSet[Callable[[Token], object]]" = weakref.WeakSet()
 
     def __len__(self) -> int:
-        return len(self._known)
+        return len(self._verdicts)
 
     def inline_safe(self, key: Callable[[Token], object]) -> bool:
-        try:
-            known = self._known.get(key)
-        except TypeError:  # not weakly referenceable (or unhashable): certify without caching
+        shape = _shape(key)
+        if shape is None:
             return is_inline_safe(key)
-        if known is None:
-            known = is_inline_safe(key)
-            self._known[key] = known
-        return known
+        code, closed_over = shape
+        known = self._verdicts.get(code)
+        if known is not None and _same(known[0], closed_over):
+            return known[1]
+        verdict = is_inline_safe(key)
+        self._verdicts[code] = (closed_over, verdict)
+        return verdict
+
+    def seen_before(self, key: Callable[[Token], object]) -> bool:
+        """Whether this same key object was passed before; records it if not.
+
+        A place index is worth building only for a key the selector passes again. One built
+        inline on every call is a new object each time, so it is keyed by a scan instead of
+        rebuilding an index over the whole place on each ask.
+        """
+        try:
+            if key in self._seen:
+                return True
+            self._seen.add(key)
+        except TypeError:  # not weakly referenceable: never indexed
+            pass
+        return False

@@ -39,8 +39,9 @@ eligibility is membership (`job.skill in server.skills`):
   is stored and available in its arc's place (`Place.holds_available`, O(tokens chosen)), and
   that the guard holds. It then consumes by identity, as every binding is. A failed check or a
   raising selector is buffered and reported through `on_error` (off the lock, edge-triggered per
-  transition: the same failure reports once, then again when it changes or after the transition
-  fires), and the transition reads as not enabled.
+  transition and per view, timed or timing-ignoring: the same failure reports once, then again
+  after that view's ask succeeds or the transition fires), and the transition reads as not
+  enabled. The cause is an `InvalidSelection` for a rejected choice.
 - **Enablement.** The selector is the probe: `_binding_exists` asks it too. A transition with a
   selector is volatile (ADR 0006), so every reconcile asks it again. Before asking, the engine
   checks each arc's count and settle window, so an arc that cannot be met never reaches the
@@ -55,9 +56,14 @@ eligibility is membership (`job.skill in server.skills`):
 - **Indexed lookups.** `groups(i, key)` with a certified `key` registers a place join index
   (ADR 0010) for that key on first use and reads it at O(keys) afterwards. At most four key
   functions per arc keep an index; a fifth evicts the oldest, so a selector that builds a new
-  lambda on every call pays a rebuild rather than leaking indexes. The certification of each key
-  is cached weakly, so those lambdas are not kept alive either. A transition's indexes are
-  released when its arc moves to another place or its selector is cleared. An uncertified key,
+  lambda on every call pays a rebuild rather than leaking indexes. An index is built only for a
+  key object passed a second time, so a key built inline on every call (a fresh lambda, or a
+  bound method, which is a new object on each access) is keyed by a scan, not by rebuilding an
+  index over the whole place on each ask. Certification verdicts are cached weakly by the key's
+  code object and the identities of what it closes over, so such keys are certified once. A transition's indexes are
+  released when its arc moves to another place or its selector is cleared. A selector assigned to a
+  transition already in a net is picked up the next time the transition is evaluated or chosen:
+  the scheduler is rebuilt and any `join_key` index it had is released. An uncertified key,
   or a place type other than `Place`, is keyed on each call.
 - **Scheduler.** A selector transition ignores its binding policy, so a `RANDOM` or `PRIORITY`
   policy on it (or as the net default) does not turn off the incremental scheduler.
@@ -66,7 +72,10 @@ eligibility is membership (`job.skill in server.skills`):
 
 - **Lock.** The selector runs under the engine lock, like guards and `binding_priority_key`.
   A snapshot would cost a copy of every input place per probe, which is what the view exists to
-  avoid. The contract: cheap, pure, and never calling back into the net. The lock is not
+  avoid. The contract: cheap, pure, and never calling back into the net. Like
+  `binding_priority_key`, and unlike an uncertified guard or arc callable, the selector and the
+  keys it passes to `groups` run inline with no `expr_timeout_secs` limit, so one that blocks
+  holds the engine lock. The lock is not
   re-entrant, so for the length of the call the engine swaps in a guard that raises
   `RuntimeError` on the selector's own thread (reported like any raising selector) instead of
   deadlocking. A failure is reported once, and again only when it changes or after the

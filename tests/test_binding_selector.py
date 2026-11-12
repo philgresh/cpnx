@@ -345,23 +345,69 @@ def test_a_repeated_failure_is_reported_once_and_again_when_it_changes():
 
 
 def test_a_failure_reports_again_after_the_transition_fires():
-    calls = {"n": 0}
+    mode = {"fail": True}
 
-    def every_other(view: BindingView):
-        calls["n"] += 1
-        if calls["n"] % 2:
+    def switchable(view: BindingView):
+        if mode["fail"]:
             raise LookupError("not now")
         return [next(view.available(0))]
 
-    net = _one_arc_net(every_other)
+    net = _one_arc_net(switchable)
     errors: list[BaseException] = []
     net.on_error = lambda _name, error, _token: errors.append(error)
     with net:
         assert net.step() is False
+        assert net.step() is False
+        assert len(errors) == 1
+        mode["fail"] = False
         assert net.step() is True
         net._await_inflight()
+        mode["fail"] = True
         assert net.step() is False
     assert len(errors) == 2
+
+
+def test_a_failure_reports_again_after_the_selector_recovers_without_firing():
+    mode = {"fail": True}
+
+    def switchable(view: BindingView):
+        if mode["fail"]:
+            raise LookupError("not now")
+        return None
+
+    net = _one_arc_net(switchable)
+    errors: list[BaseException] = []
+    net.on_error = lambda _name, error, _token: errors.append(error)
+    with net:
+        net.step()
+        mode["fail"] = False
+        net.step()
+        mode["fail"] = True
+        net.step()
+    assert len(errors) == 2
+
+
+def counts_what_it_sees(view: BindingView):
+    raise LookupError(f"sees {len(list(view.available(0)))}")
+
+
+def test_timed_and_timing_ignoring_failures_each_report_once():
+    net = PetriNet(seed=1, places=[Place("in"), Place("out")])
+    net.add_transition(
+        Transition("t", [InputArc("in")], [OutputArc("out")], _identity, binding_selector=counts_what_it_sees)
+    )
+    net.advance_time(10.0)
+    net.deposit("in", Token(payload={"i": 0}))
+    net.deposit("in", Token(payload={"i": 1}, available_at=20.0))
+    errors: list[BaseException] = []
+    net.on_error = lambda _name, error, _token: errors.append(error)
+    with net:
+        for _ in range(5):
+            net.step()
+            net.is_quiescent()
+            net.is_dead()
+    messages = sorted(str(e.__cause__) for e in errors)
+    assert messages == ["sees 1", "sees 2"]
 
 
 def _run_with_deadline(fn, secs: float = 10.0):
@@ -390,6 +436,111 @@ def test_a_selector_calling_back_into_the_net_is_reported_not_deadlocked():
         assert _run_with_deadline(net.step) is False
         assert len(net.marking["in"]) == 5, "the lock is restored after the call"
     assert errors and "called back into the net" in str(errors[0])
+
+
+def test_another_thread_waits_on_the_lock_while_a_selector_runs():
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow(view: BindingView):
+        entered.set()
+        release.wait(5)
+        return None
+
+    net = _one_arc_net(slow)
+    seen: dict[str, object] = {}
+
+    def reader():
+        entered.wait(5)
+        seen["marking"] = len(net.marking["in"])
+
+    with net:
+        stepper = threading.Thread(target=net.step, daemon=True)
+        stepper.start()
+        other = threading.Thread(target=reader, daemon=True)
+        other.start()
+        other.join(0.3)
+        assert other.is_alive(), "the other thread waits for the engine lock"
+        release.set()
+        other.join(5)
+        stepper.join(5)
+    assert seen == {"marking": 5}
+
+
+def test_a_selector_assigned_on_a_live_net_is_asked_not_its_cached_search_binding():
+    net = PetriNet(seed=1, places=[Place("in"), Place("out")])
+    net.add_transition(Transition("t", [InputArc("in")], [OutputArc("out")], _identity))
+    for i in range(3):
+        net.deposit("in", Token(payload={"i": i}))
+    with net:
+        assert net.is_quiescent() is False
+        assert "t" in net._enabled_bindings, "the scheduler cached the search's binding"
+        net.transitions["t"].binding_selector = newest
+        net.drive_to_quiescence()
+        assert "t" in net._volatile_transitions
+    assert _payloads(net, "out") == [2, 1, 0], "every firing is the selector's choice"
+
+
+def test_a_selector_assigned_on_a_live_net_releases_the_old_join_index():
+    net = PetriNet(seed=1, places=[Place("in"), Place("out")])
+    net.add_transition(Transition("t", [InputArc("in", join_key=_key)], [OutputArc("out")], _identity))
+    for i in range(3):
+        net.deposit("in", Token(payload={"i": i}))
+    with net:
+        assert net.is_quiescent() is False
+        assert net.places["in"]._store._join_indexes
+        transition = net.transitions["t"]
+        transition.inputs[0].join_key = None
+        transition.binding_selector = newest
+        net.drive_to_quiescence()
+    assert _payloads(net, "out") == [2, 1, 0]
+    assert not net.places["in"]._store._join_indexes
+
+
+def test_a_selector_index_is_released_when_its_arc_moves_to_another_place():
+    net = PetriNet(seed=1, places=[Place("jobs"), Place("other"), Place("out")])
+    net.add_transition(
+        Transition("t", [InputArc("jobs")], [OutputArc("out")], _identity, binding_selector=match_certified_one)
+    )
+    for i in range(6):
+        net.deposit("jobs", Token(payload={"i": i, "skill": 1}))
+    with net:
+        net.is_dead()
+        net.is_dead()
+        assert net.places["jobs"]._store._join_indexes
+        net.transitions["t"].inputs[0].place = "other"
+        net.deposit("other", Token(payload={"i": 9, "skill": 1}))
+        net.is_dead()
+    assert not net.places["jobs"]._store._join_indexes
+
+
+def test_inline_keys_are_certified_once_and_never_indexed(monkeypatch):
+    import cpnx.selection as selection
+
+    calls = {"n": 0}
+    real = selection.is_inline_safe
+
+    def counting(key):
+        calls["n"] += 1
+        return real(key)
+
+    monkeypatch.setattr(selection, "is_inline_safe", counting)
+
+    def inline_key(view: BindingView):
+        group = view.group(0, lambda t: t.payload["skill"], 0)
+        return [group[0]] if group else None
+
+    net = _jobs_net(inline_key)
+    with net:
+        net.drive_to_quiescence()
+    assert not net.places["jobs"]._store._join_indexes, "a key seen once is scanned, not indexed"
+
+    cache = selection.KeyCertifications()
+    for _ in range(20):
+        assert cache.inline_safe(lambda t: t.payload["skill"])
+    assert calls["n"] == 1, "a lambda rebuilt with the same code and closure is certified once"
 
 
 def test_binding_priority_key_set_after_a_selector_is_rejected():
@@ -436,8 +587,9 @@ def _jobs_net(selector) -> PetriNet:
 def test_clearing_a_selector_releases_its_place_indexes():
     net = _jobs_net(match_certified_one)
     with net:
-        net.step()
-        net._await_inflight()
+        for _ in range(2):  # an index is built once the same key is passed a second time
+            net.step()
+            net._await_inflight()
         assert net.places["jobs"]._store._join_indexes
         net.transitions["t"].binding_selector = None
         net.step()
@@ -482,6 +634,9 @@ def test_a_selector_arc_keeps_at_most_four_place_indexes():
     net = _jobs_net(rotating)
     place = net.places["jobs"]
     with net:
+        for _ in range(5):  # first sighting of each key: scanned, no index yet
+            net.is_dead()
+        assert not place._store._join_indexes
         for _ in range(4):
             net.is_dead()
         first_ids = set(place._store._join_indexes)

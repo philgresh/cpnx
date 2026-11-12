@@ -710,10 +710,13 @@ class Transition:
                enabled". Made for dispatchers whose policy (shortest queue, skill match,
                random among eligible) is the thing a simulation studies.
 
-               **Contract.** Like a guard, the selector runs under the engine lock, possibly
-               several times per firing (each enablement check asks it), so it must be cheap
-               and must not call back into the net (doing so raises `RuntimeError`, which is
-               reported like any raising selector). It must be a pure function of the view:
+               **Contract.** The selector runs under the engine lock, possibly several times
+               per firing (each enablement check asks it), so it must be cheap and must not
+               call back into the net (doing so raises `RuntimeError`, which is reported like
+               any raising selector). Unlike an uncertified guard, and like
+               `binding_priority_key`, it runs inline with no `expr_timeout_secs` limit, and so
+               do the keys it passes to `view.groups`: one that blocks holds the engine lock.
+               It must be a pure function of the view:
                draw randomness only from `view.random`, which is seeded from the net's `seed`,
                the transition and its firing count, so the same seed and selector give the same
                firings across processes. Use [`BindingView.groups`][cpnx.BindingView.groups]

@@ -2284,9 +2284,11 @@ class PetriNet:
         #: Transition name -> the first error its selector raised or returned this pass,
         #: dispatched via `on_error` off the lock by `_flush_selection_failures`.
         self._pending_selector_failures: dict[str, Exception] = {}
-        #: Transition name -> the signature of the selector failure last reported, so a failure
-        #: that repeats on every enabling check reports once (cleared when the transition fires).
-        self._selector_faults: dict[str, tuple[str, str]] = {}
+        #: ``(transition, ignore_timing)`` -> the signature of the selector failure last reported
+        #: from that view, so a failure that repeats on every enabling check reports once. Kept
+        #: per view because a reconcile asks with and without timing, which can fail differently;
+        #: cleared when that view's ask succeeds and, for both views, when the transition fires.
+        self._selector_faults: dict[tuple[str, bool], tuple[str, str]] = {}
 
     def _get_model_time_under_lock(self) -> float:
         """Internal helper to get the model time without acquiring the engine lock."""
@@ -2783,7 +2785,13 @@ class PetriNet:
             return None
         min_priority = min(p for p, bucket in self._priority_buckets.items() if bucket)
         name = self._rng.choice(self._priority_buckets[min_priority])
-        return self.transitions[name], self._enabled_bindings[name]
+        transition = self.transitions[name]
+        if transition.binding_selector is not None and name not in self._volatile_transitions:
+            # A selector assigned after the scheduler was built: the cached binding came from a
+            # search. Rebuild, so the selector is asked (and the transition is volatile) from now on.
+            self._scheduler_ready = False
+            return self._select_incremental()
+        return transition, self._enabled_bindings[name]
 
     def _consume_binding(self, binding: _Binding, m_time: float | None) -> tuple[list[Token], list[tuple[str, Token]]]:
         """Remove the exact tokens named by `binding` from their source places.
@@ -2905,7 +2913,7 @@ class PetriNet:
                     consumed_tokens, token_sources = self._consume_binding(binding, m_time)
                     if transition.binding_selector is not None:
                         self._selector_firings[transition.name] = self._selector_firings.get(transition.name, 0) + 1
-                        self._selector_faults.pop(transition.name, None)
+                        self._clear_selector_faults(transition.name)
                     self._running_count += 1
                     firing = (transition, consumed_tokens, token_sources)
                     if not inline:
@@ -3953,7 +3961,8 @@ class PetriNet:
         """
         if transition.binding_selector is not None:
             return self._selector_binding(transition, m_time, ignore_timing)
-        self._release_stale_search_state(transition)
+        if self._selector_transitions or self._join_registrations:
+            self._release_stale_search_state(transition)
         shared = _shared_places(transition)
         if shared and _drains_a_place_twice(transition, shared):
             return None
@@ -3986,7 +3995,8 @@ class PetriNet:
         """
         if transition.binding_selector is not None:
             return self._selector_binding(transition, m_time, ignore_timing) is not None
-        self._release_stale_search_state(transition)
+        if self._selector_transitions or self._join_registrations:
+            self._release_stale_search_state(transition)
         shared = _shared_places(transition)
         if shared and _drains_a_place_twice(transition, shared):
             return False
@@ -5191,13 +5201,14 @@ class PetriNet:
         """
         conflict = selector_conflict(transition)
         if conflict is not None:
-            return self._reject_selection(transition, InvalidSelection(conflict))
+            return self._reject_selection(transition, InvalidSelection(conflict), ignore_timing)
         t_limit = _LAST_FINITE_TIME if ignore_timing else m_time
         places = self._selector_places(transition, t_limit, ignore_timing)
         if places is None:
             return None
         name = transition.name
-        self._selector_transitions.add(name)
+        if name not in self._selector_transitions:
+            self._adopt_selector(transition)
         self._release_stale_selector_indexes(name, places)
         view = BindingView(
             name,
@@ -5212,11 +5223,13 @@ class PetriNet:
         try:
             choice = self._call_selector(selector, view)
             if choice is None:
+                self._selector_faults.pop((name, ignore_timing), None)
                 return None
             per_arc = normalize_choice(choice, transition.inputs)
             self._check_selection(transition, places, per_arc, t_limit)
         except Exception as exc:
-            return self._reject_selection(transition, exc)
+            return self._reject_selection(transition, exc, ignore_timing)
+        self._selector_faults.pop((name, ignore_timing), None)
         return list(zip(transition.inputs, per_arc, strict=True))
 
     def _selector_places(
@@ -5258,19 +5271,46 @@ class PetriNet:
         finally:
             self._lock = lock
 
-    def _reject_selection(self, transition: Transition, exc: Exception) -> None:
+    def _reject_selection(self, transition: Transition, exc: Exception, ignore_timing: bool) -> None:
         """Buffer `exc` for `on_error` and report no binding. Caller holds the lock.
 
-        Edge-triggered per transition: the same failure (same type and message, which names any
-        offending tokens) reports once, and again only when it changes or after the transition
-        has fired. Selector transitions are re-asked on every enabling check, so `run()`'s
-        polling would otherwise report it on each poll.
+        Edge-triggered per transition and view (timed, or timing-ignoring): the same failure
+        (same type and message, which names any offending tokens) reports once, and again only
+        after that view's ask has succeeded or the transition has fired. Selector transitions
+        are re-asked on every enabling check, so `run()`'s polling would otherwise report it on
+        each poll. A failure is latched only once it is actually buffered, so one that loses
+        this pass's single slot to the other view reports on a later pass, and the same failure
+        already reported from the other view is latched without a second report.
         """
+        name = transition.name
         signature = (type(exc).__qualname__, str(exc))
-        if self._selector_faults.get(transition.name) != signature:
-            self._selector_faults[transition.name] = signature
-            self._pending_selector_failures.setdefault(transition.name, exc)
+        faults = self._selector_faults
+        if faults.get((name, ignore_timing)) == signature:
+            return None
+        if faults.get((name, not ignore_timing)) == signature:
+            faults[(name, ignore_timing)] = signature
+            return None
+        if name not in self._pending_selector_failures:
+            self._pending_selector_failures[name] = exc
+            faults[(name, ignore_timing)] = signature
         return None
+
+    def _clear_selector_faults(self, name: str) -> None:
+        """Forget both views' reported failures for `name`, so the next failure reports. Caller holds the lock."""
+        self._selector_faults.pop((name, False), None)
+        self._selector_faults.pop((name, True), None)
+
+    def _adopt_selector(self, transition: Transition) -> None:
+        """Take over a transition that gained a selector after it joined the net. Caller holds the lock.
+
+        Its scheduler state was built for a search (not volatile, maybe a cached search binding),
+        and a `join_key` it carried before may still have a place index registered, so rebuild the
+        scheduler and release that index before asking the selector.
+        """
+        self._selector_transitions.add(transition.name)
+        self._scheduler_ready = False
+        if self._join_registrations:
+            self._release_stale_join_indexes(transition)
 
     def _release_stale_search_state(self, transition: Transition) -> None:
         """Before a search: drop join indexes and selector state `transition` no longer uses. Caller holds the lock."""
@@ -5283,7 +5323,7 @@ class PetriNet:
         """Drop the selector state of a transition whose `binding_selector` was cleared. Caller holds the lock."""
         name = transition.name
         self._selector_transitions.discard(name)
-        self._selector_faults.pop(name, None)
+        self._clear_selector_faults(name)
         self._release_stale_selector_indexes(name, [])
         if self._searches_bindings(transition) and not self._has_search_policy_transition:
             self._has_search_policy_transition = True
@@ -5338,7 +5378,8 @@ class PetriNet:
     ) -> "dict[object, Iterable[tuple[object, Token]]]":
         """`BindingView.groups`: from a place join index when *key* certifies, else by keying the pool."""
         place = places[position]
-        if type(place) is Place and self._selector_keys.inline_safe(key):
+        keys_cache = self._selector_keys
+        if type(place) is Place and keys_cache.seen_before(key) and keys_cache.inline_safe(key):
             index_id = self._selector_index(transition_name, position, key, place)
             indexed = place.peek_join(index_id, keys, model_time=t_limit)
             if indexed is not None:
