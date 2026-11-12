@@ -1935,11 +1935,14 @@ class PetriNet:
         self.places: dict[str, Place] = {}
         self.transitions: dict[str, Transition] = {}
         self._running_count = 0
-        self._drive_limits: dict[str, int] = {}
+        self._drive_limits: dict[str, int | bool] = {}
         self._nested_undo: list[_NestedUndo] | None = None
         self._pending_restore: tuple[dict[str, tuple[Token, ...]], list[_NestedUndo], float] | None = None
         self._settle_lock = threading.Lock()
         self._closing = False
+        #: Set by `__exit__`. An inline drive never submits to `_executor`, so it checks this to
+        #: refuse to fire on a closed net, as `step()` does when its submit raises.
+        self._shut_down = False
         self._parent: weakref.ref[PetriNet] | None = None
         self._subnets: list[PetriNet] = []
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -2810,43 +2813,94 @@ class PetriNet:
                 already been shut down, such as after exiting a `with` block). Any tokens
                 already consumed from input places are returned before the error propagates.
         """
+        return self._fire_one(inline=False)
+
+    def _fire_one(self, *, inline: bool) -> bool:
+        """Select and consume one firing under the lock, then run it; see `step`.
+
+        With *inline* the action runs here on the calling thread, after the lock is released and
+        the deferred selection callbacks have been flushed, so the firing has committed (or rolled
+        back) when this returns. Otherwise it is submitted to the thread pool, as `step` does.
+        """
         # Synthesize resource-return arcs once, before any firing — covers callers that reach
         # `step` without `validate` (direct `step`, `drive_to_quiescence`). Fast-path no-op
         # after the first call.
         self._ensure_resource_returns_synthesized()
+        firing: tuple[Transition, list[Token], list[tuple[str, Token]]] | None = None
         try:
             with self._lock:
                 selected = self._select_transition_to_fire()
-                if not selected:
-                    fired = False
-                else:
+                if selected:
+                    if inline and self._shut_down:
+                        # Match `step()`, whose submit raises once the pool is shut down, only
+                        # when something would fire: refuse before consuming, so no token is touched.
+                        raise RuntimeError("cannot fire inline after the net's thread pools were shut down")
                     # The binding was resolved during selection (guard evaluated once); consume
                     # exactly those tokens. Under BindingPolicy.FIRST the chosen tokens may not
                     # be at the head of their places, so consumption is by token id, not FIFO.
                     transition, binding = selected
                     m_time = self._get_model_time_under_lock()
                     consumed_tokens, token_sources = self._consume_binding(binding, m_time)
-
                     self._running_count += 1
-                    try:
-                        self._executor.submit(self._execute_transition, transition, consumed_tokens, token_sources)
-                    except Exception:
-                        # submit() failed (e.g. executor shut down) — undo the increment so
-                        # is_quiescent() doesn't permanently block.
-                        self._running_count -= 1
-                        # Return consumed tokens back to their source places
-                        for src_name, t in token_sources:
-                            self._deposit_under_lock(src_name, t)
-                        raise
-                    fired = True
+                    firing = (transition, consumed_tokens, token_sources)
+                    if not inline:
+                        self._submit_firing_under_lock(*firing)
         finally:
             # Dispatch any deferred callbacks accumulated during selection, off the lock —
             # even if consume/submit raised, so buffered signals are never delayed.
+            self._flush_after_selection(firing if inline else None)
+
+        if firing is None:
+            return False
+        if inline:
+            # Off the lock, as on a worker thread. `_execute_transition` catches the action's
+            # exceptions, commits or rolls back, runs the callbacks and decrements
+            # `_running_count`. A `KeyboardInterrupt` or `SystemExit` from the action hands the
+            # tokens back as taken and propagates; any other `BaseException` fails the firing,
+            # then propagates (see `_fire_and_commit`).
+            self._execute_transition(*firing, inline=True)
+        return True
+
+    def _flush_after_selection(
+        self, unstarted: "tuple[Transition, list[Token], list[tuple[str, Token]]] | None"
+    ) -> None:
+        """Dispatch the callbacks deferred during selection, off the lock.
+
+        *unstarted* is an inline firing that is consumed and counted running but not yet
+        executed. If a callback raises a `BaseException` the flush does not catch (a
+        `SystemExit` from `on_error`, or Ctrl-C landing here), that firing would never run, so
+        its tokens go back as they were taken and it stops counting as running.
+        """
+        try:
             self._flush_search_exhaustions()
             self._flush_priority_key_failures()
             self._flush_selection_failures()
+        except BaseException:
+            if unstarted is not None:
+                self._abandon_unstarted(unstarted[2])
+            raise
 
-        return fired
+    def _abandon_unstarted(self, token_sources: list[tuple[str, Token]]) -> None:
+        """Undo a consumed firing that will never execute: return its tokens and its running count."""
+        self._return_unstarted(token_sources)
+        with self._lock:
+            self._running_count -= 1
+        self._work_available.set()
+
+    def _submit_firing_under_lock(
+        self, transition: Transition, consumed_tokens: list[Token], token_sources: list[tuple[str, Token]]
+    ) -> None:
+        """Hand a consumed firing to the thread pool. Caller holds `self._lock` and has counted it running."""
+        try:
+            self._executor.submit(self._execute_transition, transition, consumed_tokens, token_sources)
+        except Exception:
+            # submit() failed (e.g. executor shut down) — undo the increment so
+            # is_quiescent() doesn't permanently block.
+            self._running_count -= 1
+            # Return consumed tokens back to their source places
+            for src_name, t in token_sources:
+                self._deposit_under_lock(src_name, t)
+            raise
 
     def _inject_resource_returns(self, transition: Transition) -> int:
         """Append a synthesized `OutputArc` for each resource-pool `InputArc` this transition
@@ -3040,7 +3094,9 @@ class PetriNet:
             if not self.step():
                 self._wait_for_work(deadline, stop_event)
 
-    def drive_to_quiescence(self, *, max_ticks: int = 1_000_000, max_spins: int = 10_000_000) -> DriveResult:
+    def drive_to_quiescence(
+        self, *, max_ticks: int = 1_000_000, max_spins: int = 10_000_000, inline_actions: bool = False
+    ) -> DriveResult:
         """Drive the net to quiescence on its **logical clock**, jumping over timed waits.
 
         The deterministic counterpart to [`run`][cpnx.PetriNet.run]. Where `run` waits out
@@ -3070,6 +3126,27 @@ class PetriNet:
                 nets whose actions legitimately block for longer, so a slow-but-healthy action is
                 not mistaken for a hung one. It counts spins, so how long it lasts depends on the
                 machine; it is not a time bound. It is passed to subnet drives as `max_ticks` is.
+                It does not apply to firings run with `inline_actions`.
+            inline_actions: Run each firing's action on the calling thread instead of handing it to
+                the thread pool. The drive already keeps one firing in flight, so the order of
+                firings, commits and seeded draws is the same either way; inline execution only
+                drops the per-firing handoff and the wait for it, which dominates the cost of
+                cheap actions. The trade-off is the hung-action guard: an inline action that
+                blocks blocks the drive, and `max_spins` cannot cut it short. Set
+                `action_timeout_secs` on a transition whose action can hang; that action still
+                runs on its own worker under the timeout. `SubstitutionTransition` firings run
+                inline too, and their subnet drives inherit the setting. A `KeyboardInterrupt` or
+                `SystemExit` raised by an inline action hands the firing's tokens back exactly
+                as they were taken (a paced permit starts no cooldown), with no attempt counted
+                and nothing dead-lettered, and propagates out of the drive; on the thread pool
+                it is lost with the worker and the firing fails. Any other `BaseException` that
+                is not an `Exception` fails the firing as usual, then propagates. That holds for
+                an interrupt raised inside the action body. One that lands while the engine is
+                committing or rolling back can leave that firing half done. With
+                `action_timeout_secs`, the interrupt reaches the drive while it waits for the
+                action, which keeps running on its worker and may still have side effects after
+                its tokens are back. An inline drive that would fire on a net whose `with` block
+                has exited raises `RuntimeError`, as `step()` does. See ADR 0012.
 
         Returns:
             A [`DriveResult`][cpnx.DriveResult] with the number of firings and clock advances.
@@ -3085,13 +3162,13 @@ class PetriNet:
         if self._model_time is None:
             self.advance_time(math.nextafter(self.model_time, math.inf))
 
-        self._drive_limits = {"max_ticks": max_ticks, "max_spins": max_spins}
+        self._drive_limits = {"max_ticks": max_ticks, "max_spins": max_spins, "inline_actions": inline_actions}
         try:
-            return self._drive_logical_clock(max_ticks, max_spins)
+            return self._drive_logical_clock(max_ticks, max_spins, inline_actions)
         finally:
             self._drive_limits = {}
 
-    def _drive_logical_clock(self, max_ticks: int, max_spins: int) -> DriveResult:
+    def _drive_logical_clock(self, max_ticks: int, max_spins: int, inline: bool) -> DriveResult:
         """Fire and advance until a fixed point or *max_ticks*; see `drive_to_quiescence`."""
         steps = 0
         ticks = 0
@@ -3100,8 +3177,9 @@ class PetriNet:
             # deliberate: `step` returns as soon as the action is submitted, so awaiting means at
             # most one action is ever in flight. This keeps the drive single-threaded (determinism)
             # and ensures each completed action's outputs are committed before the next enablement
-            # check (instant accounting).
-            while not self._aborted() and self.step():
+            # check (instant accounting). An inline firing has committed by the time
+            # `_fire_one` returns, so its await finds nothing in flight.
+            while not self._aborted() and self._fire_one(inline=inline):
                 steps += 1
                 self._await_inflight(max_spins=max_spins)
             # Nothing fires right now. Done, or just waiting out a cooldown/settle window?
@@ -3300,6 +3378,7 @@ class PetriNet:
 
     def __exit__(self, *_: object) -> None:
         """Shut down the thread pool, waiting for in-flight transitions to finish."""
+        self._shut_down = True
         self._executor.shutdown(wait=True)
         # Zombie action threads may still be running after a timeout — don't wait.
         self._action_executor.shutdown(wait=False, cancel_futures=True)
@@ -5264,13 +5343,15 @@ class PetriNet:
         transition: Transition,
         consumed_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
+        *,
+        inline: bool = False,
     ) -> None:
         start_time = time.monotonic()
         try:
             if isinstance(transition, SubstitutionTransition):
-                outcome = self._fire_substitution_atomically(transition, consumed_tokens, token_sources)
+                outcome = self._fire_substitution_atomically(transition, consumed_tokens, token_sources, inline=inline)
             else:
-                outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time)
+                outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, inline=inline)
             if outcome is None:
                 return
 
@@ -5297,6 +5378,8 @@ class PetriNet:
         token_sources: list[tuple[str, Token]],
         start_time: float,
         action_error: BaseException | None = None,
+        *,
+        inline: bool = False,
     ) -> "_FiringOutcome | None":
         """Run the action and commit or roll back; *action_error* fails the firing without it.
 
@@ -5304,6 +5387,15 @@ class PetriNet:
         it: one that starts after that failure, or whose subnet drive the failure cuts short. It
         hands its tokens back without retrying, dead-lettering or calling back, and the restore
         resets the net.
+
+        On an *inline* firing, an action that raises `KeyboardInterrupt` or `SystemExit` is the
+        caller stopping the drive, not the firing failing: its tokens go back exactly as they were
+        taken (`_return_unstarted`, so a paced permit keeps its availability), with no attempt
+        counted, and the interrupt is re-raised. Any other `BaseException` (`CancelledError`,
+        `GeneratorExit`) fails the firing like an `Exception` and is re-raised after the rollback
+        by `_execute_transition`, so a caller that catches it and drives again cannot re-fire the
+        same token forever. On the pool nothing would receive the re-raise, so a worker rolls
+        every interrupt back as a failure.
         """
         if self._aborted():
             self._return_unstarted(token_sources)
@@ -5315,6 +5407,9 @@ class PetriNet:
         if isinstance(error, _EnclosingFiringFailed):
             self._return_interrupted(token_sources)
             return None
+        if inline and isinstance(error, (KeyboardInterrupt, SystemExit)):
+            self._return_unstarted(token_sources)
+            raise error
         with self._lock:
             duration = time.monotonic() - start_time
             success, error, data_tokens, dl_data, deposited = self._commit_or_rollback_transition(
@@ -5365,6 +5460,8 @@ class PetriNet:
         transition: SubstitutionTransition,
         consumed_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
+        *,
+        inline: bool = False,
     ) -> "_FiringOutcome | None":
         """Fire a substitution transition as one transaction on its subnet.
 
@@ -5398,7 +5495,7 @@ class PetriNet:
                 return self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, exc)
             subnet._nested_undo = nested = []
             try:
-                outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time)
+                outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, inline=inline)
             except BaseException:
                 subnet._request_restore(checkpoint, nested)
                 raise

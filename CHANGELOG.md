@@ -87,6 +87,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`drive_to_quiescence(inline_actions=True)` runs each firing on the driving thread**
+  ([#79](https://github.com/philgresh/cpnx/issues/79),
+  [ADR 0012](https://github.com/philgresh/cpnx/blob/main/docs/adr/0012-inline-drive-actions.md)).
+  The drive already keeps one firing in flight, so handing each action to the thread pool and
+  spinning until it commits was pure overhead. Inline, the firings, commits, retries, dead
+  letters and seeded draws happen in the same order, and substitution firings and their subnet
+  drives run inline too. On #79's two-transition chain (5 000 tokens, 10 000 firings) the cost
+  per firing drops from about 137 to about 50 µs, about 2.8×; `bench_timed_backlog.py`'s drive
+  arm gains an `inline` column (about 1.5× there). It is opt-in because an inline action that
+  blocks blocks the drive, and `max_spins` cannot cut it short; set `action_timeout_secs` on an
+  action that can hang. A `KeyboardInterrupt` or `SystemExit` raised by an inline action
+  hands its tokens back exactly as they were taken (no attempt counted, nothing dead-lettered,
+  no permit cooldown) and propagates out of the drive. With `action_timeout_secs`, the action
+  itself may still be running on its worker. Any other `BaseException` from an inline action,
+  such as `asyncio.CancelledError`, fails the firing as usual (an attempt is counted, and it
+  can dead-letter) and then propagates out of the drive. `step()`, `run()` and the default drive are unchanged.
 - **`InputArc.join_key` joins input arcs on equal keys, and a join with no match no longer
   walks every candidate** ([#64](https://github.com/philgresh/cpnx/issues/64),
   [ADR 0010](https://github.com/philgresh/cpnx/blob/main/docs/adr/0010-equi-join-index.md)).
