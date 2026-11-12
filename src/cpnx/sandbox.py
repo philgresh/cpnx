@@ -81,21 +81,88 @@ def _find_target_node(tree: ast.AST, start_line: int) -> ast.AST | None:
     return _most_specific_node(_function_nodes(tree), start_line)
 
 
+#: Where a callable's own code lies in its file: `(line, end_line, column, end_column)`, as
+#: `code.co_positions()` gives them. Columns are UTF-8 byte offsets, as in the AST.
+_Position = tuple[int, int, int, int]
+
+
+def _body_anchor(func: Callable) -> _Position | None:
+    """Return the position of one instruction of `func`'s own body, or `None` if none is known.
+
+    Nested functions compile to code objects of their own, so every positioned instruction
+    of `func` lies in its body and outside the body of any function nested in it. The last
+    one is taken: the leading instructions (`RESUME` and the like) carry the function's first
+    line with no real span.
+
+    Returns:
+        The position, or `None` when the interpreter records no columns: before Python
+        3.11, under `-X no_debug_ranges`, or for an object with no code of its own.
+    """
+    func = inspect.unwrap(func)
+    code = getattr(getattr(func, "__func__", func), "__code__", None)
+    positions = getattr(code, "co_positions", None)
+    if positions is None:
+        return None
+    anchor = None
+    for position in positions():
+        line, end_line, column, end_column = position
+        if None in position or (line, column) == (end_line, end_column):
+            continue
+        anchor = position
+    return anchor
+
+
+def _body_span(node: ast.AST) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Return where the body of a `def` or `lambda` node starts and ends, as `(line, column)` pairs."""
+    body = node.body if isinstance(node.body, list) else [node.body]
+    first, last = body[0], body[-1]
+    # A decorated statement starts at its first decorator; the AST gives the `def` line.
+    starts = [first, *getattr(first, "decorator_list", [])]
+    start = min((item.lineno, item.col_offset) for item in starts)
+    return start, (last.end_lineno, last.end_col_offset)
+
+
+def _body_holds(node: ast.AST, anchor: _Position) -> bool:
+    line, end_line, column, end_column = anchor
+    start, end = _body_span(node)
+    return start <= (line, column) and (end_line, end_column) <= end
+
+
 class _ParsedSource:
     """One parsed source file: its function nodes, and the lookups made among them so far.
 
     Attributes:
         stamp: The file's `(st_mtime_ns, st_size)` when it was read.
         functions: Its `def`, `async def` and `lambda` nodes, from one walk of the tree.
-        by_line: The node `_find_target_node` gives for each start line asked for so far.
+        found: The nodes `locate` gave for each `(start_line, anchor)` asked for so far.
     """
 
-    __slots__ = ("stamp", "functions", "by_line")
+    __slots__ = ("stamp", "functions", "found")
 
     def __init__(self, stamp: tuple[int, int], tree: ast.AST) -> None:
         self.stamp = stamp
         self.functions = _function_nodes(tree)
-        self.by_line: dict[int, ast.AST | None] = {}
+        self.found: dict[tuple[int, _Position | None], tuple[ast.AST, ...]] = {}
+
+    def locate(self, start_line: int, anchor: _Position | None) -> tuple[ast.AST, ...]:
+        """Return the nodes a callable starting on `start_line` may be; see `_source_nodes`."""
+        key = (start_line, anchor)
+        if key not in self.found:
+            self.found[key] = self._locate(start_line, anchor)
+        return self.found[key]
+
+    def _locate(self, start_line: int, anchor: _Position | None) -> tuple[ast.AST, ...]:
+        candidates = [node for node in self.functions if _node_contains_line(node, start_line)]
+        if anchor is not None:
+            # Every function around the callable holds the anchor too; its own node starts last.
+            holding = [node for node in candidates if _body_holds(node, anchor)]
+            if holding:
+                return (max(holding, key=lambda node: (node.lineno, node.col_offset)),)
+        starting = [node for node in candidates if node.lineno == start_line]
+        if len(starting) > 1:
+            return tuple(starting)
+        node = _most_specific_node(candidates, start_line)
+        return () if node is None else (node,)
 
 
 #: Parsed source files by path. Building many arcs and transitions from the same functions
@@ -108,19 +175,30 @@ _SOURCE_CACHE: dict[str, _ParsedSource] = {}
 _SOURCE_CACHE_LOCK = threading.Lock()
 
 
-def _source_node(func: Callable) -> ast.AST | None:
-    """Return the `def`/`lambda` node of `func` in its source file, or `None` if there is none.
+def _source_nodes(func: Callable) -> tuple[ast.AST, ...]:
+    """Return the `def`/`lambda` nodes `func` may be in its source file: one, when it can be told.
 
-    The node is the one `_find_target_node` finds for the line `func` starts on, in the file
-    as it is on disk now. It is shared between callers and threads: read it, and copy it
-    before changing it.
+    The file is read as it is on disk now. Of the function nodes whose lines include the line
+    `func` starts on:
+
+    - With column positions (`_body_anchor`), the result is the one node whose body holds
+      `func`'s own code, so two lambdas on one line, a lambda and the lambda it returns, and
+      a `def` with a lambda default on its first line are each their own node.
+    - Without them, or when no body holds that position (the file changed since import), the
+      line is all there is. If several function nodes start on it they cannot be told apart
+      and all are returned: `func` is one of them, so a caller that holds `func` to what any
+      of them does is never more lenient than the truth. Otherwise the result is the most
+      specific node around the line (`_find_target_node`), as it always was.
+
+    The nodes are shared between callers and threads: read them, and copy one before
+    changing it.
 
     Args:
         func: The callable to locate.
 
     Returns:
-        The node, or `None` when `func` has no source file or no function node spans its
-        first line.
+        The candidate nodes; empty when `func` has no source file or no function node spans
+        its first line.
 
     Raises:
         OSError: If the source cannot be found or read.
@@ -130,7 +208,8 @@ def _source_node(func: Callable) -> ast.AST | None:
     _, start_line = inspect.getsourcelines(func)
     source_file = inspect.getsourcefile(func)
     if not source_file:
-        return None
+        return ()
+    anchor = _body_anchor(func)
     status = os.stat(source_file)
     stamp = (status.st_mtime_ns, status.st_size)
     with _SOURCE_CACHE_LOCK:
@@ -139,9 +218,7 @@ def _source_node(func: Callable) -> ast.AST | None:
             with open(source_file, encoding="utf-8") as handle:
                 tree = ast.parse(handle.read(), filename=source_file)
             parsed = _SOURCE_CACHE[source_file] = _ParsedSource(stamp, tree)
-        if start_line not in parsed.by_line:
-            parsed.by_line[start_line] = _most_specific_node(parsed.functions, start_line)
-        return parsed.by_line[start_line]
+        return parsed.locate(start_line, anchor)
 
 
 _FORBIDDEN_FUNCS = frozenset({"open", "print", "eval", "exec", "__import__", "sleep"})
@@ -188,9 +265,10 @@ def _verify_ast_purity(tree: ast.AST, is_fallback: bool = False) -> None:
 
 def _try_verify_via_sourcefile(func: Callable) -> bool:
     try:
-        target_node = _source_node(func)
-        if target_node is not None:
-            _verify_ast_purity(target_node)
+        nodes = _source_nodes(func)
+        for node in nodes:
+            _verify_ast_purity(node)
+        if nodes:
             return True
     except PermissionError:
         raise

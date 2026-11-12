@@ -58,7 +58,7 @@ import types
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .sandbox import SandboxEvaluator, _source_node
+from .sandbox import SandboxEvaluator, _source_nodes
 from .tokens import FrozenDict
 
 #: Builtins that iterate/reduce a finite iterable. Added on top of the string
@@ -143,22 +143,24 @@ def _is_immutable(value: object) -> bool:
     return False
 
 
-def _get_ast_node(func: Callable) -> ast.AST | None:
-    """Recover the ``Lambda``/``FunctionDef`` AST node for *func*, or ``None``.
+def _get_ast_nodes(func: Callable) -> list[ast.AST]:
+    """Recover the ``Lambda``/``FunctionDef`` AST nodes *func* may be.
 
-    Returns ``None`` when the source cannot be located (compiled builtins, REPL
-    lambdas, ``exec``-created code) — which certification treats as *not
-    certified*, never as *allowed*.
+    Empty when the source cannot be located (compiled builtins, REPL lambdas,
+    ``exec``-created code) — which certification treats as *not certified*, never as
+    *allowed*. Otherwise one node, except where several functions start on *func*'s line and
+    the interpreter records no columns to tell them apart (before Python 3.11, or under
+    ``-X no_debug_ranges``): then all of them, and *func* certifies only if every one does.
 
-    The node is a private copy of the one in the shared per-file parse
-    (:func:`cpnx.sandbox._source_node`), because :func:`_strip_annotations` changes it in
-    place and the purity and lint checks read the shared one.
+    The nodes are private copies of those in the shared per-file parse
+    (:func:`cpnx.sandbox._source_nodes`), because :func:`_strip_annotations` changes them in
+    place and the purity and lint checks read the shared ones.
     """
     try:
-        node = _source_node(func)
+        nodes = _source_nodes(func)
     except (OSError, TypeError, SyntaxError):
-        return None
-    return copy.deepcopy(node)
+        return []
+    return [copy.deepcopy(node) for node in nodes]
 
 
 def _param_names(node: ast.AST) -> frozenset[str]:
@@ -269,9 +271,23 @@ class _Certifier:
     def _certify_uncached(self, func: Callable, stack: frozenset[Callable]) -> Verdict:
         if getattr(func, "__wrapped__", None) is not None:
             return Verdict(False, "decorated callable (wrapper hides certified body)")
-        node = _get_ast_node(func)
-        if node is None:
+        nodes = _get_ast_nodes(func)
+        if not nodes:
             return Verdict(False, "source unavailable")
+        for node in nodes:
+            verdict = self._certify_node(func, node, stack)
+            if not verdict.certified:
+                if len(nodes) > 1:
+                    # `func` is one of these, and which one cannot be told: any failure fails it.
+                    return Verdict(
+                        False,
+                        f"{len(nodes)} functions start on line {node.lineno} and cannot be told apart "
+                        f"without column positions; one of them fails: {verdict.reason}",
+                    )
+                return verdict
+        return Verdict(True)
+
+    def _certify_node(self, func: Callable, node: ast.AST, stack: frozenset[Callable]) -> Verdict:
         if isinstance(node, ast.AsyncFunctionDef):
             return Verdict(False, "async callable")
         if getattr(node, "decorator_list", None):
@@ -422,7 +438,7 @@ def _strip_annotations(node: ast.AST) -> None:
     reference *types* that are never evaluated when the callable is *called*, so
     they must not disqualify it — otherwise every type-annotated guard would fail
     on the class name in its own signature. The node is a private copy
-    (:func:`_get_ast_node`), so mutating it is safe.
+    (:func:`_get_ast_nodes`), so mutating it is safe.
     """
     for child in ast.walk(node):
         if isinstance(child, ast.arg):
