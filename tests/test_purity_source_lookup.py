@@ -418,6 +418,7 @@ def test_a_method_of_an_immutable_builtin_is_a_default_a_guard_may_hold(tmp_path
     assert certify(module.grows).reason == "default value is mutable or uncertified"
 
 
+@pytest.mark.skipif(sys.version_info < (3, 11), reason="code records column positions from 3.11")
 def test_code_without_positions_is_still_found_by_its_compiled_twin(tmp_path, monkeypatch):
     # A `.pyc` written under `-X no_debug_ranges` and run without it: the running code has no
     # columns, the source compiled here has. The compiled twin still says which lambda it is.
