@@ -66,6 +66,69 @@ def _find_target_node(tree: ast.AST, start_line: int) -> ast.AST | None:
     return target_node
 
 
+class _ParsedSource:
+    """One source file's parse, plus the callable node found for each start line."""
+
+    __slots__ = ("source", "tree", "targets")
+
+    def __init__(self, source: bytes, tree: ast.AST) -> None:
+        self.source = source
+        self.tree = tree
+        self.targets: dict[int, ast.AST | None] = {}
+
+
+#: ``path -> _ParsedSource``, keyed on the file's bytes. The purity check, the linter
+#: and the certifier each need the node of every guard, key and action they see, and all three
+#: used to parse the whole defining file and walk its whole tree once per callable, per
+#: transition built. Building nets in a loop (a test module of a few thousand lines, a
+#: generated model) then cost ~0.1 s per callable. The trees are shared, so nothing may
+#: mutate them: every consumer only walks its node (the certifier skips annotations as it
+#: walks instead of stripping them). The file is re-read on every lookup and compared with the
+#: bytes that were parsed: the read is cheap, the parse is the cost. An mtime-and-size stamp is
+#: not enough, since a same-size edit within one mtime tick would then be checked against the old
+#: code while the new code runs (with bytecode writing off, nothing else catches it).
+_SOURCE_CACHE: dict[str, _ParsedSource] = {}
+
+#: What "the source cannot be found or parsed" looks like: no file (``OSError``), a builtin or
+#: C function (``TypeError``), unparsable source (``SyntaxError``), or undecodable bytes
+#: (``UnicodeDecodeError``, a ``ValueError``).
+_SOURCE_UNAVAILABLE = (OSError, TypeError, SyntaxError, ValueError)
+
+
+def _parsed_source(path: str) -> _ParsedSource:
+    with open(path, "rb") as handle:
+        source = handle.read()
+    cached = _SOURCE_CACHE.get(path)
+    if cached is None or cached.source != source:
+        # Bytes, so ast.parse honours a PEP 263 coding cookie.
+        cached = _SOURCE_CACHE[path] = _ParsedSource(source, ast.parse(source, filename=path))
+    return cached
+
+
+def _callable_node(func: Callable) -> ast.AST | None:
+    """Return the ``FunctionDef``/``Lambda`` node that defines *func*, from a shared parse.
+
+    The node belongs to a cached tree: read it, never mutate it. Raises one of
+    :data:`_SOURCE_UNAVAILABLE` when the source cannot be found, read or parsed.
+    """
+    path = inspect.getsourcefile(func)
+    _, start_line = inspect.getsourcelines(func)
+    if not path:
+        return None
+    parsed = _parsed_source(path)
+    if start_line not in parsed.targets:
+        parsed.targets[start_line] = _find_target_node(parsed.tree, start_line)
+    return parsed.targets[start_line]
+
+
+def _callable_node_or_none(func: Callable) -> ast.AST | None:
+    """:func:`_callable_node`, with unavailable source reported as ``None``."""
+    try:
+        return _callable_node(func)
+    except _SOURCE_UNAVAILABLE:
+        return None
+
+
 _FORBIDDEN_FUNCS = frozenset({"open", "print", "eval", "exec", "__import__", "sleep"})
 
 # Two deliberately different attribute denylists, keyed on how precisely we could
@@ -110,17 +173,10 @@ def _verify_ast_purity(tree: ast.AST, is_fallback: bool = False) -> None:
 
 def _try_verify_via_sourcefile(func: Callable) -> bool:
     try:
-        file_path = inspect.getsourcefile(func)
-        lines, start_line = inspect.getsourcelines(func)
-        if file_path:
-            with open(file_path, "r", encoding="utf-8") as f:
-                file_content = f.read()
-            tree = ast.parse(file_content, filename=file_path)
-
-            target_node = _find_target_node(tree, start_line)
-            if target_node is not None:
-                _verify_ast_purity(target_node)
-                return True
+        target_node = _callable_node(func)
+        if target_node is not None:
+            _verify_ast_purity(target_node)
+            return True
     except PermissionError:
         raise
     except Exception:

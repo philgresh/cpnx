@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Building a transition no longer re-parses the module that defines its callables.** The
+  purity check, the linter and the certifier each parsed the callable's whole source file and
+  walked its whole tree for every guard, key, filter and action, on every transition built.
+  They now share one parse per file (parsed again whenever the file's bytes change) and look
+  each callable's node up once. One shared-place property-test example (a net built from a
+  2,400-line test module) went from ~350 ms to ~1 ms, and the full test suite from ~5 min to
+  ~20 s on 4 cores. Source files are now read as bytes, so a module with a PEP 263 coding
+  cookie (e.g. `latin-1`) and non-ASCII text no longer makes the linter or the certifier raise
+  `UnicodeDecodeError`, and the purity check takes its precise path on it instead of the
+  stricter `getsource` fallback.
+
 - **Two `consume_all` input arcs on one place are never enabled, and adding such a transition
   warns** ([#75](https://github.com/philgresh/cpnx/issues/75)). Each would drain what the
   other leaves. A guard-free `FIRST` transition of that shape used to fire, the first arc
@@ -179,6 +190,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fix below as well.
 
 ### Fixed
+
+- **Certification no longer admits three callables that run more than it checked.** A
+  certified guard, key or filter runs inline, so these were real gaps:
+
+  - **A nested `def`'s annotations are now checked before 3.14** (without
+    `from __future__ import annotations`). They run every time the `def` statement does, i.e.
+    on every call, but were skipped like the callable's own annotations. A side effect: on
+    3.10–3.13, a nested `def` whose annotations name anything other than a builtin, `typing`
+    constructs included (`def rank(x: Optional[int]) -> int`, `def key(t: Token) -> int`),
+    now uncertifies its callable, which then runs on the executor (a guard) or loses the
+    place index (a key or filter). The reason names the annotation's name, e.g. "reads
+    mutable/uncertified external 'Optional'". Drop the nested annotations or add the future
+    import to keep it inline.
+  - **A `class` statement inside a callable is rejected.** Its body runs on every call,
+    including its annotations before 3.14, and its names were counted as the callable's own,
+    hiding reads of same-named mutable globals.
+  - **A walrus in the callable's own default values no longer counts as a local binding.**
+    Defaults run once, at definition, so `def guard(t, _=(STATE := 0))` binds nothing when it
+    runs, and its read of a mutable global `STATE` is now rejected.
+
+- **`certify()` no longer raises `RecursionError` on a very long guard expression.** Binding
+  collection recursed once per AST level, so a guard of ~1,500 `a + b + …` terms aborted
+  `Transition` construction. Every AST walk in certification is now iterative, and anything
+  else nested too deeply to certify is reported as not certified, as `certify` documents.
 
 - **Two input arcs on one place now take two different tokens**
   ([#75](https://github.com/philgresh/cpnx/issues/75)). A transition with two arcs reading the

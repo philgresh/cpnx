@@ -69,7 +69,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .certification import _UNRESOLVED, _resolve_name, _root_name
-from .sandbox import _find_target_node
+from .sandbox import _callable_node_or_none
 
 #: Category label for findings whose root symbol is a network client/transport.
 NETWORK = "network"
@@ -347,39 +347,6 @@ def _classify_call(node: ast.Call, func: Callable) -> tuple[str, str] | None:
     return None
 
 
-#: Per-source-file parsed-module cache: ``path -> (mtime, tree)``. Constructing many
-#: transitions from one module re-lints each callable from ``__setattr__``; without this,
-#: every call re-reads and re-parses the whole defining file. The cache is linting-private
-#: and only ever *walked* (never mutated), so it cannot be corrupted by certification's
-#: in-place annotation stripping on its own separate parse. Invalidated on mtime change.
-_FILE_TREE_CACHE: dict[str, tuple[float, ast.AST]] = {}
-
-
-def _get_cached_ast_node(func: Callable) -> ast.AST | None:
-    """Recover *func*'s ``Lambda``/``FunctionDef`` node, caching the file parse by mtime.
-
-    Mirrors :func:`cpnx.certification._get_ast_node` but memoises the (expensive) whole-file
-    ``ast.parse`` per source file, so N callables in one module cost one parse, not N.
-    Returns ``None`` when the source cannot be located (compiled builtin, REPL lambda).
-    """
-    try:
-        _, start_line = inspect.getsourcelines(func)
-        source_file = inspect.getsourcefile(func)
-        if not source_file:
-            return None
-        mtime = os.path.getmtime(source_file)
-        cached = _FILE_TREE_CACHE.get(source_file)
-        if cached is None or cached[0] != mtime:
-            with open(source_file, encoding="utf-8") as handle:
-                tree = ast.parse(handle.read(), filename=source_file)
-            _FILE_TREE_CACHE[source_file] = (mtime, tree)
-        else:
-            tree = cached[1]
-    except (OSError, TypeError, SyntaxError):
-        return None
-    return _find_target_node(tree, start_line)
-
-
 def lint_callable(func: Callable) -> list[LintFinding]:
     """Scan *func*'s body for network / database / clock / randomness trouble spots.
 
@@ -391,7 +358,7 @@ def lint_callable(func: Callable) -> list[LintFinding]:
     """
     if not callable(func):
         return []
-    node = _get_cached_ast_node(func)
+    node = _callable_node_or_none(func)
     if node is None:
         return []
 
