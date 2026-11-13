@@ -61,7 +61,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from .sandbox import SandboxEvaluator, _callable_nodes_or_empty
+from .sandbox import SandboxEvaluator, _alike_note, _callable_nodes_or_empty
 from .tokens import FrozenDict
 
 #: Builtins that iterate/reduce a finite iterable. Added on top of the string
@@ -268,14 +268,9 @@ class _Certifier:
         for node in nodes:
             verdict = self._certify_node(func, node, stack)
             if not verdict.certified:
-                if len(nodes) > 1:
-                    # `func` is one of these, and which one cannot be told: any failure fails it.
-                    return Verdict(
-                        False,
-                        f"{len(nodes)} functions start on line {node.lineno} and cannot be told apart "
-                        f"without column positions; one of them fails: {verdict.reason}",
-                    )
-                return verdict
+                # With several nodes `func` is one of them, and which one cannot be told: any
+                # failure fails it, and the reason says so.
+                return Verdict(False, f"{verdict.reason}{_alike_note(nodes)}")
         return Verdict(True)
 
     def _certify_node(self, func: Callable, node: ast.AST, stack: frozenset[Callable]) -> Verdict:

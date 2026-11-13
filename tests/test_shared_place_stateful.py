@@ -55,9 +55,10 @@ def _checked_arc(place: str, kind: str) -> InputArc:
 def _new_arc(place: str, kind: str) -> InputArc:
     """A new arc of `kind` on `place`.
 
-    Constructing an `InputArc` checks each callable's source, which parses the module that
-    defines it: some 20 ms per arc for the callables of `_KINDS`, more than everything else an
-    example does. A copy of an arc already checked is a separate arc object without that cost.
+    Constructing an `InputArc` checks each callable's source. When this was written that
+    parsed the defining module every time, some 20 ms per arc; the parse is shared now, so
+    the copy saves little. It is kept because it is harmless: a copy of an arc already
+    checked is a separate arc object.
     """
     return copy.copy(_checked_arc(place, kind))
 

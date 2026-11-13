@@ -5,28 +5,35 @@ node in its source file. They used to go by the line it starts on alone, so of t
 on one line both were read as the last one: an impure lambda passed the purity check and was
 certified to run inline because its neighbour was clean.
 
-Where the interpreter records columns (`code.co_positions`, Python 3.11 and later) the node is
-now the one whose body holds the callable's own code. Without columns, callables that start on
-one line cannot be told apart, and each is held to what any of them does.
+The node is now one that starts on the callable's first line. Where the interpreter records
+columns (`code.co_positions`, Python 3.11 and later) it is the one whose body holds the
+callable's own code. Without columns, a node is ruled out when it cannot be the callable: a
+`def` of another name, a lambda where the callable is a `def`, or a body that names
+something the callable's code does not. Callables that are still alike after that cannot be
+told apart; each is held to what any of them does, and the error says so.
 """
 
 import importlib
 import importlib.util
 import inspect
 import itertools
+import os
 import pkgutil
+import subprocess
 import sys
 
 import pytest
 
 import cpnx.sandbox
-from cpnx import InputArc
+from cpnx import InputArc, OutputArc
 from cpnx.certification import certify
 from cpnx.linting import lint_callable
 from cpnx.sandbox import verify_callable_purity
 
 _SOURCE = """\
 import time
+
+from cpnx import Transition
 
 prints, clean = (lambda t: print(t)), (lambda t: t.payload["n"])
 clean_first, prints_last = (lambda t: t.payload["n"]), (lambda t: print(t))
@@ -43,6 +50,24 @@ def keep(*checks):
 @keep(lambda t: t.payload["n"])
 def decorated(tokens):
     return print(tokens) or len(tokens) > 0
+sleeps, reads = (lambda t: t.payload.sleep()), (lambda t: t.payload.sleep)
+pulls, plain = (lambda t: (yield t.payload["n"])), (lambda t: t.payload["n"])
+clock_call, clock_ref = (lambda t: time.monotonic() > t.payload["n"]), (lambda t: (time.monotonic, t.payload["n"]))
+def action_then_guard(**arcs):
+    return Transition("t", action=lambda b: print(b), guard=lambda b: True, **arcs)
+def guard_then_action(**arcs):
+    return Transition("t", guard=lambda b: True, action=lambda b: print(b), **arcs)
+def same(func):
+    return func
+def outer(seen):
+    @same
+    def inner(tokens):
+        return len(seen) > 0
+    return inner
+def outer_plain(seen):
+    def inner(tokens):
+        return len(seen) > 0
+    return inner
 """
 
 _names = itertools.count()
@@ -61,11 +86,24 @@ def case(tmp_path_factory):
     return module
 
 
+def _forget_columns(monkeypatch):
+    monkeypatch.setattr(cpnx.sandbox, "_body_anchor", lambda func: None)
+    cpnx.sandbox._SOURCE_CACHE.clear()
+
+
 @pytest.fixture
 def no_columns(monkeypatch):
     """Check as an interpreter without column positions does (3.10, or `-X no_debug_ranges`)."""
-    monkeypatch.setattr(cpnx.sandbox, "_body_anchor", lambda func: None)
+    _forget_columns(monkeypatch)
+    yield
     cpnx.sandbox._SOURCE_CACHE.clear()
+
+
+@pytest.fixture(params=["columns as the interpreter records them", "no columns"])
+def either_way(request, monkeypatch):
+    """Run a test on both lookups: what must hold whether or not there are columns."""
+    if request.param == "no columns":
+        _forget_columns(monkeypatch)
     yield
     cpnx.sandbox._SOURCE_CACHE.clear()
 
@@ -103,7 +141,9 @@ def test_certification_certifies_only_the_clean_lambda_of_a_line(case):
 
 @has_columns
 def test_lint_reports_a_clock_read_only_for_the_lambda_that_makes_it(case):
-    assert _lint_symbols(case.clocked) == ["time.monotonic"]
+    (finding,) = lint_callable(case.clocked)
+    assert finding.symbol == "time.monotonic"
+    assert "functions start on line" not in finding.message
     assert _lint_symbols(case.steady) == []
 
 
@@ -138,10 +178,22 @@ def test_a_lambda_ending_on_a_line_is_told_from_the_one_starting_there(case):
 
 
 @has_columns
-def test_a_decorated_def_is_not_taken_for_a_lambda_in_its_decorator(case):
+def test_lambdas_that_name_the_same_things_are_told_apart_by_position(case):
+    assert not _is_pure(case.sleeps)
+    assert _is_pure(case.reads)
+    assert not certify(case.pulls).certified
+    assert certify(case.plain).certified
+    assert _lint_symbols(case.clock_call) == ["time.monotonic"]
+    assert _lint_symbols(case.clock_ref) == []
+
+
+# -- with or without columns ---------------------------------------------------------------------
+
+
+def test_a_decorated_def_is_not_taken_for_a_lambda_in_its_decorator(case, either_way):
     # The def's first line is its decorator's, and the only function node on that line is
-    # the lambda passed to the decorator. The def's code lies outside that lambda, so the
-    # def is not located at all, which is what a decorated def without such a lambda gets.
+    # the lambda passed to the decorator. The def is not that lambda, so it is not located
+    # at all, which is what a decorated def without such a lambda gets.
     assert not _is_pure(case.decorated)
     verdict = certify(case.decorated)
     assert not verdict.certified
@@ -149,25 +201,91 @@ def test_a_decorated_def_is_not_taken_for_a_lambda_in_its_decorator(case):
     assert lint_callable(case.decorated) == []
 
 
-# -- without columns: callables starting on one line share one verdict ---------------------------
+def test_a_decorated_def_inside_a_function_is_not_taken_for_that_function(case, either_way):
+    # Its first line is its decorator's, where no function starts. Read as the function
+    # around it, `seen` would count as a local and the read of it would certify.
+    assert certify(case.outer([])).reason == "source unavailable"
+    assert "'seen'" in certify(case.outer_plain([])).reason
 
 
-def test_without_columns_purity_holds_each_lambda_to_its_neighbour(case, no_columns):
-    for func in (case.prints, case.clean, case.clean_first, case.prints_last):
-        with pytest.raises(PermissionError, match="Forbidden function call 'print'"):
+def test_a_guard_on_one_line_with_an_impure_action_is_checked_alone(case, either_way):
+    # An action may have side effects; the guard beside it names no `print`.
+    arcs = {"inputs": [InputArc("p")], "outputs": [OutputArc("q")]}
+    assert case.action_then_guard(**arcs).name == "t"
+    assert case.guard_then_action(**arcs).name == "t"
+
+
+def test_a_lambda_ending_on_a_line_does_not_start_there(case, either_way):
+    assert _is_pure(case.short_last)
+    assert certify(case.short_last).certified
+
+
+# -- without columns: told apart by kind, name and what the body names ---------------------------
+
+
+def test_without_columns_lambdas_that_name_different_things_are_told_apart(case, no_columns):
+    assert not _is_pure(case.prints)
+    assert _is_pure(case.clean)
+    assert certify(case.clean).certified
+    assert certify(case.clean_first).certified
+    assert not certify(case.prints_last).certified
+    assert _lint_symbols(case.clocked) == ["time.monotonic"]
+    assert _lint_symbols(case.steady) == []
+
+
+def test_without_columns_a_returned_lambda_is_told_from_the_one_that_returns_it(case, no_columns):
+    # The outer lambda names `time`; the code of the one it returns does not.
+    assert _is_pure(case.made)
+    assert certify(case.made).certified
+    # The outer one's code holds the inner one's, so by names alone it could be either.
+    assert not _is_pure(case.make)
+
+
+def test_without_columns_a_def_and_a_default_lambda_are_told_apart_by_kind(case, no_columns):
+    assert not _is_pure(case.impure_body)
+    pick = case.impure_body.__defaults__[0]
+    assert _is_pure(pick)
+    assert certify(pick).certified
+
+
+def test_without_columns_purity_holds_lambdas_alike_to_each_other_and_says_so(case, no_columns):
+    for func in (case.sleeps, case.reads):
+        with pytest.raises(PermissionError) as raised:
             verify_callable_purity(func)
+        message = str(raised.value)
+        assert "Forbidden attribute call '.sleep'" in message
+        assert "2 functions start on line" in message
+        assert "separate lines" in message
 
 
-def test_without_columns_neither_lambda_of_a_mixed_line_is_certified(case, no_columns):
-    for func in (case.prints, case.clean, case.clean_first, case.prints_last):
+def test_without_columns_neither_of_two_lambdas_alike_is_certified(case, no_columns):
+    for func in (case.pulls, case.plain):
         verdict = certify(func)
         assert not verdict.certified
         assert "2 functions start on line" in verdict.reason
+        assert "separate lines" in verdict.reason
+        assert "await/yield" in verdict.reason
 
 
-def test_without_columns_lint_reports_the_line_s_findings_for_each_lambda(case, no_columns):
-    assert _lint_symbols(case.clocked) == ["time.monotonic"]
-    assert _lint_symbols(case.steady) == ["time.monotonic"]
+def test_without_columns_lint_reports_for_lambdas_alike_and_says_so(case, no_columns):
+    for func in (case.clock_call, case.clock_ref):
+        (finding,) = lint_callable(func)
+        assert finding.symbol == "time.monotonic"
+        assert "2 functions start on line" in finding.message
+        assert "separate lines" in finding.message
+
+
+def test_without_columns_a_lambda_told_apart_is_rejected_in_the_usual_words(case, no_columns):
+    with pytest.raises(PermissionError) as raised:
+        verify_callable_purity(case.prints)
+    assert str(raised.value) == "Forbidden function call 'print' inside CPN callable."
+
+
+def test_without_columns_a_lambda_that_names_more_could_still_be_its_neighbour(case, no_columns):
+    # Names only rule a node out. `clocked` names everything `steady` does and more, so
+    # going by names its code could have come from either, and both are read.
+    assert len(cpnx.sandbox._callable_nodes(case.clocked)) == 2
+    assert len(cpnx.sandbox._callable_nodes(case.steady)) == 1
 
 
 def test_without_columns_clean_lambdas_on_one_line_still_pass_and_certify(case, no_columns):
@@ -177,13 +295,34 @@ def test_without_columns_clean_lambdas_on_one_line_still_pass_and_certify(case, 
         assert lint_callable(func) == []
 
 
-def test_without_columns_a_callable_alone_on_its_line_is_found_as_before(case, no_columns):
-    assert not _is_pure(case.make)  # `make` and the lambda it returns start on one line
-    assert _is_pure(case.short_last)  # the only function starting on its line
-    assert certify(case.short_last).certified
+@has_columns
+def test_an_interpreter_run_without_debug_ranges_takes_the_no_columns_path(case):
+    # The tests above take the columns away by patching. This one asks a real interpreter
+    # that was told to record none, so a change in how it reports "no column" shows up here.
+    script = (
+        "import importlib.util, sys\n"
+        "import cpnx.sandbox as sandbox\n"
+        "from cpnx.certification import certify\n"
+        "spec = importlib.util.spec_from_file_location('same_line_case_child', sys.argv[1])\n"
+        "case = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(case)\n"
+        "assert sandbox._body_anchor(case.plain) is None, sandbox._body_anchor(case.plain)\n"
+        "assert len(sandbox._callable_nodes(case.plain)) == 2\n"
+        "assert not certify(case.plain).certified\n"
+        "assert certify(case.clean).certified\n"
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(entry for entry in sys.path if entry)}
+    child = subprocess.run(
+        [sys.executable, "-X", "no_debug_ranges", "-c", script, case.__file__],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert child.returncode == 0, child.stderr
 
 
-# -- the position rule, on real code -------------------------------------------------------------
+# -- the rule, on real code ----------------------------------------------------------------------
 
 
 def _own_functions(owner, module_name: str):
@@ -196,19 +335,24 @@ def _own_functions(owner, module_name: str):
             yield value
 
 
-def test_every_function_of_cpnx_itself_is_found_at_its_own_definition():
-    # The rule rests on where the interpreter says a function's code lies, which each Python
-    # version compiles a little differently (generators, closures, `with`, `try`). cpnx's own
-    # few hundred functions are a sample of real code to hold it to.
+def test_every_function_of_cpnx_itself_is_found_at_its_own_definition(either_way):
+    # The rule rests on where the interpreter says a function's code lies and on what names
+    # its code carries, which each Python version compiles a little differently (generators,
+    # closures, `with`, `try`). cpnx's own few hundred functions are a sample of real code to
+    # hold it to.
     found = 0
     for info in pkgutil.iter_modules(cpnx.__path__):
         module = importlib.import_module(f"cpnx.{info.name}")
         for func in _own_functions(module, module.__name__):
             try:
                 nodes = cpnx.sandbox._callable_nodes(func)
+                first_line = inspect.getsourcelines(func)[0][0]
             except (OSError, TypeError):  # generated by `dataclass`: no source
                 continue
-            if not nodes:  # decorated, so its first line is the decorator's: not located, as before
+            if not nodes:
+                # Only a decorated function goes unlocated (its first line is its decorator's),
+                # or one the interpreter made up for a class's annotations.
+                assert first_line.lstrip().startswith("@") or func.__name__ == "__annotate__", func.__qualname__
                 continue
             found += 1
             where = (func.__name__, func.__code__.co_firstlineno)

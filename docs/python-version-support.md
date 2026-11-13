@@ -299,9 +299,14 @@ tripping a Python-level deprecation.
   place where a verdict depends on the interpreter. Where several functions start on one
   source line (`key=lambda ..., filter=lambda ...`), `sandbox._callable_nodes` tells them
   apart by where each one's code lies. Python 3.10 records no columns, and neither does
-  `-X no_debug_ranges` on any version; there each such callable is held to what any of
-  them does, so one impure lambda fails the purity check for all on its line, none is
-  certified unless all certify, and the lint reports each with the findings of all.
+  `-X no_debug_ranges` on any version; there it goes by what the code object does say: its
+  name (a `def`'s own, `<lambda>` for a lambda) and the names it carries (`co_names` and the
+  variable tables, through nested code objects). A lambda whose body uses a name the code
+  lacks is ruled out. Lambdas on one line that use the same names are left; each is held to
+  what any of them does, and the error, certification reason or lint message says that
+  several functions start on the line. `tests/test_same_line_callables.py` runs one case
+  in a child interpreter under `-X no_debug_ranges`, so a change in how CPython reports a
+  missing column shows up in CI.
 * **`unittest.assertWarns` no longer swallows non-matching warnings.** cpnx's suite uses
   `pytest.warns`, not `assertWarns`.
 

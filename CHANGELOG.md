@@ -199,13 +199,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `filter` is clean; with the two swapped, the clean one was rejected. The same held for a
   lambda and the lambda it returns, and for a `def` with a lambda default on its first line,
   which was read as that lambda. On Python 3.11 and later each callable is now found by where
-  its own code lies (`code.co_positions`). A `def` outside any function whose decorator takes
-  a lambda argument was read as that lambda too; it is now not found at all, like any other
-  decorated `def`, so it is not certified and the purity check reads its source as a whole.
-  Python 3.10 records no columns, and neither does `-X no_debug_ranges`: there, callables
-  that start on one line are held to what any of them does. One impure lambda fails the
-  purity check for all of them, none is certified unless all certify, and each is reported
-  with the lint findings of all. Put them on separate lines to have each judged alone.
+  its own code lies (`code.co_positions`). Python 3.10 records no columns, and neither does
+  `-X no_debug_ranges`: there a callable is told from the others on its line by what it is
+  (a `def` by its name, a lambda as a lambda) and by the names its code carries, so a guard
+  beside an `action=lambda b: print(b)` is still checked alone. Only lambdas on one line that
+  use the same names cannot be told apart there. Those are held to what any of them does:
+  one that fails the purity check or certification fails it for the others, each is
+  reported with the lint findings of all, and the error, the certification reason and the
+  lint message say that N functions start on that line and to put them on separate lines.
+
+  A decorated `def` was also read as some other function: as a lambda among its decorator's
+  arguments, or, inside a function, as the function around it, whose locals then counted as
+  its own, so a read of an enclosing variable certified. On every Python it is now not found
+  at all, like any other decorated `def`: it is not certified ("source unavailable") and the
+  purity check reads its source as a whole.
 
 - **Certification no longer admits three callables that run more than it checked.** A
   certified guard, key or filter runs inline, so these were real gaps:

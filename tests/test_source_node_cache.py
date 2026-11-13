@@ -105,7 +105,7 @@ def test_callables_of_one_file_share_its_parse(module, work):
     _check_all(module.reads_the_clock)
 
     assert work["parse", module.__file__] == 1
-    assert work["walk"] == 2  # one search of the tree for each line a callable starts on
+    assert work["walk"] == 1  # the file's functions are collected once, when it is parsed
 
 
 def test_arcs_built_from_one_callable_parse_its_file_once(module, work):
@@ -183,8 +183,8 @@ def test_an_edited_source_file_is_read_again(tmp_path):
 
 
 def test_certification_leaves_annotations_for_the_other_checks(module):
-    # Certification blanks annotations out of the node it reads. The purity check must still
-    # see them afterwards, as it did when each check parsed the file for itself.
+    # Certification skips annotations as it walks the shared tree and changes nothing in it,
+    # so the purity check, which reads the same tree, still sees them afterwards.
     assert certify(module.sleeps_in_an_annotation).certified
     with pytest.raises(PermissionError, match=r"\.sleep"):
         verify_callable_purity(module.sleeps_in_an_annotation)
