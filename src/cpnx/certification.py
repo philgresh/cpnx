@@ -61,7 +61,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from .sandbox import SandboxEvaluator, _callable_node_or_none
+from .sandbox import SandboxEvaluator, _alike_note, _callable_nodes_or_empty
 from .tokens import FrozenDict
 
 #: Builtins that iterate/reduce a finite iterable. Added on top of the string
@@ -262,9 +262,18 @@ class _Certifier:
     def _certify_uncached(self, func: Callable, stack: frozenset[Callable]) -> Verdict:
         if getattr(func, "__wrapped__", None) is not None:
             return Verdict(False, "decorated callable (wrapper hides certified body)")
-        node = _callable_node_or_none(func)
-        if node is None:
+        nodes = _callable_nodes_or_empty(func)
+        if not nodes:
             return Verdict(False, "source unavailable")
+        for node in nodes:
+            verdict = self._certify_node(func, node, stack)
+            if not verdict.certified:
+                # With several nodes `func` is one of them, and which one cannot be told: any
+                # failure fails it, and the reason says so.
+                return Verdict(False, f"{verdict.reason}{_alike_note(nodes)}")
+        return Verdict(True)
+
+    def _certify_node(self, func: Callable, node: ast.AST, stack: frozenset[Callable]) -> Verdict:
         if isinstance(node, ast.AsyncFunctionDef):
             return Verdict(False, "async callable")
         if getattr(node, "decorator_list", None):

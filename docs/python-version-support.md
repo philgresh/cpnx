@@ -16,8 +16,8 @@ release there was **no `sys.version_info` gating anywhere in `src/`**.
 
 | module | AST surface | other introspection |
 | --- | --- | --- |
-| `cpnx/certification.py` | 34 distinct `ast.*` names, 46 references | `func.__code__` (source comes from `sandbox._callable_node`) |
-| `cpnx/sandbox.py` | 17 distinct `ast.*` names | `inspect.getsource{,file,lines}` |
+| `cpnx/certification.py` | 34 distinct `ast.*` names, 46 references | `func.__code__` (source comes from `sandbox._callable_nodes`) |
+| `cpnx/sandbox.py` | 17 distinct `ast.*` names | `inspect.getsource{,file,lines}`, `code.co_positions()` where it exists |
 | `cpnx/linting.py` | 7 distinct `ast.*` names | `inspect.currentframe` + `f_back` walk, `code.co_filename`, `ast.unparse` |
 
 All three decide by matching on node **classes**. That makes exactly two kinds of release
@@ -271,8 +271,8 @@ tripping a Python-level deprecation.
   3.13, 3.14 and 3.15 (`1` from a non-internal caller; `_FALLBACK_STACKLEVEL = 3`), and
   `_PACKAGE_ROOT` resolves identically. `tests/test_linting.py` passes on all three.
 * **PEP 649/749 deferred annotation evaluation (3.14).** Certification verdicts differ by
-  version in one place, on purpose. Certification ignores an annotation only where it never
-  runs when the callable is called (`certification._inert_annotations`): the callable's own
+  version here, on purpose (the one other place is column positions, below). Certification
+  ignores an annotation only where it never runs when the callable is called (`certification._inert_annotations`): the callable's own
   signature, local variable annotations (all in function scope, since a nested `class` is
   rejected), and a nested `def`'s signature only when annotations are lazy, i.e. on 3.14+ or
   under `from __future__ import annotations`. Before 3.14 a nested `def`'s annotations run on
@@ -295,6 +295,18 @@ tripping a Python-level deprecation.
   and must never break construction. It is also **not** a 3.14 change: `get_type_hints` raises
   the same `NameError` on 3.13, 3.14 and 3.15 for the same callable, so PEP 649 moves *when*
   annotations are evaluated without changing this outcome.
+* **Column positions (`code.co_positions`, 3.11+).** Not a 3.14 or 3.15 change, but the other
+  place where a verdict depends on the interpreter. Where several functions start on one
+  source line (`key=lambda ..., filter=lambda ...`), `sandbox._callable_nodes` tells them
+  apart by where each one's code lies. Python 3.10 records no columns, and neither does
+  `-X no_debug_ranges` on any version; there it goes by what the code object does say: its
+  name (a `def`'s own, `<lambda>` for a lambda) and the names it carries (`co_names` and the
+  variable tables, through nested code objects). A lambda whose body uses a name the code
+  lacks is ruled out. Lambdas on one line that use the same names are left; each is held to
+  what any of them does, and the error, certification reason or lint message says that
+  several functions start on the line. `tests/test_same_line_callables.py` runs one case
+  in a child interpreter under `-X no_debug_ranges`, so a change in how CPython reports a
+  missing column shows up in CI.
 * **`unittest.assertWarns` no longer swallows non-matching warnings.** cpnx's suite uses
   `pytest.warns`, not `assertWarns`.
 

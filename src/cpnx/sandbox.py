@@ -1,5 +1,6 @@
 import ast
 import inspect
+import types
 from typing import Callable
 
 
@@ -66,15 +67,141 @@ def _find_target_node(tree: ast.AST, start_line: int) -> ast.AST | None:
     return target_node
 
 
-class _ParsedSource:
-    """One source file's parse, plus the callable node found for each start line."""
+_FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
-    __slots__ = ("source", "tree", "targets")
+#: Where a callable's own code lies in its file: `(line, end_line, column, end_column)`, as
+#: `code.co_positions()` gives them. Columns are UTF-8 byte offsets, as in the AST.
+_Position = tuple[int, int, int, int]
+
+
+def _own_code(func: Callable) -> types.CodeType | None:
+    """Return the code object `func` runs, or `None` if it has none of its own."""
+    func = inspect.unwrap(func)
+    return getattr(getattr(func, "__func__", func), "__code__", None)
+
+
+def _body_anchor(func: Callable) -> _Position | None:
+    """Return the position of one instruction of `func`'s own body, or `None` if none is known.
+
+    Nested functions compile to code objects of their own, so every positioned instruction
+    of `func` lies in its body and outside the body of any function nested in it. The last
+    one is taken: the leading instructions (`RESUME` and the like) carry the function's first
+    line with no real span.
+
+    Returns:
+        The position, or `None` when the interpreter records no columns: before Python
+        3.11, under `-X no_debug_ranges`, or for an object with no code of its own.
+    """
+    positions = getattr(_own_code(func), "co_positions", None)
+    if positions is None:
+        return None
+    anchor = None
+    for position in positions():
+        line, end_line, column, end_column = position
+        if None in position or (line, column) == (end_line, end_column):
+            continue
+        anchor = position
+    return anchor
+
+
+def _body_span(node: ast.AST) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Return where the body of a `def` or `lambda` node starts and ends, as `(line, column)` pairs."""
+    body = node.body if isinstance(node.body, list) else [node.body]
+    first, last = body[0], body[-1]
+    # A decorated statement starts at its first decorator; the AST gives the `def` line.
+    starts = [first, *getattr(first, "decorator_list", [])]
+    start = min((item.lineno, item.col_offset) for item in starts)
+    return start, (last.end_lineno, last.end_col_offset)
+
+
+def _body_holds(node: ast.AST, anchor: _Position) -> bool:
+    line, end_line, column, end_column = anchor
+    start, end = _body_span(node)
+    return start <= (line, column) and (end_line, end_column) <= end
+
+
+def _node_holding(candidates: tuple[ast.AST, ...], anchor: _Position) -> tuple[ast.AST, ...]:
+    """Return the candidate whose body `anchor` lies in, or nothing if it lies in none.
+
+    Of a lambda and a lambda inside it on one line, both hold the inner one's code; its own
+    node is the innermost, the one that starts last. If none holds it, the callable's code
+    lies in none of the candidates: reading one of them anyway would judge some other
+    function's body.
+    """
+    holding = [node for node in candidates if _body_holds(node, anchor)]
+    return (max(holding, key=lambda node: (node.lineno, node.col_offset)),) if holding else ()
+
+
+def _lambda_names(node: ast.Lambda) -> frozenset[str]:
+    """Return the variable and attribute names the body of a lambda uses, nested lambdas included.
+
+    A name with a leading `__` is left out: inside a class the compiler stores `__x` as
+    `_Class__x`, and `__debug__` is a constant, so neither can be looked for by its spelling.
+    """
+    names = set()
+    for child in ast.walk(node.body):
+        match child:
+            case ast.Name(id=name) | ast.Attribute(attr=name) if not name.startswith("__"):
+                names.add(name)
+    return frozenset(names)
+
+
+def _code_names(code: types.CodeType) -> frozenset[str]:
+    """Return every name `code` and the code objects nested in it refer to."""
+    names = {*code.co_names, *code.co_varnames, *code.co_freevars, *code.co_cellvars}
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            names |= _code_names(const)
+    return frozenset(names)
+
+
+def _could_be(node: ast.AST, code: types.CodeType, code_names: frozenset[str]) -> bool:
+    """Say whether `node` can be the source of `code`, going by its kind, its name and its names.
+
+    A `def` compiles to code of its own name, and no two `def`s start on one line, so the
+    name settles it. A lambda compiles to `<lambda>`, and several may share a line. Whatever
+    name a lambda's body uses, the compiler records in its code object or in one nested in
+    it (`co_names` and the variable tables), also for a branch it then drops as unreachable.
+    So a lambda whose body uses a name that `code` does not carry is some other lambda. The
+    converse does not hold: `code` may carry more names than a lambda uses and still not
+    rule it out.
+    """
+    if isinstance(node, ast.Lambda):
+        return code.co_name == "<lambda>" and _lambda_names(node) <= code_names
+    return node.name == code.co_name
+
+
+def _first_line(node: ast.AST) -> int:
+    """Return the line a function node's source starts on: its first decorator's, if it has one.
+
+    The AST gives a decorated `def` the line of the `def` keyword, but its code object and
+    `inspect.getsourcelines` start at its first decorator.
+    """
+    return min([node.lineno, *(decorator.lineno for decorator in getattr(node, "decorator_list", ()))])
+
+
+class _ParsedSource:
+    """One source file's parse, plus the function nodes found for each lookup made in it.
+
+    A lookup is a start line and, where the interpreter records columns, the position of the
+    callable's own code (`_body_anchor`): callables that share a start line are told apart by it.
+    """
+
+    __slots__ = ("source", "tree", "functions", "targets")
 
     def __init__(self, source: bytes, tree: ast.AST) -> None:
         self.source = source
         self.tree = tree
-        self.targets: dict[int, ast.AST | None] = {}
+        self.functions = [node for node in ast.walk(tree) if isinstance(node, _FUNCTION_NODES)]
+        self.targets: dict[tuple[int, _Position | None], tuple[ast.AST, ...]] = {}
+
+    def locate(self, start_line: int, anchor: _Position | None) -> tuple[ast.AST, ...]:
+        """Return the function nodes starting on `start_line` that `anchor` allows: all, if it is `None`."""
+        key = (start_line, anchor)
+        if key not in self.targets:
+            starting = tuple(node for node in self.functions if _first_line(node) == start_line)
+            self.targets[key] = starting if anchor is None else _node_holding(starting, anchor)
+        return self.targets[key]
 
 
 #: ``path -> _ParsedSource``, keyed on the file's bytes. The purity check, the linter
@@ -105,28 +232,73 @@ def _parsed_source(path: str) -> _ParsedSource:
     return cached
 
 
-def _callable_node(func: Callable) -> ast.AST | None:
-    """Return the ``FunctionDef``/``Lambda`` node that defines *func*, from a shared parse.
+def _callable_nodes(func: Callable) -> tuple[ast.AST, ...]:
+    """Return the `def`/`lambda` nodes `func` may be, from a shared parse: one, when it can be told.
 
-    The node belongs to a cached tree: read it, never mutate it. Raises one of
-    :data:`_SOURCE_UNAVAILABLE` when the source cannot be found, read or parsed.
+    The candidates are the function nodes that start on the line `func` starts on, a
+    decorated `def` counting from its first decorator (`_first_line`), as its code does. So a
+    decorated `def` is found as itself, at any depth: neither a lambda among its decorator's
+    arguments nor the function around it is taken for it. Certification then refuses it for
+    its decorator, and the purity check and the lint read its own body.
+
+    - With column positions (`_body_anchor`), the result is the candidate that `func`'s own
+      code lies in, so two lambdas on one line, a lambda and the lambda it returns, a `def`
+      with a lambda default on its first line, and a `def` with a lambda in its decorator are
+      each their own node.
+    - Without them, the candidates that cannot be `func` are dropped (`_could_be`): a `def`
+      of another name, a lambda where `func` is a `def`, and a lambda whose body uses a name
+      that `func`'s code does not carry. What is left is usually one node. Where it is
+      several (lambdas on one line, none using a name the others' code lacks), they cannot be
+      told apart and all are returned: `func` is one of them, so a caller that holds `func`
+      to what any of them does is never more lenient than the truth.
+
+    The nodes belong to a cached tree: read them, never mutate them.
+
+    Args:
+        func: The callable to locate.
+
+    Returns:
+        The candidate nodes; empty when `func` has no source file or no function node is it.
+
+    Raises:
+        OSError: If the source cannot be found or read.
+        TypeError: If `func` is a builtin or C function.
+        SyntaxError: If the source cannot be parsed.
+        ValueError: If the source cannot be decoded.
     """
     path = inspect.getsourcefile(func)
     _, start_line = inspect.getsourcelines(func)
-    if not path:
-        return None
-    parsed = _parsed_source(path)
-    if start_line not in parsed.targets:
-        parsed.targets[start_line] = _find_target_node(parsed.tree, start_line)
-    return parsed.targets[start_line]
+    code = _own_code(func)
+    if not path or code is None:
+        return ()
+    anchor = _body_anchor(func)
+    nodes = _parsed_source(path).locate(start_line, anchor)
+    if anchor is not None:
+        return nodes
+    code_names = _code_names(code)
+    return tuple(node for node in nodes if _could_be(node, code, code_names))
 
 
-def _callable_node_or_none(func: Callable) -> ast.AST | None:
-    """:func:`_callable_node`, with unavailable source reported as ``None``."""
+def _alike_note(nodes: tuple[ast.AST, ...]) -> str:
+    """Return what to add to a complaint about a callable that was not told from its neighbours.
+
+    Empty for a callable that was found alone. Otherwise the complaint may be about a
+    neighbour's body, and the way out is the same either way.
+    """
+    if len(nodes) < 2:
+        return ""
+    return (
+        f" ({len(nodes)} functions start on line {nodes[0].lineno} and cannot be told apart "
+        "without column positions; put them on separate lines)"
+    )
+
+
+def _callable_nodes_or_empty(func: Callable) -> tuple[ast.AST, ...]:
+    """Return `_callable_nodes(func)`, with unavailable source reported as no nodes."""
     try:
-        return _callable_node(func)
+        return _callable_nodes(func)
     except _SOURCE_UNAVAILABLE:
-        return None
+        return ()
 
 
 _FORBIDDEN_FUNCS = frozenset({"open", "print", "eval", "exec", "__import__", "sleep"})
@@ -172,12 +344,17 @@ def _verify_ast_purity(tree: ast.AST, is_fallback: bool = False) -> None:
 
 
 def _try_verify_via_sourcefile(func: Callable) -> bool:
+    nodes: tuple[ast.AST, ...] = ()
     try:
-        target_node = _callable_node(func)
-        if target_node is not None:
-            _verify_ast_purity(target_node)
+        nodes = _callable_nodes(func)
+        for node in nodes:
+            _verify_ast_purity(node)
+        if nodes:
             return True
-    except PermissionError:
+    except PermissionError as exc:
+        note = _alike_note(nodes)
+        if note:
+            raise PermissionError(f"{exc}{note}") from None
         raise
     except Exception:
         pass
