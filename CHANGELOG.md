@@ -210,9 +210,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   A decorated `def` was also read as some other function: as a lambda among its decorator's
   arguments, or, inside a function, as the function around it, whose locals then counted as
-  its own, so a read of an enclosing variable certified. On every Python it is now not found
-  at all, like any other decorated `def`: it is not certified ("source unavailable") and the
-  purity check reads its source as a whole.
+  its own, so a read of an enclosing variable certified. On every Python it is now found as
+  itself, starting from its first decorator, as its code does. It is not certified ("decorated
+  callable"), and the purity check and the lint read its own body. That also covers a
+  decorated `def` outside any function, which was not found before: the purity check then read
+  its source text, which gives up at the first `=` and let a `print` or `open` in the body
+  through, and the lint reported nothing. The lint now reports such a callable's findings,
+  so a decorated guard may start to warn, or to raise under strict lint.
 
 - **Certification no longer admits three callables that run more than it checked.** A
   certified guard, key or filter runs inline, so these were real gaps:

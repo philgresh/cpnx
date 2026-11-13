@@ -171,6 +171,15 @@ def _could_be(node: ast.AST, code: types.CodeType, code_names: frozenset[str]) -
     return node.name == code.co_name
 
 
+def _first_line(node: ast.AST) -> int:
+    """Return the line a function node's source starts on: its first decorator's, if it has one.
+
+    The AST gives a decorated `def` the line of the `def` keyword, but its code object and
+    `inspect.getsourcelines` start at its first decorator.
+    """
+    return min([node.lineno, *(decorator.lineno for decorator in getattr(node, "decorator_list", ()))])
+
+
 class _ParsedSource:
     """One source file's parse, plus the function nodes found for each lookup made in it.
 
@@ -190,7 +199,7 @@ class _ParsedSource:
         """Return the function nodes starting on `start_line` that `anchor` allows: all, if it is `None`."""
         key = (start_line, anchor)
         if key not in self.targets:
-            starting = tuple(node for node in self.functions if node.lineno == start_line)
+            starting = tuple(node for node in self.functions if _first_line(node) == start_line)
             self.targets[key] = starting if anchor is None else _node_holding(starting, anchor)
         return self.targets[key]
 
@@ -226,14 +235,16 @@ def _parsed_source(path: str) -> _ParsedSource:
 def _callable_nodes(func: Callable) -> tuple[ast.AST, ...]:
     """Return the `def`/`lambda` nodes `func` may be, from a shared parse: one, when it can be told.
 
-    The candidates are the function nodes that start on the line `func` starts on. A
-    decorated `def` starts a line below its first line (its decorator's), so it is not among
-    them and is not located, and neither a lambda among its decorator's arguments nor the
-    function around it is taken for it.
+    The candidates are the function nodes that start on the line `func` starts on, a
+    decorated `def` counting from its first decorator (`_first_line`), as its code does. So a
+    decorated `def` is found as itself, at any depth: neither a lambda among its decorator's
+    arguments nor the function around it is taken for it. Certification then refuses it for
+    its decorator, and the purity check and the lint read its own body.
 
     - With column positions (`_body_anchor`), the result is the candidate that `func`'s own
-      code lies in, so two lambdas on one line, a lambda and the lambda it returns, and a
-      `def` with a lambda default on its first line are each their own node.
+      code lies in, so two lambdas on one line, a lambda and the lambda it returns, a `def`
+      with a lambda default on its first line, and a `def` with a lambda in its decorator are
+      each their own node.
     - Without them, the candidates that cannot be `func` are dropped (`_could_be`): a `def`
       of another name, a lambda where `func` is a `def`, and a lambda whose body uses a name
       that `func`'s code does not carry. What is left is usually one node. Where it is
