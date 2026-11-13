@@ -158,14 +158,52 @@ def test_a_walrus_in_a_default_value_does_not_hide_a_mutable_global(tmp_path):
     assert "STATE" in verdict.reason
 
 
-# Everything that runs when a guard is called must be walked, and only names the guard really
-# binds may hide a global. Each case runs `evil()` per call or reads the global STATE.
-RUNS_OR_READS_AT_CALL_TIME = {
+MODULE_PRELUDE = "STATE = [1]\nCALLS = []\n\n\ndef evil(*a):\n    CALLS.append(1)\n    return int\n\n\n"
+
+# Everything that runs when a guard is called must be walked. Each case calls `evil()` (which
+# appends to a global) on every call, so the certifier must reject the call to it.
+RUNS_AT_CALL_TIME = {
     "nested_decorator": "def guard(tokens):\n    @evil\n    def h(x):\n        return x\n\n    return True\n",
     "nested_default": "def guard(tokens):\n    def h(x=evil()):\n        return x\n\n    return True\n",
     "lambda_default": "def guard(tokens):\n    h = lambda x=evil(): x  # noqa: E731\n    return True\n",
     "annotated_target": "def guard(tokens):\n    evil().x: int\n    return True\n",
     "fstring": "def guard(tokens):\n    return f'{evil()}' != ''\n",
+}
+
+
+@pytest.mark.parametrize("case", sorted(RUNS_AT_CALL_TIME))
+def test_code_that_runs_at_call_time_is_checked(tmp_path, case):
+    path = tmp_path / f"runs_{case}.py"
+    path.write_text(MODULE_PRELUDE + RUNS_AT_CALL_TIME[case])
+    verdict = certify(_load(path, f"runs_{case}_guard").guard)
+    assert not verdict.certified
+    assert "evil" in verdict.reason
+
+
+# A default value runs once, at definition, but a default holding a mutable global hands the
+# callable live state through a parameter whose reads are never checked. The read in the
+# default is what must reject it.
+MUTABLE_DEFAULT = {
+    "positional": "def guard(tokens, live=STATE):\n    return len(live) > 0\n",
+    "keyword_only": "def guard(tokens, *, live=STATE):\n    return len(live) > 0\n",
+    "lambda": "guard = lambda tokens, live=STATE: len(live) > 0  # noqa: E731\n",
+}
+
+
+@pytest.mark.parametrize("case", sorted(MUTABLE_DEFAULT))
+def test_a_default_holding_a_mutable_global_does_not_certify(tmp_path, case):
+    path = tmp_path / f"default_{case}.py"
+    path.write_text(MODULE_PRELUDE + MUTABLE_DEFAULT[case])
+    verdict = certify(_load(path, f"default_{case}_guard").guard)
+    assert not verdict.certified
+    assert verdict.reason == "reads mutable/uncertified external 'STATE'"
+
+
+# Conservative rejects, not soundness rules: each guard really does bind STATE locally, so it
+# never reads the global. The certifier rejects them only because it doesn't model these
+# binding forms (except-as, match captures, a walrus in a nested lambda's default). Teaching
+# it one of them may flip its case to certified; that is not a hole opening.
+BINDING_FORM_NOT_MODELLED = {
     "except_name": (
         "def guard(tokens):\n    try:\n        pass\n    except ValueError as STATE:\n        pass\n"
         "    return len(STATE) > 0\n"
@@ -179,17 +217,20 @@ RUNS_OR_READS_AT_CALL_TIME = {
 }
 
 
-@pytest.mark.parametrize("case", sorted(RUNS_OR_READS_AT_CALL_TIME))
-def test_code_that_runs_at_call_time_is_checked(tmp_path, case):
-    path = tmp_path / f"runs_{case}.py"
-    path.write_text("STATE = [1]\nCALLS = []\n\n\ndef evil(*a):\n    CALLS.append(1)\n    return int\n\n\n")
-    path.write_text(path.read_text() + RUNS_OR_READS_AT_CALL_TIME[case])
-    assert not certify(_load(path, f"runs_{case}_guard").guard).certified
+@pytest.mark.parametrize("case", sorted(BINDING_FORM_NOT_MODELLED))
+def test_a_binding_form_the_certifier_does_not_model_is_conservatively_rejected(tmp_path, case):
+    path = tmp_path / f"unmodelled_{case}.py"
+    path.write_text(MODULE_PRELUDE + BINDING_FORM_NOT_MODELLED[case])
+    verdict = certify(_load(path, f"unmodelled_{case}_guard").guard)
+    assert not verdict.certified
+    assert verdict.reason == "reads mutable/uncertified external 'STATE'"
 
 
-@pytest.mark.parametrize("terms", [250, 400])
+@pytest.mark.parametrize("terms", [250, 400, 1500])
 def test_a_guard_with_a_long_expression_still_certifies(tmp_path, terms):
-    # Copying the cached node recursed once per AST level and raised RecursionError here.
+    # Every AST walk in the gates must be iterative: a recursive one (copying the node,
+    # collecting bindings) raised RecursionError somewhere between 250 and 1500 terms. Much
+    # past 1500, Python 3.10's own compiler can't import the module.
     path = tmp_path / f"deep{terms}.py"
     path.write_text(f"def guard(tokens):\n    return {' + '.join(['len(tokens)'] * terms)} > 0\n")
     guard = _load(path, f"deep_guard_{terms}").guard
