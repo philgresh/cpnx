@@ -40,7 +40,8 @@ eligibility is membership (`job.skill in server.skills`):
   that the guard holds. It then consumes by identity, as every binding is. A failed check or a
   raising selector is buffered and reported through `on_error` (off the lock, edge-triggered per
   transition and per view, timed or timing-ignoring: the same failure reports once, then again
-  after that view's ask succeeds or the transition fires; one view stays quiet about a failure
+  after that view's ask succeeds, its place drains below the arcs' counts (the failing tokens
+  are gone) or the transition fires; one view stays quiet about a failure
   the other is still reporting), and the transition reads as not enabled. The cause is an
   `InvalidSelection` for a rejected choice or a conflict.
 - **Enablement.** The selector is the probe: `_binding_exists` asks it too. A transition with a
@@ -58,7 +59,9 @@ eligibility is membership (`job.skill in server.skills`):
   must be a pure function of the view, as a guard must be (ADR 0003); `verify_callable_purity`
   and the side-effect linter check it at assignment.
 - **Indexed lookups.** `groups(i, key)` with a certified `key` registers a place join index
-  (ADR 0010) for that key on its second use and reads it at O(keys) afterwards. At most four
+  (ADR 0010) for that key on its second use and reads it at O(keys) afterwards (O(K log K) when
+  `groups` returns every key, to order them by their first token as a scan would, so whether an
+  ask was scanned or indexed never changes what the selector sees). At most four
   reused key functions per arc keep an index; a fifth evicts the oldest. An index is built only
   for a key object passed a second time, so a key built inline on every call (a fresh lambda, or a
   bound method, which is a new object on each access) is keyed by a scan, not by rebuilding an

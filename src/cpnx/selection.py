@@ -130,7 +130,9 @@ class BindingView:
         again, the place keeps an index for it from then on, so later calls cost O(keys) however
         deep the place is. Otherwise the tokens are keyed on each call, with no time limit, under
         the engine lock. Pass the same function object each time (a module-level function, not a
-        lambda or bound method built per call), so the index is built once and reused.
+        lambda or bound method built per call), so the index is built once and reused. Keys come
+        back in the order their first available token is read, whether or not an index served
+        the call, so iterating them is as reproducible as the place itself.
         """
         return {k: TokenGroup(g) for k, g in self._groups(arc, key, None).items()}
 

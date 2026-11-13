@@ -809,7 +809,11 @@ def test_a_failure_reports_again_after_the_timed_view_recovers_while_a_token_was
     assert len(errors) == 2, "the recurrence reports, though the other view's latch is stale"
 
 
-@pytest.mark.parametrize("choice", [[None], [42], {0: 5}])
+@pytest.mark.parametrize(
+    "choice",
+    [[None], [42], {0: 5}, [], {1: 5}],
+    ids=["none", "int", "mapping-int", "too-few-choices", "mapping-wrong-arc"],
+)
 def test_a_choice_item_that_is_not_a_token_is_an_invalid_selection(choice):
     from cpnx import InvalidSelection
 
@@ -881,12 +885,16 @@ def test_swapping_the_selector_function_releases_the_old_ones_indexes_and_latche
         assert not net.places["jobs"]._store._join_indexes, "the new selector never reads the old indexes"
         net.transitions["t"].binding_selector = raises
         net.step()
-        net.transitions["t"].binding_selector = flaky_everywhere
-        _FLAKY["fail"] = True
         net.step()
-        net.transitions["t"].binding_selector = raises
+        assert len(errors) == 1, "a repeated failure reports once"
+        net.transitions["t"].binding_selector = raises_the_same
         net.step()
-    assert len(errors) == 3, "each swap starts with a clean latch, so the same failure reports again"
+    assert len(errors) == 2, "a swap starts with a clean latch, so the same failure from another function reports"
+    assert str(errors[0].__cause__) == str(errors[1].__cause__)
+
+
+def raises_the_same(view: BindingView):
+    raise LookupError("no server")
 
 
 def first_of_each(view: BindingView):
@@ -947,3 +955,78 @@ def test_a_group_read_raises_index_error_for_a_token_that_left_the_place():
     orphan = _JoinGroup([entry], 1, entry, OrderedDict(), {})
     with pytest.raises(IndexError, match="left the place"):
         orphan.token_at(0)
+
+
+def first_group(view: BindingView):
+    groups = view.groups(0, skill)
+    return [groups[next(iter(groups))][0]]
+
+
+def _first_group_order(probes: int) -> list[int]:
+    net = PetriNet(seed=1, places=[Place("jobs"), Place("out")])
+    net.add_transition(Transition("t", [InputArc("jobs")], [OutputArc("out")], _identity, binding_selector=first_group))
+    for i, s in enumerate(["A", "B", "A", "B", "A"]):
+        net.deposit("jobs", Token(payload={"i": i, "skill": s}))
+    with net:
+        for _ in range(probes):
+            net.is_dead()
+        while net.step():
+            net._await_inflight()
+    return _payloads(net, "out")
+
+
+def test_groups_key_order_does_not_depend_on_how_often_the_selector_is_asked():
+    # The first ask of a key scans the place; later asks read an index whose groups were
+    # created in another order once a group's oldest token is consumed. Both must agree.
+    orders = {probes: _first_group_order(probes) for probes in (0, 1, 3)}
+    assert orders[0] == orders[1] == orders[3] == [0, 1, 2, 3, 4], "always the oldest remaining job"
+
+
+def test_a_failure_reports_again_once_its_tokens_have_drained():
+    def rejects_bad(view: BindingView):
+        if any(t.payload.get("bad") for t in view.available(0)):
+            raise LookupError("bad token")
+        return None
+
+    net = PetriNet(seed=1, places=[Place("in"), Place("out")])
+    net.add_transition(Transition("t", [InputArc("in")], [OutputArc("out")], _identity, binding_selector=rejects_bad))
+    errors: list[BaseException] = []
+    net.on_error = lambda _name, error, _token: errors.append(error)
+    first = Token(payload={"i": 0, "bad": True})
+    net.deposit("in", first)
+    with net:
+        net.step()
+        net.step()
+        assert len(errors) == 1
+        net.places["in"].retrieve_specific([first])  # the user removes the bad token
+        net.step()
+        net.deposit("in", Token(payload={"i": 1, "bad": True}))
+        net.step()
+    assert len(errors) == 2, "the same failure over new tokens reports again"
+
+
+def job_and_slot(view: BindingView):
+    jobs = view.group(0, skill, 1)
+    slots = list(view.available(1))
+    return [jobs[-1], slots[0]] if jobs and slots else None
+
+
+def test_a_selector_can_choose_from_a_resource_place():
+    from cpnx import ResourcePlace
+
+    net = PetriNet(seed=1, places=[Place("jobs"), ResourcePlace("slots", capacity=2), Place("done")])
+    net.add_transition(
+        Transition(
+            "t",
+            [InputArc("jobs"), InputArc("slots")],
+            [OutputArc("done")],
+            _identity,
+            binding_selector=job_and_slot,
+        )
+    )
+    for i in range(6):
+        net.deposit("jobs", Token(payload={"i": i, "skill": i % 2}))
+    with net:
+        net.drive_to_quiescence()
+    assert _payloads(net, "done") == [5, 3, 1], "the selector's skill-1 jobs, newest first"
+    assert len(net.marking["slots"]) == 2, "each borrowed slot was returned"

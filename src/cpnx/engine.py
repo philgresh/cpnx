@@ -21,7 +21,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Generic, Iterable, Iterator, Sequence, Sized, TypeAlias, TypeVar, cast
 
 from cpnx.analysis import ImpactMap, risk_report, trace_impact
-from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace
+from cpnx.places import PacedResourcePlace, Place, ResourcePlace, SinkPlace, _JoinGroup
 from cpnx.retries import (
     DEFAULT_RETRY_POLICY,
     RetryPolicy,
@@ -556,6 +556,18 @@ def _shared_join_index(
         if other_place is place and other_key is join_key and other_depth == depth:
             return index_id
     return None
+
+
+def _in_read_order(groups: "dict[object, _JoinGroup]") -> "dict[object, _JoinGroup]":
+    """Index-served `BindingView.groups`, with keys ordered by each group's first token in read order.
+
+    A join index keeps its keys in the order each group was created, which drifts from the
+    place's read order once a group's oldest tokens are consumed, while a scan yields keys in
+    read order. Sorting by each group's head entry makes the two agree, so how often the engine
+    asks a selector (and so whether an ask was scanned or indexed) cannot change what it sees.
+    O(K log K) in the keys returned.
+    """
+    return dict(sorted(groups.items(), key=lambda item: item[1].head))
 
 
 def _release_join_entry(registered: "dict[int, _JoinRegistration]", entry: "_JoinRegistration") -> None:
@@ -1787,9 +1799,9 @@ class PetriNet:
             de-duplicated only within a single pass, so a persistent one fires about once per
             `step()` that resolves that transition. The **`binding_selector`** report is
             edge-triggered per transition and per view (timed, or timing-ignoring): the same
-            failure reports once, and again after that view's ask succeeds or the transition
-            fires. All three wrap the original exception in a descriptive `RuntimeError` and
-            chain it as `__cause__`.
+            failure reports once, and again after that view's ask succeeds, its place drains
+            below the arcs' counts, or the transition fires. All three wrap the original
+            exception in a descriptive `RuntimeError` and chain it as `__cause__`.
 
     Example:
         ```python
@@ -5239,13 +5251,13 @@ class PetriNet:
         try:
             choice = self._call_selector(selector, view)
             if choice is None:
-                self._note_selector_success(name, ignore_timing)
+                self._rearm_selector_view(name, ignore_timing)
                 return None
             per_arc = normalize_choice(choice, transition.inputs)
             self._check_selection(transition, places, per_arc, t_limit)
         except Exception as exc:
             return self._reject_selection(transition, exc, ignore_timing)
-        self._note_selector_success(name, ignore_timing)
+        self._rearm_selector_view(name, ignore_timing)
         return list(zip(transition.inputs, per_arc, strict=True))
 
     def _prepare_selector(
@@ -5280,7 +5292,9 @@ class PetriNet:
         """Each input arc's place, or `None` when an arc cannot be met at all (so the selector is not asked).
 
         Arcs that share a place need their counts together, as a search does (#77), so a shared
-        place too shallow for all of them is not enabled rather than a selector failure.
+        place too shallow for all of them is not enabled rather than a selector failure. A place
+        that cannot meet the counts re-arms this view's failure latch: the tokens a latched
+        failure involved are gone. An unmet settle window does not, since the tokens stay.
         """
         needed: dict[str, int] = {}
         for arc in transition.inputs:
@@ -5289,6 +5303,7 @@ class PetriNet:
         for arc in transition.inputs:
             place = self.places.get(arc.place)
             if place is None or not place.can_retrieve(needed[arc.place], model_time=t_limit):
+                self._rearm_selector_view(transition.name, ignore_timing)
                 return None
             if not ignore_timing and not self._is_settle_time_met(place, arc):
                 return None
@@ -5329,8 +5344,8 @@ class PetriNet:
         names any offending tokens):
 
         - reports once, and stays quiet while that view keeps failing with it;
-        - reports again after that view's ask succeeds (`_note_selector_success`) or the
-          transition fires;
+        - reports again after that view's ask succeeds, or its place can no longer meet the
+          arcs' counts (`_rearm_selector_view`), or the transition fires;
         - is not reported a second time from one view while the other view is still failing with
           it, which is when the other view confirmed it in this flush epoch or the one before. A
           latch the other view stopped confirming (its timing-ignoring probe runs only while
@@ -5356,8 +5371,13 @@ class PetriNet:
             faults[(name, ignore_timing)] = (signature, epoch)
         return None
 
-    def _note_selector_success(self, name: str, ignore_timing: bool) -> None:
-        """This view's ask gave a valid binding or `None`: its next failure reports. Caller holds the lock."""
+    def _rearm_selector_view(self, name: str, ignore_timing: bool) -> None:
+        """Let this view's next failure report. Caller holds the lock.
+
+        Called when the view's ask gave a valid binding or `None`, and when its places drained
+        below the arcs' counts: the tokens that failed are gone, so a later identical failure
+        involves new ones and is worth reporting, as an arc key's fault report does.
+        """
         if self._selector_faults:
             self._selector_faults.pop((name, ignore_timing), None)
 
@@ -5475,14 +5495,19 @@ class PetriNet:
         keys: Iterable[object] | None,
         t_limit: float | None,
     ) -> "dict[object, Iterable[tuple[object, Token]]]":
-        """`BindingView.groups`: from a place join index when *key* certifies, else by keying the pool."""
+        """`BindingView.groups`: from a place join index when *key* certifies, else by keying the pool.
+
+        Either way every key comes back in the order its first available token is read, so the
+        view a selector sees does not depend on whether this ask was served by a scan or an index.
+        """
         place = places[position]
         keys_cache = self._selector_keys
         if type(place) is Place and keys_cache.seen_before(key) and keys_cache.inline_safe(key):
             index_id = self._selector_index(transition_name, position, key, place)
             indexed = place.peek_join(index_id, keys, model_time=t_limit)
             if indexed is not None:
-                return cast("dict[object, Iterable[tuple[object, Token]]]", indexed)
+                ordered = _in_read_order(cast("dict[object, _JoinGroup]", indexed)) if keys is None else indexed
+                return cast("dict[object, Iterable[tuple[object, Token]]]", ordered)
         grouped: dict[object, list[tuple[object, Token]]] = {}
         for token in place.peek(len(place), model_time=t_limit):
             grouped.setdefault(key(token), []).append((None, token))

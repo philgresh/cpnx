@@ -529,6 +529,11 @@ class _JoinGroup:
     def __len__(self) -> int:
         return self._end
 
+    @property
+    def head(self) -> _JoinEntry:
+        """The sort position of the group's first token, which orders groups by the place's read order."""
+        return self._entries[0]
+
     def token_at(self, position: int) -> Token:
         """The token of entry *position* (``0 <= position < len(self)``), for random access.
 
