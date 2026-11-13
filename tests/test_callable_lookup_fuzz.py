@@ -16,7 +16,10 @@ that wrote it, and its true verdicts are what the gates say when made to read th
 - a callable whose own body holds a forbidden call never passes the purity check or
   certifies, in either mode;
 - the same source run as a notebook cell is judged as it is from a file, and run with no
-  source at all it is rejected.
+  source at all it is rejected;
+- run under the file name of another generated source, a callable is read only where that
+  source compiles to its very code, and otherwise refused; and it never passes where a
+  function it holds as a default does not.
 """
 
 import ast
@@ -24,6 +27,7 @@ import importlib.util
 import itertools
 import linecache
 import sys
+import types
 from contextlib import contextmanager
 
 import pytest
@@ -306,3 +310,44 @@ def test_a_notebook_cell_is_judged_as_its_file_and_no_source_is_rejected(directo
                 assert not certify(orphan).certified
     finally:
         linecache.cache.pop(filename, None)
+
+
+def _compiles_to(source, path, code):
+    """Say whether `source` compiles to code equal to `code` on its line, positions aside."""
+    bare = cpnx.sandbox._without_positions(code)
+    pending = [compile(source, path, "exec", dont_inherit=True)]
+    while pending:
+        each = pending.pop()
+        pending.extend(const for const in each.co_consts if isinstance(const, types.CodeType))
+        if (each.co_firstlineno, each.co_name) == (code.co_firstlineno, code.co_name):
+            if cpnx.sandbox._without_positions(each) == bare:
+                return True
+    return False
+
+
+@_SETTINGS
+@given(module=_modules(), other=_modules(), columns=st.booleans())
+def test_code_is_judged_only_by_source_that_compiles_to_it(directory, module, other, columns):
+    # The code of `module` runs under the file name of `other`: a file edited since import, or
+    # code compiled under a name whose source is another's. The gates may read `other` only
+    # where it compiles to that very code (then the two behave alike, whatever their dead
+    # branches say); anywhere else they must refuse the callable. Default values are not in
+    # the code, so a callable is never passed where a function it holds as a default is not.
+    source, names = module
+    path = directory / f"elsewhere_{next(_names)}.py"
+    path.write_text(other[0], encoding="utf-8")
+    linecache.checkcache(str(path))
+    namespace = {"__name__": "__main__"}
+    exec(compile(source, str(path), "exec"), namespace)  # noqa: S102 - code from another source
+    with _columns(columns):
+        for where in names:
+            func = _get(namespace, where)
+            pure, certified, _ = _verdicts(func)
+            if not cpnx.sandbox._callable_nodes_or_empty(func):
+                assert (pure, certified) == (False, False), (where, source, other[0])
+            else:
+                assert _compiles_to(other[0], str(path), func.__code__), (where, source, other[0])
+            for default in func.__defaults__ or ():
+                if isinstance(default, types.FunctionType):
+                    assert pure <= _is_pure(default), (where, source, other[0])
+                    assert certified <= certify(default).certified, (where, source, other[0])

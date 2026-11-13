@@ -61,7 +61,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from .sandbox import SandboxEvaluator, _alike_note, _callable_nodes_or_empty
+from .sandbox import SandboxEvaluator, _alike_note, _callable_nodes_or_empty, _default_values
 from .tokens import FrozenDict
 
 #: Builtins that iterate/reduce a finite iterable. Added on top of the string
@@ -90,6 +90,10 @@ _IMMUTABLE_LEAVES = (int, float, str, bytes, bool, type(None))
 #: ``dict`` — and ``FrozenDict``, though it recursively freezes nested ``dict``/``list``
 #: values, admits any *hashable* value, so a custom object with mutable attributes passes
 #: straight through. So both recurse through :func:`_is_immutable` on keys *and* values.
+#: The objects the builtin names hold. A default value that is one of them is what a read of
+#: that builtin name gives, which a certified body may do.
+_BUILTIN_VALUES = tuple(value for name, value in vars(builtins).items() if not name.startswith("_"))
+
 _FROZEN_MAPPINGS = tuple(t for t in (FrozenDict, getattr(builtins, "frozendict", None)) if t is not None)
 
 #: ``types.LazyImportType`` on 3.15+ (:pep:`810`), else ``None``.
@@ -271,6 +275,23 @@ class _Certifier:
                 # With several nodes `func` is one of them, and which one cannot be told: any
                 # failure fails it, and the reason says so.
                 return Verdict(False, f"{verdict.reason}{_alike_note(nodes)}")
+        return self._check_default_values(func, stack)
+
+    def _check_default_values(self, func: Callable, stack: frozenset[Callable]) -> Verdict:
+        """Each default value must be one a guard may read: immutable, a builtin, or a certifying callable.
+
+        The walk of the source checks the default *expressions*, but those ran once, where
+        the callable was defined, and the source may have changed since: a file edited so that
+        only a default differs still compiles to the same code. So the values the callable
+        holds are checked too, by the rule a global read is held to (:meth:`_check_name`).
+        """
+        for value in _default_values(func):
+            value = _force_lazy_import(value)
+            if _is_immutable(value) or any(value is builtin for builtin in _BUILTIN_VALUES):
+                continue
+            if callable(value) and self.certify(value, stack).certified:
+                continue
+            return Verdict(False, "default value is mutable or uncertified")
         return Verdict(True)
 
     def _certify_node(self, func: Callable, node: ast.AST, stack: frozenset[Callable]) -> Verdict:

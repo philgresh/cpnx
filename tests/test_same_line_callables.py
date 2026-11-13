@@ -13,6 +13,7 @@ something the callable's code does not. Callables that are still alike after tha
 told apart; each is held to what any of them does, and the error says so.
 """
 
+import ast
 import importlib
 import importlib.util
 import inspect
@@ -91,6 +92,8 @@ clean_d, dead_dictcomp = (lambda b: True), (lambda b: print(b) or 0 and {ww: 1 f
 clean_n, dead_lambda = (lambda b: True), (lambda b: 0 and (lambda: ww) or print(b))
 class Mangles:
     reads, prints = (lambda s: s.__x), (lambda s: print(s))
+plain_m, dead_maker = (lambda b: b), (lambda k: (lambda b: b if 1 else (w for w in b)))
+gen_prints, gen_clean = (lambda t: sorted(print(x) for x in t)), (lambda t: sorted(x for x in t))
 """
 
 _names = itertools.count()
@@ -349,14 +352,55 @@ def test_a_nested_scope_in_a_dead_branch_does_not_rule_out_its_lambda(case, name
     assert not certify(func).certified
 
 
-def test_without_columns_a_lambda_ruled_out_by_names_falls_back_to_its_whole_line(case, no_columns, monkeypatch):
+def test_without_columns_a_lambda_ruled_out_by_names_falls_back_to_the_nodes_that_name_its_code(
+    case, no_columns, monkeypatch
+):
     # Should the compiler drop a name some other way, no node left would use every name the
-    # code does. Then every function starting on the line is read, never only the neighbour.
+    # code does. Then the line's nodes that do are read: the lambda's own, never the neighbour.
     real = cpnx.sandbox._lambda_names
-    monkeypatch.setattr(cpnx.sandbox, "_lambda_names", lambda node: real(node) | {"never_compiled"})
-    assert len(cpnx.sandbox._callable_nodes(case.prints)) == 2
+    monkeypatch.setattr(cpnx.sandbox, "_lambda_names", lambda node, code: real(node, code) | {"never_compiled"})
+    (node,) = cpnx.sandbox._callable_nodes(case.prints)
+    assert ast.unparse(node) == "lambda t: print(t)"
     assert not _is_pure(case.prints)
     assert not certify(case.prints).certified
+    (node,) = cpnx.sandbox._callable_nodes(case.clean)
+    assert ast.unparse(node) == "lambda t: t.payload['n']"
+    assert _is_pure(case.clean)
+    # `key_a` and `key_b` use the same global and attribute names: both are read for each.
+    assert len(cpnx.sandbox._callable_nodes(case.key_a)) == 2
+
+
+def test_without_columns_a_dead_branch_in_a_returned_lambda_does_not_rule_out_its_maker(case, no_columns):
+    # The generator expression is dropped inside the inner lambda, so the outer lambda's code
+    # holds one nested code object where its source has two nested scopes.
+    for func, source in ((case.dead_maker, "lambda k:"), (case.dead_maker(0), "lambda b: b if 1")):
+        found = [ast.unparse(node) for node in cpnx.sandbox._callable_nodes(func)]
+        assert any(text.startswith(source) for text in found), found
+
+
+def test_without_columns_live_nested_scopes_still_tell_lambdas_apart(case, no_columns):
+    # Nothing was dropped (each generator expression has its code object), so the names inside
+    # them count, as on `main`: the clean lambda is not held to its neighbour's `print`.
+    assert len(cpnx.sandbox._callable_nodes(case.gen_clean)) == 1
+    assert _is_pure(case.gen_clean)
+    assert lint_callable(case.gen_clean) == []
+    assert not _is_pure(case.gen_prints)
+
+
+@pytest.mark.parametrize(
+    ("stored", "readings"),
+    [
+        ("_K__x", ("__x",)),
+        ("_A__B__x", ("__B__x", "__x")),
+        ("_K___x", ("___x", "__x")),
+        ("foo__bar", ()),
+        ("plain", ()),
+        ("__x", ()),
+        ("_K__dunder__", ()),
+    ],
+)
+def test_a_stored_name_is_read_back_as_the_private_names_it_can_mangle(stored, readings):
+    assert sorted(cpnx.sandbox._demanglings(stored)) == sorted(readings)
 
 
 def test_without_columns_a_mangled_name_still_counts_as_its_own(case, no_columns):

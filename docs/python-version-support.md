@@ -302,12 +302,17 @@ tripping a Python-level deprecation.
   `-X no_debug_ranges` on any version; there it goes by what the code object does say: its
   name (a `def`'s own, `<lambda>` for a lambda) and the names it carries (`co_names` and the
   variable tables, through nested code objects). A lambda whose body uses a name the code
-  lacks is ruled out. Names inside a nested scope (a lambda, generator expression or
-  comprehension) do not count: in a branch the compiler drops, no code object is made for
-  one. On 3.10 and 3.11 that covers list, set and dict comprehensions as well; PEP 709
-  inlines them from 3.12. If no node left uses every global and attribute name the code
-  does, every function on the line is read ([#90](https://github.com/philgresh/cpnx/issues/90)).
-  REPL input is read from `linecache` from 3.13, when the REPL started keeping it. Lambdas on one line that use the same names are left; each is held to
+  lacks is ruled out. Names inside a nested scope (a lambda or generator expression, and on
+  3.10 and 3.11 a list, set or dict comprehension, which PEP 709 inlines from 3.12) count
+  only when the code has a code object for each: in a branch the compiler drops, none is
+  made. If no node left uses every global and attribute name the code does, the nodes on
+  the line that do are read ([#90](https://github.com/philgresh/cpnx/issues/90)). On every
+  version, a node is used only if its source compiles to a code object equal to the one
+  that runs, positions aside: a `.pyc` written by 3.12.3 records other positions than
+  3.12.13 compiles, and 3.12.13 still loads it. REPL input is read from 3.13, when
+  the REPL started keeping it, through the private `linecache._getlines_from_code` (looked
+  up with `getattr`, so its absence only loses REPL lookups). Lambdas on one line that use
+  the same names are left; each is held to
   what any of them does, and the error, certification reason or lint message says that
   several functions start on the line. `tests/test_same_line_callables.py` runs one case
   in a child interpreter under `-X no_debug_ranges`, so a change in how CPython reports a

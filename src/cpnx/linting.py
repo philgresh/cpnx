@@ -353,8 +353,9 @@ def lint_callable(func: Callable) -> list[LintFinding]:
     Pure inspection: never warns, never raises, never mutates. Returns findings in
     source order, de-duplicated by ``(category, symbol, lineno)``. Returns ``[]``
     when *func* is not callable or its source cannot be recovered (a compiled
-    builtin, a REPL lambda) — an unseeable body is reported as "nothing found",
-    never as a false positive, consistent with the best-effort contract.
+    builtin, code with no source, a REPL lambda before Python 3.13) — an unseeable
+    body is reported as "nothing found", never as a false positive, consistent with
+    the best-effort contract.
 
     Before Python 3.11 (and under ``-X no_debug_ranges``) the interpreter records no column
     positions, so two lambdas that start on one source line and use the same names cannot be
