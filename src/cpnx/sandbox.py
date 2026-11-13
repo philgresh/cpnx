@@ -41,32 +41,6 @@ class SandboxEvaluator:
     }
 
 
-def _node_contains_line(node: ast.AST, start_line: int) -> bool:
-    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-        return False
-    if not hasattr(node, "lineno"):
-        return False
-    end_lineno = getattr(node, "end_lineno", node.lineno)
-    return node.lineno <= start_line <= end_lineno
-
-
-def _is_more_specific_node(new_node: ast.AST, current_target: ast.AST) -> bool:
-    target_start = current_target.lineno
-    target_end = getattr(current_target, "end_lineno", target_start)
-    new_end = getattr(new_node, "end_lineno", new_node.lineno)
-    return new_node.lineno >= target_start and new_end <= target_end
-
-
-def _find_target_node(tree: ast.AST, start_line: int) -> ast.AST | None:
-    target_node = None
-    for node in ast.walk(tree):
-        if not _node_contains_line(node, start_line):
-            continue
-        if target_node is None or _is_more_specific_node(node, target_node):
-            target_node = node
-    return target_node
-
-
 _FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
 #: Where a callable's own code lies in its file: `(line, end_line, column, end_column)`, as

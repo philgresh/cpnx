@@ -206,8 +206,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A callable that shares its source line with another is now checked against its own body.**
-  The purity check, the side-effect lint and inline-safety certification found a callable in
+- **A callable that shares its source line with another is now checked against its own body**
+  ([#90](https://github.com/philgresh/cpnx/issues/90)). The purity check, the side-effect lint and inline-safety certification found a callable in
   its source file by the line it starts on alone, so two lambdas on one line were both read
   as the last one. With `key=lambda t: print(t), filter=lambda t: t.payload["n"] > 0` on one
   line, the `key` passed the purity check and was certified to run inline, unbounded, because

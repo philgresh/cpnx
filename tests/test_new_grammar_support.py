@@ -301,7 +301,7 @@ def test_certification_of_a_lazy_import_does_not_depend_on_call_order(tmp_path):
 def test_module_level_lazy_import_does_not_disturb_a_guard_in_the_same_file(tmp_path):
     # PEP 810 permits `lazy` only at module scope, so a lazy import can never appear
     # inside a guard body. It can appear in the guard's *file*, which certification
-    # parses whole — _find_target_node must still isolate the function.
+    # parses whole — the lookup must still isolate the function.
     guard = _load_guard(
         tmp_path,
         "grammar_lazy_module",

@@ -7,8 +7,6 @@ from cpnx.engine import PetriNet
 from cpnx.places import Place
 from cpnx.sandbox import (
     _clean_fallback_source,
-    _is_more_specific_node,
-    _node_contains_line,
     _verify_function_defaults,
     verify_callable_purity,
 )
@@ -120,18 +118,6 @@ def test_verify_callable_purity_raises_on_uninspectable():
 
     with pytest.raises(PermissionError, match="source unavailable"):
         verify_callable_purity(partial_fn)
-
-
-def test_find_target_node_outside_span():
-    import ast
-
-    from cpnx.sandbox import _find_target_node
-
-    source = "def foo():\n    pass\n"
-    tree = ast.parse(source)
-    # Provide a start_line that does not match any function in the AST
-    node = _find_target_node(tree, 10)
-    assert node is None
 
 
 def test_callable_expression_timeout():
@@ -263,50 +249,6 @@ class TestCleanFallbackSource:
 
     def test_no_equals_sign_unchanged(self):
         assert _clean_fallback_source("len(tokens)") == "len(tokens)"
-
-
-class TestNodeContainsLine:
-    def _parse_func(self, source: str) -> ast.FunctionDef:
-        return ast.parse(source).body[0]
-
-    def test_line_inside_span(self):
-        node = self._parse_func("def foo():\n    pass\n")
-        assert _node_contains_line(node, 1)
-        assert _node_contains_line(node, 2)
-
-    def test_line_outside_span(self):
-        node = self._parse_func("def foo():\n    pass\n")
-        assert not _node_contains_line(node, 0)
-        assert not _node_contains_line(node, 99)
-
-    def test_non_function_node_always_false(self):
-        # A Pass statement is not a FunctionDef/Lambda
-        tree = ast.parse("def foo():\n    pass\n")
-        pass_node = tree.body[0].body[0]
-        assert not _node_contains_line(pass_node, 2)
-
-    def test_lambda_node(self):
-        tree = ast.parse("f = lambda x: x", mode="exec")
-        # Walk to find the Lambda node
-        lambda_node = next(n for n in ast.walk(tree) if isinstance(n, ast.Lambda))
-        assert _node_contains_line(lambda_node, lambda_node.lineno)
-
-
-class TestIsMoreSpecificNode:
-    def _parse_nested(self) -> tuple[ast.FunctionDef, ast.FunctionDef]:
-        source = "def outer():\n    def inner():\n        pass\n"
-        tree = ast.parse(source)
-        outer = tree.body[0]
-        inner = outer.body[0]
-        return outer, inner
-
-    def test_inner_is_more_specific_than_outer(self):
-        outer, inner = self._parse_nested()
-        assert _is_more_specific_node(inner, outer)
-
-    def test_outer_is_not_more_specific_than_inner(self):
-        outer, inner = self._parse_nested()
-        assert not _is_more_specific_node(outer, inner)
 
 
 class TestVerifyFunctionDefaults:
