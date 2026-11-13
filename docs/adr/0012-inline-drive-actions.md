@@ -1,6 +1,6 @@
 # ADR 0012 — Run a logical-clock drive's firings on the driving thread
 
-- **Status:** Accepted
+- **Status:** Accepted — shipped in 0.8.0 via [#83](https://github.com/philgresh/cpnx/pull/83)
 - **Date:** 2026-11-10
 - **Relates to:** [0003](0003-inline-execution-and-string-removal.md) (inline guards and arc
   expressions, the same trade of a thread handoff for a direct call),

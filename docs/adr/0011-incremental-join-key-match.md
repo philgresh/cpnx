@@ -1,6 +1,6 @@
 # ADR 0011 — Keep a join's matching keys up to date across its places
 
-- **Status:** Accepted
+- **Status:** Accepted — shipped in 0.8.0 via [#74](https://github.com/philgresh/cpnx/pull/74)
 - **Date:** 2026-11-09
 - **Relates to:** [0010](0010-equi-join-index.md) (the join index this builds on, and whose
   last open consequence this closes), [0006](0006-incremental-enablement.md) (the scheduler

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-11-13
+
 ### Changed
 
 - **Building a transition no longer re-parses the module that defines its callables.** The
@@ -450,6 +452,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#65](https://github.com/philgresh/cpnx/issues/65)). The incremental scheduler also folds
   each dirty place's dependents into its re-check set with one set union over a precomputed
   name set, 3–5× faster for that step (22 µs instead of 83 µs with 1 024 dependents).
+
+### Known issues
+
+- **Without column positions, an impure lambda can be certified by a clean lambda on the same
+  line** ([#90](https://github.com/philgresh/cpnx/issues/90)). On Python 3.10, or under
+  `-X no_debug_ranges`, a lambda is told from the others on its line by the names its code
+  carries. A generator expression, comprehension or lambda in a branch the compiler drops
+  (`lambda b: print(b) if 1 else (w for w in b)`) leaves its names out of the code, so the
+  lambda's own node is ruled out and a clean neighbour on the same line is judged instead: the
+  impure lambda passes the purity check and is certified to run inline. 0.7.0 rejected this
+  shape; Python 3.11 and later with column positions are not affected. Until it is fixed, put
+  each guard, key and filter lambda on its own line.
+- **A callable whose source cannot be located passes the purity check**
+  ([#90](https://github.com/philgresh/cpnx/issues/90)). The purity check then falls back to
+  the callable's source text and lets the callable through when that text does not parse. A
+  class passed as a callable, a function from a module edited after it was imported, and a
+  lambda on the last line of a call in a notebook cell can reach it. Certification does not
+  certify these, so they never run inline. 0.7.0 behaved the same way.
 
 ## [0.7.0] — 2026-10-20
 
