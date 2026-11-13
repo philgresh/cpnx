@@ -10,13 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Building a transition no longer re-parses the module that defines its callables.** The
-  purity check, the linter and the certifier each parsed the callable's whole source file and
-  walked its whole tree for every guard, key, filter and action, on every transition built.
-  They now share one parse per file (parsed again whenever the file's bytes change) and look
-  each callable's node up once. One shared-place property-test example (a net built from a
-  2,400-line test module) went from ~350 ms to ~1 ms, and the full test suite from ~5 min to
-  ~20 s on 4 cores. Source files are now read as bytes, so a module with a PEP 263 coding
-  cookie (e.g. `latin-1`) and non-ASCII text no longer makes the linter or the certifier raise
+  purity check, the linter and the certifier each parsed the callable's whole source file and walked
+  its whole tree for every guard, key, filter and action, on every transition built. They now share
+  one parse per file (parsed again whenever the file's bytes change, and kept for the 256 files used
+  last) and look each callable's node up once. One shared-place property-test example (a net built
+  from a 2,400-line test module) went from ~350 ms to ~1 ms, and the full test suite from ~5 min to
+  ~20 s on 4 cores. Source files are now read as bytes, so a module with a PEP 263 coding cookie
+  (e.g. `latin-1`) and non-ASCII text no longer makes the linter or the certifier raise
   `UnicodeDecodeError`, and the purity check reads it instead of rejecting it.
 
 - **The purity check now fails closed, and notebook callables reach every gate**
@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     rejected like a literal one, and a function default whose source can be read must pass
     the purity check itself (the message names the parameter). Certification holds each
     default to the rule for a global read, allowing of the builtins only those a guard may
-    call (`len`, not `print`).
+    call (`len`, not `print`) and the methods of immutable builtin types (`str.lower`).
 
 - **Two `consume_all` input arcs on one place are never enabled, and adding such a transition
   warns** ([#75](https://github.com/philgresh/cpnx/issues/75)). Each would drain what the
@@ -261,27 +261,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrapper's, so the lint sees its body (the purity check and certification refuse it).
 
 - **The gates judge a callable only by source that compiles to its very code**
-  ([#90](https://github.com/philgresh/cpnx/issues/90)). The source found for a callable is
-  compiled (once per file) and must hold a code object equal to the one that runs: the same
-  instructions, constants, names and flags. Positions are not compared, since two patch
-  releases of one Python can record them differently in a `.pyc` both load. Before, a file edited
-  since import was read as it now is: an impure lambda whose line now held a clean `def`
-  was certified by that `def`, and a stale `.pyc` (a same-size edit within one mtime tick)
-  ran old code that was judged by the new text. Code compiled under a file name with no
-  file (`exec(compile(src, "rules.py", "exec"), module.__dict__)`) was judged by the
-  module's own source, which `inspect` files under that name: a clean lambda on the same
-  line certified an impure one. All of these are now "source unavailable". `inspect` is no
-  longer asked for the start line, so a lookup files no source in `linecache`. Default
-  argument values run where the function is defined, not in its code, so an edit to a
-  default alone leaves the code equal: the purity check and certification now also check
-  the default values the callable holds. The purity check rejects a `list`, `dict` or `set`
-  and checks a Python function as a callable of its own (once each, so defaults that hold
-  each other end; one with no source to read is left to certification); certification
-  holds each value to the rule for a global read (immutable, a builtin a guard may call, or
-  a certifying callable), and an unhashable callable is not certified rather than raising.
-  The compile allows top-level `await`, as a notebook cell may use it, and is silent: a
-  compiler warning elsewhere in the file (`x is 1`) is neither printed again nor, under an
-  "error" filter, a reason to refuse the file's callables.
+  ([#90](https://github.com/philgresh/cpnx/issues/90)). The source found for a callable is compiled
+  (once per file) and must hold a code object equal to the one that runs: the same instructions,
+  constants, names and flags. Positions are not compared, since two patch releases of one Python can
+  record them differently in a `.pyc` both load. Before, a file edited since import was read as it
+  now is: an impure lambda whose line now held a clean `def` was certified by that `def`, and a
+  stale `.pyc` (a same-size edit within one mtime tick) ran old code that was judged by the new
+  text. Code compiled under a file name with no file (`exec(compile(src, "rules.py", "exec"),
+  module.__dict__)`) was judged by the module's own source, which `inspect` files under that name: a
+  clean lambda on the same line certified an impure one. All of these are now "source unavailable".
+  `inspect` is no longer asked for the start line, so a lookup files no source in `linecache`.
+  Default argument values run where the function is defined, not in its code, so an edit to a
+  default alone leaves the code equal: the purity check and certification now also check the default
+  values the callable holds. The purity check rejects a `list`, `dict` or `set` and checks a Python
+  function as a callable of its own (once each, so defaults that hold each other end; one with no
+  source to read is left to certification); certification holds each value to the rule for a global
+  read (immutable, a builtin a guard may call or a method of an immutable builtin type, or a
+  certifying callable), and an unhashable callable is not certified rather than raising. The compile
+  allows top-level `await`, as a notebook cell may use it, and is silent: a compiler warning
+  elsewhere in the file (`x is 1`) is neither printed again nor, under an "error" filter, a reason
+  to refuse the file's callables.
 
 - **A callable that shares its source line with another is now checked against its own body**
   ([#90](https://github.com/philgresh/cpnx/issues/90)). The purity check, the side-effect lint

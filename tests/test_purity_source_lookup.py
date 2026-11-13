@@ -405,3 +405,37 @@ def test_a_builtin_default_certifies_only_if_a_guard_may_call_it(tmp_path):
     )
     assert certify(module.quiet).certified, certify(module.quiet).reason
     assert certify(module.loud).reason == "default value is mutable or uncertified"
+
+
+def test_a_method_of_an_immutable_builtin_is_a_default_a_guard_may_hold(tmp_path):
+    module = _load(
+        tmp_path,
+        "method_defaults_90",
+        "def lowered(ts, f=str.lower, j='-'.join):\n    return f is not None and j is not None\n\n\n"
+        "def grows(ts, f=list.append):\n    return f is not None\n",
+    )
+    assert certify(module.lowered).certified, certify(module.lowered).reason
+    assert certify(module.grows).reason == "default value is mutable or uncertified"
+
+
+def test_code_without_positions_is_still_found_by_its_compiled_twin(tmp_path, monkeypatch):
+    # A `.pyc` written under `-X no_debug_ranges` and run without it: the running code has no
+    # columns, the source compiled here has. The compiled twin still says which lambda it is.
+    # By names alone the two lambdas cannot be told apart.
+    module = _load(tmp_path, "twin_90", "low, high = (lambda t: len(t) > 0), (lambda t: len(t) > 1)\n")
+    monkeypatch.setattr(cpnx.sandbox, "_body_anchor", lambda func: None)
+    cpnx.sandbox._SOURCE_CACHE.clear()
+    (low,), (high,) = _callable_nodes(module.low), _callable_nodes(module.high)
+    assert ast.unparse(low.body) == "len(t) > 0"
+    assert ast.unparse(high.body) == "len(t) > 1"
+
+
+def test_the_source_cache_keeps_the_files_used_last(tmp_path, monkeypatch):
+    monkeypatch.setattr(cpnx.sandbox, "_SOURCE_CACHE_SIZE", 2)
+    cpnx.sandbox._SOURCE_CACHE.clear()
+    modules = [_load(tmp_path, f"cached_{index}_90", "guard = lambda t: len(t) > 0\n") for index in range(3)]
+    for module in modules:
+        verify_callable_purity(module.guard)
+    verify_callable_purity(modules[1].guard)
+    assert list(cpnx.sandbox._SOURCE_CACHE) == [modules[2].__file__, modules[1].__file__]
+    cpnx.sandbox._SOURCE_CACHE.clear()

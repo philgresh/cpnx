@@ -361,7 +361,11 @@ def _without_positions(code: types.CodeType) -> types.CodeType:
 #: bytes that were parsed: the read is cheap, the parse is the cost. An mtime-and-size stamp is
 #: not enough, since a same-size edit within one mtime tick would then be checked against the old
 #: code while the new code runs (with bytecode writing off, nothing else catches it).
+#: At most `_SOURCE_CACHE_SIZE` files are kept, the least recently used dropped first: a
+#: notebook kernel gives each cell run a file name of its own.
 _SOURCE_CACHE: dict[str, _ParsedSource] = {}
+_SOURCE_CACHE_SIZE = 256
+_SOURCE_CACHE_LOCK = threading.Lock()
 
 #: What "the source cannot be found or parsed" looks like: no file (``OSError``), source that
 #: does not parse or compile (``SyntaxError``), undecodable bytes (``UnicodeDecodeError``, a
@@ -395,10 +399,15 @@ def _read_source(path: str, func: Callable, code: types.CodeType) -> bytes | str
 
 def _parsed_source(path: str, func: Callable, code: types.CodeType) -> _ParsedSource:
     source = _read_source(path, func, code)
-    cached = _SOURCE_CACHE.get(path)
+    with _SOURCE_CACHE_LOCK:
+        cached = _SOURCE_CACHE.pop(path, None)
     if cached is None or cached.source != source:
         # Bytes where there is a file, so ast.parse honours a PEP 263 coding cookie.
-        cached = _SOURCE_CACHE[path] = _ParsedSource(source, path, ast.parse(source, filename=path))
+        cached = _ParsedSource(source, path, ast.parse(source, filename=path))
+    with _SOURCE_CACHE_LOCK:
+        _SOURCE_CACHE[path] = cached  # last, as the most recently used
+        while len(_SOURCE_CACHE) > _SOURCE_CACHE_SIZE:
+            del _SOURCE_CACHE[next(iter(_SOURCE_CACHE))]
     return cached
 
 
@@ -409,7 +418,8 @@ def _callable_nodes(func: Callable) -> tuple[ast.AST, ...]:
     decorated `def` counting from its first decorator (`_first_line`), as its code does. So a
     decorated `def` is found as itself, at any depth: neither a lambda among its decorator's
     arguments nor the function around it is taken for it. Certification then refuses it for
-    its decorator, and the purity check and the lint read its own body.
+    its decorator, the purity check refuses it for the wrapper that runs, and the lint reads
+    its own body.
 
     The source must compile to code equal to `func`'s, positions aside (`_without_positions`),
     starting on its line. A file edited since it was loaded, a stale `.pyc`, or source that
@@ -456,8 +466,13 @@ def _callable_nodes(func: Callable) -> tuple[ast.AST, ...]:
     if held == ():
         return ()
     candidates = parsed.locate(code.co_firstlineno, None)
-    anchor = _body_anchor(func)
-    if anchor is not None and held is not None:
+    if held is not None:
+        # Found by code equality. Several nodes compile to the same code only when they are
+        # alike; where `func`'s own code records a position (its `.pyc` may not, if it was
+        # written without them), it tells which of them `func` is.
+        anchor = _body_anchor(func)
+        if anchor is None:
+            return held
         chosen = tuple(node for node in parsed.locate(code.co_firstlineno, anchor) if node in held)
         return chosen or held
     code_names = _code_names(code)
@@ -577,17 +592,21 @@ def verify_callable_purity(func: Callable) -> None:
     _verify_purity(func, frozenset())
 
 
-def _verify_purity(func: Callable, seen: frozenset[int]) -> None:
-    """`verify_callable_purity`, with the functions already being checked (by `id`) in `seen`."""
+def _verify_purity(func: Callable, seen: frozenset[int], nodes: tuple[ast.AST, ...] | None = None) -> None:
+    """`verify_callable_purity`, with the functions already being checked (by `id`) in `seen`.
+
+    `nodes` is `_callable_nodes(func)` where the caller has looked it up already.
+    """
     if getattr(func, "__wrapped__", None) is not None:
         raise PermissionError(
             f"Cannot verify purity of {func!r}: it is decorated, and the wrapper that runs is not "
             "the body that can be read. Pass the undecorated function."
         )
-    try:
-        nodes = _callable_nodes(func)
-    except _SOURCE_UNAVAILABLE as exc:
-        raise _source_unavailable(func) from exc
+    if nodes is None:
+        try:
+            nodes = _callable_nodes(func)
+        except _SOURCE_UNAVAILABLE as exc:
+            raise _source_unavailable(func) from exc
     if not nodes:
         raise _source_unavailable(func)
     try:
@@ -605,20 +624,16 @@ def _verify_default_values(func: Callable, seen: frozenset[int]) -> None:
             raise PermissionError(
                 f"Mutable default argument '{name}' in CPN callable introduces hidden state between firings."
             )
-        if isinstance(value, types.FunctionType) and id(value) not in seen and _has_source(value):
-            try:
-                _verify_purity(value, seen)
-            except PermissionError as exc:
-                raise PermissionError(f"Default '{name}' of {_label(func)}: {exc}") from None
-
-
-def _has_source(func: Callable) -> bool:
-    """Say whether `func`'s source can be read at all, whether or not it still compiles to its code."""
-    try:
-        _callable_nodes(func)
-    except _SOURCE_UNAVAILABLE:
-        return False
-    return True
+        if not isinstance(value, types.FunctionType) or id(value) in seen:
+            continue
+        try:
+            nodes = _callable_nodes(value)
+        except _SOURCE_UNAVAILABLE:
+            continue  # No source to read at all: left to certification.
+        try:
+            _verify_purity(value, seen, nodes)
+        except PermissionError as exc:
+            raise PermissionError(f"Default '{name}' of {_label(func)}: {exc}") from None
 
 
 def _label(func: Callable) -> str:

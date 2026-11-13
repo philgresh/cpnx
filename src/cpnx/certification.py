@@ -99,6 +99,27 @@ _BUILTIN_VALUES = tuple(
     value for name, value in vars(builtins).items() if name in _ALLOWED_CALL_NAMES and not name.startswith("_")
 )
 
+#: Builtin types whose methods cannot change the value they are called on (``str.lower``):
+#: such a method, held as a default value, is what the same spelling in the body reads.
+_IMMUTABLE_BUILTIN_TYPES = (int, float, complex, str, bytes, bool, tuple, frozenset, range)
+
+
+def _is_inert_builtin(value: object) -> bool:
+    """Say whether `value` is a builtin a guard may hold: one it may call, or a method of an immutable builtin type.
+
+    The method may be unbound (``str.lower``) or bound to an immutable value (``"-".join``).
+    """
+    if any(value is builtin for builtin in _BUILTIN_VALUES):
+        return True
+    receiver = getattr(value, "__self__", None)
+    if isinstance(value, types.BuiltinMethodType) and type(receiver) in _IMMUTABLE_BUILTIN_TYPES:
+        return _is_immutable(receiver)
+    owner = getattr(value, "__objclass__", None)
+    return isinstance(value, (types.MethodDescriptorType, types.ClassMethodDescriptorType)) and owner in (
+        _IMMUTABLE_BUILTIN_TYPES
+    )
+
+
 #: ``types.LazyImportType`` on 3.15+ (:pep:`810`), else ``None``.
 _LAZY_IMPORT_TYPE = getattr(types, "LazyImportType", None)
 
@@ -298,7 +319,7 @@ class _Certifier:
         """
         for _name, value in _default_values(func):
             value = _force_lazy_import(value)
-            if _is_immutable(value) or any(value is builtin for builtin in _BUILTIN_VALUES):
+            if _is_immutable(value) or _is_inert_builtin(value):
                 continue
             if callable(value) and self.certify(value, stack).certified:
                 continue
