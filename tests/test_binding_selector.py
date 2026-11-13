@@ -216,11 +216,25 @@ def test_groups_serve_indexed_and_scanned_keys_alike(selector):
 
 
 @pytest.mark.parametrize("key", [skill, opaque_skill], ids=["indexed", "scanned"])
-def test_a_group_supports_len_index_and_iteration(key):
+def test_a_group_supports_len_index_and_iteration(key, monkeypatch):
+    from cpnx.places import _JoinGroup
+
+    reads = {"n": 0}
+    real_token_at = _JoinGroup.token_at
+
+    def counting_token_at(self, position):
+        reads["n"] += 1
+        return real_token_at(self, position)
+
+    monkeypatch.setattr(_JoinGroup, "token_at", counting_token_at)
     seen = {}
+    asks = {"n": 0}
 
     def select(view: BindingView):
+        asks["n"] += 1
         group = view.group(0, key, 1)
+        if asks["n"] == 1:
+            return None  # the first sighting of a key is scanned; the second is indexed
         seen["len"] = len(group)
         seen["items"] = [t.payload["i"] for t in group]
         seen["last"] = group[-1].payload["i"]
@@ -237,7 +251,9 @@ def test_a_group_supports_len_index_and_iteration(key):
         net.deposit("jobs", Token(payload={"i": i, "skill": i % 2}))
     with net:
         net.step()
+        net.step()
     assert seen == {"len": 3, "items": [1, 3, 5], "last": 5, "slice": [3, 5], "missing": 0}
+    assert (reads["n"] > 0) is (key is skill), "the indexed group reads through the place index"
 
 
 def random_pick(view: BindingView):
@@ -459,10 +475,11 @@ def test_another_thread_waits_on_the_lock_while_a_selector_runs():
     with net:
         stepper = threading.Thread(target=net.step, daemon=True)
         stepper.start()
+        assert entered.wait(5), "the selector is running, holding the engine lock"
         other = threading.Thread(target=reader, daemon=True)
         other.start()
         other.join(0.3)
-        assert other.is_alive(), "the other thread waits for the engine lock"
+        assert other.is_alive() and "marking" not in seen, "the other thread waits for the engine lock"
         release.set()
         other.join(5)
         stepper.join(5)
@@ -516,7 +533,7 @@ def test_a_selector_index_is_released_when_its_arc_moves_to_another_place():
     assert not net.places["jobs"]._store._join_indexes
 
 
-def test_inline_keys_are_certified_once_and_never_indexed(monkeypatch):
+def _count_certifications(monkeypatch) -> dict[str, int]:
     import cpnx.selection as selection
 
     calls = {"n": 0}
@@ -527,6 +544,11 @@ def test_inline_keys_are_certified_once_and_never_indexed(monkeypatch):
         return real(key)
 
     monkeypatch.setattr(selection, "is_inline_safe", counting)
+    return calls
+
+
+def test_inline_keys_are_scanned_never_certified_or_indexed(monkeypatch):
+    calls = _count_certifications(monkeypatch)
 
     def inline_key(view: BindingView):
         group = view.group(0, lambda t: t.payload["skill"], 0)
@@ -535,12 +557,55 @@ def test_inline_keys_are_certified_once_and_never_indexed(monkeypatch):
     net = _jobs_net(inline_key)
     with net:
         net.drive_to_quiescence()
-    assert not net.places["jobs"]._store._join_indexes, "a key seen once is scanned, not indexed"
+        for _ in range(20):
+            net.is_dead()
+    assert _payloads(net, "out") == [0, 3, 6, 9]
+    assert calls["n"] == 0
+    assert not net.places["jobs"]._store._join_indexes
+    assert len(net._selector_keys) == 0
 
-    cache = selection.KeyCertifications()
-    for _ in range(20):
-        assert cache.inline_safe(lambda t: t.payload["skill"])
-    assert calls["n"] == 1, "a lambda rebuilt with the same code and closure is certified once"
+
+def _payload_key(field: str):
+    def key(token: Token) -> object:
+        return token.payload[field]
+
+    return key
+
+
+_BY_SKILL = _payload_key("skill")
+_BY_A = _payload_key("a")
+
+
+def test_two_keys_from_one_factory_are_each_certified_once(monkeypatch):
+    calls = _count_certifications(monkeypatch)
+
+    def both(view: BindingView):
+        view.groups(0, _BY_SKILL)
+        view.groups(0, _BY_A)
+        return None
+
+    net = _jobs_net(both)
+    with net:
+        for _ in range(10):
+            net.is_dead()
+    assert calls["n"] == 2
+    assert len(net.places["jobs"]._store._join_indexes) == 2
+
+
+def test_a_callable_does_not_borrow_another_functions_verdict():
+    from cpnx.certification import is_inline_safe
+    from cpnx.selection import KeyCertifications
+
+    class Pretender:
+        __func__ = staticmethod(skill)
+
+        def __call__(self, token: Token) -> object:
+            return token.payload["skill"]
+
+    cache = KeyCertifications()
+    assert cache.inline_safe(skill) is True
+    pretender = Pretender()
+    assert cache.inline_safe(pretender) is is_inline_safe(pretender)
 
 
 def test_binding_priority_key_set_after_a_selector_is_rejected():
@@ -648,22 +713,6 @@ def test_a_selector_arc_keeps_at_most_four_place_indexes():
     assert {entry[0] for entry in registered.values()} == set(_ROTATION[1:])
 
 
-def test_inline_key_lambdas_do_not_grow_the_certification_cache():
-    import gc
-
-    def inline_key(view: BindingView):
-        group = view.group(0, lambda t: t.payload["skill"], 0)
-        return [group[0]] if group else None
-
-    net = _jobs_net(inline_key)
-    with net:
-        net.drive_to_quiescence()
-        for _ in range(50):
-            net.is_dead()
-    gc.collect()
-    assert len(net._selector_keys) <= 4
-
-
 def cooling(view: BindingView):
     return [view.arcs and _COOLING["token"]]
 
@@ -709,3 +758,105 @@ def test_a_mapping_choice_and_a_multi_token_arc_fire():
         net._await_inflight()
     assert sorted(_payloads(net, "out")) == [2, 3, 100]
     assert _payloads(net, "jobs") == [0, 1]
+
+
+def test_available_pages_through_a_deep_place_in_order():
+    seen: dict[str, list[int]] = {}
+
+    def everything(view: BindingView):
+        seen["ids"] = [t.payload["i"] for t in view.available(0)]
+        return None
+
+    net = _one_arc_net(everything, n=300)
+    with net:
+        net.is_dead()
+    assert seen["ids"] == list(range(300))
+
+
+_FLAKY = {"fail": True}
+
+
+def flaky_everywhere(view: BindingView):
+    if _FLAKY["fail"]:
+        raise LookupError("down")
+    return None
+
+
+def test_a_failure_reports_again_after_the_timed_view_recovers_while_a_token_was_cooling():
+    _FLAKY["fail"] = True
+    net = PetriNet(seed=1, places=[Place("in"), Place("out")])
+    net.add_transition(
+        Transition("t", [InputArc("in")], [OutputArc("out")], _identity, binding_selector=flaky_everywhere)
+    )
+    net.advance_time(10.0)
+    net.deposit("in", Token(payload={"i": 0}))
+    net.deposit("in", Token(payload={"i": 1}, available_at=20.0))
+    errors: list[BaseException] = []
+    net.on_error = lambda _name, error, _token: errors.append(error)
+    with net:
+        for _ in range(3):
+            net.step()
+            net.is_quiescent()
+            net.is_dead()
+        assert len(errors) == 1, "both views fail the same way: one report"
+        net.advance_time(30.0)  # the cooling token matures, so only the timed view is asked
+        _FLAKY["fail"] = False
+        for _ in range(3):
+            net.step()
+            net.is_dead()
+        _FLAKY["fail"] = True
+        net.step()
+    assert len(errors) == 2, "the recurrence reports, though the other view's latch is stale"
+
+
+@pytest.mark.parametrize("choice", [[None], [42], {0: 5}])
+def test_a_choice_item_that_is_not_a_token_is_an_invalid_selection(choice):
+    from cpnx import InvalidSelection
+
+    net = _one_arc_net(lambda view: choice)
+    errors: list[BaseException] = []
+    net.on_error = lambda _name, error, _token: errors.append(error)
+    with net:
+        assert net.step() is False
+    assert errors and isinstance(errors[0].__cause__, InvalidSelection)
+
+
+def test_a_conflict_releases_the_selectors_place_indexes():
+    net = _jobs_net(match_certified_one)
+    errors: list[BaseException] = []
+    net.on_error = lambda _name, error, _token: errors.append(error)
+    with net:
+        net.is_dead()
+        net.is_dead()
+        assert net.places["jobs"]._store._join_indexes
+        net.transitions["t"].inputs[0].key = _key
+        net.is_dead()
+    assert not net.places["jobs"]._store._join_indexes
+    assert errors and "key" in str(errors[0])
+
+
+def test_an_arc_moved_to_an_empty_place_releases_the_old_index():
+    net = PetriNet(seed=1, places=[Place("jobs"), Place("empty"), Place("out")])
+    net.add_transition(
+        Transition("t", [InputArc("jobs")], [OutputArc("out")], _identity, binding_selector=match_certified_one)
+    )
+    for i in range(4):
+        net.deposit("jobs", Token(payload={"i": i, "skill": 0}))
+    with net:
+        net.is_dead()
+        net.is_dead()
+        assert net.places["jobs"]._store._join_indexes
+        net.transitions["t"].inputs[0].place = "empty"
+        net.is_dead()
+    assert not net.places["jobs"]._store._join_indexes
+
+
+def test_replacing_a_selector_transition_releases_its_place_indexes():
+    net = _jobs_net(match_certified_one)
+    with net:
+        net.is_dead()
+        net.is_dead()
+        assert net.places["jobs"]._store._join_indexes
+        net.add_transition(Transition("t", [InputArc("jobs")], [OutputArc("out")], _identity))
+    assert not net.places["jobs"]._store._join_indexes
+    assert net._selector_indexes == {}

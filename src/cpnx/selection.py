@@ -148,7 +148,16 @@ class InvalidSelection(ValueError):
 
 
 def _as_tokens(item: object, arc: "InputArc", position: int) -> list[Token]:
-    tokens = [item] if isinstance(item, Token) else list(item)  # type: ignore[call-overload]
+    if isinstance(item, Token):
+        tokens = [item]
+    else:
+        try:
+            tokens = list(item)  # type: ignore[call-overload]
+        except TypeError as exc:
+            raise InvalidSelection(
+                f"input arc {position} on '{arc.place}' takes a Token or a sequence of tokens; the "
+                f"selector chose {item!r}."
+            ) from exc
     if len(tokens) != arc.count or not all(isinstance(t, Token) for t in tokens):
         raise InvalidSelection(
             f"input arc {position} on '{arc.place}' takes {arc.count} token(s); the selector chose {tokens!r}."
@@ -200,60 +209,32 @@ def selector_conflict(transition: "Transition") -> str | None:
     return None
 
 
-def _shape(key: Callable[[Token], object]) -> "tuple[object, tuple[object, ...]] | None":
-    """What a key's certification depends on beyond its identity: its code, and what it closes over.
-
-    Two functions with the same code, defaults, bound `self` and closure contents certify alike,
-    which is what lets a key built inline on every call (a fresh lambda, or a bound method,
-    which is a new object on each attribute access) reuse a verdict. `None` for a callable
-    that is not a plain function or method.
-    """
-    func = getattr(key, "__func__", key)
-    code = getattr(func, "__code__", None)
-    if code is None:
-        return None
-    try:
-        cells = tuple(cell.cell_contents for cell in func.__closure__ or ())
-    except ValueError:  # an empty cell: not certifiable anyway, so don't share a verdict
-        return None
-    bound = getattr(key, "__self__", None) if func is not key else None
-    return code, (bound, func.__defaults__, func.__kwdefaults__, func.__globals__, *cells)
-
-
-def _same(left: tuple[object, ...], right: tuple[object, ...]) -> bool:
-    return len(left) == len(right) and all(a is b for a, b in zip(left, right, strict=True))
-
-
 class KeyCertifications:
     """Remembers whether `BindingView.groups` key functions certify, and which were seen before.
 
-    A verdict is cached by the key's code object together with the identities of what it
-    closes over (see `_shape`), so a key built inline on every selector call, such as
-    `view.groups(0, lambda t: t.payload["skill"])` or a bound method, is certified once rather
-    than on every ask. Both caches are weak in the code object or key, so they stay as large as
-    the set of key functions still alive. Other callables are certified on each call.
+    Both caches are keyed weakly on the key object itself, so they stay as large as the set of
+    key functions still alive. Only a key passed a second time by identity is certified (see
+    `seen_before`): one built inline on every call, such as `lambda t: t.payload["skill"]` or a
+    bound method (a new object on each attribute access), is scanned and never certified. A key
+    that cannot be weakly referenced is never indexed.
     """
 
     def __init__(self) -> None:
-        self._verdicts: "weakref.WeakKeyDictionary[object, tuple[tuple[object, ...], bool]]" = (
-            weakref.WeakKeyDictionary()
-        )
+        self._verdicts: "weakref.WeakKeyDictionary[Callable[[Token], object], bool]" = weakref.WeakKeyDictionary()
         self._seen: "weakref.WeakSet[Callable[[Token], object]]" = weakref.WeakSet()
 
     def __len__(self) -> int:
         return len(self._verdicts)
 
     def inline_safe(self, key: Callable[[Token], object]) -> bool:
-        shape = _shape(key)
-        if shape is None:
+        try:
+            known = self._verdicts.get(key)
+        except TypeError:  # not weakly referenceable (or unhashable): certify without caching
             return is_inline_safe(key)
-        code, closed_over = shape
-        known = self._verdicts.get(code)
-        if known is not None and _same(known[0], closed_over):
-            return known[1]
-        verdict = is_inline_safe(key)
-        self._verdicts[code] = (closed_over, verdict)
-        return verdict
+        if known is None:
+            known = is_inline_safe(key)
+            self._verdicts[key] = known
+        return known
 
     def seen_before(self, key: Callable[[Token], object]) -> bool:
         """Whether this same key object was passed before; records it if not.

@@ -722,8 +722,11 @@ class Transition:
                firings across processes. Use [`BindingView.groups`][cpnx.BindingView.groups]
                with a certified key for indexed lookups that stay O(keys) as places deepen.
                Input arcs of a selector transition may not set `key`, `filter`, `join_key` or
-               `consume_all`, and `binding_priority_key` must be unset (`ValueError`). See
-               ADR 0013.
+               `consume_all`, and `binding_priority_key` must be unset: assigning the selector,
+               or `binding_priority_key` afterwards, raises `ValueError`. A conflict introduced
+               later through the arcs (setting one of those on an arc, or reassigning `inputs`)
+               cannot be caught at assignment, so it is reported through `on_error` and the
+               transition reads as not enabled until it is resolved. See ADR 0013.
     """
 
     name: str

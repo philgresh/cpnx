@@ -40,8 +40,9 @@ eligibility is membership (`job.skill in server.skills`):
   that the guard holds. It then consumes by identity, as every binding is. A failed check or a
   raising selector is buffered and reported through `on_error` (off the lock, edge-triggered per
   transition and per view, timed or timing-ignoring: the same failure reports once, then again
-  after that view's ask succeeds or the transition fires), and the transition reads as not
-  enabled. The cause is an `InvalidSelection` for a rejected choice.
+  after that view's ask succeeds or the transition fires; one view stays quiet about a failure
+  the other is still reporting), and the transition reads as not enabled. The cause is an
+  `InvalidSelection` for a rejected choice or a conflict.
 - **Enablement.** The selector is the probe: `_binding_exists` asks it too. A transition with a
   selector is volatile (ADR 0006), so every reconcile asks it again. Before asking, the engine
   checks each arc's count and settle window, so an arc that cannot be met never reaches the
@@ -59,9 +60,10 @@ eligibility is membership (`job.skill in server.skills`):
   lambda on every call pays a rebuild rather than leaking indexes. An index is built only for a
   key object passed a second time, so a key built inline on every call (a fresh lambda, or a
   bound method, which is a new object on each access) is keyed by a scan, not by rebuilding an
-  index over the whole place on each ask. Certification verdicts are cached weakly by the key's
-  code object and the identities of what it closes over, so such keys are certified once. A transition's indexes are
-  released when its arc moves to another place or its selector is cleared. A selector assigned to a
+  index over the whole place on each ask; such a key is never certified either. Verdicts for
+  keys passed again are cached weakly on the key object. A transition's indexes are
+  released when its arc moves to another place, when its selector is cleared or the transition is
+  replaced, and while a conflict keeps the selector from being asked. A selector assigned to a
   transition already in a net is picked up the next time the transition is evaluated or chosen:
   the scheduler is rebuilt and any `join_key` index it had is released. An uncertified key,
   or a place type other than `Place`, is keyed on each call.
