@@ -16,6 +16,18 @@ Transitions fire work over the thread pool; arcs connect them to places.
 
 ::: cpnx.BindingPolicy
 
+## External binding selection
+
+A [`binding_selector`][cpnx.Transition] lets outside logic choose the tokens a transition binds, in place of the product search and `BindingPolicy`: a dispatcher's policy (shortest queue, skill match, random among eligible servers) is often what a simulation studies, and it rarely fits a single sort key. The selector receives a read-only `BindingView` of the tokens each input arc could take, draws any randomness from `view.random`, and returns one choice per arc; the engine checks it and fires exactly those tokens. See [ADR 0013](https://github.com/philgresh/cpnx/blob/main/docs/adr/0013-binding-selector.md).
+
+::: cpnx.BindingView
+
+::: cpnx.TokenGroup
+
+::: cpnx.BindingSelector
+
+::: cpnx.InvalidSelection
+
 ## Retry scheduling
 
 `RetryPolicy` says how long a rolled-back data token waits before each retry: capped exponential backoff with optional full jitter, the shape recommended by the AWS Builders' Library's [Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/). Attach one per transition ([`Transition.retry_policy`][cpnx.Transition]) — retry behaviour belongs to the dependency a transition talks to, not to the net — and a transition that declares none inherits [`PetriNet.retry_policy`][cpnx.PetriNet]. How *many* times it retries before dead-lettering stays [`Transition.max_retries`][cpnx.Transition].

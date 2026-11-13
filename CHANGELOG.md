@@ -114,6 +114,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself may still be running on its worker. Any other `BaseException` from an inline action,
   such as `asyncio.CancelledError`, fails the firing as usual (an attempt is counted, and it
   can dead-letter) and then propagates out of the drive. `step()`, `run()` and the default drive are unchanged.
+- **`Transition.binding_selector` lets outside logic choose the tokens a transition binds**
+  ([#80](https://github.com/philgresh/cpnx/issues/80),
+  [ADR 0013](https://github.com/philgresh/cpnx/blob/main/docs/adr/0013-binding-selector.md)).
+  The selector gets a read-only [`BindingView`][cpnx.BindingView] of the tokens each input arc
+  could take (lazy, plus `groups`/`group` lookups served from a place index when the key
+  certifies) and a `view.random` stream seeded from the net's seed, the transition and its
+  firing count. It returns one choice per arc, or `None`. The engine checks that the tokens are
+  available, distinct and pass the guard, then fires exactly those; an invalid choice is
+  reported through `on_error` and does not fire. On #80's dispatcher (100 servers, 13 skills), a
+  selector that picks uniformly among all eligible pairs costs about the same per firing at
+  1 000, 2 000 and 4 000 waiting jobs (×0.96, ×1.01), while `RANDOM`'s roughly doubles to
+  about 2.2× the selector's, and its
+  first pick over 200 seeds ranges over the whole queue where `RANDOM`'s stays within the first
+  10 jobs. `BindingPolicy` now documents that truncation. New benchmark:
+  `benchmarks/bench_dispatch_selector.py`. `Place.holds_available` is new too.
 - **`InputArc.join_key` joins input arcs on equal keys, and a join with no match no longer
   walks every candidate** ([#64](https://github.com/philgresh/cpnx/issues/64),
   [ADR 0010](https://github.com/philgresh/cpnx/blob/main/docs/adr/0010-equi-join-index.md)).

@@ -529,6 +529,28 @@ class _JoinGroup:
     def __len__(self) -> int:
         return self._end
 
+    @property
+    def head(self) -> _JoinEntry:
+        """The sort position of the group's first token, which orders groups by the place's read order."""
+        return self._entries[0]
+
+    def token_at(self, position: int) -> Token:
+        """The token of entry *position* (``0 <= position < len(self)``), for random access.
+
+        Read under the engine lock, while the marking is fixed, every entry of the view is a
+        stored token, so this is one list index and one dict lookup. If the place was changed
+        directly meanwhile (see the class docstring), a position may name a later token, or
+        raise `IndexError` when it is past the shifted list or its token has left; a position
+        cannot be skipped as `__iter__` skips. The engine re-checks a chosen token before firing.
+        """
+        if not 0 <= position < self._end:
+            raise IndexError(position)
+        entry = self._entries[position]
+        token = (self._timed if entry[0] else self._ready).get(entry[2])
+        if token is None:
+            raise IndexError(f"the token at position {position} left the place while it was read")
+        return token
+
     def __iter__(self) -> "Iterator[tuple[_JoinEntry, Token]]":
         ready, timed, cut = self._ready, self._timed, self._cut
         last: _JoinEntry | tuple[()] = ()
@@ -1248,6 +1270,19 @@ class Place:
                 )
             self._store.remove_identity(tokens)
             return tokens
+
+    def holds_available(self, tokens: list[Token], model_time: float | None = None) -> bool:
+        """Return whether every token in *tokens* is stored here and available at the effective time.
+
+        The check [`retrieve_specific`][cpnx.Place.retrieve_specific] makes before it removes
+        anything, without raising or removing: O(len(tokens)), however many tokens are stored.
+        It does not check that *tokens* are distinct.
+        """
+        with self._lock:
+            t_limit = model_time if model_time is not None else time.monotonic()
+            if any(t.available_at > t_limit for t in tokens):
+                return False
+            return not self._store.missing_identities(set(map(id, tokens)))
 
     def retrieve_all(self, model_time: float | None = None) -> list[Token]:
         """Remove and return every currently-available token, leaving not-yet-available tokens behind.
