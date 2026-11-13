@@ -1,6 +1,6 @@
 # ADR 0013 — Let outside logic choose a transition's binding
 
-- **Status:** Proposed
+- **Status:** Accepted — shipped in 0.8.0 via [#84](https://github.com/philgresh/cpnx/pull/84)
 - **Date:** 2026-11-10
 - **Relates to:** [0001](0001-combinatorial-binding-search.md) (the bounded product search and
   `BindingPolicy`), [0003](0003-inline-execution-and-string-removal.md) (callables that run under
