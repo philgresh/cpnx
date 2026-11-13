@@ -9,16 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Building a transition no longer re-parses the module that defines its callables.** The
-  purity check, the linter and the certifier each parsed the callable's whole source file and walked
-  its whole tree for every guard, key, filter and action, on every transition built. They now share
-  one parse per file (parsed again whenever the file's bytes change, and kept for the 256 files used
-  last) and look each callable's node up once. One shared-place property-test example (a net built
-  from a 2,400-line test module) went from ~350 ms to ~1 ms, and the full test suite from ~5 min to
-  ~20 s on 4 cores. Source files are now read as bytes, so a module with a PEP 263 coding cookie
-  (e.g. `latin-1`) and non-ASCII text no longer makes the linter or the certifier raise
-  `UnicodeDecodeError`, and the purity check reads it instead of rejecting it.
-
 - **The purity check now fails closed, and notebook callables reach every gate**
   ([#90](https://github.com/philgresh/cpnx/issues/90)). These follow from the fixes of the
   same issue under **Fixed** below, and can break code that worked:
@@ -48,11 +38,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     source: a default that *names* a `list`, `dict` or `set` (`def guard(t, s=STATE)`) is
     rejected like a literal one, and a function default whose source can be read must pass
     the purity check itself (the message names the parameter, and one whose source no longer
-    parses is refused). Defaults are followed through `functools.partial` and bound methods, and
-    a forbidden builtin held as one (`run=print`, `run=os.system`) is refused like a call to it
-    in the body. Certification holds each
-    default to the rule for a global read, allowing of the builtins only those a guard may
-    call (`len`, not `print`) and the methods of immutable builtin types (`str.lower`).
+    parses is refused). Defaults are followed through `functools.partial` and bound methods,
+    and a forbidden builtin held as one (`run=print`, `run=os.system`) is refused like a call
+    to it in the body. Certification holds each default to the rule for a global read,
+    allowing of the builtins only those a guard may call (`len`, not `print`) and the methods
+    of immutable builtin types (`str.lower`).
+
+- **The shared source parse keeps the 256 files used last**
+  ([#90](https://github.com/philgresh/cpnx/issues/90)). It kept every file it read, so a
+  notebook session, which gives each cell run a file name of its own, grew it without bound.
+
+### Fixed
+
+- **Without column positions, an impure lambda beside a clean one is no longer certified**
+  ([#90](https://github.com/philgresh/cpnx/issues/90)). On Python 3.10, or under
+  `-X no_debug_ranges`, a lambda is told from the others on its line by the names its code
+  carries. A generator expression, comprehension or lambda in a branch the compiler drops
+  (`print(b) if 1 else (w for w in b)`) leaves no code object, so its names reach no code,
+  and the lambda's own node was ruled out. Its clean neighbour was then read instead:
+  `lambda b: print(b) if 1 else (w for w in b)` beside `lambda b: True` passed the purity
+  check and was certified to run inline. Names inside a nested scope now count only when the
+  code has a code object for each nested scope, that is, when no branch was dropped; so
+  lambdas that 0.8.0 told apart by names inside live generator expressions are still told
+  apart. If no node left accounts for every global and attribute name the code uses, the
+  nodes on the line that do are read instead, and if none does, the callable is not found.
+  0.8.0 listed this under **Known issues**.
+
+- **The purity check rejects a callable whose own body it cannot find, instead of reading its
+  source text** ([#90](https://github.com/philgresh/cpnx/issues/90)). It used to fall back
+  to `inspect.getsource`, cut the text at the first `=`, and let the callable through when
+  the rest did not parse: in a notebook cell, `guard=lambda b: print(b))` on the last line of
+  a call passed. Callables are now looked up in the source held for their code, file or not,
+  so a notebook cell, a Python 3.13+ REPL entry and a module in a zip archive are read as
+  precisely as a file, and certification and the lint now see them too. A callable wrapped
+  with `functools.wraps` in another module is now looked up in its own file rather than the
+  wrapper's, so the lint sees its body (the purity check and certification refuse it). 0.8.0
+  listed this under **Known issues**.
+
+- **The gates judge a callable only by source that compiles to its very code**
+  ([#90](https://github.com/philgresh/cpnx/issues/90)). The source found for a callable is compiled
+  (once per file) and must hold a code object equal to the one that runs: the same instructions,
+  constants, names and flags. Positions are not compared, since two patch releases of one Python can
+  record them differently in a `.pyc` both load. Before, a file edited since import was read as it
+  now is: an impure lambda whose line now held a clean `def` was certified by that `def`, and a
+  stale `.pyc` (a same-size edit within one mtime tick) ran old code that was judged by the new
+  text. Code compiled under a file name with no file (`exec(compile(src, "rules.py", "exec"),
+  module.__dict__)`) was judged by the module's own source, which `inspect` files under that name: a
+  clean lambda on the same line certified an impure one. All of these are now "source unavailable".
+  `inspect` is no longer asked for the start line, so a lookup files no source in `linecache`.
+  Default argument values run where the function is defined, not in its code, so an edit to a
+  default alone leaves the code equal: the purity check and certification now also check the default
+  values the callable holds. The purity check rejects a `list`, `dict` or `set` and checks a Python
+  function as a callable of its own (once each, so defaults that hold each other end; one with no
+  source to read is left to certification); certification holds each value to the rule for a global
+  read (immutable, a builtin a guard may call or a method of an immutable builtin type, or a
+  certifying callable), and an unhashable callable is not certified rather than raising. A global
+  read is now held to that same rule, so a global bound to `len` or `str.lower` certifies. The
+  compile allows top-level `await`, as a notebook cell may use it, and it and the parse before it
+  are silent: a warning elsewhere in the file (`x is 1`, an invalid escape such as `'\d+'`) is
+  neither printed again nor, under an "error" filter, a reason to refuse the file's callables. The
+  silencing is one filter, for that file alone, put into the filter list in use and taken out again,
+  so another thread's filters and warnings are left alone. A NaN constant (`1e999 - 1e999`, folded)
+  is compared by its kind, as two compiles make two NaNs that are not equal. Only a Python function
+  (or a bound method of one) is read as its code: a callable object that carries or forwards a
+  `__code__` or `__func__` is "source unavailable", as before. The lint reads a decorated
+  callable's own body even where the wrapper is not a Python function (`functools.lru_cache`).
+
+## [0.8.0] — 2026-11-13
+
+### Changed
+
+- **Building a transition no longer re-parses the module that defines its callables.** The
+  purity check, the linter and the certifier each parsed the callable's whole source file and
+  walked its whole tree for every guard, key, filter and action, on every transition built.
+  They now share one parse per file (parsed again whenever the file's bytes change) and look
+  each callable's node up once. One shared-place property-test example (a net built from a
+  2,400-line test module) went from ~350 ms to ~1 ms, and the full test suite from ~5 min to
+  ~20 s on 4 cores. Source files are now read as bytes, so a module with a PEP 263 coding
+  cookie (e.g. `latin-1`) and non-ASCII text no longer makes the linter or the certifier raise
+  `UnicodeDecodeError`, and the purity check takes its precise path on it instead of the
+  stricter `getsource` fallback.
 
 - **Two `consume_all` input arcs on one place are never enabled, and adding such a transition
   warns** ([#75](https://github.com/philgresh/cpnx/issues/75)). Each would drain what the
@@ -240,85 +305,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Without column positions, an impure lambda beside a clean one is no longer certified**
-  ([#90](https://github.com/philgresh/cpnx/issues/90)). On Python 3.10, or under
-  `-X no_debug_ranges`, a lambda is told from the others on its line by the names its code
-  carries. A generator expression, comprehension or lambda in a branch the compiler drops
-  (`print(b) if 1 else (w for w in b)`) leaves no code object, so its names reach no code,
-  and the lambda's own node was ruled out. Its clean neighbour was then read instead:
-  `lambda b: print(b) if 1 else (w for w in b)` beside `lambda b: True` passed the purity
-  check and was certified to run inline. Names inside a nested scope now count only when the
-  code has a code object for each nested scope, that is, when no branch was dropped; so
-  lambdas that `main` told apart by names inside live generator expressions are still told
-  apart. If no node left accounts for every global and attribute name the code uses, the
-  nodes on the line that do are read instead, and if none does, the callable is not found.
-
-- **The purity check rejects a callable whose own body it cannot find, instead of reading its
-  source text** ([#90](https://github.com/philgresh/cpnx/issues/90)). It used to fall back
-  to `inspect.getsource`, cut the text at the first `=`, and let the callable through when
-  the rest did not parse: in a notebook cell, `guard=lambda b: print(b))` on the last line of
-  a call passed. Callables are now looked up in the source held for their code, file or not,
-  so a notebook cell, a Python 3.13+ REPL entry and a module in a zip archive are read as
-  precisely as a file, and certification and the lint now see them too. A callable wrapped
-  with `functools.wraps` in another module is now looked up in its own file rather than the
-  wrapper's, so the lint sees its body (the purity check and certification refuse it).
-
-- **The gates judge a callable only by source that compiles to its very code**
-  ([#90](https://github.com/philgresh/cpnx/issues/90)). The source found for a callable is compiled
-  (once per file) and must hold a code object equal to the one that runs: the same instructions,
-  constants, names and flags. Positions are not compared, since two patch releases of one Python can
-  record them differently in a `.pyc` both load. Before, a file edited since import was read as it
-  now is: an impure lambda whose line now held a clean `def` was certified by that `def`, and a
-  stale `.pyc` (a same-size edit within one mtime tick) ran old code that was judged by the new
-  text. Code compiled under a file name with no file (`exec(compile(src, "rules.py", "exec"),
-  module.__dict__)`) was judged by the module's own source, which `inspect` files under that name: a
-  clean lambda on the same line certified an impure one. All of these are now "source unavailable".
-  `inspect` is no longer asked for the start line, so a lookup files no source in `linecache`.
-  Default argument values run where the function is defined, not in its code, so an edit to a
-  default alone leaves the code equal: the purity check and certification now also check the default
-  values the callable holds. The purity check rejects a `list`, `dict` or `set` and checks a Python
-  function as a callable of its own (once each, so defaults that hold each other end; one with no
-  source to read is left to certification); certification holds each value to the rule for a global
-  read (immutable, a builtin a guard may call or a method of an immutable builtin type, or a
-  certifying callable), and an unhashable callable is not certified rather than raising. A global
-  read is now held to that same rule, so a global bound to `len` or `str.lower` certifies. The
-  compile allows top-level `await`, as a notebook cell may use it, and it and the parse before it
-  are silent: a warning elsewhere in the file (`x is 1`, an invalid escape such as `'\d+'`) is
-  neither printed again nor, under an "error" filter, a reason to refuse the file's callables. The
-  silencing is one filter, for that file alone, put into the filter list in use and taken out again,
-  so another thread's filters and warnings are left alone. A NaN constant (`1e999 - 1e999`, folded)
-  is compared by its kind, as two compiles make two NaNs that are not equal. Only a Python function
-  (or a bound method of one) is read as its code: a callable object that carries or forwards a
-  `__code__` or `__func__` is "source unavailable", as before. The lint reads a decorated
-  callable's own body even where the wrapper is not a Python function (`functools.lru_cache`).
-
-- **A callable that shares its source line with another is now checked against its own body**
-  ([#90](https://github.com/philgresh/cpnx/issues/90)). The purity check, the side-effect lint
-  and inline-safety certification found a callable in its source file by the line it starts on
-  alone, so two lambdas on one line were both read as the last one. With `key=lambda t:
-  print(t), filter=lambda t: t.payload["n"] > 0` on one line, the `key` passed the purity
-  check and was certified to run inline, unbounded, because the `filter` is clean; with the
-  two swapped, the clean one was rejected. The same held for a lambda and the lambda it
-  returns, and for a `def` with a lambda default on its first line, which was read as that
-  lambda. On Python 3.11 and later each callable is now found by where its own code lies
-  (`code.co_positions`). Python 3.10 records no columns, and neither does `-X
-  no_debug_ranges`: there a callable is told from the others on its line by what it is (a
-  `def` by its name, a lambda as a lambda) and by the names its code carries, so a guard
+- **A callable that shares its source line with another is now checked against its own body.**
+  The purity check, the side-effect lint and inline-safety certification found a callable in
+  its source file by the line it starts on alone, so two lambdas on one line were both read
+  as the last one. With `key=lambda t: print(t), filter=lambda t: t.payload["n"] > 0` on one
+  line, the `key` passed the purity check and was certified to run inline, unbounded, because
+  the `filter` is clean; with the two swapped, the clean one was rejected. The same held for a
+  lambda and the lambda it returns, and for a `def` with a lambda default on its first line,
+  which was read as that lambda. On Python 3.11 and later each callable is now found by where
+  its own code lies (`code.co_positions`). Python 3.10 records no columns, and neither does
+  `-X no_debug_ranges`: there a callable is told from the others on its line by what it is
+  (a `def` by its name, a lambda as a lambda) and by the names its code carries, so a guard
   beside an `action=lambda b: print(b)` is still checked alone. Only lambdas on one line that
-  use the same names cannot be told apart there. Those are held to what any of them does: one
-  that fails the purity check or certification fails it for the others, each is reported with
-  the lint findings of all, and the error, the certification reason and the lint message say
-  that N functions start on that line and to put them on separate lines.
+  use the same names cannot be told apart there. Those are held to what any of them does:
+  one that fails the purity check or certification fails it for the others, each is
+  reported with the lint findings of all, and the error, the certification reason and the
+  lint message say that N functions start on that line and to put them on separate lines.
 
   A decorated `def` was also read as some other function: as a lambda among its decorator's
   arguments, or, inside a function, as the function around it, whose locals then counted as
   its own, so a read of an enclosing variable certified. On every Python it is now found as
   itself, starting from its first decorator, as its code does. It is not certified ("decorated
-  callable"), the purity check refuses it (see **Changed**), and the lint reads its own body.
-  That also covers a decorated `def` outside any function, which was not found before: the
-  purity check then read its source text, which gives up at the first `=` and let a `print`
-  or `open` in the body through, and the lint reported nothing. The lint now reports such a
-  callable's findings.
+  callable"), and the purity check and the lint read its own body. That also covers a
+  decorated `def` outside any function, which was not found before: the purity check then read
+  its source text, which gives up at the first `=` and let a `print` or `open` in the body
+  through, and the lint reported nothing. The lint now reports such a callable's findings,
+  so a decorated guard may start to warn, or to raise under strict lint.
 
 - **Certification no longer admits three callables that run more than it checked.** A
   certified guard, key or filter runs inline, so these were real gaps:
@@ -537,6 +549,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#65](https://github.com/philgresh/cpnx/issues/65)). The incremental scheduler also folds
   each dirty place's dependents into its re-check set with one set union over a precomputed
   name set, 3–5× faster for that step (22 µs instead of 83 µs with 1 024 dependents).
+
+### Known issues
+
+- **Without column positions, an impure lambda can be certified by a clean lambda on the same
+  line** ([#90](https://github.com/philgresh/cpnx/issues/90)). On Python 3.10, or under
+  `-X no_debug_ranges`, a lambda is told from the others on its line by the names its code
+  carries. A generator expression, comprehension or lambda in a branch the compiler drops
+  (`lambda b: print(b) if 1 else (w for w in b)`) leaves its names out of the code, so the
+  lambda's own node is ruled out and a clean neighbour on the same line is judged instead: the
+  impure lambda passes the purity check and is certified to run inline. 0.7.0 rejected this
+  shape; Python 3.11 and later with column positions are not affected. Until it is fixed, put
+  each guard, key and filter lambda on its own line.
+- **A callable whose source cannot be located passes the purity check**
+  ([#90](https://github.com/philgresh/cpnx/issues/90)). The purity check then falls back to
+  the callable's source text and lets the callable through when that text does not parse. A
+  class passed as a callable, a function from a module edited after it was imported, and a
+  lambda on the last line of a call in a notebook cell can reach it. Certification does not
+  certify these, so they never run inline. 0.7.0 behaved the same way.
 
 ## [0.7.0] — 2026-10-20
 

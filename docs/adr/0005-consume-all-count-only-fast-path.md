@@ -1,6 +1,6 @@
 # ADR 0005 — Count-only fast path for `consume_all` enablement
 
-- **Status:** Accepted — merged in [#40](https://github.com/philgresh/cpnx/pull/40) (unreleased; after 0.4.1)
+- **Status:** Accepted — merged in [#40](https://github.com/philgresh/cpnx/pull/40) (shipped in 0.5.0)
 - **Date:** 2026-07-27
 - **Deciders:** cpnx maintainers
 - **Related:** `docs/adr/0001-combinatorial-binding-search.md` (guard-free fast path, binding
