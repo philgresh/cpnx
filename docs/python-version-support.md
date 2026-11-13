@@ -17,7 +17,7 @@ release there was **no `sys.version_info` gating anywhere in `src/`**.
 | module | AST surface | other introspection |
 | --- | --- | --- |
 | `cpnx/certification.py` | 34 distinct `ast.*` names, 46 references | `func.__code__` (source comes from `sandbox._callable_nodes`) |
-| `cpnx/sandbox.py` | 17 distinct `ast.*` names | `inspect.getsource{,file,lines}`, `code.co_positions()` where it exists |
+| `cpnx/sandbox.py` | 24 distinct `ast.*` names | `inspect.getsource{file,lines}`, `linecache`, `code.co_positions()` where it exists |
 | `cpnx/linting.py` | 7 distinct `ast.*` names | `inspect.currentframe` + `f_back` walk, `code.co_filename`, `ast.unparse` |
 
 All three decide by matching on node **classes**. That makes exactly two kinds of release
@@ -302,7 +302,12 @@ tripping a Python-level deprecation.
   `-X no_debug_ranges` on any version; there it goes by what the code object does say: its
   name (a `def`'s own, `<lambda>` for a lambda) and the names it carries (`co_names` and the
   variable tables, through nested code objects). A lambda whose body uses a name the code
-  lacks is ruled out. Lambdas on one line that use the same names are left; each is held to
+  lacks is ruled out. Names inside a nested scope (a lambda, generator expression or
+  comprehension) do not count: in a branch the compiler drops, no code object is made for
+  one. On 3.10 and 3.11 that covers list, set and dict comprehensions as well; PEP 709
+  inlines them from 3.12. If no node left uses every global and attribute name the code
+  does, every function on the line is read ([#90](https://github.com/philgresh/cpnx/issues/90)).
+  REPL input is read from `linecache` from 3.13, when the REPL started keeping it. Lambdas on one line that use the same names are left; each is held to
   what any of them does, and the error, certification reason or lint message says that
   several functions start on the line. `tests/test_same_line_callables.py` runs one case
   in a child interpreter under `-X no_debug_ranges`, so a change in how CPython reports a

@@ -85,6 +85,12 @@ def top_impure(tokens):
     count = len(tokens)
     print(count)
     return count == 1
+clean_g, dead_genexp = (lambda b: True), (lambda b: print(b) if 1 else (ww for ww in b))
+clean_l, dead_listcomp = (lambda b: True), (lambda b: [ww for ww in b] if 0 else print(b))
+clean_d, dead_dictcomp = (lambda b: True), (lambda b: print(b) or 0 and {ww: 1 for ww in b})
+clean_n, dead_lambda = (lambda b: True), (lambda b: 0 and (lambda: ww) or print(b))
+class Mangles:
+    reads, prints = (lambda s: s.__x), (lambda s: print(s))
 """
 
 _names = itertools.count()
@@ -327,6 +333,37 @@ def test_without_columns_clean_lambdas_on_one_line_still_pass_and_certify(case, 
         verify_callable_purity(func)
         assert certify(func).certified
         assert lint_callable(func) == []
+
+
+_DEAD_BRANCHES = ("dead_genexp", "dead_listcomp", "dead_dictcomp", "dead_lambda")
+
+
+@pytest.mark.parametrize("name", _DEAD_BRANCHES)
+def test_a_nested_scope_in_a_dead_branch_does_not_rule_out_its_lambda(case, name, either_way):
+    # No code object is made for a generator expression, comprehension or lambda in a branch
+    # the compiler drops, so the names inside it reach no code. Counted, they ruled out the
+    # impure lambda's own node, which was then judged by its clean neighbour and certified.
+    func = getattr(case, name)
+    with pytest.raises(PermissionError, match="Forbidden function call 'print'"):
+        verify_callable_purity(func)
+    assert not certify(func).certified
+
+
+def test_without_columns_a_lambda_ruled_out_by_names_falls_back_to_its_whole_line(case, no_columns, monkeypatch):
+    # Should the compiler drop a name some other way, no node left would use every name the
+    # code does. Then every function starting on the line is read, never only the neighbour.
+    real = cpnx.sandbox._lambda_names
+    monkeypatch.setattr(cpnx.sandbox, "_lambda_names", lambda node: real(node) | {"never_compiled"})
+    assert len(cpnx.sandbox._callable_nodes(case.prints)) == 2
+    assert not _is_pure(case.prints)
+    assert not certify(case.prints).certified
+
+
+def test_without_columns_a_mangled_name_still_counts_as_its_own(case, no_columns):
+    # In a class, `s.__x` compiles to `_Mangles__x`; the lambda that reads it is still found alone.
+    assert len(cpnx.sandbox._callable_nodes(case.Mangles.reads)) == 1
+    assert _is_pure(case.Mangles.reads)
+    assert not _is_pure(case.Mangles.prints)
 
 
 @has_columns

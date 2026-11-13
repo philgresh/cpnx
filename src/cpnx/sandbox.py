@@ -1,5 +1,6 @@
 import ast
 import inspect
+import linecache
 import types
 from typing import Callable
 
@@ -106,18 +107,41 @@ def _node_holding(candidates: tuple[ast.AST, ...], anchor: _Position) -> tuple[a
     return (max(holding, key=lambda node: (node.lineno, node.col_offset)),) if holding else ()
 
 
-def _lambda_names(node: ast.Lambda) -> frozenset[str]:
-    """Return the variable and attribute names the body of a lambda uses, nested lambdas included.
+#: The expressions that compile to a code object of their own. In a branch the compiler drops
+#: as unreachable (`x if 1 else (y for y in z)`, `0 and (lambda: z)`), no code object is made
+#: for them, so the names inside them reach no code object at all.
+_NESTED_SCOPES = (ast.Lambda, ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp)
 
-    A name with a leading `__` is left out: inside a class the compiler stores `__x` as
-    `_Class__x`, and `__debug__` is a constant, so neither can be looked for by its spelling.
+
+def _names_in(node: ast.AST, *, nested: bool) -> frozenset[str]:
+    """Return the variable and attribute names used under `node`, with or without nested scopes.
+
+    Without them (`nested=False`), what lies inside a lambda, generator expression or
+    comprehension below `node` is left out.
     """
     names = set()
-    for child in ast.walk(node.body):
+    pending = [node]
+    while pending:
+        child = pending.pop()
         match child:
-            case ast.Name(id=name) | ast.Attribute(attr=name) if not name.startswith("__"):
+            case ast.Name(id=name) | ast.Attribute(attr=name):
                 names.add(name)
+        if nested or not isinstance(child, _NESTED_SCOPES):
+            pending.extend(ast.iter_child_nodes(child))
     return frozenset(names)
+
+
+def _lambda_names(node: ast.Lambda) -> frozenset[str]:
+    """Return the names the body of a lambda uses in its own scope, which its code always carries.
+
+    The compiler records each such name in the lambda's code object, also for a branch it
+    then drops as unreachable. It does not for the names inside a nested scope in such a
+    branch (`_NESTED_SCOPES`), so those are left out: counting them could rule out the
+    lambda's own node. A name with a leading `__` is left out as well: inside a class the
+    compiler stores `__x` as `_Class__x`, and `__debug__` is a constant, so neither can be
+    looked for by its spelling.
+    """
+    return frozenset(name for name in _names_in(node.body, nested=False) if not name.startswith("__"))
 
 
 def _code_names(code: types.CodeType) -> frozenset[str]:
@@ -134,15 +158,50 @@ def _could_be(node: ast.AST, code: types.CodeType, code_names: frozenset[str]) -
 
     A `def` compiles to code of its own name, and no two `def`s start on one line, so the
     name settles it. A lambda compiles to `<lambda>`, and several may share a line. Whatever
-    name a lambda's body uses, the compiler records in its code object or in one nested in
-    it (`co_names` and the variable tables), also for a branch it then drops as unreachable.
-    So a lambda whose body uses a name that `code` does not carry is some other lambda. The
-    converse does not hold: `code` may carry more names than a lambda uses and still not
-    rule it out.
+    name a lambda's body uses in its own scope (`_lambda_names`), the compiler records in its
+    code object (`co_names` and the variable tables), also for a branch it then drops as
+    unreachable. So a lambda whose body uses such a name that `code` does not carry is some
+    other lambda. The converse does not hold: `code` may carry more names than a lambda uses
+    and still not rule it out.
     """
     if isinstance(node, ast.Lambda):
         return code.co_name == "<lambda>" and _lambda_names(node) <= code_names
     return node.name == code.co_name
+
+
+def _global_names(code: types.CodeType) -> frozenset[str]:
+    """Return the global and attribute names (`co_names`) of `code` and the code nested in it."""
+    names = set(code.co_names)
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            names |= _global_names(const)
+    return frozenset(names)
+
+
+def _accounts_for(node: ast.AST, needed: frozenset[str]) -> bool:
+    """Say whether the source under `node` uses every name in `needed`.
+
+    Inside a class the compiler stores a name `__x` as `_Class__x`: that counts as `__x`.
+    """
+    names = _names_in(node, nested=True)
+    return all(name in names or f"__{name.partition('__')[2]}" in names for name in needed)
+
+
+def _plausible(nodes: tuple[ast.AST, ...], code: types.CodeType, starting: tuple[ast.AST, ...]) -> tuple[ast.AST, ...]:
+    """Return `nodes`, or every node in `starting` if none of `nodes` can be the lambda `code` is.
+
+    Every global and attribute name in a lambda's code comes from its own source, so its own
+    node uses them all. If no node left by `_could_be` does, `_could_be` ruled out the
+    lambda's own node, and the lookup falls back to every function that starts on its line.
+    That is never more lenient: the lambda is one of them. A `def` is told by its name alone,
+    which `_could_be` cannot get wrong.
+    """
+    if code.co_name != "<lambda>":
+        return nodes
+    needed = _global_names(code)
+    if any(_accounts_for(node, needed) for node in nodes):
+        return nodes
+    return starting
 
 
 def _first_line(node: ast.AST) -> int:
@@ -163,7 +222,7 @@ class _ParsedSource:
 
     __slots__ = ("source", "tree", "functions", "targets")
 
-    def __init__(self, source: bytes, tree: ast.AST) -> None:
+    def __init__(self, source: bytes | str, tree: ast.AST) -> None:
         self.source = source
         self.tree = tree
         self.functions = [node for node in ast.walk(tree) if isinstance(node, _FUNCTION_NODES)]
@@ -196,12 +255,34 @@ _SOURCE_CACHE: dict[str, _ParsedSource] = {}
 _SOURCE_UNAVAILABLE = (OSError, TypeError, SyntaxError, ValueError)
 
 
-def _parsed_source(path: str) -> _ParsedSource:
-    with open(path, "rb") as handle:
-        source = handle.read()
+def _read_source(path: str, func: Callable, code: types.CodeType) -> bytes | str:
+    """Return the source `func` was defined in: its file's bytes, or the lines `inspect` holds for it.
+
+    Code with no file on disk can still have source that `inspect` finds, and gives the start
+    line from: a notebook cell (registered in `linecache`), a REPL entry (Python 3.13+), or a
+    module loaded from a zip archive (read through its loader). Those lines are read the way
+    `inspect.findsource` reads them, except that a module's loader is asked only for its own
+    file: `linecache` would otherwise file another module's source under this name.
+    """
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError:
+        module = inspect.getmodule(inspect.unwrap(func), path)
+        lines = linecache.getlines(path, module.__dict__ if getattr(module, "__file__", None) == path else None)
+        from_code = getattr(linecache, "_getlines_from_code", None)
+        if not lines and path.startswith("<") and from_code is not None:
+            lines = from_code(code)
+        if not lines:
+            raise
+        return "".join(lines)
+
+
+def _parsed_source(path: str, func: Callable, code: types.CodeType) -> _ParsedSource:
+    source = _read_source(path, func, code)
     cached = _SOURCE_CACHE.get(path)
     if cached is None or cached.source != source:
-        # Bytes, so ast.parse honours a PEP 263 coding cookie.
+        # Bytes where there is a file, so ast.parse honours a PEP 263 coding cookie.
         cached = _SOURCE_CACHE[path] = _ParsedSource(source, ast.parse(source, filename=path))
     return cached
 
@@ -221,7 +302,9 @@ def _callable_nodes(func: Callable) -> tuple[ast.AST, ...]:
       each their own node.
     - Without them, the candidates that cannot be `func` are dropped (`_could_be`): a `def`
       of another name, a lambda where `func` is a `def`, and a lambda whose body uses a name
-      that `func`'s code does not carry. What is left is usually one node. Where it is
+      that `func`'s code does not carry in its own scope (`_lambda_names`). Should that
+      leave no node that uses every name `func`'s code does, all candidates are kept
+      (`_plausible`). What is left is usually one node. Where it is
       several (lambdas on one line, none using a name the others' code lacks), they cannot be
       told apart and all are returned: `func` is one of them, so a caller that holds `func`
       to what any of them does is never more lenient than the truth.
@@ -232,7 +315,7 @@ def _callable_nodes(func: Callable) -> tuple[ast.AST, ...]:
         func: The callable to locate.
 
     Returns:
-        The candidate nodes; empty when `func` has no source file or no function node is it.
+        The candidate nodes; empty when `func` has no code of its own or no function node is it.
 
     Raises:
         OSError: If the source cannot be found or read.
@@ -240,17 +323,20 @@ def _callable_nodes(func: Callable) -> tuple[ast.AST, ...]:
         SyntaxError: If the source cannot be parsed.
         ValueError: If the source cannot be decoded.
     """
-    path = inspect.getsourcefile(func)
-    _, start_line = inspect.getsourcelines(func)
     code = _own_code(func)
-    if not path or code is None:
+    if code is None:
         return ()
+    # `getsourcelines` reads the function a decorator wraps (`__wrapped__`), as `_own_code`
+    # does, so the file is that function's too. A REPL entry has no source file, only lines
+    # that `linecache` holds under the code's own file name.
+    _, start_line = inspect.getsourcelines(func)
+    path = inspect.getsourcefile(inspect.unwrap(func)) or code.co_filename
     anchor = _body_anchor(func)
-    nodes = _parsed_source(path).locate(start_line, anchor)
+    nodes = _parsed_source(path, func, code).locate(start_line, anchor)
     if anchor is not None:
         return nodes
     code_names = _code_names(code)
-    return tuple(node for node in nodes if _could_be(node, code, code_names))
+    return _plausible(tuple(node for node in nodes if _could_be(node, code, code_names)), code, nodes)
 
 
 def _alike_note(nodes: tuple[ast.AST, ...]) -> str:
@@ -277,18 +363,7 @@ def _callable_nodes_or_empty(func: Callable) -> tuple[ast.AST, ...]:
 
 _FORBIDDEN_FUNCS = frozenset({"open", "print", "eval", "exec", "__import__", "sleep"})
 
-# Two deliberately different attribute denylists, keyed on how precisely we could
-# locate the callable's source:
-#   * _FORBIDDEN_ATTRS — used when we parsed the whole source file and isolated the
-#     exact function/lambda node (_try_verify_via_sourcefile). Precise context, so a
-#     tight denylist suffices.
-#   * _FALLBACK_FORBIDDEN_ATTRS — used when we could only recover a mangled source
-#     snippet via inspect.getsource (_try_verify_via_getsource). Less certainty about
-#     what we're looking at, so we additionally ban common network I/O method names
-#     (get/post/request/connect). Keep this a SUPERSET of _FORBIDDEN_ATTRS; do not
-#     collapse the two — the fallback is intentionally stricter.
 _FORBIDDEN_ATTRS = frozenset({"sleep", "system", "popen", "urlopen"})
-_FALLBACK_FORBIDDEN_ATTRS = _FORBIDDEN_ATTRS | frozenset({"get", "post", "request", "connect"})
 
 
 def _verify_function_defaults(args: ast.arguments) -> None:
@@ -297,11 +372,11 @@ def _verify_function_defaults(args: ast.arguments) -> None:
             raise PermissionError("Mutable default argument in CPN callable introduces hidden state between firings.")
 
 
-def _verify_node_purity(node: ast.AST, forbidden_attrs: frozenset[str]) -> None:
+def _verify_node_purity(node: ast.AST) -> None:
     match node:
         case ast.Call(func=ast.Name(id=name)) if name in _FORBIDDEN_FUNCS:
             raise PermissionError(f"Forbidden function call '{name}' inside CPN callable.")
-        case ast.Call(func=ast.Attribute(attr=attr)) if attr in forbidden_attrs:
+        case ast.Call(func=ast.Attribute(attr=attr)) if attr in _FORBIDDEN_ATTRS:
             raise PermissionError(f"Forbidden attribute call '.{attr}' inside CPN callable.")
         case ast.Import() | ast.ImportFrom():
             raise PermissionError("Imports are forbidden inside CPN callables.")
@@ -311,60 +386,9 @@ def _verify_node_purity(node: ast.AST, forbidden_attrs: frozenset[str]) -> None:
             _verify_function_defaults(args)
 
 
-def _verify_ast_purity(tree: ast.AST, is_fallback: bool = False) -> None:
-    forbidden_attrs = _FALLBACK_FORBIDDEN_ATTRS if is_fallback else _FORBIDDEN_ATTRS
+def _verify_ast_purity(tree: ast.AST) -> None:
     for node in ast.walk(tree):
-        _verify_node_purity(node, forbidden_attrs)
-
-
-def _try_verify_via_sourcefile(func: Callable) -> bool:
-    nodes: tuple[ast.AST, ...] = ()
-    try:
-        nodes = _callable_nodes(func)
-        for node in nodes:
-            _verify_ast_purity(node)
-        if nodes:
-            return True
-    except PermissionError as exc:
-        note = _alike_note(nodes)
-        if note:
-            raise PermissionError(f"{exc}{note}") from None
-        raise
-    except Exception:
-        pass
-    return False
-
-
-def _clean_fallback_source(source: str) -> str:
-    if source.endswith(","):
-        source = source[:-1]
-    if "=" in source and not source.startswith("def "):
-        parts = source.split("=", 1)
-        # After splitting on the first "=", the comparison-operator char (>, <, !)
-        # is the last char of parts[0].  A bare "=" (for "==") also stays.
-        if not parts[0].rstrip().endswith((">", "<", "!", "=")):
-            source = parts[1].strip()
-    return source
-
-
-def _try_verify_via_getsource(func: Callable) -> None:
-    try:
-        import textwrap
-
-        source = textwrap.dedent(inspect.getsource(func)).strip()
-        source = _clean_fallback_source(source)
-        tree = ast.parse(source)
-        _verify_ast_purity(tree, is_fallback=True)
-    except PermissionError:
-        raise
-    except (OSError, TypeError) as exc:
-        raise PermissionError(
-            f"Cannot verify purity of {func!r}: source unavailable. "
-            "Use a plain lambda or def-statement function instead."
-        ) from exc
-    except Exception:
-        # Source cannot be retrieved or parsed (e.g. compiled built-in, REPL lambda) — allow with caution.
-        pass
+        _verify_node_purity(node)
 
 
 def verify_callable_purity(func: Callable) -> None:
@@ -384,7 +408,28 @@ def verify_callable_purity(func: Callable) -> None:
     - Mutable default arguments (``list``, ``dict``, or ``set`` literals as
       parameter defaults), which would introduce hidden persistent state between
       transition firings.
+
+    It also raises when the callable's own ``def`` or ``lambda`` cannot be found in its
+    source: a builtin, a ``functools.partial``, a class or other callable object, code with
+    no source (``exec`` of a string, ``python -c``), or a source file edited since it was
+    loaded so that no function starts on the callable's line any more. A check that cannot
+    see the body passes nothing.
     """
-    if _try_verify_via_sourcefile(func):
-        return
-    _try_verify_via_getsource(func)
+    try:
+        nodes = _callable_nodes(func)
+    except Exception as exc:
+        raise _source_unavailable(func) from exc
+    if not nodes:
+        raise _source_unavailable(func)
+    try:
+        for node in nodes:
+            _verify_ast_purity(node)
+    except PermissionError as exc:
+        raise PermissionError(f"{exc}{_alike_note(nodes)}") from None
+
+
+def _source_unavailable(func: Callable) -> PermissionError:
+    return PermissionError(
+        f"Cannot verify purity of {func!r}: source unavailable. "
+        "Use a plain lambda or def-statement function, in a file or a notebook cell, instead."
+    )

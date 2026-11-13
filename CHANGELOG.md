@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ~20 s on 4 cores. Source files are now read as bytes, so a module with a PEP 263 coding
   cookie (e.g. `latin-1`) and non-ASCII text no longer makes the linter or the certifier raise
   `UnicodeDecodeError`, and the purity check takes its precise path on it instead of the
-  stricter `getsource` fallback.
+  `getsource` fallback.
 
 - **Two `consume_all` input arcs on one place are never enabled, and adding such a transition
   warns** ([#75](https://github.com/philgresh/cpnx/issues/75)). Each would drain what the
@@ -205,6 +205,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fix below as well.
 
 ### Fixed
+
+- **Without column positions, an impure lambda beside a clean one is no longer certified**
+  ([#90](https://github.com/philgresh/cpnx/issues/90)). On Python 3.10, or under
+  `-X no_debug_ranges`, a lambda is told from the others on its line by the names its code
+  carries. A generator expression, comprehension or lambda in a branch the compiler drops
+  (`print(b) if 1 else (w for w in b)`) leaves no code object, so its names reach no code,
+  and the lambda's own node was ruled out. Its clean neighbour was then read instead:
+  `lambda b: print(b) if 1 else (w for w in b)` beside `lambda b: True` passed the purity
+  check and was certified to run inline. Names inside a nested scope no longer count, and
+  if no node left accounts for every global and attribute name the code uses, every function
+  on the line is read.
+
+- **The purity check rejects a callable whose own body it cannot find, instead of reading its
+  source text** ([#90](https://github.com/philgresh/cpnx/issues/90)). It used to fall back
+  to `inspect.getsource`, cut the text at the first `=`, and let the callable through when
+  the rest did not parse: in a notebook cell, `guard=lambda b: print(b))` on the last line of
+  a call passed. Callables are now looked up in the source `inspect` holds for them, file or
+  not, so a notebook cell, a Python 3.13+ REPL entry and a module in a zip archive are read
+  as precisely as a file, and certification and the lint now see them too. A notebook
+  lambda can therefore be certified, and its lint findings now show up. What is still not
+  found is rejected with "source unavailable": a class passed as a callable, code with no
+  source, or a file edited since import so that the callable's line no longer starts a
+  function. A callable wrapped with `functools.wraps` in another module is now looked up in
+  its own file rather than the wrapper's, so the lint sees its body.
 
 - **A callable that shares its source line with another is now checked against its own body**
   ([#90](https://github.com/philgresh/cpnx/issues/90)). The purity check, the side-effect lint and inline-safety certification found a callable in

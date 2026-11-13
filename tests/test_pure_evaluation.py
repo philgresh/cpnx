@@ -6,7 +6,6 @@ import pytest
 from cpnx.engine import PetriNet
 from cpnx.places import Place
 from cpnx.sandbox import (
-    _clean_fallback_source,
     _verify_function_defaults,
     verify_callable_purity,
 )
@@ -225,30 +224,6 @@ class TestAtomicRollback:
 # ---------------------------------------------------------------------------
 # Direct unit tests for extracted sandbox helpers
 # ---------------------------------------------------------------------------
-
-
-class TestCleanFallbackSource:
-    def test_trailing_comma_stripped(self):
-        assert _clean_fallback_source("lambda t: t,") == "lambda t: t"
-
-    def test_no_trailing_comma_unchanged(self):
-        assert _clean_fallback_source("lambda t: t") == "lambda t: t"
-
-    def test_assignment_lhs_stripped(self):
-        assert _clean_fallback_source("action = lambda t: t") == "lambda t: t"
-
-    def test_def_prefix_not_stripped(self):
-        src = "def f(x):\n    return x"
-        assert _clean_fallback_source(src) == src
-
-    def test_comparison_operators_not_treated_as_assignment(self):
-        # >, <, ! before the = are preserved (the original bug: endswith(">=") failed
-        # because split on "=" leaves only the first char of the operator).
-        for expr in ("x >= 1", "x <= 1", "x != 1"):
-            assert _clean_fallback_source(expr) == expr
-
-    def test_no_equals_sign_unchanged(self):
-        assert _clean_fallback_source("len(tokens)") == "len(tokens)"
 
 
 class TestVerifyFunctionDefaults:
