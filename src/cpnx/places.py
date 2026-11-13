@@ -22,7 +22,7 @@ import threading
 import time
 from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from cpnx.tokens import AVAILABLE_NOW, Token
 
@@ -173,18 +173,33 @@ _JOIN_GENERATIONS = itertools.count(1)
 """Source of `_JoinIndex.generation` values, shared so that no two indexes ever hand out the same one."""
 
 
-_HeadReport = tuple[int, dict[object, float] | None, dict[object, float | None]]
-"""What `_JoinIndex.head_changes` returns: ``(generation, every_head, changes)``."""
+_JoinHead = tuple[float, _JoinEntry]
+"""What a head report says of one key: ``(when, first)``.
+
+*when* is the time the key binds at the place (``-inf`` if it binds now), and *first* is the
+first entry of the key's group under the source's first index. The engine sorts keys by it as a
+lower bound on their candidates' positions, not as their first candidate: the search can skip
+that token (an earlier arc took it, or a later arc needs it), so the key's first candidate may
+come later (see `cpnx.engine._merge_from_bounds`).
+"""
+
+_HeadReport = tuple[tuple[int, ...], dict[object, _JoinHead] | None, dict[object, _JoinHead | None]]
+"""What `_TokenStore.join_head_changes` returns: ``(generations, every_head, changes)``."""
 
 
 def _check_join_depth(depth: object) -> None:
     """Raise `ValueError` unless *depth* is an `int` of at least 1 (not a `bool`).
 
-    `_join_head_time` reads a group's *depth*-th entry, so a depth of 0 or less would read from
+    A head report reads a group's first *depth* entries, so a depth of 0 or less would read from
     the end and report a wrong head time without failing.
     """
     if isinstance(depth, bool) or not isinstance(depth, int) or depth < 1:
         raise ValueError(f"join index depth must be an int >= 1, got {depth!r}")
+
+
+def _entry_time(entry: _JoinEntry) -> float:
+    """When a join entry's token is available: ``-inf`` if it is ready now."""
+    return entry[1] if entry[0] else -math.inf
 
 
 def _join_head_time(group: list[_JoinEntry], depth: int = 1) -> float | None:
@@ -195,8 +210,93 @@ def _join_head_time(group: list[_JoinEntry], depth: int = 1) -> float | None:
     """
     if len(group) < depth:
         return None
-    head = group[depth - 1]
-    return head[1] if head[0] else -math.inf
+    return _entry_time(group[depth - 1])
+
+
+def _hall_holds(arcs: list[int], leads: list[list[_JoinEntry]]) -> bool:
+    """Hall's condition over every set of two or more classes; single classes are checked by the caller.
+
+    *arcs* is how many join arcs each class (one `join_key` function) has, and *leads* the
+    entries of its group available so far. A set of classes passes when its groups hold at least
+    as many distinct tokens, told apart by seq, as it has arcs. Each set is settled by group
+    sizes when it can: it passes when one of its groups alone is big enough and fails when all of
+    them together are too small.
+    """
+    for size in range(2, len(arcs) + 1):
+        for chosen in itertools.combinations(range(len(arcs)), size):
+            need = sum(arcs[j] for j in chosen)
+            sizes = [len(leads[j]) for j in chosen]
+            if max(sizes) >= need:
+                continue
+            if sum(sizes) < need or len({entry[2] for j in chosen for entry in leads[j]}) < need:
+                return False
+    return True
+
+
+def _hall_candidate_times(arcs: list[int], leads: list[list[_JoinEntry]]) -> list[float]:
+    """The times at which `_hall_time` must check Hall's condition, earliest first.
+
+    Every class needs `arcs` tokens of its own group first, so nothing binds before the latest of
+    those times. After that, the condition can only change when another entry becomes available.
+    """
+    start = max(_entry_time(lead[count - 1]) for count, lead in zip(arcs, leads, strict=True))
+    later = {when for lead in leads for entry in lead if (when := _entry_time(entry)) > start}
+    return [start, *sorted(later)]
+
+
+def _hall_time(classes: list[tuple[int, list[_JoinEntry]]]) -> float | None:
+    """When one key first binds at a place read with several `join_key` functions, or ``None`` if it never does.
+
+    *classes* holds one ``(arcs, group)`` per function: how many join arcs read the place with
+    it and the key's group under it. Each arc must take a token of its own, and by Hall's theorem
+    (P. Hall, 1935) a distinct choice exists iff every set of classes reaches at least as many
+    tokens as it has arcs. The tokens available at a time are a prefix of each group, so the
+    condition only gains as time passes, and the answer is the earliest entry time at which it
+    holds.
+
+    Only each group's first ``D`` entries matter, ``D`` being every arc on the place: a set of
+    classes needs at most ``D`` tokens, so a group past that many passes any set holding it. The
+    cost is therefore bounded by the arcs, never by the place.
+    """
+    arcs = [count for count, _ in classes]
+    reach = sum(arcs)
+    leads = [group[:reach] for _, group in classes]
+    if any(len(lead) < count for count, lead in zip(arcs, leads, strict=True)):
+        return None
+    for when in _hall_candidate_times(arcs, leads):
+        cut = (1, when, math.inf)
+        if _hall_holds(arcs, [lead[: bisect.bisect_right(lead, cut)] for lead in leads]):
+            return when
+    return None
+
+
+def _source_head(indexes: "list[_JoinIndex]", arcs: list[int], key: object) -> _JoinHead | None:
+    """When *key* binds through *indexes*, one per `join_key` function used *arcs* times, with its first entry.
+
+    ``None`` when it does not bind with the tokens now stored. See `_TokenStore.join_head_changes`.
+    """
+    if len(indexes) == 1:
+        group = indexes[0].group(key)
+        when = None if group is None else _join_head_time(group, arcs[0])
+        return None if when is None else (when, cast("list[_JoinEntry]", group)[0])
+    classes: list[tuple[int, list[_JoinEntry]]] = []
+    for index, count in zip(indexes, arcs, strict=True):
+        group = index.group(key)
+        if group is None or len(group) < count:
+            return None
+        classes.append((count, group))
+    when = _hall_time(classes)
+    return None if when is None else (when, classes[0][1][0])
+
+
+def _every_head(indexes: "list[_JoinIndex]", arcs: list[int]) -> dict[object, _JoinHead]:
+    """`_source_head` for every key that binds, read afresh."""
+    every: dict[object, _JoinHead] = {}
+    for key in indexes[0].keys():
+        head = _source_head(indexes, arcs, key)
+        if head is not None:
+            every[key] = head
+    return every
 
 
 class _JoinIndex:
@@ -222,17 +322,16 @@ class _JoinIndex:
     `_KeyIndex.rearm` does, so a place that never drains gets its index back within that many
     deposits.
 
-    **Head changes.** The engine keeps, per join transition, the keys that every join place
-    holds (`cpnx.engine._JoinMatch`, ADR 0011). It needs to hear when a group's *head* changes,
-    because a group's head decides when the key becomes available. The head is the group's
-    first `depth` entries: a self-join, whose `depth` join arcs read one place and take one
-    token each (issue #75), can use a key only once that many of its tokens are available, so
-    its index reports a key only from then on. When the place's join arcs share one function,
-    its `_JoinMatch` then lists only keys that bind; with several, only keys that may.
-    `head_changes` hands it the keys whose head changed since its last call, which `add` and
-    `discard` collect once a reader has asked. `generation` changes whenever the groups are
-    replaced wholesale (disabled, cleared or rebuilt), and a reader that sees a new one gets
-    every head instead. Each index has exactly one reader; see `head_changes`.
+    **Head changes.** The engine keeps, per join transition, the keys that bind at every join
+    place (`cpnx.engine._JoinMatch`, ADR 0011). It needs to hear when the first few entries of a
+    group change, because they decide when the key binds. "First few" is the first `depth`: a
+    self-join, whose join arcs read one place and take one token each (issue #75), reads that
+    many of a key's tokens. `drain` hands its reader the keys whose first `depth` entries changed
+    since its last call, which `add` and `discard` collect once a reader has asked, and
+    `_TokenStore.join_head_changes` turns them into the times those keys bind. `generation`
+    changes whenever the groups are replaced wholesale (disabled, cleared or rebuilt), and a
+    reader that sees a new one reads every key instead. Each index has exactly one reader; see
+    `drain`.
     """
 
     __slots__ = (
@@ -337,37 +436,34 @@ class _JoinIndex:
         self._dirty = None
         self.generation = next(_JOIN_GENERATIONS)
 
-    def head_changes(self, generation: int | None) -> "_HeadReport":
-        """Report the group heads that changed since a reader last saw *generation*.
+    def drain(self, generation: int | None) -> tuple[bool, set[object]]:
+        """Hand over the keys whose first `depth` entries changed since a reader last saw *generation*.
 
-        Returns ``(generation, every_head, changes)``. When *generation* is this index's
-        current one, *every_head* is ``None`` and *changes* maps each key whose group head
-        changed since the previous call to its new `_join_head_time`, or to ``None`` if the key
-        has fewer than `depth` tokens left. Otherwise (including a first call with ``None``)
-        *every_head* maps every key with at least `depth` tokens to its head time and *changes*
-        is empty. Either way change tracking restarts
-        from here, so each change is reported once.
+        Returns ``(full, keys)``. When *generation* is this index's current one, *full* is
+        ``False`` and *keys* holds each key whose first `depth` entries changed since the
+        previous call. Otherwise (including a first call with ``None``) *full* is ``True``: the
+        reader must read every key afresh, and *keys* is empty. Either way change tracking
+        restarts from here, so each change is handed over once.
 
         **One reader per index.** A call drains the changes, so a second reader would miss
-        them. The engine registers one index per (transition, input position) for that reason,
+        them. The engine registers one index per (transition, place, `join_key`) for that reason,
         even when two transitions share an `InputArc` object. Once a reader has asked, changes
         are collected until the index is cleared or disabled, whether or not it asks again.
-        That set is bounded by the index's distinct keys.
+        That set holds at most one entry per distinct key deposited since the last call.
         """
-        groups, depth = self._groups, self.depth
-        if generation != self.generation:
-            self._dirty = set()
-            every = {key: _join_head_time(group, depth) for key, group in groups.items() if len(group) >= depth}
-            return self.generation, every, {}  # type: ignore[return-value]  # filtered to depth
         dirty = self._dirty
-        if not dirty:
-            return self.generation, None, {}
         self._dirty = set()
-        changes: dict[object, float | None] = {}
-        for key in dirty:
-            group = groups.get(key)
-            changes[key] = _join_head_time(group, depth) if group else None
-        return self.generation, None, changes
+        if generation != self.generation:
+            return True, set()
+        return False, dirty or set()
+
+    def group(self, key: object) -> list[_JoinEntry] | None:
+        """The live entries of *key*'s group, or ``None`` if no token has that key."""
+        return self._groups.get(key)
+
+    def keys(self) -> Iterable[object]:
+        """Every key with a token in the index."""
+        return self._groups.keys()
 
     def available_groups(
         self,
@@ -583,12 +679,48 @@ class _TokenStore:
             return None
         return index.available_groups(keys, t_limit, self._ready, self._cooling_by_seq)
 
-    def join_head_changes(self, index_id: int, generation: int | None) -> "_HeadReport | None":
-        """`_JoinIndex.head_changes` for *index_id*, or ``None`` if that index is not serving."""
-        index = self.join_index(index_id)
-        if index is None:
+    def join_head_changes(
+        self, sources: "tuple[tuple[int, int], ...]", generations: "tuple[int, ...] | None"
+    ) -> "_HeadReport | None":
+        """Report when each changed join key binds at this place, for the engine's cross-place key match.
+
+        *sources* holds one ``(index_id, arcs)`` per `join_key` function that the reading
+        transition's join arcs use on this place: an index registered for that function and how
+        many join arcs use it. Each such index must be registered with a `depth` of at least
+        every arc on the place, so that it hands over every change to the entries the report reads.
+
+        Returns ``(generations, every_head, changes)``, ``None`` if one of the indexes is not
+        serving (and then none is drained). With the *generations* the previous call returned,
+        *every_head* is ``None`` and *changes* maps each key whose leading entries changed since
+        then to its `_JoinHead`, or to ``None`` when it does not bind at any time with the tokens
+        now stored. Otherwise *every_head* maps every key that binds to its `_JoinHead` and
+        *changes* is empty.
+
+        One function: a key binds once its `arcs`-th token is available. Several: once each arc
+        can take a token of its own (`_hall_time`). Either way only the first few entries of each
+        of the key's groups are read, so a report costs O(changed keys).
+        """
+        serving = self._serving_join_indexes(sources)
+        if serving is None:
             return None
-        return index.head_changes(generation)
+        arcs = [count for _, count in sources]
+        olds = generations if generations is not None else (None,) * len(serving)
+        drained = [index.drain(old) for index, old in zip(serving, olds, strict=True)]
+        now = tuple(index.generation for index in serving)
+        if any(full for full, _ in drained):
+            return now, _every_head(serving, arcs), {}
+        dirty: set[object] = set().union(*(keys for _, keys in drained))
+        return now, None, {key: _source_head(serving, arcs, key) for key in dirty}
+
+    def _serving_join_indexes(self, sources: "tuple[tuple[int, int], ...]") -> "list[_JoinIndex] | None":
+        """The join index of each source, or ``None`` if one is not serving."""
+        indexes: list[_JoinIndex] = []
+        for index_id, _ in sources:
+            index = self.join_index(index_id)
+            if index is None:
+                return None
+            indexes.append(index)
+        return indexes
 
     def append(self, token: Token) -> None:
         """Add *token*, routing it to the ready set or the cooling heap by `available_at`."""
@@ -1255,11 +1387,11 @@ class Place:
         Args:
             index_id: Identifies the registering arc.
             key_fn: The certified `join_key`, called once per token as it is deposited.
-            depth: How many join arcs of the registering transition read this place with
-                *key_fn*, each taking a different token.
-                [`join_head_changes`][cpnx.Place.join_head_changes] then reports a key only
-                while it holds at least that many tokens. Changing it rebuilds the index.
-                Defaults to 1.
+            depth: How many of each key's leading tokens the index watches for
+                [`join_head_changes`][cpnx.Place.join_head_changes]: how many join arcs of
+                the registering transition read this place with *key_fn*, each taking a
+                different token, or every join arc on the place when they use several
+                functions. Changing it rebuilds the index. Defaults to 1.
 
         Raises:
             ValueError: If *depth* is not an `int` of at least 1.
@@ -1300,20 +1432,27 @@ class Place:
             t_limit = model_time if model_time is not None else time.monotonic()
             return self._store.join_groups(index_id, keys, t_limit)
 
-    def join_head_changes(self, index_id: int, generation: int | None) -> "_HeadReport | None":
-        """Report which join keys' earliest tokens changed, for the engine's cross-place key match.
+    def join_head_changes(
+        self, sources: "tuple[tuple[int, int], ...]", generations: "tuple[int, ...] | None"
+    ) -> "_HeadReport | None":
+        """Report when each changed join key binds here, for the engine's cross-place key match.
 
-        For the join index registered under *index_id*, returns ``(generation, every_head,
-        changes)``. With the *generation* the previous call returned, *every_head* is ``None``
-        and *changes* maps each key whose earliest tokens changed since then to the time they
-        are all available (``-inf`` when they are ready now), or to ``None`` when the key has
-        left. Otherwise *every_head* maps every key to that time and *changes* is empty. "Earliest
-        tokens" means the first `depth` given at registration, one by default; a key with fewer
-        is reported as left. ``None`` when the index is not registered or not serving, exactly
-        as for [`peek_join`][cpnx.Place.peek_join].
+        *sources* holds one ``(index_id, arcs)`` per `join_key` function the reading
+        transition's join arcs use on this place: an index registered for that function, with a
+        `depth` of at least every join arc on the place, and how many of those arcs use it.
+
+        Returns ``(generations, every_head, changes)``. With the *generations* the previous call
+        returned, *every_head* is ``None`` and *changes* maps each key whose earliest tokens
+        changed since then to ``(when, first)``, or to ``None`` when it no longer binds. *when*
+        is the time the key binds (``-inf`` when it binds now): once its `arcs`-th token is
+        available for one function, and once each arc can take a token of its own for several.
+        *first* is the sort position of its first token under the first source. Otherwise
+        *every_head* maps every key that binds to that pair and *changes* is empty. ``None``
+        when an index is not registered or not serving, exactly as for
+        [`peek_join`][cpnx.Place.peek_join].
         """
         with self._lock:
-            return self._store.join_head_changes(index_id, generation)
+            return self._store.join_head_changes(sources, generations)
 
     def can_retrieve(self, count: int = 1, model_time: float | None = None) -> bool:
         """Return ``True`` if at least *count* tokens are currently available for retrieval.

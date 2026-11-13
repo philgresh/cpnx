@@ -9,13 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Building arcs and transitions no longer parses a callable's source file on every
-  construction.** The purity check, the side-effect lint and inline-safety certification each
-  found a callable's node by parsing its file and walking the whole tree, every time an
-  `InputArc`, `OutputArc` or `Transition` was built. A file is now parsed and walked once, and
-  again only when its modification time or size changes. A transition with four arc callables
-  and a guard, defined in a 1 900-line module, took 163 ms to build and now takes 0.6 ms.
-  Verdicts, warnings and errors are unchanged.
+- **Building a transition no longer re-parses the module that defines its callables.** The
+  purity check, the linter and the certifier each parsed the callable's whole source file and
+  walked its whole tree for every guard, key, filter and action, on every transition built.
+  They now share one parse per file (parsed again whenever the file's bytes change) and look
+  each callable's node up once. One shared-place property-test example (a net built from a
+  2,400-line test module) went from ~350 ms to ~1 ms, and the full test suite from ~5 min to
+  ~20 s on 4 cores. Source files are now read as bytes, so a module with a PEP 263 coding
+  cookie (e.g. `latin-1`) and non-ASCII text no longer makes the linter or the certifier raise
+  `UnicodeDecodeError`, and the purity check takes its precise path on it instead of the
+  stricter `getsource` fallback.
 
 - **Two `consume_all` input arcs on one place are never enabled, and adding such a transition
   warns** ([#75](https://github.com/philgresh/cpnx/issues/75)). Each would drain what the
@@ -95,6 +98,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`drive_to_quiescence(inline_actions=True)` runs each firing on the driving thread**
+  ([#79](https://github.com/philgresh/cpnx/issues/79),
+  [ADR 0012](https://github.com/philgresh/cpnx/blob/main/docs/adr/0012-inline-drive-actions.md)).
+  The drive already keeps one firing in flight, so handing each action to the thread pool and
+  spinning until it commits was pure overhead. Inline, the firings, commits, retries, dead
+  letters and seeded draws happen in the same order, and substitution firings and their subnet
+  drives run inline too. On #79's two-transition chain (5 000 tokens, 10 000 firings) the cost
+  per firing drops from about 137 to about 50 µs, about 2.8×; `bench_timed_backlog.py`'s drive
+  arm gains an `inline` column (about 1.5× there). It is opt-in because an inline action that
+  blocks blocks the drive, and `max_spins` cannot cut it short; set `action_timeout_secs` on an
+  action that can hang. A `KeyboardInterrupt` or `SystemExit` raised by an inline action
+  hands its tokens back exactly as they were taken (no attempt counted, nothing dead-lettered,
+  no permit cooldown) and propagates out of the drive. With `action_timeout_secs`, the action
+  itself may still be running on its worker. Any other `BaseException` from an inline action,
+  such as `asyncio.CancelledError`, fails the firing as usual (an attempt is counted, and it
+  can dead-letter) and then propagates out of the drive. `step()`, `run()` and the default drive are unchanged.
 - **`InputArc.join_key` joins input arcs on equal keys, and a join with no match no longer
   walks every candidate** ([#64](https://github.com/philgresh/cpnx/issues/64),
   [ADR 0010](https://github.com/philgresh/cpnx/blob/main/docs/adr/0010-equi-join-index.md)).
@@ -182,11 +201,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which was read as that lambda. On Python 3.11 and later each callable is now found by where
   its own code lies (`code.co_positions`). A `def` outside any function whose decorator takes
   a lambda argument was read as that lambda too; it is now not found at all, like any other
-  decorated `def`, so it is not certified and the purity check reads its source as a whole. Python 3.10 records no columns, and neither does
-  `-X no_debug_ranges`: there, callables that start on one line are held to what any of them
-  does. One impure lambda fails the purity check for all of them, none is certified unless
-  all certify, and each is reported with the lint findings of all. Put them on separate
-  lines to have each judged alone.
+  decorated `def`, so it is not certified and the purity check reads its source as a whole.
+  Python 3.10 records no columns, and neither does `-X no_debug_ranges`: there, callables
+  that start on one line are held to what any of them does. One impure lambda fails the
+  purity check for all of them, none is certified unless all certify, and each is reported
+  with the lint findings of all. Put them on separate lines to have each judged alone.
+
+- **Certification no longer admits three callables that run more than it checked.** A
+  certified guard, key or filter runs inline, so these were real gaps:
+
+  - **A nested `def`'s annotations are now checked before 3.14** (without
+    `from __future__ import annotations`). They run every time the `def` statement does, i.e.
+    on every call, but were skipped like the callable's own annotations. A side effect: on
+    3.10–3.13, a nested `def` whose annotations name anything other than a builtin, `typing`
+    constructs included (`def rank(x: Optional[int]) -> int`, `def key(t: Token) -> int`),
+    now uncertifies its callable, which then runs on the executor (a guard) or loses the
+    place index (a key or filter). The reason names the annotation's name, e.g. "reads
+    mutable/uncertified external 'Optional'". Drop the nested annotations or add the future
+    import to keep it inline.
+  - **A `class` statement inside a callable is rejected.** Its body runs on every call,
+    including its annotations before 3.14, and its names were counted as the callable's own,
+    hiding reads of same-named mutable globals.
+  - **A walrus in the callable's own default values no longer counts as a local binding.**
+    Defaults run once, at definition, so `def guard(t, _=(STATE := 0))` binds nothing when it
+    runs, and its read of a mutable global `STATE` is now rejected.
+
+- **`certify()` no longer raises `RecursionError` on a very long guard expression.** Binding
+  collection recursed once per AST level, so a guard of ~1,500 `a + b + …` terms aborted
+  `Transition` construction. Every AST walk in certification is now iterative, and anything
+  else nested too deeply to certify is reported as not certified, as `certify` documents.
 
 - **Two input arcs on one place now take two different tokens**
   ([#75](https://github.com/philgresh/cpnx/issues/75)). A transition with two arcs reading the
@@ -212,12 +255,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `binding_search_limit` ahead of a key that holds a pair. Such a place also drops keys that
   fail Hall's condition (some set of its functions reaches fewer distinct tokens than arcs),
   so a backlog of tokens carrying one key under both functions can't hide a pair either
-  ([#78](https://github.com/philgresh/cpnx/issues/78)). Its guard-free existence probe reads the
-  matched keys in doubling batches and stops at the first that binds, so it pays only for the
-  keys before the first that binds: 0.015 ms on a 4 000-key `manager == id` chain, but linear
-  in a backlog of keys that all fail Hall's condition. Firing and guarded probes, linear in
-  keys as before, cost about 1.2× `main` on that chain. A self-join of three or more arcs with
-  one function skips a key's self-pairings unbuilt, so a key deeper than the limit still binds.
+  ([#78](https://github.com/philgresh/cpnx/issues/78)). The place reports when each key passes
+  Hall's condition as its tokens change, rechecking only the keys a deposit or removal touches
+  (ADR 0011 §4a), so the guard-free existence probe asks for one key again and a backlog of
+  keys that fail costs nothing per probe. Firing and guarded probes no longer merge every key's
+  candidates: they sort keys by a lower bound on their candidates and open each only once the
+  search reaches that bound (ADR 0011 §3), with the same candidates in the same order. On a `manager == id` chain (`benchmarks/bench_self_join_chain.py`) a `FIRST`
+  firing takes about 14 µs at 1 000, 4 000 and 16 000 keys, where `main` takes 1.9, 7.7 and
+  34.7 ms. A self-join of three or more arcs with one function skips a key's self-pairings
+  unbuilt, so a key deeper than the limit still binds.
   Every arc on a shared place of a join transition takes tokens the earlier arcs left: join
   arcs with any `join_key`, and arcs without one, drawn from the remaining tokens as in the
   product search. Both are pruned by a residual Hall check so that neither strands a later
@@ -227,7 +273,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A plain arc taking several tokens steps over the combinations it may not take rather than
   reading them, so its cost stays with the options it yields. Each key's walk costs O(1) to
   start, and plain arcs after every join arc, off the key's places, are walked once for all
-  keys. The existence probe keeps its one-key and first-binding-key shortcuts unless an arc
+  keys. The existence probe keeps its one-key shortcut unless an arc
   without a `join_key` on a shared place reads a join place, or sits before a join arc on a
   place where some arc has a `filter`. Such an arc can run a later arc out of tokens once
   per key, so firing can use up `binding_search_limit` where one key alone would bind, and

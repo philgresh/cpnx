@@ -1,7 +1,5 @@
 import ast
 import inspect
-import os
-import threading
 from typing import Callable
 
 
@@ -58,27 +56,21 @@ def _is_more_specific_node(new_node: ast.AST, current_target: ast.AST) -> bool:
     return new_node.lineno >= target_start and new_end <= target_end
 
 
-def _function_nodes(tree: ast.AST) -> list[ast.AST]:
-    """Every `def`, `async def` and `lambda` node of `tree`, in `ast.walk` order."""
-    return [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and hasattr(node, "lineno")
-    ]
+def _nodes_spanning(tree: ast.AST, start_line: int) -> list[ast.AST]:
+    """Return the `def`, `async def` and `lambda` nodes whose lines include `start_line`."""
+    return [node for node in ast.walk(tree) if _node_contains_line(node, start_line)]
 
 
-def _most_specific_node(nodes: list[ast.AST], start_line: int) -> ast.AST | None:
+def _most_specific_node(candidates: list[ast.AST]) -> ast.AST | None:
     target_node = None
-    for node in nodes:
-        if not _node_contains_line(node, start_line):
-            continue
+    for node in candidates:
         if target_node is None or _is_more_specific_node(node, target_node):
             target_node = node
     return target_node
 
 
 def _find_target_node(tree: ast.AST, start_line: int) -> ast.AST | None:
-    return _most_specific_node(_function_nodes(tree), start_line)
+    return _most_specific_node(_nodes_spanning(tree, start_line))
 
 
 #: Where a callable's own code lies in its file: `(line, end_line, column, end_column)`, as
@@ -144,55 +136,68 @@ def _nodes_by_line(candidates: list[ast.AST], start_line: int) -> tuple[ast.AST,
     starting = [node for node in candidates if node.lineno == start_line]
     if len(starting) > 1:
         return tuple(starting)
-    node = _most_specific_node(candidates, start_line)
+    node = _most_specific_node(candidates)
     return () if node is None else (node,)
 
 
 class _ParsedSource:
-    """One parsed source file: its function nodes, and the lookups made among them so far.
+    """One source file's parse, plus the callable nodes found for each lookup made in it.
 
-    Attributes:
-        stamp: The file's `(st_mtime_ns, st_size)` when it was read.
-        functions: Its `def`, `async def` and `lambda` nodes, from one walk of the tree.
-        found: The nodes `locate` gave for each `(start_line, anchor)` asked for so far.
+    A lookup is a start line and, where the interpreter records columns, the position of the
+    callable's own code (`_body_anchor`): callables that share a start line are told apart by it.
     """
 
-    __slots__ = ("stamp", "functions", "found")
+    __slots__ = ("source", "tree", "targets")
 
-    def __init__(self, stamp: tuple[int, int], tree: ast.AST) -> None:
-        self.stamp = stamp
-        self.functions = _function_nodes(tree)
-        self.found: dict[tuple[int, _Position | None], tuple[ast.AST, ...]] = {}
+    def __init__(self, source: bytes, tree: ast.AST) -> None:
+        self.source = source
+        self.tree = tree
+        self.targets: dict[tuple[int, _Position | None], tuple[ast.AST, ...]] = {}
 
     def locate(self, start_line: int, anchor: _Position | None) -> tuple[ast.AST, ...]:
-        """Return the nodes a callable starting on `start_line` may be; see `_source_nodes`."""
+        """Return the nodes a callable starting on `start_line` may be; see `_callable_nodes`."""
         key = (start_line, anchor)
-        if key not in self.found:
-            self.found[key] = self._locate(start_line, anchor)
-        return self.found[key]
-
-    def _locate(self, start_line: int, anchor: _Position | None) -> tuple[ast.AST, ...]:
-        candidates = [node for node in self.functions if _node_contains_line(node, start_line)]
-        if anchor is not None:
-            return _node_holding(candidates, anchor)
-        return _nodes_by_line(candidates, start_line)
+        if key not in self.targets:
+            candidates = _nodes_spanning(self.tree, start_line)
+            if anchor is None:
+                self.targets[key] = _nodes_by_line(candidates, start_line)
+            else:
+                self.targets[key] = _node_holding(candidates, anchor)
+        return self.targets[key]
 
 
-#: Parsed source files by path. Building many arcs and transitions from the same functions
-#: checks each callable again on every construction, three times over (the purity blocklist
-#: here, `cpnx.linting`, `cpnx.certification`), and each check needs the callable's node. A
-#: file is parsed and walked once, until its modification time or size changes. It holds
-#: syntax trees only, never the callables, so it keeps no function alive; it grows by one
-#: entry per source file that defines a checked callable.
+#: ``path -> _ParsedSource``, keyed on the file's bytes. The purity check, the linter
+#: and the certifier each need the node of every guard, key and action they see, and all three
+#: used to parse the whole defining file and walk its whole tree once per callable, per
+#: transition built. Building nets in a loop (a test module of a few thousand lines, a
+#: generated model) then cost ~0.1 s per callable. The trees are shared, so nothing may
+#: mutate them: every consumer only walks its node (the certifier skips annotations as it
+#: walks instead of stripping them). The file is re-read on every lookup and compared with the
+#: bytes that were parsed: the read is cheap, the parse is the cost. An mtime-and-size stamp is
+#: not enough, since a same-size edit within one mtime tick would then be checked against the old
+#: code while the new code runs (with bytecode writing off, nothing else catches it).
 _SOURCE_CACHE: dict[str, _ParsedSource] = {}
-_SOURCE_CACHE_LOCK = threading.Lock()
+
+#: What "the source cannot be found or parsed" looks like: no file (``OSError``), a builtin or
+#: C function (``TypeError``), unparsable source (``SyntaxError``), or undecodable bytes
+#: (``UnicodeDecodeError``, a ``ValueError``).
+_SOURCE_UNAVAILABLE = (OSError, TypeError, SyntaxError, ValueError)
 
 
-def _source_nodes(func: Callable) -> tuple[ast.AST, ...]:
-    """Return the `def`/`lambda` nodes `func` may be in its source file: one, when it can be told.
+def _parsed_source(path: str) -> _ParsedSource:
+    with open(path, "rb") as handle:
+        source = handle.read()
+    cached = _SOURCE_CACHE.get(path)
+    if cached is None or cached.source != source:
+        # Bytes, so ast.parse honours a PEP 263 coding cookie.
+        cached = _SOURCE_CACHE[path] = _ParsedSource(source, ast.parse(source, filename=path))
+    return cached
 
-    The file is read as it is on disk now. Of the function nodes whose lines include the line
-    `func` starts on:
+
+def _callable_nodes(func: Callable) -> tuple[ast.AST, ...]:
+    """Return the `def`/`lambda` nodes `func` may be, from a shared parse: one, when it can be told.
+
+    Of the function nodes whose lines include the line `func` starts on:
 
     - With column positions (`_body_anchor`), the result is the one node whose body holds
       `func`'s own code, so two lambdas on one line, a lambda and the lambda it returns, and
@@ -206,35 +211,33 @@ def _source_nodes(func: Callable) -> tuple[ast.AST, ...]:
       the result is the most specific node around the line (`_find_target_node`), as it
       always was.
 
-    The nodes are shared between callers and threads: read them, and copy one before
-    changing it.
+    The nodes belong to a cached tree: read them, never mutate them.
 
     Args:
         func: The callable to locate.
 
     Returns:
-        The candidate nodes; empty when `func` has no source file or no function node spans
-        its first line.
+        The candidate nodes; empty when `func` has no source file or no function node is it.
 
     Raises:
         OSError: If the source cannot be found or read.
-        TypeError: If `func` is not an object `inspect` can locate (a builtin, a partial).
-        SyntaxError: If the file does not parse.
+        TypeError: If `func` is a builtin or C function.
+        SyntaxError: If the source cannot be parsed.
+        ValueError: If the source cannot be decoded.
     """
+    path = inspect.getsourcefile(func)
     _, start_line = inspect.getsourcelines(func)
-    source_file = inspect.getsourcefile(func)
-    if not source_file:
+    if not path:
         return ()
-    anchor = _body_anchor(func)
-    status = os.stat(source_file)
-    stamp = (status.st_mtime_ns, status.st_size)
-    with _SOURCE_CACHE_LOCK:
-        parsed = _SOURCE_CACHE.get(source_file)
-        if parsed is None or parsed.stamp != stamp:
-            with open(source_file, encoding="utf-8") as handle:
-                tree = ast.parse(handle.read(), filename=source_file)
-            parsed = _SOURCE_CACHE[source_file] = _ParsedSource(stamp, tree)
-        return parsed.locate(start_line, anchor)
+    return _parsed_source(path).locate(start_line, _body_anchor(func))
+
+
+def _callable_nodes_or_empty(func: Callable) -> tuple[ast.AST, ...]:
+    """Return `_callable_nodes(func)`, with unavailable source reported as no nodes."""
+    try:
+        return _callable_nodes(func)
+    except _SOURCE_UNAVAILABLE:
+        return ()
 
 
 _FORBIDDEN_FUNCS = frozenset({"open", "print", "eval", "exec", "__import__", "sleep"})
@@ -281,7 +284,7 @@ def _verify_ast_purity(tree: ast.AST, is_fallback: bool = False) -> None:
 
 def _try_verify_via_sourcefile(func: Callable) -> bool:
     try:
-        nodes = _source_nodes(func)
+        nodes = _callable_nodes(func)
         for node in nodes:
             _verify_ast_purity(node)
         if nodes:

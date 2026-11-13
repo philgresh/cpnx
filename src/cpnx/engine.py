@@ -3,6 +3,7 @@
 import bisect
 import concurrent.futures
 import enum
+import functools
 import heapq
 import itertools
 import math
@@ -134,30 +135,73 @@ _LAST_FINITE_TIME = sys.float_info.max
 _MIN_SUBNET_SLICE_SECS = 0.05
 
 _JOIN_INDEX_IDS = itertools.count(1)
-"""Ids for place join indexes, one per (transition, input position). Module-wide, because a place
+"""Ids for place join indexes, one per (transition, place, `join_key`). Module-wide, because a place
 object may be shared by two nets and its indexes are keyed by id alone."""
 
 
+_JoinSource: TypeAlias = "tuple[Place, tuple[tuple[int, int], ...]]"
+"""One join place of a `_JoinMatch`: the place and, per `join_key` function its join arcs use there,
+``(index_id, arcs)`` (see `Place.join_head_changes`)."""
+
+
+class _FirstOrder:
+    """The keys of a `_JoinMatch` that bind by `frontier`, sorted by a lower bound on their candidates.
+
+    `entries` holds ``(first, uid)`` per key, where `first` is the first entry of the key's group
+    at the transition's first join arc. Every candidate of the key takes that entry or a later one
+    there, and the arcs before it have no `join_key`, so their options do not depend on the key:
+    `first`, after those arcs' least positions, bounds every candidate of the key from below. The
+    first join arc's first entries differ between keys (one token has one key under one
+    function), so they order the keys.
+
+    It is a bound, not the key's first candidate: the search can keep the first join arc off
+    that entry (an earlier arc on its place took the token, or a later join arc there needs it),
+    and the key's first candidate then comes later. `_merge_from_bounds` relies on the bound
+    alone; ordering keys by it and stopping at the first one opened yields candidates out of
+    product order.
+    """
+
+    __slots__ = ("frontier", "entries")
+
+    def __init__(self, frontier: float, entries: list[tuple[tuple[int, float, int], int]]) -> None:
+        self.frontier = frontier
+        self.entries = entries
+
+    def add(self, when: float, first: tuple[int, float, int], uid: int) -> None:
+        """List a key that binds at `when`, if that is by the frontier."""
+        if when <= self.frontier:
+            bisect.insort(self.entries, (first, uid))
+
+    def drop(self, when: float, first: tuple[int, float, int], uid: int) -> None:
+        """Unlist a key that was listed as binding at `when`."""
+        if when <= self.frontier:
+            del self.entries[bisect.bisect_left(self.entries, (first, uid))]
+
+
 class _JoinMatch:
-    """The join keys that every `join_key` place of one transition holds, by when they all become available.
+    """The join keys that bind at every `join_key` place of one transition, by when they all do.
 
     `_join_candidates` would otherwise read every key of its smallest join place on every
     probe and look each one up in the others, which costs O(keys in that place) even when
-    only a few keys are held everywhere (ADR 0011). This keeps that intersection up to date
-    from the places' join indexes instead.
+    only a few keys bind everywhere (ADR 0011). This keeps that intersection up to date from
+    the places' join indexes instead.
 
-    A key's group in a place becomes available when its head token does (the available
-    tokens of a group are a prefix of it), so the key is available everywhere at
-    ``when(key) = max(head time per place)``, with ``-inf`` for a ready head. `_order` holds
-    ``(when, uid)`` for every key held by all the places, sorted, so the keys available at
-    `t` are a prefix of it, found with one bisection. `uid` stands in for the key itself,
-    which need not be orderable.
+    Each place (`sources`) reports when each key binds there (`Place.join_head_changes`): once
+    its arcs' tokens are available, or, where its join arcs use several `join_key` functions,
+    once each arc can take a token of its own (Hall's condition). The key binds everywhere at
+    ``when(key) = max(per place)``, with ``-inf`` for now. `_order` holds ``(when, uid)`` for
+    every key that binds at all, sorted, so the keys that bind at `t` are a prefix of it, found
+    with one bisection. `uid` stands in for the key itself, which need not be orderable.
 
-    `refresh` drains each place's head changes (`Place.join_head_changes`) into a mirror of
-    its heads (`_heads`) and recomputes `when` for each key that changed, so a probe pays for
-    what changed since the last one, not for the size of the places. A place that hands back
-    a whole new set of heads (its index was rebuilt, cleared or replaced) makes this rebuild
-    from the mirrors.
+    `refresh` drains each place's changes into a mirror of its report (`_heads`) and
+    recomputes `when` for each key that changed, so a probe pays for what changed since the
+    last one, not for the size of the places. A place that hands back a whole new report (an
+    index was rebuilt, cleared or replaced) makes this rebuild from the mirrors.
+
+    `ordered_keys` lists the keys that bind at `t` sorted by a lower bound on their candidates,
+    so the firing path can open them one at a time (`_merge_from_bounds`). It reads a
+    `_FirstOrder`: one for the clock, whose frontier follows the probes' time, and one for the
+    timing-ignoring horizon. Each is kept up to date as keys change.
 
     The mirrors and the order are read under the engine lock and fed under each place's lock
     in turn, so a change made to a place directly, between those reads, can leave a key listed
@@ -168,23 +212,39 @@ class _JoinMatch:
     __slots__ = (
         "index_ids",
         "places",
+        "sources",
         "_generations",
         "_heads",
         "_when",
         "_order",
         "_key_by_uid",
+        "_first_by_uid",
         "_uids",
+        "_clock",
+        "_horizon",
     )
 
-    def __init__(self, index_ids: tuple[int, ...], places: tuple[Place, ...]) -> None:
+    def __init__(
+        self,
+        index_ids: tuple[int, ...],
+        places: tuple[Place, ...],
+        sources: "tuple[_JoinSource, ...]",
+    ) -> None:
+        #: Per join arc, the index its key's group is read through. Arcs of one function on one
+        #: place share an index (`PetriNet._ensure_join_index`), which is that function's source,
+        #: so `refresh` has just found every one of them serving.
         self.index_ids = index_ids
         self.places = places
-        self._generations: list[int | None] = [None] * len(index_ids)
-        self._heads: list[dict[object, float]] = [{} for _ in index_ids]
+        self.sources = sources
+        self._generations: list[tuple[int, ...] | None] = [None] * len(sources)
+        self._heads: list[dict[object, tuple[float, tuple[int, float, int]]]] = [{} for _ in sources]
         self._when: dict[object, tuple[float, int]] = {}
         self._order: list[tuple[float, int]] = []
         self._key_by_uid: dict[int, object] = {}
+        self._first_by_uid: dict[int, tuple[int, float, int]] = {}
         self._uids = itertools.count()
+        self._clock: _FirstOrder | None = None
+        self._horizon: _FirstOrder | None = None
 
     def serves(self, index_ids: tuple[int, ...], places: tuple[Place, ...]) -> bool:
         """Whether this match was built for exactly these join arcs reading exactly these places."""
@@ -199,8 +259,8 @@ class _JoinMatch:
         rebuild = False
         changed: set[object] = set()
         serving = True
-        for i, (index_id, place) in enumerate(zip(self.index_ids, self.places, strict=True)):
-            got = place.join_head_changes(index_id, self._generations[i])
+        for i, (place, pairs) in enumerate(self.sources):
+            got = place.join_head_changes(pairs, self._generations[i])
             if got is None:
                 # Keep what the earlier places reported: their changes are drained now. This
                 # place's mirror is stale, but its next report is a full one (its generation
@@ -213,11 +273,11 @@ class _JoinMatch:
                 rebuild = True
                 continue
             mirror = self._heads[i]
-            for key, when in heads.items():
-                if when is None:
+            for key, head in heads.items():
+                if head is None:
                     mirror.pop(key, None)
                 else:
-                    mirror[key] = when
+                    mirror[key] = head
             changed.update(heads)
         # Rebuild even when a later place is not serving: the full report is consumed now and
         # will not come again, so skipping it would leave `_order` stale. The result goes
@@ -229,54 +289,117 @@ class _JoinMatch:
                 self._update(key)
         return serving
 
-    def keys_at(self, t_limit: float, limit: int | None = None, *, start: int = 0) -> list[object]:
-        """The keys every place holds its depth of tokens of at `t_limit`, from the `start`-th up to the `limit`-th."""
+    def iter_keys_at(self, t_limit: float) -> Iterator[object]:
+        """The keys that bind at every place at `t_limit`, by when they bind, read lazily.
+
+        Not product order: `ordered_keys` gives the keys for a search in that order.
+        """
         # Every uid is a finite int, so `(t_limit, inf)` sorts after every entry at `t_limit`.
         end = bisect.bisect_right(self._order, (t_limit, math.inf))
-        if limit is not None:
-            end = min(end, limit)
         key_by_uid = self._key_by_uid
-        return [key_by_uid[uid] for _, uid in self._order[start:end]]
+        return (key_by_uid[uid] for _, uid in itertools.islice(self._order, end))
+
+    def ordered_keys(self, t_limit: float) -> list[tuple[tuple[int, float, int], int]]:
+        """The keys that bind at `t_limit`, as ``(first, uid)`` sorted by the lower bound `first` (see `_FirstOrder`).
+
+        The list is live: read it within the probe, and turn a uid into its key with `key_of`.
+        Bringing the clock's order to a later `t_limit` costs the keys that came to bind in
+        between, each once, so a run whose clock only moves forward pays for each key once.
+        """
+        if t_limit == _LAST_FINITE_TIME:
+            if self._horizon is None:
+                self._horizon = self._first_order(t_limit)
+            return self._horizon.entries
+        if self._clock is None:
+            self._clock = self._first_order(t_limit)
+        else:
+            self._move_clock(self._clock, t_limit)
+        return self._clock.entries
+
+    def key_of(self, uid: int) -> object:
+        """The key `uid` stands for."""
+        return self._key_by_uid[uid]
+
+    def _first_order(self, frontier: float) -> _FirstOrder:
+        """A `_FirstOrder` of the keys that bind by `frontier`, built from `_order`."""
+        end = bisect.bisect_right(self._order, (frontier, math.inf))
+        first_by_uid = self._first_by_uid
+        return _FirstOrder(frontier, sorted((first_by_uid[uid], uid) for _, uid in self._order[:end]))
+
+    def _move_clock(self, view: _FirstOrder, t_limit: float) -> None:
+        """Bring the clock's `_FirstOrder` to `t_limit`, adding or dropping the keys whose time lies between."""
+        old = view.frontier
+        if t_limit == old:
+            return
+        low, high = sorted((old, t_limit))
+        lo = bisect.bisect_right(self._order, (low, math.inf))
+        hi = bisect.bisect_right(self._order, (high, math.inf))
+        first_by_uid = self._first_by_uid
+        if t_limit > old:
+            view.frontier = t_limit
+            for when, uid in self._order[lo:hi]:
+                view.add(when, first_by_uid[uid], uid)
+        else:
+            for when, uid in self._order[lo:hi]:
+                view.drop(when, first_by_uid[uid], uid)
+            view.frontier = t_limit
+
+    def _views(self) -> "list[_FirstOrder]":
+        """The `_FirstOrder`s built so far."""
+        return [view for view in (self._clock, self._horizon) if view is not None]
 
     def _rebuild(self) -> None:
         """Recompute every key from the mirrors, walking the smallest one."""
         self._when = {}
         self._order = []
         self._key_by_uid = {}
+        self._first_by_uid = {}
+        self._clock = self._horizon = None
         for key in min(self._heads, key=len):
             self._update(key)
 
     def _when_held(self, key: object) -> float | None:
-        """When `key` is available in every place, or `None` if some place does not hold it."""
+        """When `key` binds at every place, or `None` if it does not bind at some place."""
         latest = -math.inf
         for mirror in self._heads:
-            when = mirror.get(key)
-            if when is None:
+            head = mirror.get(key)
+            if head is None:
                 return None
-            if when > latest:
-                latest = when
+            if head[0] > latest:
+                latest = head[0]
         return latest
 
     def _update(self, key: object) -> None:
-        """Move `key` to its place in `_order`, adding or dropping it as the mirrors now say."""
+        """Move `key` to its place in `_order` and the views, adding or dropping it as the mirrors now say."""
         new = self._when_held(key)
+        first = self._heads[0][key][1] if new is not None else None
         old = self._when.get(key)
+        views = self._views()
         if old is not None:
-            if new == old[0]:
+            uid = old[1]
+            old_first = self._first_by_uid[uid]
+            if new == old[0] and first == old_first:
                 return
             del self._order[bisect.bisect_left(self._order, old)]
+            for view in views:
+                view.drop(old[0], old_first, uid)
             if new is None:
                 del self._when[key]
-                del self._key_by_uid[old[1]]
+                del self._key_by_uid[uid]
+                del self._first_by_uid[uid]
                 return
-            entry = (new, old[1])
         elif new is None:
             return
         else:
-            entry = (new, next(self._uids))
-            self._key_by_uid[entry[1]] = key
+            uid = next(self._uids)
+            self._key_by_uid[uid] = key
+        assert first is not None
+        entry = (new, uid)
         self._when[key] = entry
+        self._first_by_uid[uid] = first
         bisect.insort(self._order, entry)
+        for view in views:
+            view.add(new, first, uid)
 
 
 def _lazy_product(streams: list[Iterator[_T]]) -> Iterator[tuple[_T, ...]]:
@@ -384,6 +507,23 @@ _JoinRegistration: TypeAlias = tuple[InputArc, Place, Callable[[Token], object],
 """A `_join_registrations` entry: `(arc, place, join_key, index_id, depth)`."""
 
 
+def _shared_join_index(
+    registered: "dict[int, _JoinRegistration]", place: Place, join_key: Callable[[Token], object], depth: int
+) -> int | None:
+    """The id of an index another position registered on `place` for `join_key` at `depth`, if any."""
+    for _, other_place, other_key, index_id, other_depth in registered.values():
+        if other_place is place and other_key is join_key and other_depth == depth:
+            return index_id
+    return None
+
+
+def _release_join_entry(registered: "dict[int, _JoinRegistration]", entry: "_JoinRegistration") -> None:
+    """Unregister the index of a removed `entry` from its place, unless another position still reads it."""
+    index_id = entry[3]
+    if all(other[3] != index_id for other in registered.values()):
+        entry[1].unregister_join_index(index_id)
+
+
 def _registration_matches(
     entry: _JoinRegistration,
     arc: InputArc,
@@ -411,13 +551,20 @@ class _JoinShape:
       *different* functions match a key through different tokens, so they do not add to each
       other's depth. Functions are told apart by identity, as `_registration_matches` does;
       two equal but distinct functions only cost the shortcut, never a binding.
-    - `mixed`: for each place read by join arcs with different functions, its function classes
-      as `(arcs, positions)`. Depths are then a necessary condition only, and Hall's condition
-      (`_has_distinct_tokens`) decides: a token whose key is the same under two functions lists
-      that key under each, though its only candidate hands it to both arcs.
+    - `index_depths`: the depth each join arc's index is registered with: its `depths` entry,
+      or every join arc on its place where they use several functions. The index then hands over
+      every change to the entries Hall's condition reads (`Place.join_head_changes`).
+    - `places`: per join place, in the order of its first join arc, its function classes as
+      `(arcs, positions)`, each in the order of its first position.
+    - `mixed`: the `places` entries with more than one class. Depths are then a necessary
+      condition only, and Hall's condition decides (`_has_distinct_tokens`): a token whose key is
+      the same under two functions lists that key under each, though its only candidate hands it
+      to both arcs.
     """
 
     depths: dict[int, int]
+    index_depths: dict[int, int]
+    places: list[list[tuple[int, list[int]]]]
     mixed: list[list[tuple[int, list[int]]]]
 
 
@@ -433,7 +580,9 @@ def _plain_join_shape(positions: tuple[int, ...]) -> _JoinShape:
     """The cached `_JoinShape` of a join with no shared place and join arcs at `positions`."""
     shape = _PLAIN_JOIN_SHAPES.get(positions)
     if shape is None:
-        shape = _PLAIN_JOIN_SHAPES[positions] = _JoinShape(dict.fromkeys(positions, 1), [])
+        depths = dict.fromkeys(positions, 1)
+        places = [[(1, [i])] for i in positions]
+        shape = _PLAIN_JOIN_SHAPES[positions] = _JoinShape(depths, depths, places, [])
     return shape
 
 
@@ -443,18 +592,38 @@ def _join_shape(
     """Build the `_JoinShape` of `transition`, whose join arcs are `joins` and shared places `shared`."""
     if not shared:  # the usual join: one arc per place, so every depth is 1
         return _plain_join_shape(tuple([i for i, _, _ in joins]))
-    classes_by_place = _join_classes_by_place(joins)
-    depths = {i: len(positions) for classes in classes_by_place for positions in classes for i in positions}
-    mixed = [[(len(positions), positions) for positions in classes] for classes in classes_by_place if len(classes) > 1]
-    return _JoinShape(depths, mixed)
+    places = _join_classes_by_place(joins)
+    depths = {i: arcs for classes in places for arcs, positions in classes for i in positions}
+    mixed = [classes for classes in places if len(classes) > 1]
+    return _JoinShape(depths, _index_depths(depths, mixed), places, mixed)
 
 
-def _join_classes_by_place(joins: "list[tuple[int, InputArc, Place]]") -> list[list[list[int]]]:
-    """Per place read by `joins`, the input positions of its join arcs, grouped by `join_key` identity."""
+def _join_classes_by_place(joins: "list[tuple[int, InputArc, Place]]") -> list[list[tuple[int, list[int]]]]:
+    """Per place read by `joins`, its join arcs grouped by `join_key` identity, as `(arcs, positions)`."""
     by_place: dict[int, dict[int, list[int]]] = {}
     for i, arc, place in joins:
         by_place.setdefault(id(place), {}).setdefault(id(arc.join_key), []).append(i)
-    return [list(classes.values()) for classes in by_place.values()]
+    return [[(len(positions), positions) for positions in classes.values()] for classes in by_place.values()]
+
+
+def _index_depths(depths: dict[int, int], mixed: list[list[tuple[int, list[int]]]]) -> dict[int, int]:
+    """`_JoinShape.index_depths`: `depths`, but every join arc on a place in `mixed` watches all of the place's arcs."""
+    index_depths = dict(depths)
+    for classes in mixed:
+        every = sum(arcs for arcs, _ in classes)
+        index_depths.update((i, every) for _, positions in classes for i in positions)
+    return index_depths
+
+
+def _join_sources(
+    joins: "list[tuple[int, InputArc, Place]]", shape: _JoinShape, index_by_position: dict[int, int]
+) -> "tuple[_JoinSource, ...]":
+    """A `_JoinMatch`'s sources: per join place, the index of each function's first arc and its arc count."""
+    place_at = {i: place for i, _, place in joins}
+    return tuple(
+        (place_at[classes[0][1][0]], tuple((index_by_position[positions[0]], arcs) for arcs, positions in classes))
+        for classes in shape.places
+    )
 
 
 def _has_distinct_tokens(groups: "list[tuple[int, Iterable[tuple[object, Token]]]]") -> bool:
@@ -469,7 +638,9 @@ def _has_distinct_tokens(groups: "list[tuple[int, Iterable[tuple[object, Token]]
 
     Single functions are already checked: `_join_key_groups` keeps a group only if it holds
     the arcs' depth. So only sets of two or more are checked. The usual two functions leave one
-    set, which `_pair_has_distinct_tokens` checks: the one implementation of that check.
+    set, which `_pair_has_distinct_tokens` checks: the one implementation of that check over
+    token groups. `places._hall_time` checks the same condition over index entries, for the
+    match's per-key state.
     Each is settled by group sizes when it can: a set passes when one of its groups alone holds
     enough tokens, and fails when all of them together hold too few. Only otherwise are tokens
     read, at most `need` per group, and told apart by identity.
@@ -554,7 +725,7 @@ class _Replay(Generic[_T]):
 
     `_distinct_candidates` walks each arc's options once per choice of the earlier arcs; this
     keeps a lazy stream (a `_PeekStream`, a truncated `_arc_options`) lazy across those walks.
-    `_distinct_key_products` shares one walk of a join's key-free arcs across its keys with it.
+    `_key_opener` shares one walk of a join's key-free arcs across its keys with it.
     """
 
     __slots__ = ("_source", "_seen")
@@ -769,8 +940,8 @@ class _JoinPlan:
     `distinct` is whether any level is constrained, so each key's candidates come from
     `_key_combos` rather than a plain product. `drained` holds the shared places a
     `consume_all` arc reads, where `_satisfying` gives that arc what the other arcs leave.
-    `shortcut` is whether the guard-free existence probe may look at one key, or stop at the
-    first that binds, and still agree with firing (see `_join_plan`).
+    `shortcut` is whether the guard-free existence probe may look at one key and still agree
+    with firing (see `_join_shortcut`).
     `pair` marks the usual self-join, exactly two join arcs on one place, which
     `_pair_key_combos` enumerates directly. Levels from `split` on read no place the earlier
     levels read and no join place, so their options are the same for every key: their walk is
@@ -1090,18 +1261,35 @@ def _key_combos(lists: list, levels: tuple[_JoinLevel, ...], cap: int) -> Iterat
         found.append(False)
 
 
-def _distinct_key_products(per_key: list[list], plan: _JoinPlan, cap: int) -> Iterator[Iterator[tuple]]:
-    """Each key's `_key_combos`, with the levels from `plan.split` on walked once for all keys."""
+def _key_opener(plan: _JoinPlan, lists: list, cap: int) -> Callable[[list], Iterator[tuple]]:
+    """How to enumerate one key's candidates in product order from its per-arc `lists`, as `plan` directs.
+
+    `lists` is any one key's lists: only its levels from `plan.split` on are read, and those are
+    the same for every key. Where `plan` has a shared place, candidates come from `_key_combos`
+    (or `_pair_key_combos` for the usual two-arc self-join), which builds no candidate that
+    reuses a token and counts its dead ends, with the levels from `plan.split` on walked once
+    for all keys (`_shared_tail`). Otherwise they are the product of the lists. Built once per
+    search, so a key opened late in a merge reuses the walk the earlier keys shared.
+    """
+    if plan.pair:
+        return _pair_key_combos
+    if not plan.distinct:
+        return _plain_key_product
     split, levels = plan.split, plan.levels
     if split == len(levels):
-        return (_key_combos(lists, levels, cap) for lists in per_key)
-    tail = per_key[0][split:]
+        return functools.partial(_key_combos, levels=levels, cap=cap)
+    tail = lists[split:]
     shared = _Replay(_key_combos(tail, levels[split:], cap))
     pad = tuple(_dead_prefix([], tail, levels[split:]))
     head_levels = levels[:split]
     if all(level.kind == _FREE for level in head_levels):
-        return (_shared_tail(itertools.product(*lists[:split]), shared, pad) for lists in per_key)
-    return (_shared_tail(_key_combos(lists[:split], head_levels, cap), shared, pad) for lists in per_key)
+        return lambda key_lists: _shared_tail(itertools.product(*key_lists[:split]), shared, pad)
+    return lambda key_lists: _shared_tail(_key_combos(key_lists[:split], head_levels, cap), shared, pad)
+
+
+def _plain_key_product(lists: list) -> Iterator[tuple]:
+    """One key's candidates where no level is constrained: the product of its lists."""
+    return _lazy_product([iter(group) for group in lists])
 
 
 def _shared_tail(head: Iterator[tuple], tail: "_Replay[tuple]", pad: tuple) -> Iterator[tuple]:
@@ -1247,6 +1435,56 @@ def _dead_prefix(chosen: list, lists: list, levels: tuple[_JoinLevel, ...]) -> _
 def _read_positions(combo: tuple) -> tuple:
     """The per-arc read positions of a `(position, value)` combination, for `heapq.merge`."""
     return tuple(position for position, _ in combo)
+
+
+def _merge_from_bounds(keys: "Iterable[tuple[tuple, Callable[[], Iterator[tuple] | None]]]") -> Iterator[tuple]:
+    """Merge per-key candidates into product order, opening each key only once the merge reaches it.
+
+    `keys` yields `(bound, open)` per key, sorted by `bound`: a lower bound on the read positions
+    of every candidate of that key, and a function that returns the key's candidates in product
+    order (`None` for a key that has gone). A key whose bound is not below the smallest candidate
+    already open cannot hold anything before it, nor can any later key, so the next key needs
+    opening only when its bound would come first. A heap of the open keys does the rest, as
+    `heapq.merge` would, but it holds only the keys reached so far plus one: yielding `n`
+    candidates opens at most `n + 1` keys while the bounds are tight, and costs O(n log n)
+    however many keys there are. Candidates of different keys never tie (keys are disjoint),
+    and the counter keeps the heap from comparing the combinations themselves.
+
+    A bound shorter than the candidates compares below every candidate that starts with it, so
+    a bound can stop at the first arc whose position it pins down.
+    """
+    opening = iter(keys)
+    pending = next(opening, None)
+    heap: list[tuple[tuple, int, tuple, Iterator[tuple]]] = []
+    order = itertools.count()
+    while True:
+        while pending is not None and (not heap or pending[0] < heap[0][0]):
+            product = pending[1]()
+            first = None if product is None else next(product, None)
+            if first is not None:
+                heapq.heappush(heap, (_read_positions(first), next(order), first, cast("Iterator[tuple]", product)))
+            pending = next(opening, None)
+        if not heap:
+            return
+        _, n, combo, product = heap[0]
+        yield combo
+        following = next(product, None)
+        if following is None:
+            heapq.heappop(heap)
+        else:
+            heapq.heapreplace(heap, (_read_positions(following), n, following, product))
+
+
+def _bound_prefix(options: list, first_join: int) -> tuple:
+    """The least read position of each arc before the first join arc, the same for every key.
+
+    Those arcs have no `join_key`, so their option lists do not depend on the key: a plain list of
+    `(index, option)` pairs starts at its first index, and an `_Ordered` arc's options (index
+    tuples, see `_untaken_indexed`) at its first `count` indexes.
+    """
+    return tuple(
+        tuple(range(lists.count)) if isinstance(lists, _Ordered) else lists[0][0] for lists in options[:first_join]
+    )
 
 
 def _as_list(pool: _Pool) -> list[Token]:
@@ -1697,11 +1935,14 @@ class PetriNet:
         self.places: dict[str, Place] = {}
         self.transitions: dict[str, Transition] = {}
         self._running_count = 0
-        self._drive_limits: dict[str, int] = {}
+        self._drive_limits: dict[str, int | bool] = {}
         self._nested_undo: list[_NestedUndo] | None = None
         self._pending_restore: tuple[dict[str, tuple[Token, ...]], list[_NestedUndo], float] | None = None
         self._settle_lock = threading.Lock()
         self._closing = False
+        #: Set by `__exit__`. An inline drive never submits to `_executor`, so it checks this to
+        #: refuse to fire on a closed net, as `step()` does when its submit raises.
+        self._shut_down = False
         self._parent: weakref.ref[PetriNet] | None = None
         self._subnets: list[PetriNet] = []
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -1760,15 +2001,16 @@ class PetriNet:
         #: Lets `_ensure_key_index` skip re-registering on the hot path, while still
         #: rebuilding when an arc's ``key`` is reassigned after construction.
         self._key_index_arcs: dict[int, Callable[[Token], object]] = {}
-        #: Transition name -> ``{input position: (arc, place, join_key, index_id, depth)}`` for each
-        #: place join index registered for one of its arcs (see `_ensure_join_index`). Each
-        #: (transition, input position) gets its own index id, so an `InputArc` object shared by
-        #: two transitions is read through two indexes, each with one reader (ADR 0011 §2).
+        #: Transition name -> ``{input position: (arc, place, join_key, index_id, depth)}`` for
+        #: each join arc read through a place join index (see `_ensure_join_index`). Positions
+        #: reading one place with one `join_key` share an index id; two transitions never do, so
+        #: an `InputArc` object shared by two transitions is read through two indexes, each with
+        #: one reader (ADR 0011 §2).
         #: Holding the place lets `_release_stale_join_indexes` drop an index once its arc stops
         #: reading that place through it.
         self._join_registrations: dict[str, dict[int, _JoinRegistration]] = {}
         #: Transition name -> the `_JoinMatch` that tracks which join keys all its join places
-        #: hold (see `_matched_join_keys`). Dropped whenever it cannot serve.
+        #: hold (see `_matched_join_combos`). Dropped whenever it cannot serve.
         self._join_matches: dict[str, _JoinMatch] = {}
         #: Transition name -> first exception from a `binding_priority_key` that raised for
         #: *every* candidate binding during the current enabling pass (so `PRIORITY` silently
@@ -2571,43 +2813,94 @@ class PetriNet:
                 already been shut down, such as after exiting a `with` block). Any tokens
                 already consumed from input places are returned before the error propagates.
         """
+        return self._fire_one(inline=False)
+
+    def _fire_one(self, *, inline: bool) -> bool:
+        """Select and consume one firing under the lock, then run it; see `step`.
+
+        With *inline* the action runs here on the calling thread, after the lock is released and
+        the deferred selection callbacks have been flushed, so the firing has committed (or rolled
+        back) when this returns. Otherwise it is submitted to the thread pool, as `step` does.
+        """
         # Synthesize resource-return arcs once, before any firing — covers callers that reach
         # `step` without `validate` (direct `step`, `drive_to_quiescence`). Fast-path no-op
         # after the first call.
         self._ensure_resource_returns_synthesized()
+        firing: tuple[Transition, list[Token], list[tuple[str, Token]]] | None = None
         try:
             with self._lock:
                 selected = self._select_transition_to_fire()
-                if not selected:
-                    fired = False
-                else:
+                if selected:
+                    if inline and self._shut_down:
+                        # Match `step()`, whose submit raises once the pool is shut down, only
+                        # when something would fire: refuse before consuming, so no token is touched.
+                        raise RuntimeError("cannot fire inline after the net's thread pools were shut down")
                     # The binding was resolved during selection (guard evaluated once); consume
                     # exactly those tokens. Under BindingPolicy.FIRST the chosen tokens may not
                     # be at the head of their places, so consumption is by token id, not FIFO.
                     transition, binding = selected
                     m_time = self._get_model_time_under_lock()
                     consumed_tokens, token_sources = self._consume_binding(binding, m_time)
-
                     self._running_count += 1
-                    try:
-                        self._executor.submit(self._execute_transition, transition, consumed_tokens, token_sources)
-                    except Exception:
-                        # submit() failed (e.g. executor shut down) — undo the increment so
-                        # is_quiescent() doesn't permanently block.
-                        self._running_count -= 1
-                        # Return consumed tokens back to their source places
-                        for src_name, t in token_sources:
-                            self._deposit_under_lock(src_name, t)
-                        raise
-                    fired = True
+                    firing = (transition, consumed_tokens, token_sources)
+                    if not inline:
+                        self._submit_firing_under_lock(*firing)
         finally:
             # Dispatch any deferred callbacks accumulated during selection, off the lock —
             # even if consume/submit raised, so buffered signals are never delayed.
+            self._flush_after_selection(firing if inline else None)
+
+        if firing is None:
+            return False
+        if inline:
+            # Off the lock, as on a worker thread. `_execute_transition` catches the action's
+            # exceptions, commits or rolls back, runs the callbacks and decrements
+            # `_running_count`. A `KeyboardInterrupt` or `SystemExit` from the action hands the
+            # tokens back as taken and propagates; any other `BaseException` fails the firing,
+            # then propagates (see `_fire_and_commit`).
+            self._execute_transition(*firing, inline=True)
+        return True
+
+    def _flush_after_selection(
+        self, unstarted: "tuple[Transition, list[Token], list[tuple[str, Token]]] | None"
+    ) -> None:
+        """Dispatch the callbacks deferred during selection, off the lock.
+
+        *unstarted* is an inline firing that is consumed and counted running but not yet
+        executed. If a callback raises a `BaseException` the flush does not catch (a
+        `SystemExit` from `on_error`, or Ctrl-C landing here), that firing would never run, so
+        its tokens go back as they were taken and it stops counting as running.
+        """
+        try:
             self._flush_search_exhaustions()
             self._flush_priority_key_failures()
             self._flush_selection_failures()
+        except BaseException:
+            if unstarted is not None:
+                self._abandon_unstarted(unstarted[2])
+            raise
 
-        return fired
+    def _abandon_unstarted(self, token_sources: list[tuple[str, Token]]) -> None:
+        """Undo a consumed firing that will never execute: return its tokens and its running count."""
+        self._return_unstarted(token_sources)
+        with self._lock:
+            self._running_count -= 1
+        self._work_available.set()
+
+    def _submit_firing_under_lock(
+        self, transition: Transition, consumed_tokens: list[Token], token_sources: list[tuple[str, Token]]
+    ) -> None:
+        """Hand a consumed firing to the thread pool. Caller holds `self._lock` and has counted it running."""
+        try:
+            self._executor.submit(self._execute_transition, transition, consumed_tokens, token_sources)
+        except Exception:
+            # submit() failed (e.g. executor shut down) — undo the increment so
+            # is_quiescent() doesn't permanently block.
+            self._running_count -= 1
+            # Return consumed tokens back to their source places
+            for src_name, t in token_sources:
+                self._deposit_under_lock(src_name, t)
+            raise
 
     def _inject_resource_returns(self, transition: Transition) -> int:
         """Append a synthesized `OutputArc` for each resource-pool `InputArc` this transition
@@ -2801,7 +3094,9 @@ class PetriNet:
             if not self.step():
                 self._wait_for_work(deadline, stop_event)
 
-    def drive_to_quiescence(self, *, max_ticks: int = 1_000_000, max_spins: int = 10_000_000) -> DriveResult:
+    def drive_to_quiescence(
+        self, *, max_ticks: int = 1_000_000, max_spins: int = 10_000_000, inline_actions: bool = False
+    ) -> DriveResult:
         """Drive the net to quiescence on its **logical clock**, jumping over timed waits.
 
         The deterministic counterpart to [`run`][cpnx.PetriNet.run]. Where `run` waits out
@@ -2831,6 +3126,27 @@ class PetriNet:
                 nets whose actions legitimately block for longer, so a slow-but-healthy action is
                 not mistaken for a hung one. It counts spins, so how long it lasts depends on the
                 machine; it is not a time bound. It is passed to subnet drives as `max_ticks` is.
+                It does not apply to firings run with `inline_actions`.
+            inline_actions: Run each firing's action on the calling thread instead of handing it to
+                the thread pool. The drive already keeps one firing in flight, so the order of
+                firings, commits and seeded draws is the same either way; inline execution only
+                drops the per-firing handoff and the wait for it, which dominates the cost of
+                cheap actions. The trade-off is the hung-action guard: an inline action that
+                blocks blocks the drive, and `max_spins` cannot cut it short. Set
+                `action_timeout_secs` on a transition whose action can hang; that action still
+                runs on its own worker under the timeout. `SubstitutionTransition` firings run
+                inline too, and their subnet drives inherit the setting. A `KeyboardInterrupt` or
+                `SystemExit` raised by an inline action hands the firing's tokens back exactly
+                as they were taken (a paced permit starts no cooldown), with no attempt counted
+                and nothing dead-lettered, and propagates out of the drive; on the thread pool
+                it is lost with the worker and the firing fails. Any other `BaseException` that
+                is not an `Exception` fails the firing as usual, then propagates. That holds for
+                an interrupt raised inside the action body. One that lands while the engine is
+                committing or rolling back can leave that firing half done. With
+                `action_timeout_secs`, the interrupt reaches the drive while it waits for the
+                action, which keeps running on its worker and may still have side effects after
+                its tokens are back. An inline drive that would fire on a net whose `with` block
+                has exited raises `RuntimeError`, as `step()` does. See ADR 0012.
 
         Returns:
             A [`DriveResult`][cpnx.DriveResult] with the number of firings and clock advances.
@@ -2846,13 +3162,13 @@ class PetriNet:
         if self._model_time is None:
             self.advance_time(math.nextafter(self.model_time, math.inf))
 
-        self._drive_limits = {"max_ticks": max_ticks, "max_spins": max_spins}
+        self._drive_limits = {"max_ticks": max_ticks, "max_spins": max_spins, "inline_actions": inline_actions}
         try:
-            return self._drive_logical_clock(max_ticks, max_spins)
+            return self._drive_logical_clock(max_ticks, max_spins, inline_actions)
         finally:
             self._drive_limits = {}
 
-    def _drive_logical_clock(self, max_ticks: int, max_spins: int) -> DriveResult:
+    def _drive_logical_clock(self, max_ticks: int, max_spins: int, inline: bool) -> DriveResult:
         """Fire and advance until a fixed point or *max_ticks*; see `drive_to_quiescence`."""
         steps = 0
         ticks = 0
@@ -2861,8 +3177,9 @@ class PetriNet:
             # deliberate: `step` returns as soon as the action is submitted, so awaiting means at
             # most one action is ever in flight. This keeps the drive single-threaded (determinism)
             # and ensures each completed action's outputs are committed before the next enablement
-            # check (instant accounting).
-            while not self._aborted() and self.step():
+            # check (instant accounting). An inline firing has committed by the time
+            # `_fire_one` returns, so its await finds nothing in flight.
+            while not self._aborted() and self._fire_one(inline=inline):
                 steps += 1
                 self._await_inflight(max_spins=max_spins)
             # Nothing fires right now. Done, or just waiting out a cooldown/settle window?
@@ -3061,6 +3378,7 @@ class PetriNet:
 
     def __exit__(self, *_: object) -> None:
         """Shut down the thread pool, waiting for in-flight transitions to finish."""
+        self._shut_down = True
         self._executor.shutdown(wait=True)
         # Zombie action threads may still be running after a timeout — don't wait.
         self._action_executor.shutdown(wait=False, cancel_futures=True)
@@ -4009,15 +4327,11 @@ class PetriNet:
         is the exception: its option is still the whole pool, until `_satisfying` trims it.
         See `docs/adr/0010-equi-join-index.md`.
 
-        Each `join_key` arc is read as groups of tokens by key (`_join_groups`), served from
-        the place's persistent join index when the key is certified. When every join arc is
-        served that way, the transition's `_JoinMatch` already knows which keys all the places
-        hold available tokens of (ADR 0011), so only those are looked up. Otherwise the place
-        with the fewest tokens is read first, and each later place is asked only for the keys
-        every earlier one had, which costs O(keys in the smallest place). Each surviving key
-        contributes the product of its groups with the other arcs' options, and `heapq.merge`
-        interleaves those per-key products back into the product's order by comparing each
-        candidate's per-arc read positions. Keys are disjoint, so no two candidates tie.
+        When every join arc is served by its place's join index, the transition's `_JoinMatch`
+        already knows which keys bind at every join place (ADR 0011), and lists them sorted by a
+        lower bound on their candidates, so `_matched_join_combos` opens them one at a time
+        (`_merge_from_bounds`). Otherwise
+        `_unmatched_join_combos` reads every key of the places.
 
         An arc without a `join_key` alone on its place, or `consume_all`, contributes its usual
         options, capped at `binding_search_limit + 1` as in `_iter_candidate_bindings`. One on
@@ -4028,21 +4342,130 @@ class PetriNet:
         arc no option arrives as a `_DeadEnd`, counted like a candidate.
 
         `unordered` is for the existence probe, which only asks whether some candidate
-        satisfies the guard. When every candidate fits within `binding_search_limit`, the order
-        cannot change that answer, so the per-key products are chained instead of merged. With
-        more candidates than that, the limit decides which are examined, and the probe keeps
-        the firing path's order so the two agree.
-
-        `shared` is `_shared_places(transition)`, from the caller.
+        satisfies the guard. `shared` is `_shared_places(transition)`, from the caller.
         """
         t_limit = _LAST_FINITE_TIME if ignore_timing else m_time
         gathered = self._join_arc_options(transition, t_limit, ignore_timing, shared)
         if gathered is None:
             return None
         options, joins = gathered
+        # Every token of an available group is a valid choice for its arc only because a join arc
+        # takes exactly one token and has no `key` or `filter` (ADR 0010 §1). The one-key probe
+        # relies on that, so a future relaxation of the rule must revisit it.
+        assert all(arc.count == 1 and arc.key is None and arc.filter is None for _, arc, _ in joins)
         shape = _join_shape(transition, joins, shared)
         plan = _join_plan(transition, shared, options)
-        grouped = self._probe_join_groups(transition, joins, shape, t_limit, unordered and plan.shortcut)
+        match = self._serving_join_match(transition.name, joins, shape, t_limit)
+        if match is None:
+            combos = self._unmatched_join_combos(transition.name, joins, shape, options, plan, t_limit, unordered)
+        else:
+            assert t_limit is not None
+            first_only = unordered and plan.shortcut and transition.guard is None
+            combos = self._matched_join_combos(match, joins, options, plan, t_limit, first_only)
+        if combos is None:
+            return None
+        return self._join_bindings(transition.inputs, options, combos), plan.drained
+
+    def _matched_join_combos(
+        self,
+        match: _JoinMatch,
+        joins: list[tuple[int, InputArc, Place]],
+        options: "list[list[tuple[int, list[Token]]] | None]",
+        plan: _JoinPlan,
+        t_limit: float,
+        first_only: bool,
+    ) -> Iterator[tuple] | None:
+        """The join candidates as `(position, value)` combinations, from the keys `match` lists.
+
+        Every listed key binds: each place reports a key only once each of its join arcs can take
+        a token of its own (issues #75 and #78). So with no guard, an existence probe
+        (`first_only`) needs one key, the first by when it binds, and costs O(1) however many keys
+        the places hold.
+
+        Otherwise the keys come sorted by their first join arc's first entry
+        (`_JoinMatch.ordered_keys`). With the least positions of the arcs before it, which do not
+        depend on the key, that entry bounds every candidate of the key from below, so
+        `_merge_from_bounds` opens keys only as the merge reaches them. Examining `n` candidates
+        reads about `n + 1` keys, at O(log keys) each, where merging every key's candidates would
+        read them all. The bound is exact unless an earlier arc on the first join arc's place, or
+        the residual Hall check, keeps that arc off its first token; the merge then opens a key
+        early, never late.
+
+        `first_only` is set only where `_JoinPlan.shortcut` holds: every key then shows the same
+        pattern of candidates and dead ends, so one key decides as firing would (`_join_shortcut`
+        has the rule: an arc without a `join_key` that reads a join place, or that can dead-end
+        ahead of a join arc, makes the keys differ or repeats its dead ends once per key).
+
+        Each key's candidates come from one `_key_opener`, built here, so the walk of the arcs
+        after the join arcs is shared by every key the search opens.
+        """
+        opener = _key_opener(plan, options, self.binding_search_limit + 1)
+        if first_only:
+            # The first key that still opens: one, unless a place lost keys without the engine lock.
+            for key in match.iter_keys_at(t_limit):
+                candidates = self._open_join_key(match, joins, options, opener, key, t_limit)
+                if candidates is not None:
+                    return candidates
+            return None
+        ordered = match.ordered_keys(t_limit)
+        if not ordered:
+            return None
+        if len(ordered) == 1:
+            return self._open_join_key(match, joins, options, opener, match.key_of(ordered[0][1]), t_limit)
+        prefix = _bound_prefix(options, joins[0][0])
+        return _merge_from_bounds(
+            (
+                (*prefix, first),
+                functools.partial(self._open_join_key, match, joins, options, opener, match.key_of(uid), t_limit),
+            )
+            for first, uid in ordered
+        )
+
+    def _open_join_key(
+        self,
+        match: _JoinMatch,
+        joins: list[tuple[int, InputArc, Place]],
+        options: "list[list[tuple[int, list[Token]]] | None]",
+        opener: Callable[[list], Iterator[tuple]],
+        key: object,
+        t_limit: float,
+    ) -> Iterator[tuple] | None:
+        """The product of `key`'s groups with the other arcs' options, or `None` if a place has lost the key.
+
+        Reads one group per join arc from its index, at O(1) each. A place can lose a key the match
+        still lists only when it is changed without the engine lock (see `_JoinMatch`). Each arc
+        is read through its function's index (`_JoinMatch.index_ids`), which the match's refresh
+        has just found serving, so an index can decline here only after such a change too, and
+        the key is then treated as gone, as with any stale read. `opener` (`_key_opener`)
+        enumerates the candidates.
+        """
+        streams: list[Iterable] = list(options)  # type: ignore[arg-type]  # join slots are filled below
+        for (i, _, place), index_id in zip(joins, match.index_ids, strict=True):
+            groups = place.peek_join(index_id, (key,), model_time=t_limit)
+            group = None if groups is None else groups.get(key)
+            if not group:
+                return None
+            streams[i] = group
+        return opener(streams)
+
+    def _unmatched_join_combos(
+        self,
+        transition_name: str,
+        joins: list[tuple[int, InputArc, Place]],
+        shape: _JoinShape,
+        options: "list[list[tuple[int, list[Token]]] | None]",
+        plan: _JoinPlan,
+        t_limit: float | None,
+        unordered: bool,
+    ) -> Iterator[tuple] | None:
+        """The join candidates when no `_JoinMatch` serves, reading every key of the join places.
+
+        Each surviving key (`_join_key_groups`) contributes the product of its groups with the
+        other arcs' options, and `heapq.merge` interleaves those per-key products back into the
+        product's order by comparing each candidate's per-arc read positions. Keys are disjoint,
+        so no two candidates tie. This costs O(keys in the smallest join place).
+        """
+        grouped = self._join_key_groups(transition_name, joins, shape, t_limit)
         if grouped is None:
             return None
         groups_by_arc, keys = grouped
@@ -4050,84 +4473,19 @@ class PetriNet:
             [groups_by_arc[i][key] if arc_options is None else arc_options for i, arc_options in enumerate(options)]
             for key in keys
         ]
-        combos = self._join_combos(per_key, plan, unordered=unordered)
-        return self._join_bindings(transition.inputs, options, combos), plan.drained
-
-    def _probe_join_groups(
-        self,
-        transition: Transition,
-        joins: list[tuple[int, InputArc, Place]],
-        shape: _JoinShape,
-        t_limit: float | None,
-        unordered: bool,
-    ) -> "tuple[dict[int, dict], list[object]] | None":
-        """`_join_key_groups` for the keys `_join_candidates` should look up.
-
-        Those are the match's available keys, or every key when no match serves (see
-        `_matched_join_keys`). With no guard, any candidate satisfies, so an existence probe
-        (`unordered`) needs only one key that binds. That holds because a join arc takes exactly
-        one token and has no `key` or `filter` (ADR 0010 §1), so every token of an available
-        group is a valid choice for its arc. The assertion keeps a future relaxation of that rule
-        from breaking this silently.
-
-        Where every join place is read with one `join_key` function, every key the match lists
-        binds: each join index is registered with its arcs' depth (see `_JoinShape`), so the
-        match lists a key only once the place holds a token for each arc (issue #75). The probe
-        then asks for one key. Where a place is read with several functions, a listed key may
-        still fail Hall's condition, so the probe reads the listed keys in doubling batches and
-        stops at the first batch with a key that passes (`_first_binding_key_groups`): it pays
-        for the keys before the first that binds, not for all of them.
-
-        The shortcuts need every key to show the same pattern of candidates and dead ends, so
-        that the one key the probe reads decides as firing, which merges every key in product
-        order, would. `_join_candidates` passes `unordered` as false unless `_JoinPlan.shortcut`
-        says so (`_join_shortcut` has the rule): an arc without a `join_key` that reads a join
-        place, or that can dead-end ahead of a join arc, makes the keys differ or repeats its
-        dead ends once per key. Such a probe reads every key, in firing's order.
-        """
-        assert all(arc.count == 1 and arc.key is None and arc.filter is None for _, arc, _ in joins)
-        name = transition.name
-        first_only = unordered and transition.guard is None
-        if first_only and shape.mixed:
-            return self._first_binding_key_groups(name, joins, shape, t_limit)
-        keys = self._matched_join_keys(name, joins, shape, t_limit, 1 if first_only else None)
-        return self._join_key_groups(name, joins, shape, keys, t_limit)
-
-    def _first_binding_key_groups(
-        self, transition_name: str, joins: list[tuple[int, InputArc, Place]], shape: _JoinShape, t_limit: float | None
-    ) -> "tuple[dict[int, dict], list[object]] | None":
-        """The groups of the first matched key that binds, reading the match in doubling batches.
-
-        For the guard-free existence probe of a transition with a place read by several
-        `join_key` functions (see `_probe_join_groups`). Falls back to every key when no match
-        serves.
-        """
-        match = self._serving_join_match(transition_name, joins, shape, t_limit)
-        if match is None:
-            return self._join_key_groups(transition_name, joins, shape, None, t_limit)
-        assert t_limit is not None
-        start, size = 0, 1
-        while keys := match.keys_at(t_limit, start + size, start=start):
-            grouped = self._join_key_groups(transition_name, joins, shape, keys, t_limit)
-            if grouped is not None:
-                return grouped[0], grouped[1][:1]
-            start, size = start + size, size * 2
-        return None
+        return self._join_combos(per_key, plan, unordered=unordered)
 
     def _join_key_groups(
         self,
         transition_name: str,
         joins: list[tuple[int, InputArc, Place]],
         shape: _JoinShape,
-        keys: list[object] | None,
         t_limit: float | None,
     ) -> "tuple[dict[int, dict], list[object]] | None":
         """Read each join arc's groups for the keys every join place has, smallest place first.
 
-        Starts from `keys`, or from every key of the first place for `None`, and narrows to the
-        keys each place has. Returns the groups by arc index and the surviving keys, or `None`
-        when no key survives, including when `keys` is empty: the match knows that no key is
-        available in every join place.
+        Starts from every key of the first place and narrows to the keys each later place has.
+        Returns the groups by arc index and the surviving keys, or `None` when no key survives.
 
         In a self-join, where several join arcs read one place with one `join_key` function, each
         takes a different token of the key's group (issue #75), so a group smaller than that
@@ -4140,13 +4498,12 @@ class PetriNet:
         functions, so per-function depths alone would keep keys whose every candidate reuses
         that token (issue #78).
         """
-        if keys is not None and not keys:
-            return None
+        keys: list[object] | None = None
         groups_by_arc: dict[int, dict] = {}
         for i, arc, place in sorted(joins, key=lambda join: len(join[2])):
             depth = shape.depths[i]
             groups = _with_enough_tokens(
-                self._join_groups(i, arc, place, keys, t_limit, transition_name, depth=depth), depth
+                self._join_groups(i, arc, place, keys, t_limit, transition_name, depth=shape.index_depths[i]), depth
             )
             if not groups:
                 return None
@@ -4156,28 +4513,6 @@ class PetriNet:
         keys = _keys_with_distinct_tokens(shape, groups_by_arc, keys)
         return (groups_by_arc, keys) if keys else None
 
-    def _matched_join_keys(
-        self,
-        transition_name: str,
-        joins: list[tuple[int, InputArc, Place]],
-        shape: _JoinShape,
-        t_limit: float | None,
-        limit: int | None,
-    ) -> list[object] | None:
-        """The join keys that every join place holds an available token of, or `None` if unknown.
-
-        Served by the transition's `_JoinMatch`, which costs O(changes since the last probe)
-        plus O(keys returned), not O(keys in the smallest place). See ADR 0011. `None`, so that
-        `_join_candidates` reads the places' keys itself, when some join arc's place is not
-        served by a join index (an uncertified key, a `Place` subclass, a disabled index), or
-        on the wall clock (`t_limit` is `None`), where the place picks the time it reads at.
-        """
-        match = self._serving_join_match(transition_name, joins, shape, t_limit)
-        if match is None:
-            return None
-        assert t_limit is not None
-        return match.keys_at(t_limit, limit)
-
     def _serving_join_match(
         self,
         transition_name: str,
@@ -4185,7 +4520,13 @@ class PetriNet:
         shape: _JoinShape,
         t_limit: float | None,
     ) -> _JoinMatch | None:
-        """The transition's `_JoinMatch`, refreshed, or `None` when it cannot serve this probe."""
+        """The transition's `_JoinMatch`, refreshed, or `None` when it cannot serve this probe.
+
+        `None`, so that `_join_candidates` reads the places' keys itself, when some join arc's
+        place is not served by a join index (an uncertified key, a `Place` subclass, a disabled
+        index), or on the wall clock (`t_limit` is `None`), where the place picks the time it
+        reads at.
+        """
         match = self._join_match(transition_name, joins, shape) if t_limit is not None else None
         if match is None:
             self._join_matches.pop(transition_name, None)
@@ -4204,20 +4545,25 @@ class PetriNet:
         so the match serves from a transition's first probe. Waiting for `_join_groups` would
         not do: it stops at the first place with no usable key, so a self-join whose keys all
         hold one token would leave its later arcs unregistered, and fall back on every probe.
+
+        Each join place reports through one index per `join_key` function its join arcs use
+        there, that of the function's first arc, with how many arcs use it (`_JoinShape.places`).
         """
-        index_ids: list[int] = []
-        depths = shape.depths
+        index_by_position: dict[int, int] = {}
         for i, arc, place in joins:
             certified: bool = arc._join_key_inline_safe  # type: ignore[attr-defined]
             join_key = arc.join_key
             if not certified or type(place) is not Place or join_key is None:
                 return None
-            index_ids.append(self._ensure_join_index(transition_name, i, arc, place, join_key, depth=depths[i]))
-        ids = tuple(index_ids)
+            index_by_position[i] = self._ensure_join_index(
+                transition_name, i, arc, place, join_key, depth=shape.index_depths[i]
+            )
+        ids = tuple(index_by_position[i] for i, _, _ in joins)
         places = tuple(place for _, _, place in joins)
         match = self._join_matches.get(transition_name)
         if match is None or not match.serves(ids, places):
-            match = self._join_matches[transition_name] = _JoinMatch(ids, places)
+            sources = _join_sources(joins, shape, index_by_position)
+            match = self._join_matches[transition_name] = _JoinMatch(ids, places, sources)
         return match
 
     def _join_arc_options(
@@ -4292,12 +4638,7 @@ class PetriNet:
         Where `plan` has a shared place, each key's candidates come from `_key_combos`, which
         builds no candidate that reuses a token and counts its dead ends.
         """
-        if plan.pair:
-            products: Iterator[Iterator[tuple]] = (_pair_key_combos(lists) for lists in per_key)
-        elif plan.distinct:
-            products = _distinct_key_products(per_key, plan, self.binding_search_limit + 1)
-        else:
-            products = (_lazy_product([iter(group) for group in lists]) for lists in per_key)
+        products = map(_key_opener(plan, per_key[0], self.binding_search_limit + 1), per_key)
         if len(per_key) == 1:
             return next(products)
         if unordered and _join_candidate_count(per_key) <= self.binding_search_limit:
@@ -4336,8 +4677,9 @@ class PetriNet:
     ) -> "dict[object, Iterable[tuple[object, Token]]] | None":
         """Return `arc`'s available tokens grouped by `join_key`, restricted to `keys` unless `None`.
 
-        `depth` is how many join arcs of the transition read `place` with this arc's `join_key`
-        (see `_JoinShape.depths`).
+        `depth` is the depth the arc's index is registered with (`_JoinShape.index_depths`): how
+        many join arcs of the transition read `place` with this arc's `join_key`, or every join
+        arc on the place when they use several functions.
 
         Each group yields `(position, token)` in the place's read order, where positions order
         the tokens the same way, and has a `len`. A certified `join_key` on a plain
@@ -4374,17 +4716,26 @@ class PetriNet:
         """Register the join index for input `position` of the transition on `place`; return its id.
 
         A no-op returning the existing id when that exact registration (same arc, place,
-        `join_key` and `depth`) is in place. Any other registration at that position is dropped from its
-        place first, and the new one gets a fresh id from `_JOIN_INDEX_IDS`.
+        `join_key` and `depth`) is in place. Otherwise the position's old registration is
+        released (`_release_join_entry`), and the position shares the index of another of the
+        transition's positions that reads `place` with the same `join_key` and `depth`, or gets
+        a new one with a fresh id from `_JOIN_INDEX_IDS`.
+
+        So a transition keeps one index per (place, function): the join arcs of a self-join read
+        one group, and the match drains that index, so no registered index goes unread (ADR 0011
+        §2). Two transitions never share one, even through a shared `InputArc` object.
         """
         registered = self._join_registrations.setdefault(transition_name, {})
         entry = registered.get(position)
         if entry is not None:
             if _registration_matches(entry, arc, place, join_key, depth):
                 return entry[3]
-            entry[1].unregister_join_index(entry[3])
-        index_id = next(_JOIN_INDEX_IDS)
-        place.register_join_index(index_id, join_key, depth)
+            del registered[position]
+            _release_join_entry(registered, entry)
+        index_id = _shared_join_index(registered, place, join_key, depth)
+        if index_id is None:
+            index_id = next(_JOIN_INDEX_IDS)
+            place.register_join_index(index_id, join_key, depth)
         registered[position] = (arc, place, join_key, index_id, depth)
         return index_id
 
@@ -4401,15 +4752,15 @@ class PetriNet:
         if not registered:
             return
         inputs = transition.inputs
-        for position, (arc, place, join_key, index_id, _depth) in list(registered.items()):
+        for position, (arc, place, join_key, _index_id, _depth) in list(registered.items()):
             if (
                 position >= len(inputs)
                 or inputs[position] is not arc
                 or arc.join_key is not join_key
                 or self.places.get(arc.place) is not place
             ):
-                place.unregister_join_index(index_id)
-                del registered[position]
+                entry = registered.pop(position)
+                _release_join_entry(registered, entry)
                 self._join_matches.pop(transition.name, None)
 
     def _group_pool_by_join_key(
@@ -4992,13 +5343,15 @@ class PetriNet:
         transition: Transition,
         consumed_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
+        *,
+        inline: bool = False,
     ) -> None:
         start_time = time.monotonic()
         try:
             if isinstance(transition, SubstitutionTransition):
-                outcome = self._fire_substitution_atomically(transition, consumed_tokens, token_sources)
+                outcome = self._fire_substitution_atomically(transition, consumed_tokens, token_sources, inline=inline)
             else:
-                outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time)
+                outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, inline=inline)
             if outcome is None:
                 return
 
@@ -5025,6 +5378,8 @@ class PetriNet:
         token_sources: list[tuple[str, Token]],
         start_time: float,
         action_error: BaseException | None = None,
+        *,
+        inline: bool = False,
     ) -> "_FiringOutcome | None":
         """Run the action and commit or roll back; *action_error* fails the firing without it.
 
@@ -5032,6 +5387,15 @@ class PetriNet:
         it: one that starts after that failure, or whose subnet drive the failure cuts short. It
         hands its tokens back without retrying, dead-lettering or calling back, and the restore
         resets the net.
+
+        On an *inline* firing, an action that raises `KeyboardInterrupt` or `SystemExit` is the
+        caller stopping the drive, not the firing failing: its tokens go back exactly as they were
+        taken (`_return_unstarted`, so a paced permit keeps its availability), with no attempt
+        counted, and the interrupt is re-raised. Any other `BaseException` (`CancelledError`,
+        `GeneratorExit`) fails the firing like an `Exception` and is re-raised after the rollback
+        by `_execute_transition`, so a caller that catches it and drives again cannot re-fire the
+        same token forever. On the pool nothing would receive the re-raise, so a worker rolls
+        every interrupt back as a failure.
         """
         if self._aborted():
             self._return_unstarted(token_sources)
@@ -5043,6 +5407,9 @@ class PetriNet:
         if isinstance(error, _EnclosingFiringFailed):
             self._return_interrupted(token_sources)
             return None
+        if inline and isinstance(error, (KeyboardInterrupt, SystemExit)):
+            self._return_unstarted(token_sources)
+            raise error
         with self._lock:
             duration = time.monotonic() - start_time
             success, error, data_tokens, dl_data, deposited = self._commit_or_rollback_transition(
@@ -5093,6 +5460,8 @@ class PetriNet:
         transition: SubstitutionTransition,
         consumed_tokens: list[Token],
         token_sources: list[tuple[str, Token]],
+        *,
+        inline: bool = False,
     ) -> "_FiringOutcome | None":
         """Fire a substitution transition as one transaction on its subnet.
 
@@ -5126,7 +5495,7 @@ class PetriNet:
                 return self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, exc)
             subnet._nested_undo = nested = []
             try:
-                outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time)
+                outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, inline=inline)
             except BaseException:
                 subnet._request_restore(checkpoint, nested)
                 raise

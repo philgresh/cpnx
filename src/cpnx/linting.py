@@ -69,7 +69,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .certification import _UNRESOLVED, _resolve_name, _root_name
-from .sandbox import _source_nodes
+from .sandbox import _callable_nodes_or_empty
 
 #: Category label for findings whose root symbol is a network client/transport.
 NETWORK = "network"
@@ -347,21 +347,6 @@ def _classify_call(node: ast.Call, func: Callable) -> tuple[str, str] | None:
     return None
 
 
-def _get_cached_ast_nodes(func: Callable) -> tuple[ast.AST, ...]:
-    """Recover the ``Lambda``/``FunctionDef`` nodes *func* may be from the shared parse of its file.
-
-    The parse and the search are cached per file (see :func:`cpnx.sandbox._source_nodes`), so
-    N callables in one module cost one parse, not N. The nodes are shared and only ever
-    *walked* here, never mutated. There is one node, except where several functions start on
-    *func*'s line and the interpreter records no columns to tell them apart; then all of them
-    are returned. Empty when the source cannot be located (compiled builtin, REPL lambda).
-    """
-    try:
-        return _source_nodes(func)
-    except (OSError, TypeError, SyntaxError):
-        return ()
-
-
 def lint_callable(func: Callable) -> list[LintFinding]:
     """Scan *func*'s body for network / database / clock / randomness trouble spots.
 
@@ -379,7 +364,7 @@ def lint_callable(func: Callable) -> list[LintFinding]:
         return []
     findings: list[LintFinding] = []
     seen: set[tuple[str, str, int]] = set()
-    for child in (child for node in _get_cached_ast_nodes(func) for child in ast.walk(node)):
+    for child in (child for node in _callable_nodes_or_empty(func) for child in ast.walk(node)):
         if not isinstance(child, ast.Call):
             continue
         hit = _classify_call(child, func)

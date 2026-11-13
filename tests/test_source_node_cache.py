@@ -1,10 +1,13 @@
-"""A callable's source file is parsed and searched once, however often the callable is checked.
+"""A callable's source file is parsed once, and caching it changes no check's verdict.
 
 Every `InputArc`, `OutputArc` and `Transition` checks its callables on construction: the purity
 blocklist (`cpnx.sandbox`), the side-effect lint (`cpnx.linting`) and inline-safety
 certification (`cpnx.certification`). Each needs the callable's node in its source file. Finding
 it used to parse the file and walk the whole tree on every check, which made building many nets
 from the same functions slow in proportion to the size of the module that defines them.
+
+The shared parse itself is covered in `tests/test_source_cache.py`. These tests add what a cache
+must not change: the same verdict, message and warning on every check, from one thread or several.
 """
 
 import ast
@@ -97,12 +100,12 @@ def test_checks_of_one_callable_parse_and_walk_its_file_once(module, work):
     assert work["walk"] == 1
 
 
-def test_callables_of_one_file_share_its_parse_and_walk(module, work):
+def test_callables_of_one_file_share_its_parse(module, work):
     _check_all(module.plain)
     _check_all(module.reads_the_clock)
 
     assert work["parse", module.__file__] == 1
-    assert work["walk"] == 1
+    assert work["walk"] == 2  # one search of the tree for each line a callable starts on
 
 
 def test_arcs_built_from_one_callable_parse_its_file_once(module, work):
@@ -113,14 +116,17 @@ def test_arcs_built_from_one_callable_parse_its_file_once(module, work):
     assert work["walk"] == 1
 
 
-def test_threads_checking_at_once_parse_the_file_once(module, work):
+def test_threads_checking_at_once_all_get_the_callable_s_verdicts(module):
+    # The cache takes no lock, so threads that meet on a file nobody has parsed yet may each
+    # parse it. Whichever parse a thread ends up reading, its verdicts are the callable's own.
     start = threading.Barrier(8)
-    errors = []
+    results, errors = [], []
 
     def check():
         try:
             start.wait()
-            _check_all(module.plain)
+            verify_callable_purity(module.plain)
+            results.append((certify(module.plain).certified, lint_callable(module.reads_the_clock)[0].symbol))
         except Exception as exc:  # pragma: no cover - reported below
             errors.append(exc)
 
@@ -131,7 +137,7 @@ def test_threads_checking_at_once_parse_the_file_once(module, work):
         thread.join()
 
     assert errors == []
-    assert work["parse", module.__file__] == 1
+    assert results == [(True, "time.monotonic")] * 8
 
 
 def test_a_rejected_callable_is_rejected_every_time(module):
