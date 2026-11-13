@@ -265,6 +265,8 @@ for _feature in __future__.all_feature_names:
 
 #: Held while a source is compiled with its warnings silenced: before Python 3.14
 #: `warnings.catch_warnings` swaps a process-wide filter list, so two at once would interleave.
+#: The swap is still process-wide there: a warning another thread raises during the compile
+#: (a few milliseconds per file, once per file) is silenced with it.
 _COMPILE_LOCK = threading.Lock()
 
 
@@ -275,13 +277,17 @@ class _ParsedSource:
     callable's own code (`_body_anchor`): callables that share a start line are told apart by it.
     """
 
-    __slots__ = ("source", "path", "tree", "functions", "targets", "compiled", "held")
+    __slots__ = ("source", "path", "tree", "starting", "targets", "compiled", "held")
 
     def __init__(self, source: bytes | str, path: str, tree: ast.AST) -> None:
         self.source = source
         self.path = path
         self.tree = tree
-        self.functions = [node for node in ast.walk(tree) if isinstance(node, _FUNCTION_NODES)]
+        # The function nodes by the line each starts on, in the order `ast.walk` meets them.
+        self.starting: dict[int, list[ast.AST]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, _FUNCTION_NODES):
+                self.starting.setdefault(_first_line(node), []).append(node)
         self.targets: dict[tuple[int, _Position | None], tuple[ast.AST, ...]] = {}
         self.compiled: dict[int, dict[tuple[int, str], list[tuple[types.CodeType, types.CodeType]]]] = {}
         self.held: dict[types.CodeType, tuple[ast.AST, ...] | None] = {}
@@ -290,7 +296,7 @@ class _ParsedSource:
         """Return the function nodes starting on `start_line` that `anchor` allows: all, if it is `None`."""
         key = (start_line, anchor)
         if key not in self.targets:
-            starting = tuple(node for node in self.functions if _first_line(node) == start_line)
+            starting = tuple(self.starting.get(start_line, ()))
             self.targets[key] = starting if anchor is None else _node_holding(starting, anchor)
         return self.targets[key]
 
@@ -550,6 +556,8 @@ def verify_callable_purity(func: Callable) -> None:
     - Mutable default arguments (``list``, ``dict``, or ``set`` literals as
       parameter defaults), which would introduce hidden persistent state between
       transition firings.
+    - A decorated callable (one with ``__wrapped__``): the wrapper is what runs, and
+      only the body it wraps can be read, so neither is vouched for.
 
     The default values the callable was defined with are checked as they are, not as its
     source spells them (the source may have been edited since): a ``list``, ``dict`` or
@@ -571,6 +579,11 @@ def verify_callable_purity(func: Callable) -> None:
 
 def _verify_purity(func: Callable, seen: frozenset[int]) -> None:
     """`verify_callable_purity`, with the functions already being checked (by `id`) in `seen`."""
+    if getattr(func, "__wrapped__", None) is not None:
+        raise PermissionError(
+            f"Cannot verify purity of {func!r}: it is decorated, and the wrapper that runs is not "
+            "the body that can be read. Pass the undecorated function."
+        )
     try:
         nodes = _callable_nodes(func)
     except _SOURCE_UNAVAILABLE as exc:
@@ -618,8 +631,7 @@ def _default_values(func: Callable) -> list[tuple[str, object]]:
     They ran once, where the function was defined, so they are not in its code and cannot
     be checked through it: only the values themselves say what the callable was given.
     """
-    target = inspect.unwrap(func)
-    target = getattr(target, "__func__", target)
+    target = getattr(func, "__func__", func)
     positional = getattr(target, "__defaults__", None) or ()
     code = getattr(target, "__code__", None)
     parameters = code.co_varnames[: code.co_argcount] if code is not None else ()

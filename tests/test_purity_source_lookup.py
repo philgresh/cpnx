@@ -240,9 +240,8 @@ def test_an_unexpected_lookup_error_reaches_every_gate_alike(monkeypatch):
 
 
 def test_a_wrapped_callable_is_looked_up_in_its_own_file(tmp_path):
-    # `getsourcelines` gives the line of the function a decorator wraps; the file must be that
-    # function's too, not the wrapper's. Looked up in the wrapper's file, it was not found
-    # and the lint reported nothing.
+    # The lint reads the body a decorator wraps: its line, and its file, not the wrapper's.
+    # Looked up in the wrapper's file, it was not found and the lint reported nothing.
     (tmp_path / "wrappers_90.py").write_text(
         "import functools\n\n\ndef logged(func):\n"
         "    @functools.wraps(func)\n    def wrapper(*args):\n        return func(*args)\n\n    return wrapper\n"
@@ -256,6 +255,10 @@ def test_a_wrapped_callable_is_looked_up_in_its_own_file(tmp_path):
         module = importlib.import_module("wrapped_90")
         assert [node.name for node in _callable_nodes(module.guard)] == ["guard"]
         assert [finding.symbol for finding in lint_callable(module.guard)] == ["time.monotonic"]
+        # The purity check reads the same body, but the wrapper is what runs: it refuses both.
+        with pytest.raises(PermissionError, match="decorated"):
+            verify_callable_purity(module.guard)
+        assert "decorated" in certify(module.guard).reason
     finally:
         sys.path.remove(str(tmp_path))
         sys.modules.pop("wrapped_90", None)

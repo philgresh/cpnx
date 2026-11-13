@@ -34,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Without column positions, a lambda on a line with another whose generator expression,
     comprehension or lambda sits in a branch the compiler drops is now held to what both
     of them do.
+  - A decorated guard, key, filter, condition, priority key or selector (one with
+    `__wrapped__`: `functools.wraps`, `functools.cache`, `lru_cache`) now raises
+    `PermissionError` at construction. The purity check read the body the decorator wraps,
+    but the wrapper is what runs, and it may print or sleep; certification already refused
+    such callables. Pass the undecorated function.
   - A callable whose code was changed as it was loaded, so that its file no longer
     compiles to it, now raises "source unavailable" and says so: a `def` holding an
     `assert` in a module pytest rewrites (a test module or `conftest.py`), and code
@@ -253,7 +258,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a notebook cell, a Python 3.13+ REPL entry and a module in a zip archive are read as
   precisely as a file, and certification and the lint now see them too. A callable wrapped
   with `functools.wraps` in another module is now looked up in its own file rather than the
-  wrapper's, so the lint sees its body.
+  wrapper's, so the lint sees its body (the purity check and certification refuse it).
 
 - **The gates judge a callable only by source that compiles to its very code**
   ([#90](https://github.com/philgresh/cpnx/issues/90)). The source found for a callable is
@@ -300,11 +305,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arguments, or, inside a function, as the function around it, whose locals then counted as
   its own, so a read of an enclosing variable certified. On every Python it is now found as
   itself, starting from its first decorator, as its code does. It is not certified ("decorated
-  callable"), and the purity check and the lint read its own body. That also covers a
-  decorated `def` outside any function, which was not found before: the purity check then read
-  its source text, which gives up at the first `=` and let a `print` or `open` in the body
-  through, and the lint reported nothing. The lint now reports such a callable's findings,
-  so a decorated guard may start to warn, or to raise under strict lint.
+  callable"), the purity check refuses it (see **Changed**), and the lint reads its own body.
+  That also covers a decorated `def` outside any function, which was not found before: the
+  purity check then read its source text, which gives up at the first `=` and let a `print`
+  or `open` in the body through, and the lint reported nothing. The lint now reports such a
+  callable's findings.
 
 - **Certification no longer admits three callables that run more than it checked.** A
   certified guard, key or filter runs inline, so these were real gaps:
