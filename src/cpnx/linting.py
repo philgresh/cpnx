@@ -350,8 +350,9 @@ def _classify_call(node: ast.Call, func: Callable) -> tuple[str, str] | None:
 def lint_callable(func: Callable) -> list[LintFinding]:
     """Scan *func*'s body for network / database / clock / randomness trouble spots.
 
-    Pure inspection: never warns, never raises, never mutates. Returns findings in
-    source order, de-duplicated by ``(category, symbol, lineno)``. Returns ``[]``
+    Pure inspection: never warns, never mutates, and raises only for an unexpected error
+    in the source lookup itself (a bug, which the purity check raises as well). Returns
+    findings in source order, de-duplicated by ``(category, symbol, lineno)``. Returns ``[]``
     when *func* is not callable or its source cannot be recovered (a compiled
     builtin, code with no source, a REPL lambda before Python 3.13) — an unseeable
     body is reported as "nothing found", never as a false positive, consistent with

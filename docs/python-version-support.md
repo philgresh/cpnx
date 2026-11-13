@@ -17,7 +17,7 @@ release there was **no `sys.version_info` gating anywhere in `src/`**.
 | module | AST surface | other introspection |
 | --- | --- | --- |
 | `cpnx/certification.py` | 34 distinct `ast.*` names, 46 references | `func.__code__` (source comes from `sandbox._callable_nodes`) |
-| `cpnx/sandbox.py` | 24 distinct `ast.*` names | `inspect.getsource{file,lines}`, `linecache`, `code.co_positions()` where it exists |
+| `cpnx/sandbox.py` | 24 distinct `ast.*` names | `inspect.{unwrap,getmodule}`, `linecache`, `compile`, `code.co_positions()` where it exists, `ast.PyCF_ALLOW_TOP_LEVEL_AWAIT` |
 | `cpnx/linting.py` | 7 distinct `ast.*` names | `inspect.currentframe` + `f_back` walk, `code.co_filename`, `ast.unparse` |
 
 All three decide by matching on node **classes**. That makes exactly two kinds of release

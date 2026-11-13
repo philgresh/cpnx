@@ -7,6 +7,9 @@ it let the callable through. A lambda on the last line of a call in a notebook c
 `inspect` holds for it, file or not, and one that is not found is rejected.
 """
 
+import ast
+import asyncio
+import dataclasses
 import functools
 import importlib
 import importlib.util
@@ -14,6 +17,7 @@ import linecache
 import os
 import sys
 import time
+import warnings
 import zipfile
 
 import pytest
@@ -117,15 +121,6 @@ def test_a_callable_whose_file_no_longer_holds_it_is_rejected(tmp_path):
         verify_callable_purity(module.guard)
 
 
-@pytest.fixture(params=["columns as the interpreter records them", "no columns"])
-def either_way(request, monkeypatch):
-    if request.param == "no columns":
-        monkeypatch.setattr(cpnx.sandbox, "_body_anchor", lambda func: None)
-    cpnx.sandbox._SOURCE_CACHE.clear()
-    yield
-    cpnx.sandbox._SOURCE_CACHE.clear()
-
-
 def test_a_file_edited_so_a_clean_def_starts_on_the_lambdas_line_is_rejected(tmp_path, either_way):
     # The running lambda is impure; the file now has a clean `def` on its line. Without
     # columns, the lookup fell back to that `def` and certified the lambda by it.
@@ -199,12 +194,12 @@ def test_an_edit_to_a_default_alone_does_not_hide_the_default_that_runs(tmp_path
     module = _load_then_edit(
         tmp_path,
         "edited_default_90",
-        "STATE = []\ndef guard(t, k=lambda b: print(b), s=STATE):\n    return k(t)\n",
-        "STATE = []\ndef guard(t, k=lambda b: bool(b), s=()):\n    return k(t)\n",
+        "def guard(t, k=lambda b: print(b)):\n    return k is not None\n",
+        "def guard(t, k=lambda b: bool(b)):\n    return k is not None\n",
     )
-    with pytest.raises(PermissionError):
+    with pytest.raises(PermissionError, match=f"Default 'k' of guard: .*{_UNAVAILABLE}"):
         verify_callable_purity(module.guard)
-    assert not certify(module.guard).certified
+    assert certify(module.guard).reason == "default value is mutable or uncertified"
 
 
 def test_a_mutable_default_value_is_refused_whatever_the_source_says(tmp_path, either_way):
@@ -214,7 +209,7 @@ def test_a_mutable_default_value_is_refused_whatever_the_source_says(tmp_path, e
         "STATE = []\ndef guard(t, s=STATE):\n    return len(s) > 0\n",
         "STATE = []\ndef guard(t, s=()):\n    return len(s) > 0\n",
     )
-    with pytest.raises(PermissionError, match="Mutable default"):
+    with pytest.raises(PermissionError, match="Mutable default argument 's'"):
         verify_callable_purity(module.guard)
     assert certify(module.guard).reason == "default value is mutable or uncertified"
 
@@ -273,3 +268,137 @@ def test_a_partial_is_still_rejected():
 
     with pytest.raises(PermissionError, match=_UNAVAILABLE):
         verify_callable_purity(functools.partial(key, scale=2))
+
+
+def _load(tmp_path, name, source):
+    path = tmp_path / f"{name}.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        spec.loader.exec_module(module)
+    return module
+
+
+def test_a_compiler_warning_elsewhere_in_the_file_does_not_fail_the_gates(tmp_path, either_way):
+    # The import warned once (or not at all, from a `.pyc`); the gates' own compile of the file
+    # must not warn again, and under an "error" filter must not refuse the file's callables.
+    module = _load(tmp_path, "warns_90", "def guard(t):\n    return len(t) > 0\n\n\ndef odd(x):\n    return x is 1\n")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        verify_callable_purity(module.guard)
+        assert certify(module.guard).certified, certify(module.guard).reason
+        assert lint_callable(module.guard) == []
+
+
+def test_a_cell_with_top_level_await_is_read_like_any_other(tmp_path, either_way):
+    # IPython's autoawait (and `python -m asyncio`) compile such a cell with top-level await
+    # allowed; the lambda in it is code like any other.
+    source = "await asyncio.sleep(0)\nguard = lambda b: len(b) > 0\nloud = lambda b: print(b)\n"
+    filename = str(tmp_path / "kernel" / "awaits_90.py")
+    linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
+    namespace = {"__name__": "__main__", "asyncio": asyncio}
+    code = compile(source, filename, "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+    asyncio.run(eval(code, namespace))  # noqa: S307 - the cell's coroutine, as the kernel runs it
+    verify_callable_purity(namespace["guard"])
+    assert certify(namespace["guard"]).certified, certify(namespace["guard"]).reason
+    assert not _is_pure(namespace["loud"])
+
+
+@dataclasses.dataclass
+class _Threshold:
+    limit: int
+
+    def __call__(self, tokens):
+        return len(tokens) > self.limit
+
+
+def test_an_unhashable_callable_is_not_certified_rather_than_raising(tmp_path):
+    module = _load(
+        tmp_path,
+        "unhashable_90",
+        "def make(limit, threshold):\n"
+        "    over = threshold(limit)\n"
+        "    def guard(toks, _over=over):\n"
+        "        return _over is not None and len(toks) > 0\n"
+        "    return guard\n\n\n"
+        "def reads(toks):\n    return OVER(toks)\n",
+    )
+    assert certify(module.make(3, _Threshold)).reason == "default value is mutable or uncertified"
+    module.OVER = _Threshold(3)
+    assert not certify(module.reads).certified
+    assert certify(_Threshold(3)).reason == "unhashable callable"
+
+
+def test_a_default_function_with_no_source_to_read_is_left_to_certification(tmp_path, either_way):
+    namespace = {}
+    exec(compile("def nowhere(x):\n    return x\n", "<no source 90>", "exec"), namespace)  # noqa: S102
+    module = _load(
+        tmp_path,
+        "sourceless_default_90",
+        "def joined(toks, _join=None):\n    return len(toks) > 0\n",
+    )
+    module.joined.__defaults__ = (namespace["nowhere"],)
+    verify_callable_purity(module.joined)
+    assert certify(module.joined).reason == "default value is mutable or uncertified"
+    module.joined.__defaults__ = (os.path.join,)
+    verify_callable_purity(module.joined)
+
+
+def test_default_functions_that_hold_each_other_are_checked_once(tmp_path, either_way):
+    module = _load(
+        tmp_path, "cycle_90", "def a(t, k=None):\n    return len(t)\n\n\ndef b(t, k=None):\n    return len(t)\n"
+    )
+    module.a.__defaults__ = (module.b,)
+    module.b.__defaults__ = (module.a,)
+    verify_callable_purity(module.a)
+    assert not certify(module.a).certified
+
+
+def test_an_impure_default_function_is_named_with_its_parameter(tmp_path, either_way):
+    module = _load(
+        tmp_path,
+        "named_default_90",
+        "def loud(t):\n    print(t)\n\n\ndef guard(t, *, check=loud):\n    return len(t)\n",
+    )
+    with pytest.raises(PermissionError, match="Default 'check' of guard: Forbidden function call 'print'"):
+        verify_callable_purity(module.guard)
+
+
+def test_a_file_edited_only_in_its_layout_still_reads_the_callable(tmp_path, either_way):
+    # The code is the same; only where its pieces sit in the line changed. Positions are not
+    # what runs, so the edited file still holds the callable.
+    module = _load_then_edit(
+        tmp_path,
+        "relaid_90",
+        "guard = lambda t: len(t) > 0 and t[0] is not None\n",
+        "guard = lambda t:   len(t) > 0   and   t[0] is not None\n",
+    )
+    linecache.checkcache(str(tmp_path / "relaid_90.py"))
+    verify_callable_purity(module.guard)
+    assert certify(module.guard).certified, certify(module.guard).reason
+
+
+def test_code_rewritten_as_it_was_loaded_is_rejected_saying_so(tmp_path, either_way):
+    # An import hook (pytest's assertion rewriting, typeguard) compiles other code than the
+    # file says. The callable is rejected, with a message that does not blame its form.
+    path = tmp_path / "hooked_90.py"
+    path.write_text("def guard(t):\n    return len(t) > 0\n")
+    tree = ast.parse(path.read_text())
+    tree.body[0].body[0].value = ast.parse("len(t) > 1", mode="eval").body
+    ast.fix_missing_locations(tree)
+    namespace = {"__name__": "hooked_90"}
+    exec(compile(tree, str(path), "exec"), namespace)  # noqa: S102 - what the hook would load
+    with pytest.raises(PermissionError, match="import hook"):
+        verify_callable_purity(namespace["guard"])
+
+
+def test_a_builtin_default_certifies_only_if_a_guard_may_call_it(tmp_path):
+    module = _load(
+        tmp_path,
+        "builtin_default_90",
+        "def quiet(t, f=len):\n    return f is not None\n\n\ndef loud(t, f=print):\n    return f is not None\n",
+    )
+    assert certify(module.quiet).certified, certify(module.quiet).reason
+    assert certify(module.loud).reason == "default value is mutable or uncertified"

@@ -205,14 +205,15 @@ def _get(namespace, where):
 
 @contextmanager
 def _columns(present):
-    real = cpnx.sandbox._body_anchor
+    real = cpnx.sandbox._body_anchor, cpnx.sandbox._code_anchor
     if not present:
         cpnx.sandbox._body_anchor = lambda func: None
+        cpnx.sandbox._code_anchor = lambda code: None
     cpnx.sandbox._SOURCE_CACHE.clear()
     try:
         yield
     finally:
-        cpnx.sandbox._body_anchor = real
+        cpnx.sandbox._body_anchor, cpnx.sandbox._code_anchor = real
         cpnx.sandbox._SOURCE_CACHE.clear()
 
 
@@ -312,16 +313,39 @@ def test_a_notebook_cell_is_judged_as_its_file_and_no_source_is_rejected(directo
         linecache.cache.pop(filename, None)
 
 
+def _what_runs(code):
+    """Return what `code` does, for comparison: its instructions, names, flags and constants, nested code too.
+
+    Built here rather than borrowed from the code under test, so that a lookup comparing
+    too little (or too much) is caught by this oracle.
+    """
+    consts = tuple(
+        _what_runs(const) if isinstance(const, types.CodeType) else (type(const), const) for const in code.co_consts
+    )
+    return (
+        code.co_code,
+        code.co_names,
+        code.co_varnames,
+        code.co_freevars,
+        code.co_cellvars,
+        code.co_flags,
+        code.co_argcount,
+        code.co_posonlyargcount,
+        code.co_kwonlyargcount,
+        code.co_name,
+        consts,
+    )
+
+
 def _compiles_to(source, path, code):
-    """Say whether `source` compiles to code equal to `code` on its line, positions aside."""
-    bare = cpnx.sandbox._without_positions(code)
+    """Say whether `source` compiles to code doing what `code` does on its line, positions aside."""
+    wanted = _what_runs(code)
     pending = [compile(source, path, "exec", dont_inherit=True)]
     while pending:
         each = pending.pop()
         pending.extend(const for const in each.co_consts if isinstance(const, types.CodeType))
-        if (each.co_firstlineno, each.co_name) == (code.co_firstlineno, code.co_name):
-            if cpnx.sandbox._without_positions(each) == bare:
-                return True
+        if (each.co_firstlineno, each.co_name) == (code.co_firstlineno, code.co_name) and _what_runs(each) == wanted:
+            return True
     return False
 
 

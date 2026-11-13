@@ -34,6 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Without column positions, a lambda on a line with another whose generator expression,
     comprehension or lambda sits in a branch the compiler drops is now held to what both
     of them do.
+  - A callable whose code was changed as it was loaded, so that its file no longer
+    compiles to it, now raises "source unavailable" and says so: a `def` holding an
+    `assert` in a module pytest rewrites (a test module or `conftest.py`), and code
+    instrumented by an import hook (`typeguard`, `beartype.claw`) or an IPython AST
+    transformer. Define such callables in a module nothing rewrites.
+  - The purity check now looks at the default values a callable holds, not only at their
+    source: a default that *names* a `list`, `dict` or `set` (`def guard(t, s=STATE)`) is
+    rejected like a literal one, and a function default whose source can be read must pass
+    the purity check itself (the message names the parameter). Certification holds each
+    default to the rule for a global read, allowing of the builtins only those a guard may
+    call (`len`, not `print`).
 
 - **Two `consume_all` input arcs on one place are never enabled, and adding such a transition
   warns** ([#75](https://github.com/philgresh/cpnx/issues/75)). Each would drain what the
@@ -259,8 +270,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   argument values run where the function is defined, not in its code, so an edit to a
   default alone leaves the code equal: the purity check and certification now also check
   the default values the callable holds. The purity check rejects a `list`, `dict` or `set`
-  and checks a Python function as a callable of its own; certification holds each value to
-  the rule for a global read (immutable, a builtin, or a certifying callable).
+  and checks a Python function as a callable of its own (once each, so defaults that hold
+  each other end; one with no source to read is left to certification); certification
+  holds each value to the rule for a global read (immutable, a builtin a guard may call, or
+  a certifying callable), and an unhashable callable is not certified rather than raising.
+  The compile allows top-level `await`, as a notebook cell may use it, and is silent: a
+  compiler warning elsewhere in the file (`x is 1`) is neither printed again nor, under an
+  "error" filter, a reason to refuse the file's callables.
 
 - **A callable that shares its source line with another is now checked against its own body**
   ([#90](https://github.com/philgresh/cpnx/issues/90)). The purity check, the side-effect lint

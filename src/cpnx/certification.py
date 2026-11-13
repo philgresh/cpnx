@@ -90,11 +90,14 @@ _IMMUTABLE_LEAVES = (int, float, str, bytes, bool, type(None))
 #: ``dict`` — and ``FrozenDict``, though it recursively freezes nested ``dict``/``list``
 #: values, admits any *hashable* value, so a custom object with mutable attributes passes
 #: straight through. So both recurse through :func:`_is_immutable` on keys *and* values.
-#: The objects the builtin names hold. A default value that is one of them is what a read of
-#: that builtin name gives, which a certified body may do.
-_BUILTIN_VALUES = tuple(value for name, value in vars(builtins).items() if not name.startswith("_"))
-
 _FROZEN_MAPPINGS = tuple(t for t in (FrozenDict, getattr(builtins, "frozendict", None)) if t is not None)
+
+#: The builtins a default value may be: those a certified body may call
+#: (``_ALLOWED_CALL_NAMES``). ``print``, ``open``, ``eval`` and the rest are not, nor is
+#: anything put into ``builtins`` at run time.
+_BUILTIN_VALUES = tuple(
+    value for name, value in vars(builtins).items() if name in _ALLOWED_CALL_NAMES and not name.startswith("_")
+)
 
 #: ``types.LazyImportType`` on 3.15+ (:pep:`810`), else ``None``.
 _LAZY_IMPORT_TYPE = getattr(types, "LazyImportType", None)
@@ -117,8 +120,10 @@ def certify(func: Callable) -> Verdict:
     """Return a :class:`Verdict` on whether *func* is safe to run inline.
 
     Never raises for an un-certifiable callable; an unverifiable one yields
-    ``Verdict(False, <reason>)``. A fresh memo/cycle-stack is used per top-level
-    call, so the result reflects the current call graph and closure state.
+    ``Verdict(False, <reason>)``. An unexpected error from the source lookup itself (a bug,
+    not missing or unreadable source) propagates, as it does from the purity check. A fresh
+    memo/cycle-stack is used per top-level call, so the result reflects the current call
+    graph and closure state.
 
     The AST walks are iterative, but a value or call graph nested deeply enough can
     still exhaust the interpreter's stack (``_is_immutable`` on a deeply nested
@@ -255,6 +260,12 @@ class _Certifier:
         self._memo: dict[Callable, Verdict] = {}
 
     def certify(self, func: Callable, stack: frozenset[Callable]) -> Verdict:
+        try:
+            hash(func)
+        except TypeError:
+            # The memo and the cycle stack key on the callable: an unhashable one (a dataclass
+            # with `__call__`) cannot be tracked through them, so it is not certified.
+            return Verdict(False, "unhashable callable")
         if func in stack:
             return Verdict(False, "cyclic call graph")
         if func in self._memo:
@@ -285,7 +296,7 @@ class _Certifier:
         only a default differs still compiles to the same code. So the values the callable
         holds are checked too, by the rule a global read is held to (:meth:`_check_name`).
         """
-        for value in _default_values(func):
+        for _name, value in _default_values(func):
             value = _force_lazy_import(value)
             if _is_immutable(value) or any(value is builtin for builtin in _BUILTIN_VALUES):
                 continue

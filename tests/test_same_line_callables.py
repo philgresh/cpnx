@@ -112,28 +112,6 @@ def case(tmp_path_factory):
     return module
 
 
-def _forget_columns(monkeypatch):
-    monkeypatch.setattr(cpnx.sandbox, "_body_anchor", lambda func: None)
-    cpnx.sandbox._SOURCE_CACHE.clear()
-
-
-@pytest.fixture
-def no_columns(monkeypatch):
-    """Check as an interpreter without column positions does (3.10, or `-X no_debug_ranges`)."""
-    _forget_columns(monkeypatch)
-    yield
-    cpnx.sandbox._SOURCE_CACHE.clear()
-
-
-@pytest.fixture(params=["columns as the interpreter records them", "no columns"])
-def either_way(request, monkeypatch):
-    """Run a test on both lookups: what must hold whether or not there are columns."""
-    if request.param == "no columns":
-        _forget_columns(monkeypatch)
-    yield
-    cpnx.sandbox._SOURCE_CACHE.clear()
-
-
 def _is_pure(func) -> bool:
     try:
         verify_callable_purity(func)

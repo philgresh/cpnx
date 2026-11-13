@@ -4,7 +4,9 @@ import ast
 import inspect
 import linecache
 import sys
+import threading
 import types
+import warnings
 from typing import Callable
 
 
@@ -158,7 +160,7 @@ def _lambda_names(node: ast.Lambda, code: types.CodeType) -> frozenset[str]:
     The compiler records each name of the lambda's own scope in its code object, also for a
     branch it then drops as unreachable. Each nested scope becomes a code object of its own,
     nested in `code` and holding the names inside it, except in a dropped branch, where none
-    is made, for it or for the scopes inside it. So if `code` has as many nested code objects,
+    is made, for it or for the scopes inside it. So if `code` has at least as many nested code objects,
     at every depth, as the body has nested scopes, none was dropped and every name counts. If
     it has fewer, the names inside nested scopes are left out: counting them could rule out
     the lambda's own node.
@@ -253,10 +255,17 @@ def _first_line(node: ast.AST) -> int:
 
 
 #: The `__future__` compiler flags. They are kept in a code object's `co_flags`, and code
-#: compiled from the same source matches only under the same ones.
+#: compiled from the same source matches only under the same ones. `nested_scopes` is left
+#: out: its flag is `CO_NESTED`, which the compiler sets on every nested function by itself,
+#: so passing it back changes nothing but would compile the file a second time.
 _FUTURE_FLAGS = 0
 for _feature in __future__.all_feature_names:
-    _FUTURE_FLAGS |= getattr(__future__, _feature).compiler_flag
+    if _feature != "nested_scopes":
+        _FUTURE_FLAGS |= getattr(__future__, _feature).compiler_flag
+
+#: Held while a source is compiled with its warnings silenced: before Python 3.14
+#: `warnings.catch_warnings` swaps a process-wide filter list, so two at once would interleave.
+_COMPILE_LOCK = threading.Lock()
 
 
 class _ParsedSource:
@@ -266,7 +275,7 @@ class _ParsedSource:
     callable's own code (`_body_anchor`): callables that share a start line are told apart by it.
     """
 
-    __slots__ = ("source", "path", "tree", "functions", "targets", "compiled")
+    __slots__ = ("source", "path", "tree", "functions", "targets", "compiled", "held")
 
     def __init__(self, source: bytes | str, path: str, tree: ast.AST) -> None:
         self.source = source
@@ -275,6 +284,7 @@ class _ParsedSource:
         self.functions = [node for node in ast.walk(tree) if isinstance(node, _FUNCTION_NODES)]
         self.targets: dict[tuple[int, _Position | None], tuple[ast.AST, ...]] = {}
         self.compiled: dict[int, dict[tuple[int, str], list[tuple[types.CodeType, types.CodeType]]]] = {}
+        self.held: dict[types.CodeType, tuple[ast.AST, ...] | None] = {}
 
     def locate(self, start_line: int, anchor: _Position | None) -> tuple[ast.AST, ...]:
         """Return the function nodes starting on `start_line` that `anchor` allows: all, if it is `None`."""
@@ -290,14 +300,26 @@ class _ParsedSource:
         Each comes with itself without positions (`_without_positions`).
 
         The source is compiled once per set of `__future__` flags, from its text rather
-        than the shared tree, so that it compiles whatever the import compiled.
+        than the shared tree, so that it compiles whatever the import compiled. Top-level
+        `await` is allowed, as IPython and `python -m asyncio` allow it in a cell; it changes
+        nothing for a file, which could not have been imported with one. The compiler's
+        warnings (`x is 1`, `return` in `finally`) are silenced: the import already gave
+        them, and under an "error" filter one would otherwise refuse every callable in the file.
 
         Raises:
             SyntaxError: If the source parses but does not compile.
         """
         flags = code.co_flags & _FUTURE_FLAGS
         if flags not in self.compiled:
-            module = compile(self.source, self.path, "exec", flags=flags, dont_inherit=True)
+            with _COMPILE_LOCK, warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                module = compile(
+                    self.source,
+                    self.path,
+                    "exec",
+                    flags=flags | ast.PyCF_ALLOW_TOP_LEVEL_AWAIT,
+                    dont_inherit=True,
+                )
             index: dict[tuple[int, str], list[tuple[types.CodeType, types.CodeType]]] = {}
             pending = [module]
             while pending:
@@ -337,7 +359,8 @@ _SOURCE_CACHE: dict[str, _ParsedSource] = {}
 
 #: What "the source cannot be found or parsed" looks like: no file (``OSError``), source that
 #: does not parse or compile (``SyntaxError``), undecodable bytes (``UnicodeDecodeError``, a
-#: ``ValueError``), or an object `inspect` cannot place (``TypeError``).
+#: ``ValueError``; also a null byte, or a cycle of ``__wrapped__``), or a code object whose
+#: file name is not a string (``TypeError``).
 _SOURCE_UNAVAILABLE = (OSError, TypeError, SyntaxError, ValueError)
 
 
@@ -444,14 +467,18 @@ def _held_nodes(parsed: _ParsedSource, code: types.CodeType) -> tuple[ast.AST, .
         positions; `()` if the source compiles to no such code on `code`'s line; `None` if
         it does but records no positions to place it by (Python 3.10, `-X no_debug_ranges`).
     """
-    own = _without_positions(code)
-    anchors = [_code_anchor(each) for each, bare in parsed.compiled_like(code) if bare == own]
-    if not anchors:
-        return ()
-    if None in anchors:
-        return None
-    candidates = parsed.locate(code.co_firstlineno, None)
-    return tuple(dict.fromkeys(node for anchor in anchors for node in _node_holding(candidates, anchor)))
+    if code not in parsed.held:
+        own = _without_positions(code)
+        anchors = [_code_anchor(each) for each, bare in parsed.compiled_like(code) if bare == own]
+        if not anchors:
+            held: tuple[ast.AST, ...] | None = ()
+        elif None in anchors:
+            held = None
+        else:
+            candidates = parsed.locate(code.co_firstlineno, None)
+            held = tuple(dict.fromkeys(node for anchor in anchors for node in _node_holding(candidates, anchor)))
+        parsed.held[code] = held
+    return parsed.held[code]
 
 
 def _alike_note(nodes: tuple[ast.AST, ...]) -> str:
@@ -526,14 +553,24 @@ def verify_callable_purity(func: Callable) -> None:
 
     The default values the callable was defined with are checked as they are, not as its
     source spells them (the source may have been edited since): a ``list``, ``dict`` or
-    ``set`` is rejected, and a Python function is checked as a callable in its own right.
+    ``set`` is rejected, also when the default names one (``s=STATE``), and a Python function
+    whose source can be read is checked as a callable in its own right (and rejected if that
+    source no longer compiles to it). A default function with no source to read at all
+    (``os.path.join`` from a frozen module, a ``.pyc``-only install) is left to
+    :mod:`cpnx.certification`, which holds every default to its own rule.
 
     It also raises when the callable's own ``def`` or ``lambda`` cannot be found in its
     source: a builtin, a ``functools.partial``, a class or other callable object, code with
     no source (``exec`` of a string, ``python -c``), or a source file that no longer compiles
-    to the code that runs (edited since it was loaded). A check that cannot see the body
+    to the code that runs (edited since it was loaded, or rewritten as it was loaded, as
+    pytest's assertion rewriting and some import hooks do). A check that cannot see the body
     passes nothing.
     """
+    _verify_purity(func, frozenset())
+
+
+def _verify_purity(func: Callable, seen: frozenset[int]) -> None:
+    """`verify_callable_purity`, with the functions already being checked (by `id`) in `seen`."""
     try:
         nodes = _callable_nodes(func)
     except _SOURCE_UNAVAILABLE as exc:
@@ -545,27 +582,79 @@ def verify_callable_purity(func: Callable) -> None:
             _verify_ast_purity(node)
     except PermissionError as exc:
         raise PermissionError(f"{exc}{_alike_note(nodes)}") from None
-    for value in _default_values(func):
+    _verify_default_values(func, seen | {id(func)})
+
+
+def _verify_default_values(func: Callable, seen: frozenset[int]) -> None:
+    """Check the default values `func` holds, as `verify_callable_purity` describes."""
+    for name, value in _default_values(func):
         if isinstance(value, (list, dict, set)):
-            raise PermissionError("Mutable default argument in CPN callable introduces hidden state between firings.")
-        if isinstance(value, types.FunctionType):
-            verify_callable_purity(value)
+            raise PermissionError(
+                f"Mutable default argument '{name}' in CPN callable introduces hidden state between firings."
+            )
+        if isinstance(value, types.FunctionType) and id(value) not in seen and _has_source(value):
+            try:
+                _verify_purity(value, seen)
+            except PermissionError as exc:
+                raise PermissionError(f"Default '{name}' of {_label(func)}: {exc}") from None
 
 
-def _default_values(func: Callable) -> list[object]:
-    """Return the default argument values `func` runs with: positional ones, then keyword-only ones.
+def _has_source(func: Callable) -> bool:
+    """Say whether `func`'s source can be read at all, whether or not it still compiles to its code."""
+    try:
+        _callable_nodes(func)
+    except _SOURCE_UNAVAILABLE:
+        return False
+    return True
+
+
+def _label(func: Callable) -> str:
+    return getattr(func, "__qualname__", None) or repr(func)
+
+
+def _default_values(func: Callable) -> list[tuple[str, object]]:
+    """Return the default argument values `func` runs with, by parameter: positional ones, then keyword-only ones.
 
     They ran once, where the function was defined, so they are not in its code and cannot
     be checked through it: only the values themselves say what the callable was given.
     """
     target = inspect.unwrap(func)
     target = getattr(target, "__func__", target)
+    positional = getattr(target, "__defaults__", None) or ()
+    code = getattr(target, "__code__", None)
+    parameters = code.co_varnames[: code.co_argcount] if code is not None else ()
+    names = parameters[len(parameters) - len(positional) :] if len(parameters) >= len(positional) else ()
     keywords = getattr(target, "__kwdefaults__", None) or {}
-    return [*(getattr(target, "__defaults__", None) or ()), *keywords.values()]
+    return [
+        *((names[index] if names else f"#{index}", value) for index, value in enumerate(positional)),
+        *keywords.items(),
+    ]
 
 
 def _source_unavailable(func: Callable) -> PermissionError:
     return PermissionError(
-        f"Cannot verify purity of {func!r}: source unavailable. "
+        f"Cannot verify purity of {func!r}: source unavailable{_why_unseen(func)}. "
         "Use a plain lambda or def-statement function, in a file or a notebook cell, instead."
+    )
+
+
+def _why_unseen(func: Callable) -> str:
+    """Say why a callable whose file still has a function on its line was not found there.
+
+    Its source compiles to other code: the file was edited since it was loaded, or the code
+    was rewritten as it was loaded (pytest's assertion rewriting, an import hook). Rewriting
+    the callable as a plain function does not help then, so the message says what to look at.
+    """
+    code = _own_code(func)
+    if code is None:
+        return ""
+    try:
+        parsed = _parsed_source(code.co_filename, func, code)
+    except _SOURCE_UNAVAILABLE:
+        return ""
+    if not parsed.locate(code.co_firstlineno, None) or _held_nodes(parsed, code) != ():
+        return ""
+    return (
+        " (its source no longer compiles to the code that runs: the file was edited since it was "
+        "loaded, or an import hook such as pytest's assertion rewriting changed the code)"
     )
