@@ -1,0 +1,6699 @@
+# Core
+
+The central object: build a net, wire places and transitions, then run it.
+
+## cpnx.PetriNet
+
+A concurrent, thread-safe executor for coloured Petri nets.
+
+A PetriNet owns a collection of named Place instances and Transition instances connected by arcs, plus three internal thread pools: one that selects and fires transitions (`max_workers` wide), one that runs transition actions (guarded per-transition by `Transition.action_timeout_secs`), and a small pool used to evaluate guard/arc-selection expressions under a timeout. All mutations of places and transitions (`deposit`, firing, rollback) happen while holding a single internal engine lock, so the net is safe to drive from multiple threads concurrently; transition *actions* themselves run outside that lock.
+
+Resource tokens (`Token.is_resource`) are always returned to their source place once a firing completes, whether it succeeds or fails. On success that return is **structural**: if a transition borrows from a `ResourcePlace` without declaring a matching `OutputArc`, validate synthesizes the return arc (an explicit self-loop, an `OutputArc` marked `synthesized=True`), so the permit's return is visible to to_dot, trace_impact, and structural invariants rather than happening off-arc. This is behaviour-preserving and can be suppressed per transition (`auto_return_resources=False`, or by declaring the arc yourself); `consume_all` borrows and the failure/rollback return stay on the implicit path. For data tokens, the net supports four error-handling dispositions:
+
+- **A. Colour-routed error (primary/canonical)** — the action catches its own exception, returns an error-coloured token, and output-arc conditions (e.g. using `OutputArc.condition`) route success vs error tokens to different places. This preserves firing rules and token conservation (1-in-1-out).
+- **B. Bounded atomic-retry** — on action failure/exception, the data token is rolled back to its source place with a delay and an incremented `attempts` counter, retrying up to `Transition.max_retries` times (default 5). Once exhausted, it is dead-lettered to `error_place`. The delay is per *attempt* and comes from the transition's RetryPolicy (or this net's `retry_policy` when it declares none): capped exponential backoff, `min(delay * backoff ** attempts, max_delay)`, drawn uniformly from `[0, that]` when the policy sets `jitter`. The default policy is a flat 1-second delay on every attempt.
+- **C. Immediate dead-letter** — setting `max_retries=0` on a transition routes any action failure immediately to `error_place`.
+- **D. Output schema violation** — when an output token fails the target place's schema (see `Place.validate_schema`), that one token is dead-lettered to `error_place` immediately (no retry — the violation is deterministic, so retrying cannot help), while the firing still **succeeds** and its other outputs are deposited normally. The dead-lettered token is re-coloured `ERROR_COLOR` with the violation detail in its payload, and both `on_token_dead_lettered` and `on_error` fire for it. Resource permits are exempt from schema validation, so this never strands a permit.
+
+Note that `error_place` can be configured as a SinkPlace (e.g. `SinkPlace("failed", keep_last=10)`) to keep only the last N failures for diagnostics, preventing unbounded memory growth in long-running streaming nets.
+
+Attributes:
+
+| Name                     | Type                                | Description                                                                                                                                                                                          |
+| ------------------------ | ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `max_workers`            |                                     | Maximum number of transitions that may fire concurrently.                                                                                                                                            |
+| `error_place`            |                                     | Name of the place that receives dead-lettered data tokens.                                                                                                                                           |
+| `cooldown_interval`      |                                     | Polling interval in seconds used by run while waiting for paced/cooldown tokens to become available.                                                                                                 |
+| `timeout_secs`           |                                     | Maximum execution time in seconds for transition action callables.                                                                                                                                   |
+| `expr_timeout_secs`      |                                     | Maximum execution time in seconds for guard and arc-selection expression callables.                                                                                                                  |
+| `retry_policy`           | `RetryPolicy`                       | Default RetryPolicy — how long a rolled-back data token waits before each retry — for transitions that declare none of their own. Validated on assignment, so it stays safe to retune on a live net. |
+| `retry_delay`            | `float`                             | View onto retry_policy.delay, the wait before the first retry. Assigning it keeps the rest of the schedule and moves only delay.                                                                     |
+| `places`                 | `dict[str, Place]`                  | Mapping of registered place name to Place instance.                                                                                                                                                  |
+| `transitions`            | `dict[str, Transition]`             | Mapping of registered transition name to Transition instance.                                                                                                                                        |
+| `on_transition_fired`    | \`Callable\[[str, float], None\]    | None\`                                                                                                                                                                                               |
+| `on_token_deposited`     | \`Callable\[[str, Token], None\]    | None\`                                                                                                                                                                                               |
+| `on_token_dead_lettered` | \`Callable\[[str, Token], None\]    | None\`                                                                                                                                                                                               |
+| `on_error`               | \`Callable\[\[str, Exception, Token | None\], None\]                                                                                                                                                                                       |
+
+Example
+
+```
+net = PetriNet(
+    max_workers=4,
+    places=[Place("source"), Place("sink")],
+    transitions=[
+        Transition(
+            name="process",
+            inputs=[InputArc("source")],
+            outputs=[OutputArc("sink")],
+            action=lambda tokens: tokens,
+        )
+    ],
+)
+net.deposit("source", Token(payload={"job_id": 1}))
+net.run()  # runs to quiescence
+```
+
+Use as a context manager to ensure the thread pool shuts down cleanly:
+
+````
+```python
+with PetriNet(max_workers=4) as net:
+    ...
+    net.run()
+````
+
+```
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+class PetriNet: """A concurrent, thread-safe executor for coloured Petri nets.
+
+````
+A [`PetriNet`][cpnx.PetriNet] owns a collection of named
+[`Place`][cpnx.Place] instances and [`Transition`][cpnx.Transition] instances connected by
+arcs, plus three internal thread pools: one that selects and fires transitions
+(`max_workers` wide), one that runs transition actions (guarded per-transition by
+`Transition.action_timeout_secs`), and a small pool used to evaluate guard/arc-selection
+expressions under a timeout. All mutations of places and transitions (`deposit`, firing,
+rollback) happen while holding a single internal engine lock, so the net is safe to drive
+from multiple threads concurrently; transition *actions* themselves run outside that lock.
+
+Resource tokens (`Token.is_resource`) are always returned to their source place once a
+firing completes, whether it succeeds or fails. On success that return is **structural**:
+if a transition borrows from a `ResourcePlace` without declaring a matching `OutputArc`,
+[`validate`][cpnx.PetriNet.validate] synthesizes the return arc (an explicit self-loop, an
+`OutputArc` marked `synthesized=True`), so the permit's return is visible to
+[`to_dot`][cpnx.PetriNet.to_dot], [`trace_impact`][cpnx.trace_impact], and structural
+invariants rather than happening off-arc. This is behaviour-preserving and can be
+suppressed per transition (`auto_return_resources=False`, or by declaring the arc
+yourself); `consume_all` borrows and the failure/rollback return stay on the implicit
+path. For data tokens, the net supports four error-handling dispositions:
+
+- **A. Colour-routed error (primary/canonical)** — the action catches its own
+  exception, returns an error-coloured token, and output-arc conditions (e.g. using
+  `OutputArc.condition`) route success vs error tokens to different places. This
+  preserves firing rules and token conservation (1-in-1-out).
+- **B. Bounded atomic-retry** — on action failure/exception, the data token is rolled
+  back to its source place with a delay and an incremented `attempts` counter, retrying
+  up to `Transition.max_retries` times (default 5). Once exhausted, it is dead-lettered
+  to `error_place`. The delay is per *attempt* and comes from the transition's
+  [`RetryPolicy`][cpnx.RetryPolicy] (or this net's `retry_policy` when it declares
+  none): capped exponential backoff, `min(delay * backoff ** attempts, max_delay)`,
+  drawn uniformly from `[0, that]` when the policy sets `jitter`. The default policy is
+  a flat 1-second delay on every attempt.
+- **C. Immediate dead-letter** — setting `max_retries=0` on a transition routes any
+  action failure immediately to `error_place`.
+- **D. Output schema violation** — when an output token fails the target place's
+  [`schema`][cpnx.Place] (see `Place.validate_schema`), that one token is dead-lettered
+  to `error_place` immediately (no retry — the violation is deterministic, so retrying
+  cannot help), while the firing still **succeeds** and its other outputs are deposited
+  normally. The dead-lettered token is re-coloured `ERROR_COLOR` with the violation
+  detail in its payload, and both `on_token_dead_lettered` and `on_error` fire for it.
+  Resource permits are exempt from schema validation, so this never strands a permit.
+
+Note that `error_place` can be configured as a [`SinkPlace`][cpnx.SinkPlace]
+(e.g. `SinkPlace("failed", keep_last=10)`) to keep only the last N failures for
+diagnostics, preventing unbounded memory growth in long-running streaming nets.
+
+Attributes:
+    max_workers: Maximum number of transitions that may fire concurrently.
+    error_place: Name of the place that receives dead-lettered data tokens.
+    cooldown_interval: Polling interval in seconds used by [`run`][cpnx.PetriNet.run]
+        while waiting for paced/cooldown tokens to become available.
+    timeout_secs: Maximum execution time in seconds for transition action callables.
+    expr_timeout_secs: Maximum execution time in seconds for guard and arc-selection
+        expression callables.
+    retry_policy: Default [`RetryPolicy`][cpnx.RetryPolicy] — how long a rolled-back
+        data token waits before each retry — for transitions that declare none of their
+        own. Validated on assignment, so it stays safe to retune on a live net.
+    retry_delay: View onto `retry_policy.delay`, the wait before the first retry.
+        Assigning it keeps the rest of the schedule and moves only `delay`.
+    places: Mapping of registered place name to `Place` instance.
+    transitions: Mapping of registered transition name to `Transition` instance.
+    on_transition_fired: Optional callback `(transition_name: str, duration_secs: float)
+        -> None`, called after a transition's action completes successfully. Fires outside
+        the engine lock, so it is safe to call [`deposit`][cpnx.PetriNet.deposit] from here.
+    on_token_deposited: Optional callback `(place_name: str, token: Token) -> None`, called
+        after any token is deposited into any place. Fires outside the engine lock. Do
+        **not** call [`add_place`][cpnx.PetriNet.add_place] or
+        [`add_transition`][cpnx.PetriNet.add_transition] from within this callback.
+    on_token_dead_lettered: Optional callback `(transition_name: str, token: Token) -> None`,
+        called when a data token is dead-lettered to `error_place` (retries exhausted, or
+        `max_retries=0`). Fires outside the engine lock.
+    on_error: Optional callback `(transition_name: str, exc: Exception, token: Token | None)
+        -> None`. Fires outside the engine lock, for five kinds of event:
+
+        - a transition's **action raises** — `token` is the data token routed to the error
+          place or rolled back, or `None` if the transition consumed no data tokens;
+        - an [`InputArc`][cpnx.InputArc] **`key`/`filter` raises**, making that arc
+          unsatisfiable so the transition cannot fire (`token` is `None`);
+        - `binding_priority_key` raises for **every** candidate binding under
+          `BindingPolicy.PRIORITY`, so selection fell back to insertion order;
+        - a [`binding_selector`][cpnx.Transition] **raises, or returns a choice the engine
+          cannot fire**, or its transition's arcs or settings were changed to conflict with
+          it, so the transition reads as not enabled (`token` is `None`). The `__cause__` is
+          an [`InvalidSelection`][cpnx.InvalidSelection] for a rejected choice or a conflict,
+          and the selector's own exception otherwise;
+        - an **output token violates its target place's `schema`** (disposition D above).
+          This is the one case that fires on an *otherwise-successful* firing: the offending
+          token is dead-lettered while the transition still succeeds. `token` is the
+          error-coloured dead-lettered token, and `exc` is a `TypeError` (matching the
+          `TypeError` a direct `deposit()` raises on a schema violation) — **not** the
+          `RuntimeError`-with-`__cause__` used by the fault reports below; there is no
+          original exception to chain, since the schema simply rejected the payload.
+
+        The **`key`/`filter`** report is *edge-triggered*: selection re-runs on every
+        enabling check, so a persistent fault reports once when it starts rather than once
+        per `step()`, and reports again only when a fault appears that involves none of
+        the tokens the last one did. The **`binding_priority_key`** report is not — it is
+        de-duplicated only within a single pass, so a persistent one fires about once per
+        `step()` that resolves that transition. The **`binding_selector`** report is
+        edge-triggered per transition and per view (timed, or timing-ignoring): the same
+        failure reports once, and again after that view's ask succeeds, its place drains
+        below the arcs' counts, or the transition fires. All three wrap the original
+        exception in a descriptive `RuntimeError` and chain it as `__cause__`.
+
+Example:
+    ```python
+    net = PetriNet(
+        max_workers=4,
+        places=[Place("source"), Place("sink")],
+        transitions=[
+            Transition(
+                name="process",
+                inputs=[InputArc("source")],
+                outputs=[OutputArc("sink")],
+                action=lambda tokens: tokens,
+            )
+        ],
+    )
+    net.deposit("source", Token(payload={"job_id": 1}))
+    net.run()  # runs to quiescence
+    ```
+
+Use as a context manager to ensure the thread pool shuts down cleanly:
+
+    ```python
+    with PetriNet(max_workers=4) as net:
+        ...
+        net.run()
+    ```
+"""
+
+def __init__(
+    self,
+    max_workers: int = 4,
+    error_place: str = "failed",
+    places: list[Place] | None = None,
+    transitions: list[Transition] | None = None,
+    cooldown_interval: float = 0.05,
+    timeout_secs: float = 1.0,
+    expr_timeout_secs: float = 0.1,
+    retry_delay: float | None = None,
+    binding_policy: BindingPolicy = BindingPolicy.FIRST,
+    binding_search_limit: int = 1000,
+    seed: int | None = None,
+    *,
+    retry_policy: RetryPolicy | None = None,
+    retry_rng: random.Random | None = None,
+) -> None:
+    """Construct the net, its thread pools, and register any initial places/transitions.
+
+    Args:
+        max_workers: Maximum number of transitions that may fire concurrently
+            (default: 4). Also sizes the internal action thread pool.
+        error_place: Name of the place that receives data tokens from failed
+                     transitions (default: `"failed"`). Created automatically as a
+                     standard `Place`, but can be overridden by registering a custom
+                     place (like a `SinkPlace`) with the same name before it is needed.
+        places: Optional list of [`Place`][cpnx.Place] (or subclass) instances to
+                register at construction time (default: `None`).
+        transitions: Optional list of [`Transition`][cpnx.Transition] instances to
+                     register at construction time (default: `None`).
+        cooldown_interval: Cooldown check polling interval in seconds, used by
+                           [`run`][cpnx.PetriNet.run] (default: 0.05).
+        timeout_secs: Maximum allowed execution time in seconds for transition
+                      action callables that declare no per-transition timeout
+                      (run off the engine lock) (default: 1.0).
+        expr_timeout_secs: Maximum allowed execution time in seconds for guard
+                           and arc selection callables. These are evaluated
+                           while holding the engine lock, so this value caps how long a
+                           *single* evaluation can block concurrent
+                           `deposit()` and `step()` calls. Note that under
+                           `BindingPolicy.FIRST` one enabling check may evaluate a
+                           callable guard up to `binding_search_limit` times in sequence,
+                           so the worst-case lock-hold time is
+                           `binding_search_limit * expr_timeout_secs` — size both
+                           accordingly. Keep well under 1 s (default: 0.1).
+
+                           **An uncertified `InputArc.key`/`filter` is dispatched *per
+                           token* over the whole available pool, which
+                           `binding_search_limit` does not bound** — it truncates
+                           candidate *bindings*, after selection has already visited
+                           every token. The worst case is therefore
+                           `len(place) * expr_timeout_secs` per such arc, per enabling
+                           check. This is the one place the guard bound above does not
+                           generalise: a guard is evaluated once per *candidate binding*
+                           (bounded), `key`/`filter` once per *token in the pool*
+                           (unbounded). Prefer callables that certify (see
+                           [`cpnx.certification`]) on deep places — a certified callable
+                           runs inline with no executor round-trip at all.
+
+                           A second caveat applies only to an uncertified `key`: this
+                           timeout bounds the *key extraction*, not the **comparisons**.
+                           `_order_available` sorts inline under the lock, so a key whose
+                           values have a slow or diverging `__lt__` can hold the lock past
+                           any timeout. Keys should return plain comparables (numbers,
+                           strings, tuples thereof).
+        retry_delay: Shorthand for `retry_policy=RetryPolicy(delay=...)`: the base
+                     delay in seconds before a rolled-back data token's first retry
+                     (default: 1.0). Mutually exclusive with `retry_policy` — passing
+                     both raises `ValueError`, since they would set the same thing.
+                     `PetriNet.retry_delay` stays readable and assignable either way; it
+                     is a view onto the default policy's `delay`.
+        binding_policy: Net-wide default strategy for resolving which input tokens
+                     bind a transition — see [`BindingPolicy`][cpnx.BindingPolicy].
+                     Defaults to `BindingPolicy.FIRST` (deterministic-complete
+                     binding search, which resolves head-only and search-free for a
+                     guard-free transition). A transition may override this via its
+                     own `binding_policy`. Must be a `BindingPolicy` member —
+                     unlike `Transition(binding_policy=None)`, `None` is rejected
+                     here, because a net *is* the default and has nothing to inherit
+                     from.
+
+                     The default was the head-only `BindingPolicy.LEGACY` through
+                     0.5.0. 0.6.0 made `FIRST` the default and kept `LEGACY` as a
+                     warning-emitting opt-out; 0.7.0 removed it, so the name no longer
+                     exists. See `docs/adr/0001-combinatorial-binding-search.md`.
+        binding_search_limit: Maximum number of input-token combinations tried per
+                     enablement check when a transition uses `BindingPolicy.FIRST`
+                     (default: 1000). Bounds both the work and the memory of a search
+                     (each arc's candidate stream is truncated to this many groups), and
+                     with a callable guard also bounds the lock-hold time to roughly
+                     `binding_search_limit * expr_timeout_secs`. If exhausted without
+                     finding a guard-satisfying binding, the transition is treated as
+                     disabled for that check and `on_binding_search_exhausted` (if set) is
+                     invoked after the lock releases. Because exhaustion means "disabled",
+                     a net whose only satisfiable binding lies beyond the limit can reach
+                     quiescence — and [`run`][cpnx.PetriNet.run] can return — with that
+                     work still pending, signalled only via the callback; raise the limit
+                     if this is a concern. Must be `>= 1`. Ignored for guard-free `FIRST`
+                     transitions, which take each arc's head without searching, except
+                     those that search anyway: one with a `join_key` arc, and one whose
+                     `filter` arc shares its place with another input arc. When several arcs
+                     read one place, a candidate that would hand one token to two arcs is
+                     never built (unless one of them is `consume_all`), but an arc's choice
+                     that leaves a later arc on that place no tokens counts toward the
+                     limit as a candidate, so the work stays bounded by the limit. Under
+                     `BindingPolicy.RANDOM`/`PRIORITY` the search cannot short-circuit
+                     (it must scan every candidate to sample or rank),
+                     so the limit truncates the selection space to the first `limit`
+                     candidates: if that prefix contains a satisfying binding they select
+                     over it and fire (signalling the truncation); if it does not, the
+                     transition is disabled for that check and can stall exactly like
+                     `FIRST`.
+        seed: Optional integer seed for the net's internal random generator
+                     (`random.Random(seed)`). When set, it drives **both** the scheduler's
+                     tie-break among equal-priority enabled transitions **and**
+                     `BindingPolicy.RANDOM` binding selection. `None` (default) uses an
+                     unseeded instance (non-reproducible). Reproducibility caveats: use
+                     `max_workers=1` for strict replay — above 1, identical seeds are **not
+                     guaranteed** to reproduce, because concurrent action-commit ordering
+                     (an OS-scheduled race) can change which transitions are enabled at a
+                     firing step and hence the draw sequence. Each
+                     [`SubstitutionTransition`][cpnx.SubstitutionTransition] subnet is its
+                     own `PetriNet` with its own RNG, so seed subnets separately if they
+                     contain `RANDOM` transitions. Seeded streams are not stable across
+                     cpnx versions.
+        retry_policy: Default [`RetryPolicy`][cpnx.RetryPolicy] for transitions that
+                     declare none of their own — how long a rolled-back data token waits
+                     before each retry (capped exponential backoff, optionally jittered).
+                     Defaults to `RetryPolicy()`, a flat 1-second delay, which is what
+                     cpnx did before policies existed. A transition paces its own
+                     dependency by setting [`Transition.retry_policy`][cpnx.Transition];
+                     this is only the fallback. Mutually exclusive with `retry_delay`.
+        retry_rng: Jitter source, used only by a policy with `jitter=True`. One
+                     stream per net, shared by every transition's policy. Defaults to a
+                     private `random.Random(seed)` — reproducible under `seed` but a
+                     **separate stream** from the one driving scheduling and
+                     `BindingPolicy.RANDOM`, so how often actions fail cannot shift the
+                     seeded firing sequence. Pass an instance to control the draws
+                     directly (e.g. `random.Random(0)` in a test). Drawn only under the
+                     engine lock, so it is never used concurrently.
+
+    Raises:
+        ValueError: If `binding_search_limit < 1`; if both `retry_delay` and
+            `retry_policy` are given; or if `retry_delay` is negative, `NaN`, or
+            infinite. A `retry_policy` validates its own fields — see
+            [`RetryPolicy`][cpnx.RetryPolicy].
+        TypeError: If `retry_delay` is not a number, `retry_policy` is not a
+            `RetryPolicy`, `retry_rng` has no callable `uniform(a, b)`, or
+            `binding_policy` is not a `BindingPolicy` (including `None`).
+    """
+    #: Created first: the `retry_policy`/`retry_delay` setters below take it, and
+    #: `_init_retry` goes through them.
+    self._lock = threading.Lock()
+    self.max_workers = max_workers
+    self.error_place = error_place
+    self.cooldown_interval = cooldown_interval
+    self.timeout_secs = timeout_secs
+    self.expr_timeout_secs = expr_timeout_secs
+    self._init_retry(retry_delay, retry_policy, retry_rng, seed)
+    #: Backing field for the `binding_policy` property. Set directly here (the property
+    #: setter recomputes `_has_search_policy_transition`, which needs `self.transitions`
+    #: to already exist — it does not yet at this point in construction), so the setter's
+    #: validation is applied explicitly first.
+    _reject_non_binding_policy(binding_policy, name="PetriNet(binding_policy=...)", allow_none=False)
+    self._binding_policy = binding_policy
+    if binding_search_limit < 1:
+        raise ValueError(f"binding_search_limit must be >= 1, got {binding_search_limit}.")
+    self.binding_search_limit = binding_search_limit
+    self._rng = random.Random(seed)
+    self._init_selectors(seed)
+    self._has_timed_features = False
+    self._model_time: float | None = None
+    self.places: dict[str, Place] = {}
+    self.transitions: dict[str, Transition] = {}
+    self._running_count = 0
+    self._drive_limits: dict[str, int | bool] = {}
+    self._nested_undo: list[_NestedUndo] | None = None
+    self._pending_restore: tuple[dict[str, tuple[Token, ...]], list[_NestedUndo], float] | None = None
+    self._settle_lock = threading.Lock()
+    self._closing = False
+    #: Set by `__exit__`. An inline drive never submits to `_executor`, so it checks this to
+    #: refuse to fire on a closed net, as `step()` does when its submit raises.
+    self._shut_down = False
+    self._parent: weakref.ref[PetriNet] | None = None
+    self._subnets: list[PetriNet] = []
+    self._executor = ThreadPoolExecutor(max_workers=max_workers)
+    self._action_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cpnx-action")
+    self._expr_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cpnx-expr")
+    # Signalled whenever tokens are deposited; wakes run() without busy-waiting.
+    self._work_available = threading.Event()
+
+    #: Called after a transition completes successfully.
+    #: Signature: `(transition_name: str, duration_secs: float) -> None`.
+    #: Fires outside the engine lock — safe to call `deposit` from here.
+    self.on_transition_fired: Callable[[str, float], None] | None = None
+
+    #: Called after any token is deposited into any place.
+    #: Signature: `(place_name: str, token: Token) -> None`.
+    #: Fires outside the engine lock — safe to call `deposit` from here.
+    #: Warning: do **not** call `add_place` or `add_transition` from
+    #: within this callback.
+    self.on_token_deposited: Callable[[str, Token], None] | None = None
+
+    #: Called when a data token is dead-lettered to the error place (due to exhausted retries or immediate failure).
+    #: Signature: `(transition_name: str, token: Token) -> None`.
+    #: Fires outside the engine lock.
+    self.on_token_dead_lettered: Callable[[str, Token], None] | None = None
+
+    #: Called when a transition's action raises an exception.
+    #: Signature: `(transition_name: str, exc: Exception, token: Token | None) -> None`.
+    #: `token` is the data token that was routed to the error place or rolled back,
+    #: or `None` if the transition had no data inputs.
+    #: Fires outside the engine lock.
+    self.on_error: Callable[[str, Exception, Token | None], None] | None = None
+
+    #: Called with a transition name when a binding search reaches `binding_search_limit`.
+    #: The meaning depends on policy: under `BindingPolicy.FIRST` the limit was hit
+    #: **without** a guard-satisfying binding, so the transition is treated as disabled for
+    #: that check; under `BindingPolicy.RANDOM`/`PRIORITY` (which must scan every candidate)
+    #: it signals that the candidate space was **truncated** to the first `limit`
+    #: candidates — a binding may still have been selected and the transition may still
+    #: fire. In both cases: raise `binding_search_limit` if you need the full space
+    #: considered.
+    #: Signature: `(transition_name: str) -> None`.
+    #: Fires **outside** the engine lock — it is safe to call back into the net (e.g.
+    #: `deposit`) from here. Exhaustions are de-duplicated *within* a single enabling pass
+    #: (so cross-thread interleavings collapse to one call), but it still fires once per
+    #: pass: a busy `run()` loop re-checks each transition on every `step()`/
+    #: `is_quiescent()` iteration, so an over-limit transition signals repeatedly while
+    #: the loop runs. Keep the callback cheap, and debounce on your side if needed.
+    #: Guard-free `FIRST` transitions signal it too when they search: a `join_key`
+    #: transition, and one whose `filter` arc shares its place with another arc.
+    self.on_binding_search_exhausted: Callable[[str], None] | None = None
+    #: Transition names whose binding search exhausted the limit during the current
+    #: lock-holding enabling pass; drained and dispatched (de-duplicated) after the lock
+    #: is released. A `set` so repeated exhaustions in one pass collapse to one callback.
+    self._pending_exhaustions: set[str] = set()
+    #: ``id(InputArc)`` -> the ``key`` last registered as a place key-index for it.
+    #: Lets `_ensure_key_index` skip re-registering on the hot path, while still
+    #: rebuilding when an arc's ``key`` is reassigned after construction.
+    self._key_index_arcs: dict[int, Callable[[Token], object]] = {}
+    #: Transition name -> ``{input position: (arc, place, join_key, index_id, depth)}`` for
+    #: each join arc read through a place join index (see `_ensure_join_index`). Positions
+    #: reading one place with one `join_key` share an index id; two transitions never do, so
+    #: an `InputArc` object shared by two transitions is read through two indexes, each with
+    #: one reader (ADR 0011 §2).
+    #: Holding the place lets `_release_stale_join_indexes` drop an index once its arc stops
+    #: reading that place through it.
+    self._join_registrations: dict[str, dict[int, _JoinRegistration]] = {}
+    #: Transition name -> the `_JoinMatch` that tracks which join keys all its join places
+    #: hold (see `_matched_join_combos`). Dropped whenever it cannot serve.
+    self._join_matches: dict[str, _JoinMatch] = {}
+    #: Transition name -> first exception from a `binding_priority_key` that raised for
+    #: *every* candidate binding during the current enabling pass (so `PRIORITY` silently
+    #: fell back to insertion order). Drained and dispatched via `on_error` (de-duplicated)
+    #: after the lock releases, so a broken key surfaces instead of failing silently.
+    self._pending_key_failures: dict[str, Exception] = {}
+    #: ``(transition, place)`` -> the first exception an `InputArc.key`/`filter` raised
+    #: while selecting for that arc, paired with whether that arc's place key-index
+    #: disabled itself as a result (which decides whether the report carries the #34
+    #: caveat). Buffered under the lock, dispatched via `on_error` (de-duplicated) by
+    #: `_flush_selection_failures` — see issue #29.
+    self._pending_selection_failures: dict[tuple[str, str], tuple[Exception, bool]] = {}
+    #: ``(transition, place)`` -> the ids of the tokens that were in the pool the last
+    #: time it reported. A later fault sharing *any* of those tokens is the same ongoing
+    #: fault and stays quiet; one sharing none is a new event and reports. Identifying the
+    #: fault by its witnesses rather than by a success-clears-it flag is what makes this
+    #: correct when selection is never reached (the place drained below `count`, so
+    #: `_gather_arc_pools` bailed first) and when two *different* views of the pool
+    #: alternate (`step()` excludes cooling tokens, `is_quiescent()` includes them) — the
+    #: latter otherwise cleared and re-armed the latch on every poll.
+    self._selection_faulted: dict[tuple[str, str], frozenset[str]] = {}
+    #: ``id(InputArc)`` for arcs whose place key-index disabled itself on a *reported*
+    #: selection fault. The engine re-arms the index (`Place.rearm_key_index`) the next
+    #: time selection succeeds for the arc and discards it here, so the fast path recovers
+    #: once the offending token is gone rather than staying disabled for the life of the
+    #: net (issue #34). Empty for a net whose keys never raise, so the healthy path pays
+    #: only a set-membership test.
+    self._key_index_disabled_arcs: set[int] = set()
+
+    # --- Incremental enablement scheduler (ADR 0006) ---
+    # `self._has_timed_features` (declared above) also gates the incremental fast path off
+    # (see `_incremental_eligible`): `PacedResourcePlace` cooldowns and `settle_secs` windows
+    # re-enable as *time* advances with no marking mutation, which a per-place dirty set
+    # cannot observe. It is monotonic (only ever flips False→True).
+    #: True when any registered transition resolves under an effective
+    #: `BindingPolicy.RANDOM`/`PRIORITY`. Those draw the seeded RNG *during binding
+    #: resolution, per enabled transition, per step*; the incremental scheduler resolves
+    #: a different count of them, which would shift the seeded stream. Latched True by
+    #: `add_transition`, and *recomputed* over the whole transition set by the
+    #: `binding_policy` setter — reassigning the net-level default can flip a transition's
+    #: *effective* policy into (or out of) a search policy, so the flag cannot be treated
+    #: as monotonic once the default is mutable.
+    self._has_search_policy_transition = False
+    #: Whether the routing tables + dirty seed have been built for the current transition
+    #: set. Reset by `add_transition`; rebuilt lazily by `_ensure_scheduler_ready`.
+    self._scheduler_ready = False
+    #: Whether resource-return self-loops have been synthesized for the current topology.
+    #: Reset by `add_place`/`add_transition`; done once (idempotently) before the first
+    #: firing or introspection via `_ensure_resource_returns_synthesized`.
+    self._resource_returns_synthesized = False
+    #: Place name -> transitions with an `InputArc` on it (adding tokens may enable them).
+    #: A source table for `_dirty_routing`, which is what a reconcile reads.
+    self._input_routing: dict[str, list[Transition]] = {}
+    #: Place name -> transitions with an *unconditional* `OutputArc` on it. Removing tokens
+    #: from such a place can release back-pressure (`_check_output_capacity`) and re-enable
+    #: the producer; conditional arcs never block, so they are excluded. A source table for
+    #: `_dirty_routing`, like `_input_routing`.
+    self._output_routing: dict[str, list[Transition]] = {}
+    #: Place name -> names of the transitions in `_input_routing` or `_output_routing` for it:
+    #: the transitions a change to that place may enable or unblock. `_reconcile_dirty` folds
+    #: each dirty place into its re-check set with one set union against this.
+    self._dirty_routing: dict[str, frozenset[str]] = {}
+    #: Places whose token pool changed since the last reconcile (the "dirty set").
+    self._dirty_places: set[str] = set()
+    #: Transitions re-evaluated on *every* reconcile because their enablement can change
+    #: with no input-place mutation (input-less sources, guard/key/filter that may read
+    #: external mutable state). See `_is_volatile`. Rebuilt by the scheduler seed.
+    self._volatile_transitions: set[str] = set()
+    #: Transitions with a satisfiable binding held back *only* by output back-pressure.
+    #: Re-checked every reconcile so they unblock the moment their output place drops below
+    #: bound — including an out-of-band `place.retrieve()` the dirty set never sees.
+    self._capacity_blocked: set[str] = set()
+    #: Selection-enabled transitions (output capacity OK *and* a timing-aware binding
+    #: resolved) -> that resolved binding, maintained incrementally. Reused by `is_dead`.
+    self._enabled_bindings: dict[str, _Binding] = {}
+    #: Transitions with a binding *ignoring* timing and capacity — the quiescence
+    #: predicate (`_is_transition_potentially_enabled`). Lets `is_quiescent` answer in O(1).
+    self._potentially_enabled: set[str] = set()
+    #: `priority` value -> list of selection-enabled transition names at that priority.
+    #: Selection picks the minimum non-empty bucket, so `step` is O(1). Maintained by
+    #: swap-remove (`_bucket_add`/`_bucket_remove`), so bucket order is not registration
+    #: order — safe because eligible (`FIRST`) nets draw RNG only for the tie-break,
+    #: whose stream advance depends on candidate *count*, not order.
+    self._priority_buckets: dict[int, list[str]] = {}
+    #: Transition name -> its index within its priority bucket (for O(1) swap-remove).
+    self._bucket_index: dict[str, int] = {}
+    #: Transition name -> registration order. Reconcile re-evaluates the affected set in this
+    #: order so bucket membership (and hence the seeded `_rng.choice` tie-break) is
+    #: deterministic across processes — a plain `set` iteration is hash-seed-randomized.
+    self._transition_order: dict[str, int] = {}
+    #: Min-heap of `(available_at, place_name)` for future-dated (retry-delayed) tokens.
+    #: Drained at reconcile: a popped boundary <= now re-dirties its place, so a rolled-back
+    #: token re-enables its transition once `retry_delay` elapses without a full-net rescan.
+    self._reactivation: list[tuple[float, str]] = []
+
+    self.add_place(Place(error_place))
+    for p in places or []:
+        self.add_place(p)
+    for t in transitions or []:
+        self.add_transition(t)
+
+@property
+def binding_policy(self) -> BindingPolicy:
+    """Net-level default binding policy for transitions that do not set their own.
+
+    Reassignable after construction. Because a transition's *effective* policy is this
+    default when the transition leaves `binding_policy` unset, changing it can move a
+    transition into or out of a `RANDOM`/`PRIORITY` search policy — which gates the
+    incremental scheduler (see `_incremental_eligible`). The setter therefore recomputes
+    `_has_search_policy_transition` over the current transition set and invalidates the
+    scheduler, so the seeded-determinism guarantee holds even if the default is mutated
+    mid-life.
+    """
+    return self._binding_policy
+
+@binding_policy.setter
+def binding_policy(self, value: BindingPolicy) -> None:
+    # Validated *before* the lock, so a rejected value cannot leave `_binding_policy`
+    # reassigned while `_has_search_policy_transition` and `_scheduler_ready` still
+    # describe the old one — the same ordering the retry setters use.
+    _reject_non_binding_policy(value, name="PetriNet.binding_policy", allow_none=False)
+    with self._lock:
+        self._binding_policy = value
+        # A new default can flip any policy-unset transition's *effective* policy in either
+        # direction, so recompute the flag from scratch rather than latching it monotonically.
+        self._has_search_policy_transition = any(self._searches_bindings(t) for t in self.transitions.values())
+        # Enabled-set caches were built under the old policy; force a rebuild before reuse.
+        self._scheduler_ready = False
+
+def _init_retry(
+    self,
+    retry_delay: float | None,
+    retry_policy: RetryPolicy | None,
+    retry_rng: random.Random | None,
+    seed: int | None,
+) -> None:
+    """Wire up the net's default retry schedule and its jitter stream.
+
+    Everything is validated here, at construction, so the rollback path never has to:
+    it runs under the engine lock holding tokens it has consumed but not yet returned,
+    so raising there would strand them.
+    """
+    if retry_delay is not None and retry_policy is not None:
+        raise ValueError(
+            "Pass retry_delay or retry_policy, not both — retry_delay is shorthand for "
+            f"RetryPolicy(delay=...). Got retry_delay={retry_delay} and {retry_policy!r}."
+        )
+    # Both go through their validating property setters below.
+    self.retry_policy = retry_policy if retry_policy is not None else DEFAULT_RETRY_POLICY
+    if retry_delay is not None:
+        self.retry_delay = retry_delay
+
+    #: Jitter source for retry delays, an *independent* stream from `_rng`: a draw per
+    #: failed firing must not shift the seeded scheduling/binding sequence, and jitter
+    #: must not mirror the scheduler's draws either — so a seeded net derives this one
+    #: from a salted seed rather than re-seeding with the same integer, which would
+    #: emit the identical sequence. Drawn only under the engine lock.
+    #: A caller-supplied generator is proved usable here, at construction, by a trial
+    #: draw: the rollback path invokes it while holding consumed tokens.
+    self._retry_rng = (
+        validated_jitter_rng(retry_rng)
+        if retry_rng is not None
+        else random.Random(None if seed is None else f"cpnx-retry-jitter:{seed}")
+    )
+
+# --- Retry schedule (see `RetryPolicy` and the `retry_*` constructor arguments) ---
+# Properties, not plain attributes, so a value that cannot schedule a sane retry is
+# rejected where the mistake is made — at the assignment — rather than later, inside the
+# rollback that would have used it. Both setters validate *before* taking the engine
+# lock, so a rejected assignment never blocks the net, and both then write under it:
+# `retry_delay` is a read-modify-write over the whole policy (it preserves the other
+# fields), so an unlocked write would drop a concurrent `retry_policy` assignment.
+
+@property
+def retry_policy(self) -> RetryPolicy:
+    """Default [`RetryPolicy`][cpnx.RetryPolicy] for transitions that declare none.
+
+    A transition's own [`retry_policy`][cpnx.Transition] wins when it has one; this is
+    the fallback. Assigning anything but a `RetryPolicy` raises `TypeError`.
+    """
+    return self._retry_policy
+
+@retry_policy.setter
+def retry_policy(self, value: RetryPolicy) -> None:
+    if not isinstance(value, RetryPolicy):
+        raise TypeError(f"retry_policy must be a RetryPolicy, got {type(value).__name__}: {value!r}.")
+    with self._lock:
+        self._retry_policy = value
+
+@property
+def retry_delay(self) -> float:
+    """Base delay in seconds before a rolled-back data token's first retry.
+
+    A view onto the default policy's [`delay`][cpnx.RetryPolicy]: reading it returns
+    `retry_policy.delay`, and assigning it swaps in a default policy with the new delay,
+    leaving the rest of the schedule alone. Assigning a non-number, a negative, `NaN`,
+    or an infinity raises.
+    """
+    return self._retry_policy.delay
+
+@retry_delay.setter
+def retry_delay(self, value: float) -> None:
+    delay = cast(float, _validated_retry_number("retry_delay", value, minimum=0.0))
+    with self._lock:
+        self._retry_policy = replace(self._retry_policy, delay=delay)
+
+def _call_expr(self, fn, *args, timeout: float | None = None):
+    t = timeout if timeout is not None else self.timeout_secs
+    fut = self._expr_executor.submit(fn, *args)
+    try:
+        return fut.result(timeout=t)
+    except FuturesTimeout as exc:
+        raise RuntimeError(f"Expression {fn!r} exceeded {t}s — possible I/O call") from exc
+
+def _init_selectors(self, seed: object) -> None:
+    """Set up the state behind `Transition.binding_selector` (ADR 0013)."""
+    #: Seeds each `BindingView.random` together with the transition and its firing count.
+    #: An unseeded net draws one at construction, so its selectors vary run to run.
+    self._selector_seed = repr(seed) if seed is not None else str(random.SystemRandom().getrandbits(64))
+    #: Transition name -> how many of its selector bindings have been consumed.
+    self._selector_firings: dict[str, int] = {}
+    #: Transition -> input position -> ``{id(key): (key, place, index_id)}`` for the place
+    #: join indexes `BindingView.groups` reads, at most `_SELECTOR_INDEXES_PER_ARC` each.
+    self._selector_indexes: dict[str, dict[int, dict[int, tuple[Callable[[Token], object], Place, int]]]] = {}
+    self._selector_keys = KeyCertifications()
+    #: Transitions that have, or had, a selector: when one loses it, `_forget_selector` drops
+    #: its place indexes and puts its own policy back into `_has_search_policy_transition`.
+    self._selector_transitions: set[str] = set()
+    #: Transition name -> the selector function its latches and place indexes were made for,
+    #: so `_prepare_selector` can drop them when the function is swapped for another.
+    self._selector_fns: dict[str, object] = {}
+    #: Transition name -> the first error its selector raised or returned this pass,
+    #: dispatched via `on_error` off the lock by `_flush_selection_failures`.
+    self._pending_selector_failures: dict[str, Exception] = {}
+    #: ``(transition, ignore_timing)`` -> ``(signature, epoch)`` of the selector failure that
+    #: view last reported or confirmed, so a failure that repeats on every enabling check
+    #: reports once. See `_reject_selection`.
+    self._selector_faults: dict[tuple[str, bool], tuple[tuple[str, str], int]] = {}
+    #: Counts `_flush_selector_failures` calls (one per `step`/`is_quiescent`/`is_dead`/firing),
+    #: so a latch can tell whether the other view confirmed a failure recently.
+    self._selector_epoch = 0
+
+def _get_model_time_under_lock(self) -> float:
+    """Internal helper to get the model time without acquiring the engine lock."""
+    if self._model_time is not None:
+        return self._model_time
+    return time.monotonic()
+
+@property
+def model_time(self) -> float:
+    """Current time used for settle windows, cooldowns, and thresholds.
+
+    Returns the logical clock set via [`advance_time`][cpnx.PetriNet.advance_time], if one
+    has ever been set; otherwise returns the real wall-clock time (`time.monotonic()`).
+    A net that never calls `advance_time` runs entirely on real time.
+
+    Returns:
+        The current logical clock value, or `time.monotonic()` if no logical clock is set.
+    """
+    with self._lock:
+        return self._get_model_time_under_lock()
+
+def advance_time(self, new_time: float) -> None:
+    """Advance the net's logical clock to `new_time` and wake any waiting `run` loop.
+
+    Once called, the net switches from real (`time.monotonic()`) to logical time for all
+    settle-window, cooldown, and threshold checks. Subsequent calls must strictly increase
+    the clock.
+
+    Args:
+        new_time: The new logical timestamp. Must be strictly greater than the current
+            model time (if one has already been set), and must be finite.
+
+    Raises:
+        ValueError: If `new_time` is less than or equal to the current model time, or is
+            not finite.
+    """
+    if not math.isfinite(new_time):
+        # A non-finite clock is unrecoverable, not merely odd: at `_model_time = inf`
+        # every `available_at > t_limit` comparison is false, so tokens parked at
+        # infinity mature immediately and *every* finite delay, cooldown and settle
+        # window in the net collapses to "already elapsed". Reject it at the setter so no
+        # caller — `drive_to_quiescence` included — can get the net into that state.
+        raise ValueError(
+            f"Clock mutability violation: the global clock must be finite, got {new_time}. "
+            "A non-finite clock makes every delay, cooldown, and settle window compare as "
+            "already elapsed."
+        )
+    with self._lock:
+        if self._model_time is not None and new_time <= self._model_time:
+            raise ValueError(
+                f"Clock mutability violation: cannot decrement global clock backward or equal "
+                f"from {self._model_time} to {new_time}."
+            )
+        self._model_time = new_time
+    # Signal that new work might have become available due to time advancing!
+    self._work_available.set()
+
+# ------------------------------------------------------------------
+# Public API
+# ------------------------------------------------------------------
+
+def add_place(self, place: Place) -> None:
+    """Register `place` with the net under its `place.name`.
+
+    Must be called before any transition arc references this place by name
+    and before [`run`][cpnx.PetriNet.run] or [`step`][cpnx.PetriNet.step] is invoked.
+
+    Args:
+        place: A [`Place`][cpnx.Place], [`ResourcePlace`][cpnx.ResourcePlace],
+               [`PacedResourcePlace`][cpnx.PacedResourcePlace], or
+               `ThresholdPlace`/`SinkPlace` instance.
+
+    Raises:
+        ValueError: If `place.name` is already registered as a transition name, or the
+            place is a socket whose colour set differs from its port's.
+    """
+    with self._lock:
+        if place.name in self.transitions:
+            raise ValueError(f"Name overlap: '{place.name}' is already registered as a Transition.")
+        for transition in self.transitions.values():
+            if isinstance(transition, SubstitutionTransition):
+                self._reject_port_socket_mismatch(transition, {place.name: place})
+        self.places[place.name] = place
+        if isinstance(place, PacedResourcePlace):
+            self._has_timed_features = True
+        # A newly-registered place may reclassify an arc as a resource borrow.
+        self._resource_returns_synthesized = False
+
+def _validate_new_transition(self, transition: Transition) -> None:
+    if transition.name in self.places:
+        raise ValueError(f"Name overlap: '{transition.name}' is already registered as a Place.")
+    for arc in transition.inputs + transition.outputs:
+        if arc.place == transition.name or arc.place in self.transitions:
+            raise TypeError(
+                f"Arc target '{arc.place}' is a Transition, not a Place. Arcs must connect Places↔Transitions only."
+            )
+
+def add_transition(self, transition: Transition) -> None:
+    """Register `transition` with the net under its `transition.name`.
+
+    All places referenced by the transition's input and output arcs must be
+    registered via [`add_place`][cpnx.PetriNet.add_place] before the first time the
+    transition fires — referencing an undeclared name raises `KeyError` at fire time.
+
+    Args:
+        transition: The [`Transition`][cpnx.Transition] (or
+            [`SubstitutionTransition`][cpnx.SubstitutionTransition]) to register.
+
+    Raises:
+        ValueError: If `transition.name` is already registered as a place name, or if
+            `transition` is a [`SubstitutionTransition`][cpnx.SubstitutionTransition] whose
+            subnet is this net, encloses it, or is already wrapped in another net, or with
+            a port whose colour set differs from its socket's, a port that is a resource
+            pool when its socket is not (or the reverse), or a resource pool mapped as a port
+            that holds permits of its own.
+        TypeError: If one of the transition's arcs targets another transition's name
+            instead of a place.
+    """
+    _warn_if_drained_twice(transition)
+    with self._lock:
+        self._validate_new_transition(transition)
+        if isinstance(transition, SubstitutionTransition):
+            self._reject_subnet_link(transition)
+            self._reject_port_socket_mismatch(transition, self.places)
+            self._reject_filled_pool_port(transition)
+        self._unlink_replaced(self.transitions.get(transition.name))
+        self._reset_selector_state(transition.name)
+        self.transitions[transition.name] = transition
+        if isinstance(transition, SubstitutionTransition):
+            self._subnets.append(transition.subnet)
+            transition.subnet._parent = weakref.ref(self)
+        if any(arc.settle_secs > 0.0 for arc in transition.inputs):
+            self._has_timed_features = True
+        if self._searches_bindings(transition):
+            self._has_search_policy_transition = True
+        if transition.binding_selector is not None:
+            self._selector_transitions.add(transition.name)
+        # The transition set changed: the routing tables and dirty seed must be rebuilt
+        # before the incremental scheduler is next consulted.
+        self._scheduler_ready = False
+        # …and its resource borrows may need a synthesized return arc.
+        self._resource_returns_synthesized = False
+
+def _reject_subnet_link(self, transition: SubstitutionTransition) -> None:
+    """Raise if *transition*'s subnet is this net, encloses it, or already has another parent."""
+    net: PetriNet | None = self
+    while net is not None:
+        if net is transition.subnet:
+            raise ValueError(
+                f"SubstitutionTransition '{transition.name}': its subnet is this net or one enclosing it."
+            )
+        net = net._parent_net()
+    parent = transition.subnet._parent_net()
+    if (
+        parent is not None
+        and parent is not self
+        and any(
+            isinstance(other, SubstitutionTransition) and other.subnet is transition.subnet
+            for other in parent.transitions.values()
+        )
+    ):
+        raise ValueError(f"SubstitutionTransition '{transition.name}': its subnet already belongs to another net.")
+
+@staticmethod
+def _reject_port_socket_mismatch(transition: SubstitutionTransition, sockets: dict[str, Place]) -> None:
+    """Raise if a port and a socket in *sockets* differ in kind or declare different colour sets.
+
+    A port and its socket are one compound place, so either both are resource pools or
+    neither is, and they have one colour set. An undeclared colour set accepts any colour and
+    matches whatever the other side declares.
+    """
+    for port_name, socket_name in transition.port_socket_map.items():
+        port, socket = transition.subnet.places.get(port_name), sockets.get(socket_name)
+        if port is None or socket is None:
+            continue
+        if isinstance(port, ResourcePlace) != isinstance(socket, ResourcePlace):
+            pool, plain = (port_name, socket_name) if isinstance(port, ResourcePlace) else (socket_name, port_name)
+            raise ValueError(
+                f"SubstitutionTransition '{transition.name}': port '{port_name}' and socket "
+                f"'{socket_name}' are one place, but '{pool}' is a resource pool and '{plain}' is not."
+            )
+        if port.color_set is None or socket.color_set is None:
+            continue
+        if set(port.color_set) != set(socket.color_set):
+            raise ValueError(
+                f"SubstitutionTransition '{transition.name}': port '{port_name}' and socket "
+                f"'{socket_name}' declare different colour sets."
+            )
+
+@staticmethod
+def _reject_filled_pool_port(transition: SubstitutionTransition) -> None:
+    """Raise if a port is a resource pool that holds permits of its own.
+
+    A port and its socket are one compound place, so the permits behind a pool port are the
+    parent's. The subnet sees them only as the firing borrows them, which the port's empty
+    marking stands in for. A pool the subnet owns is an internal place: leave it unmapped.
+    """
+    for port_name in transition.port_socket_map:
+        port = transition.subnet.places.get(port_name)
+        if isinstance(port, ResourcePlace) and port.capacity > 0:
+            raise ValueError(
+                f"SubstitutionTransition '{transition.name}': port '{port_name}' is a pool with "
+                f"capacity {port.capacity}, but a port shares its socket's permits. Use capacity=0, "
+                f"or leave the pool out of port_socket_map to keep it private to the subnet."
+            )
+
+def _unlink_replaced(self, replaced: Transition | None) -> None:
+    """Drop the subnet link of a substitution transition that `add_transition` is replacing."""
+    if isinstance(replaced, SubstitutionTransition) and replaced.subnet in self._subnets:
+        self._subnets.remove(replaced.subnet)
+        if replaced.subnet._parent_net() is self:
+            replaced.subnet._parent = None
+
+def _parent_net(self) -> "PetriNet | None":
+    """The net whose substitution transition wraps this one, if it is still alive."""
+    return self._parent() if self._parent is not None else None
+
+def deposit(self, place_name: str, token: Token) -> None:
+    """Deposit `token` into `place_name`, auto-creating a bare place if it does not exist.
+
+    This is the primary entry point for injecting work items from external
+    sources (data loaders, scheduled events, API responses, etc.). Also wakes any
+    thread blocked in [`run`][cpnx.PetriNet.run] and invokes `on_token_deposited`
+    (if set) outside the engine lock.
+
+    Note:
+        Auto-creation always produces a bare [`Place`][cpnx.Place].
+        If you need a [`ResourcePlace`][cpnx.ResourcePlace] or
+        `ThresholdPlace`, call [`add_place`][cpnx.PetriNet.add_place] first.
+
+    Args:
+        place_name: Name of the target place.
+        token: The token to deposit.
+    """
+    with self._lock:
+        if place_name not in self.places:
+            self.places[place_name] = Place(place_name)
+        self.places[place_name].deposit(token, model_time=self._get_model_time_under_lock())
+        self._mark_dirty(place_name, token)
+    self._work_available.set()
+    if self.on_token_deposited:
+        try:
+            self.on_token_deposited(place_name, token)
+        except Exception:
+            pass
+
+@staticmethod
+def _filter_highest_priority(
+    pairs: list[tuple[Transition, _Binding]],
+) -> list[tuple[Transition, _Binding]]:
+    if not pairs:
+        return []
+    min_priority = min(t.priority for t, _ in pairs)
+    return [(t, b) for t, b in pairs if t.priority == min_priority]
+
+def _enabled_transition_bindings(self) -> list[tuple[Transition, _Binding]]:
+    """Resolve each transition's binding once, keeping those that are currently enabled.
+
+    For every transition, checks output capacity and resolves a guard-satisfying binding
+    under its effective [`BindingPolicy`][cpnx.BindingPolicy]. Returning the resolved
+    binding alongside the transition lets [`step`][cpnx.PetriNet.step] consume exactly
+    those tokens without re-resolving (so the guard is evaluated once per firing).
+    """
+    m_time = self._get_model_time_under_lock()
+    result: list[tuple[Transition, _Binding]] = []
+    for t in self.transitions.values():
+        if not self._check_output_capacity(t):
+            continue
+        binding = self._resolve_binding(t, m_time)
+        if binding is not None:
+            result.append((t, binding))
+    return result
+
+def _select_transition_to_fire(self) -> tuple[Transition, _Binding] | None:
+    if self._incremental_eligible:
+        return self._select_incremental()
+    candidates = self._filter_highest_priority(self._enabled_transition_bindings())
+    return self._rng.choice(candidates) if candidates else None
+
+# ------------------------------------------------------------------
+# Incremental enablement scheduler (ADR 0006)
+# ------------------------------------------------------------------
+
+@property
+def _incremental_eligible(self) -> bool:
+    """Whether the incremental (dirty-set) scheduler may drive selection/quiescence.
+
+    Off for nets with clock-driven re-enablement (`_has_timed_features`) or any
+    `RANDOM`/`PRIORITY` transition (`_has_search_policy_transition`); those fall back to
+    the full-net scan, which is behaviour- and RNG-stream-identical. Both inputs are
+    monotonic, so this only ever flips True→False over a net's life.
+    """
+    return not self._has_timed_features and not self._has_search_policy_transition
+
+def _mark_dirty(self, place_name: str, token: Token | None = None) -> None:
+    """Flag a place whose token pool changed, for incremental re-evaluation.
+
+    No-op unless the incremental scheduler is eligible. A future-dated `token` (a
+    retry-delayed rollback) also schedules a reactivation at its `available_at`, so the
+    place re-dirties once the delay elapses — the one time-gate the fast path handles
+    rather than falling back on. A token parked at ``available_at = inf`` never matures, so
+    it schedules nothing. Caller must hold `self._lock`.
+    """
+    if not self._incremental_eligible:
+        return
+    self._dirty_places.add(place_name)
+    if (
+        token is not None
+        and token.available_at > self._get_model_time_under_lock()
+        and math.isfinite(token.available_at)
+    ):
+        heapq.heappush(self._reactivation, (token.available_at, place_name))
+
+def _build_routing(self) -> None:
+    """Build the static place→transition reverse-routing tables from the current net."""
+    inp: dict[str, list[Transition]] = {}
+    out: dict[str, list[Transition]] = {}
+    for t in self.transitions.values():
+        for arc in t.inputs:
+            inp.setdefault(arc.place, []).append(t)
+        for arc in t.outputs:
+            if arc.condition is None:
+                out.setdefault(arc.place, []).append(t)
+    self._input_routing = inp
+    self._output_routing = out
+    self._dirty_routing = {
+        place: frozenset(t.name for t in (*inp.get(place, ()), *out.get(place, ())))
+        for place in inp.keys() | out.keys()
+    }
+
+def _is_volatile(self, transition: Transition) -> bool:
+    """Whether `transition`'s enablement can change with **no input-place mutation**.
+
+    The dirty set only re-checks a transition when one of its input places changes. These
+    shapes escape that and so must be re-evaluated on every reconcile regardless:
+
+    - **input-less** transitions (sources) read no place, so no dirty flag ever routes to
+      them, yet they are (potentially) always enabled;
+    - a transition with a **`guard`**, or an input arc with a **`key`/`filter`/`join_key`**. Even a
+      *certified* callable is not necessarily token-pure: certification's documented
+      late-binding rule (see `cpnx.certification`) admits reads of a rebindable global/free
+      variable (e.g. `guard=lambda toks: gate_open` with a `bool` `gate_open` that is later
+      reassigned — `test_guard_with_resource_check`). The pre-0006 engine re-evaluated every
+      guard on every scan, so such rebinding worked; caching would silently break it. Rather
+      than probe exactly which callables are token-only, re-evaluate any of them each pass —
+      this costs the same as the old scan for guarded transitions and is never wrong. The
+      incremental win still applies fully to guard/selection-free transitions (the common
+      fan-out shape, and the `bench_transition_scan` workload).
+    """
+    if not transition.inputs:
+        return True
+    if transition.guard is not None or transition.binding_selector is not None:
+        return True
+    return any(
+        arc.key is not None or arc.filter is not None or arc.join_key is not None for arc in transition.inputs
+    )
+
+def _ensure_scheduler_ready(self) -> None:
+    """Rebuild routing + reseed the dirty set after a transition-set change. Under lock.
+
+    Seeds every non-empty place dirty (so all currently-markable transitions get an initial
+    evaluation) and primes the reactivation heap from any place already holding a cooling
+    token, then clears the maintained enabled sets so the next reconcile rebuilds them.
+    """
+    if self._scheduler_ready:
+        return
+    self._build_routing()
+    self._transition_order = {name: i for i, name in enumerate(self.transitions)}
+    self._volatile_transitions = {t.name for t in self.transitions.values() if self._is_volatile(t)}
+    self._capacity_blocked = set()
+    self._enabled_bindings = {}
+    self._potentially_enabled = set()
+    self._priority_buckets = {}
+    self._bucket_index = {}
+    self._reactivation = []
+    now = self._get_model_time_under_lock()
+    self._dirty_places = set()
+    for name, place in self.places.items():
+        if len(place) == 0:
+            continue
+        self._dirty_places.add(name)
+        if not isinstance(place, SinkPlace):
+            boundary = place.earliest_available_boundary(now)
+            if boundary is not None and math.isfinite(boundary):
+                heapq.heappush(self._reactivation, (boundary, name))
+    self._scheduler_ready = True
+
+def _reconcile_dirty(self) -> None:
+    """Bring the maintained enabled sets up to date with the dirty set. Under lock.
+
+    Drains any reactivation boundaries that have elapsed (re-dirtying their places), then
+    re-evaluates the transitions routed from the dirty places plus the always-volatile set
+    — the O(K) core that replaces the O(T) scan.
+    """
+    self._ensure_scheduler_ready()
+    now = self._get_model_time_under_lock()
+    self._drain_reactivation(now)
+    affected: set[str] = self._volatile_transitions | self._capacity_blocked
+    routing = self._dirty_routing
+    affected.update(*(routing.get(place_name, ()) for place_name in self._dirty_places))
+    self._dirty_places.clear()
+    # Re-evaluate in registration order so bucket membership — and thus the seeded
+    # tie-break `_rng.choice` indexes into it — is reproducible across processes.
+    for name in sorted(affected, key=self._transition_order.__getitem__):
+        self._reevaluate_transition(self.transitions[name], now)
+
+def _drain_reactivation(self, now: float) -> None:
+    """Pop elapsed reactivation boundaries, re-dirty their places and queue each one's next.
+
+    A place can hold several cooling tokens while the heap carries only its earliest
+    boundary (`_ensure_scheduler_ready` seeds one entry per place). Re-pushing the place's
+    next boundary after popping keeps a later token tracked until it matures, so the
+    timing-ignoring probe in `_reevaluate_transition` still runs and `is_quiescent` does not
+    report quiescence while a binding waits on that token (#68). A token parked at
+    ``available_at = inf`` never matures, so its boundary is not queued: an entry that never
+    pops would keep that probe running on every reconcile. Caller must hold the lock.
+    """
+    popped: set[str] = set()
+    while self._reactivation and self._reactivation[0][0] <= now:
+        _, place = heapq.heappop(self._reactivation)
+        popped.add(place)
+    for name in popped:
+        self._dirty_places.add(name)
+        place = self.places.get(name)
+        if place is None or isinstance(place, SinkPlace):
+            continue
+        boundary = place.earliest_available_boundary(now)
+        if boundary is not None and math.isfinite(boundary):
+            heapq.heappush(self._reactivation, (boundary, name))
+
+def _reevaluate_transition(self, transition: Transition, m_time: float) -> None:
+    """Recompute one transition's membership in the enabled + potentially-enabled sets.
+
+    Resolves the timing-aware binding **once** (never drawing the seeded RNG on the eligible
+    `FIRST` path, so a variable per-reconcile count cannot perturb the tie-break
+    stream, and re-evaluating no more than needed — see `_arc_key_evaluated_once` regression).
+    A satisfiable timing-aware binding is a fortiori potentially-enabled; the timing-ignoring
+    probe is needed only to catch a transition currently blocked *solely* by a cooling
+    (retry-delayed) token, so it runs only while such tokens are outstanding.
+    """
+    name = transition.name
+    binding = self._resolve_binding(transition, m_time)
+    if binding is not None and self._check_output_capacity(transition):
+        self._enabled_bindings[name] = binding
+        self._bucket_add(name, transition.priority)
+        self._capacity_blocked.discard(name)
+    else:
+        self._enabled_bindings.pop(name, None)
+        self._bucket_remove(name)
+        # Held back *only* by output back-pressure? Track it so it is re-checked every
+        # reconcile and unblocks as soon as its output drains (even out-of-band).
+        if binding is not None:
+            self._capacity_blocked.add(name)
+        else:
+            self._capacity_blocked.discard(name)
+
+    if binding is not None:
+        potentially = True
+    elif self._reactivation:  # cooling tokens outstanding — a timing-ignoring probe may differ
+        potentially = self._binding_exists(transition, float("inf"), ignore_timing=True)
+    else:
+        potentially = False
+    if potentially:
+        self._potentially_enabled.add(name)
+    else:
+        self._potentially_enabled.discard(name)
+
+def _bucket_add(self, name: str, priority: int) -> None:
+    """Add `name` to its priority bucket (idempotent; priority is static per transition)."""
+    if name in self._bucket_index:
+        return
+    bucket = self._priority_buckets.setdefault(priority, [])
+    self._bucket_index[name] = len(bucket)
+    bucket.append(name)
+
+def _bucket_remove(self, name: str) -> None:
+    """Remove `name` from its priority bucket in O(1) via swap-remove."""
+    idx = self._bucket_index.pop(name, None)
+    if idx is None:
+        return
+    bucket = self._priority_buckets[self.transitions[name].priority]
+    last = bucket.pop()
+    if idx < len(bucket):
+        bucket[idx] = last
+        self._bucket_index[last] = idx
+
+def _select_incremental(self) -> tuple[Transition, _Binding] | None:
+    """Select the highest-priority enabled transition from the maintained enabled set.
+
+    Reconciles pending dirties (O(K)), then picks the minimum non-empty priority bucket and
+    random-tie-breaks within it — O(1) in the transition count, versus the O(T) full scan.
+    """
+    self._reconcile_dirty()
+    if not self._enabled_bindings:
+        return None
+    min_priority = min(p for p, bucket in self._priority_buckets.items() if bucket)
+    name = self._rng.choice(self._priority_buckets[min_priority])
+    transition = self.transitions[name]
+    if transition.binding_selector is not None and name not in self._volatile_transitions:
+        # A selector assigned after the scheduler was built: the cached binding came from a
+        # search. Rebuild, so the selector is asked (and the transition is volatile) from now on.
+        self._scheduler_ready = False
+        return self._select_incremental()
+    return transition, self._enabled_bindings[name]
+
+def _consume_binding(self, binding: _Binding, m_time: float | None) -> tuple[list[Token], list[tuple[str, Token]]]:
+    """Remove the exact tokens named by `binding` from their source places.
+
+    Each arc's tokens were already resolved (and its guard satisfied) by
+    `_resolve_binding`, so consumption is a straight `retrieve_specific` by id — no
+    arc `key`/`filter` is re-evaluated here. If a token has vanished (e.g. a concurrent
+    consumer removed it between resolution and consumption), the already-consumed
+    tokens are returned to their source places before the error propagates, so none
+    are silently lost.
+
+    Args:
+        binding: The resolved binding — arcs paired with the tokens they will consume.
+        m_time: The current model time used to validate token availability.
+
+    Returns:
+        A tuple of `(consumed_tokens, token_sources)`, where `token_sources` pairs each
+        consumed token with the name of the place it came from (for rollback).
+    """
+    consumed_tokens: list[Token] = []
+    token_sources: list[tuple[str, Token]] = []
+    deferred: list[int] = []
+    try:
+        for i, (arc, tokens) in enumerate(binding):
+            if isinstance(tokens, _DrainAll):
+                # Lazily-resolved `consume_all` arc: its place is drained after every other
+                # arc has taken its tokens, so on a place it shares it takes what they leave.
+                deferred.append(i)
+                continue
+            got = self.places[arc.place].retrieve_specific(tokens, model_time=m_time)
+            if got:
+                # Removing tokens can release output back-pressure on this place, so flag
+                # it dirty for the output-side dependents too (see `_output_routing`).
+                self._mark_dirty(arc.place)
+            consumed_tokens.extend(got)
+            for t in got:
+                token_sources.append((arc.place, t))
+        if deferred:
+            consumed_tokens = self._drain_deferred(binding, deferred, m_time, token_sources)
+    except Exception:
+        # A token vanished mid-loop — return already-consumed tokens to their
+        # source places so they are not silently lost.
+        for src_name, t in token_sources:
+            self._deposit_under_lock(src_name, t)
+        raise
+    return consumed_tokens, token_sources
+
+def _drain_deferred(
+    self, binding: _Binding, deferred: list[int], m_time: float | None, token_sources: list[tuple[str, Token]]
+) -> list[Token]:
+    """Drain the `_DRAIN` arcs of `binding` (at positions `deferred`) and return every consumed token in arc order.
+
+    Each drained pool is materialized and removed now, under the same lock that selected
+    the binding, so it is consistent with the `can_retrieve` check that enabled it. The
+    other arcs' tokens are already in `token_sources`, in arc order; the drained ones are
+    added to it for rollback.
+    """
+    drained: dict[int, list[Token]] = {}
+    for i in deferred:
+        arc = binding[i][0]
+        got = self.places[arc.place].retrieve_all(model_time=m_time)
+        if got:
+            self._mark_dirty(arc.place)
+        drained[i] = got
+        token_sources.extend((arc.place, t) for t in got)
+    consumed: list[Token] = []
+    for i, (_, tokens) in enumerate(binding):
+        consumed.extend(drained[i] if i in drained else cast("list[Token]", tokens))
+    return consumed
+
+def step(self) -> bool:
+    """Fire one enabled transition and return immediately, without waiting for it to finish.
+
+    Selects the highest-priority enabled transition (ties broken at random among
+    transitions sharing the lowest `priority` value), consumes its input tokens, and
+    submits its action to the thread pool — all atomically under the engine lock. Returns
+    before the action completes; the transition's effects are committed later, from a
+    worker thread, once the action finishes.
+
+    Returns:
+        `True` if a transition was selected and its action was scheduled; `False` if no
+        transition is currently enabled. A `False` return does not mean the net is
+        finished — transitions may still be in flight, or may become enabled once
+        in-flight transitions or cooldowns complete. Use
+        [`is_quiescent`][cpnx.PetriNet.is_quiescent] to check for that.
+
+    Raises:
+        RuntimeError: If submitting to the internal thread pool fails (e.g. the pool has
+            already been shut down, such as after exiting a `with` block). Any tokens
+            already consumed from input places are returned before the error propagates.
+    """
+    return self._fire_one(inline=False)
+
+def _fire_one(self, *, inline: bool) -> bool:
+    """Select and consume one firing under the lock, then run it; see `step`.
+
+    With *inline* the action runs here on the calling thread, after the lock is released and
+    the deferred selection callbacks have been flushed, so the firing has committed (or rolled
+    back) when this returns. Otherwise it is submitted to the thread pool, as `step` does.
+    """
+    # Synthesize resource-return arcs once, before any firing — covers callers that reach
+    # `step` without `validate` (direct `step`, `drive_to_quiescence`). Fast-path no-op
+    # after the first call.
+    self._ensure_resource_returns_synthesized()
+    firing: tuple[Transition, list[Token], list[tuple[str, Token]]] | None = None
+    try:
+        with self._lock:
+            selected = self._select_transition_to_fire()
+            if selected:
+                if inline and self._shut_down:
+                    # Match `step()`, whose submit raises once the pool is shut down, only
+                    # when something would fire: refuse before consuming, so no token is touched.
+                    raise RuntimeError("cannot fire inline after the net's thread pools were shut down")
+                # The binding was resolved during selection (guard evaluated once); consume
+                # exactly those tokens. Under BindingPolicy.FIRST the chosen tokens may not
+                # be at the head of their places, so consumption is by token id, not FIFO.
+                transition, binding = selected
+                m_time = self._get_model_time_under_lock()
+                consumed_tokens, token_sources = self._consume_binding(binding, m_time)
+                if transition.binding_selector is not None:
+                    self._selector_firings[transition.name] = self._selector_firings.get(transition.name, 0) + 1
+                    self._clear_selector_faults(transition.name)
+                self._running_count += 1
+                firing = (transition, consumed_tokens, token_sources)
+                if not inline:
+                    self._submit_firing_under_lock(*firing)
+    finally:
+        # Dispatch any deferred callbacks accumulated during selection, off the lock —
+        # even if consume/submit raised, so buffered signals are never delayed.
+        self._flush_after_selection(firing if inline else None)
+
+    if firing is None:
+        return False
+    if inline:
+        # Off the lock, as on a worker thread. `_execute_transition` catches the action's
+        # exceptions, commits or rolls back, runs the callbacks and decrements
+        # `_running_count`. A `KeyboardInterrupt` or `SystemExit` from the action hands the
+        # tokens back as taken and propagates; any other `BaseException` fails the firing,
+        # then propagates (see `_fire_and_commit`).
+        self._execute_transition(*firing, inline=True)
+    return True
+
+def _flush_after_selection(
+    self, unstarted: "tuple[Transition, list[Token], list[tuple[str, Token]]] | None"
+) -> None:
+    """Dispatch the callbacks deferred during selection, off the lock.
+
+    *unstarted* is an inline firing that is consumed and counted running but not yet
+    executed. If a callback raises a `BaseException` the flush does not catch (a
+    `SystemExit` from `on_error`, or Ctrl-C landing here), that firing would never run, so
+    its tokens go back as they were taken and it stops counting as running.
+    """
+    try:
+        self._flush_search_exhaustions()
+        self._flush_priority_key_failures()
+        self._flush_selection_failures()
+    except BaseException:
+        if unstarted is not None:
+            self._abandon_unstarted(unstarted[2])
+        raise
+
+def _abandon_unstarted(self, token_sources: list[tuple[str, Token]]) -> None:
+    """Undo a consumed firing that will never execute: return its tokens and its running count."""
+    self._return_unstarted(token_sources)
+    with self._lock:
+        self._running_count -= 1
+    self._work_available.set()
+
+def _submit_firing_under_lock(
+    self, transition: Transition, consumed_tokens: list[Token], token_sources: list[tuple[str, Token]]
+) -> None:
+    """Hand a consumed firing to the thread pool. Caller holds `self._lock` and has counted it running."""
+    try:
+        self._executor.submit(self._execute_transition, transition, consumed_tokens, token_sources)
+    except Exception:
+        # submit() failed (e.g. executor shut down) — undo the increment so
+        # is_quiescent() doesn't permanently block.
+        self._running_count -= 1
+        # Return consumed tokens back to their source places
+        for src_name, t in token_sources:
+            self._deposit_under_lock(src_name, t)
+        raise
+
+def _inject_resource_returns(self, transition: Transition) -> int:
+    """Append a synthesized `OutputArc` for each resource-pool `InputArc` this transition
+    borrows from without a matching `OutputArc`, so the permit's return is a real arc
+    (an explicit self-loop) rather than the invisible implicit leftover-return.
+
+    Behaviour-preserving: resource permits are already always returned on success (see
+    `_return_leftover_resources`); this only makes the flow structural, so `to_dot`,
+    `trace_impact`, and P-invariants read the pool honestly. Skips `consume_all` borrows
+    (a fixed-count arc cannot express "return however many you drained" — those stay on
+    the implicit path) and any transition opting out via `auto_return_resources=False`.
+    Returns the number of arcs appended. Caller holds `self._lock`.
+
+    Correctness rests on **permit fungibility**: every `ResourcePlace` permit is
+    `color="resource"` (see `ResourcePlace`), so appending the return arc *last* — after
+    the transition's data outputs — cannot mis-route a permit. The deposit plan matches
+    tokens to arcs by resource-vs-data class, not by pool or position, so a synthesized
+    arc always claims a consumed permit, never a data token. `returned_pools` dedupes by
+    pool **name**: a transition with two `InputArc`s on the *same* pool gets a single
+    return arc (the second permit rides the implicit path) — an anti-pattern best written
+    `InputArc(pool, count=2)`, which synthesizes an `OutputArc(count=2)` correctly.
+    """
+    if not transition.auto_return_resources:
+        return 0
+    returned_pools = {arc.place for arc in transition.outputs}
+    injected = 0
+    for arc in transition.inputs:
+        if arc.consume_all or arc.place in returned_pools:
+            continue
+        if not isinstance(self.places.get(arc.place), ResourcePlace):
+            continue
+        transition.outputs.append(OutputArc(place=arc.place, count=arc.count, synthesized=True))
+        returned_pools.add(arc.place)
+        injected += 1
+    return injected
+
+def _synthesize_resource_returns_under_lock(self) -> None:
+    """Synthesize resource-return arcs for every transition, once. Caller holds `self._lock`."""
+    if self._resource_returns_synthesized:
+        return
+    injected = sum(self._inject_resource_returns(t) for t in self.transitions.values())
+    self._resource_returns_synthesized = True
+    if injected:
+        # Output arcs changed, so the incremental scheduler's routing tables must be rebuilt.
+        # Only invalidate when something was actually added — a net with no resource borrows
+        # must not disturb the scheduler's cached bindings (incremental-reconcile identity).
+        self._scheduler_ready = False
+
+def _ensure_resource_returns_synthesized(self) -> None:
+    """Idempotently synthesize resource-return arcs before firing or introspection.
+
+    Lock-free fast path once done; acquires the lock only for the one-time synthesis, so
+    callers that do **not** already hold `self._lock` (`step`, `drive_to_quiescence`,
+    `to_dot`, `trace_impact`) can call it safely. `validate` holds the lock already and
+    calls `_synthesize_resource_returns_under_lock` directly.
+    """
+    if self._resource_returns_synthesized:
+        return
+    with self._lock:
+        self._synthesize_resource_returns_under_lock()
+
+def _validate_transition_arcs(self, transition_name: str, transition: Transition) -> None:
+    for arc in transition.inputs + transition.outputs:
+        if arc.place in self.transitions:
+            raise TypeError(
+                f"Arc target '{arc.place}' in transition '{transition_name}' is a Transition, not a Place. "
+                f"Arcs must connect Places↔Transitions only."
+            )
+        if arc.place not in self.places:
+            raise KeyError(f"Place '{arc.place}' referenced by transition '{transition_name}' is not registered.")
+
+def validate(self) -> None:
+    """Check the net's structural topology and raise on the first problem found.
+
+    Checks for name overlaps between places and transitions, and verifies
+    that all transition arcs connect to valid, registered places rather than
+    transitions. Called automatically at the start of [`run`][cpnx.PetriNet.run].
+
+    Also **synthesizes resource-return arcs** (once, idempotently): for every transition
+    that borrows from a [`ResourcePlace`][cpnx.ResourcePlace] via an `InputArc` with no
+    matching `OutputArc`, an `OutputArc(pool)` marked `synthesized=True` is appended so the
+    permit's return is expressed structurally. This is behaviour-preserving — permits were
+    already returned on success — and is suppressed per transition by declaring the arc
+    yourself or setting `auto_return_resources=False` (see
+    [`Transition`][cpnx.Transition]). `consume_all` resource borrows are left on the
+    implicit path.
+
+    Raises:
+        ValueError: If a name is registered as both a place and a transition, a port
+            and its socket declare different colour sets, only one of them is a resource
+            pool, or a resource pool mapped as a port holds permits of its own.
+        TypeError: If a transition's arc targets another transition's name.
+        KeyError: If a transition's arc references a place that has not been
+            registered via [`add_place`][cpnx.PetriNet.add_place].
+    """
+    with self._lock:
+        # Check overlap between place names and transition names
+        overlaps = set(self.places.keys()) & set(self.transitions.keys())
+        if overlaps:
+            raise ValueError(f"Name overlap: '{list(overlaps)[0]}' is registered as both a Place and a Transition.")
+
+        # Make each resource borrow's return structural before validating arcs, so the
+        # synthesized return arcs are checked alongside the author's own.
+        self._synthesize_resource_returns_under_lock()
+
+        for name, transition in self.transitions.items():
+            self._validate_transition_arcs(name, transition)
+            if isinstance(transition, SubstitutionTransition):
+                self._reject_port_socket_mismatch(transition, self.places)
+                self._reject_filled_pool_port(transition)
+
+def _wait_for_work(self, deadline: float | None, stop_event: threading.Event | None) -> None:
+    timeout = self.cooldown_interval
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        timeout = min(remaining, timeout)
+
+    if stop_event is not None:
+        timeout = min(timeout, 0.1)
+
+    self._work_available.wait(timeout=timeout)
+
+@staticmethod
+def _should_stop_run(deadline: float | None, stop_event: threading.Event | None) -> bool:
+    if stop_event is not None and stop_event.is_set():
+        return True
+    return deadline is not None and time.monotonic() > deadline
+
+def run(
+    self,
+    deadline: float | None = None,
+    *,
+    stop_event: threading.Event | None = None,
+) -> None:
+    """Repeatedly call `step` until the net is quiescent, the deadline passes, or stopped.
+
+    Validates the net first (see [`validate`][cpnx.PetriNet.validate]), then loops:
+    clear the work-available signal, try to fire a transition via
+    [`step`][cpnx.PetriNet.step], and if nothing fired, sleep on an internal
+    `threading.Event` (bounded by `cooldown_interval`, or by 0.1s when `stop_event` is
+    given) rather than busy-waiting — the event wakes immediately when new tokens are
+    deposited, a transition completes, or the clock advances. The loop checks
+    `stop_event`/`deadline` before each firing attempt, so it exits promptly rather than
+    only between full sleep cycles.
+
+    Args:
+        deadline: **Absolute** monotonic timestamp after which the loop exits, even if
+            the net is not yet quiescent. Always construct this as
+            `time.monotonic() + <seconds>`. If `None` (default), runs until the net is
+            quiescent, with no time limit.
+        stop_event: Optional `threading.Event`. If set (by another thread) at any point
+            during the loop, `run` exits promptly, leaving any in-flight transitions
+            running in the background.
+
+    Warning:
+        Passing a raw duration (e.g. `run(30)`) instead of an absolute
+        deadline causes immediate exit because `time.monotonic()` is always
+        much larger than small floats. Use `run(deadline=time.monotonic() + 30)`.
+
+    Note:
+        A `BindingPolicy.FIRST` transition whose only satisfiable binding lies beyond
+        `binding_search_limit` counts as disabled, so `run` can return "quiescent" while
+        that token still sits in its place. The exhaustion is surfaced via
+        `on_binding_search_exhausted`; raise `binding_search_limit` if such tokens must be
+        processed. `RANDOM`/`PRIORITY` stall the same way *when no satisfying binding lies
+        within the first `limit` candidates*; if one does, they select over that truncated
+        prefix and fire (still signalling the truncation).
+
+    Note:
+        Reproducibility of a seeded net (`PetriNet(seed=...)`) holds for **synchronous
+        stepping** and for nets whose enablement does not depend on in-flight deposits.
+        In a pipelined net with concurrent actions, whether a worker-thread deposit lands
+        before or after the next `step` acquires the lock is OS-scheduled; that can change
+        which transitions are enabled at a firing step and hence the RNG draw sequence.
+        For strict replay use `max_workers=1`; above 1, identical seeds are **not**
+        guaranteed to reproduce. Seeded streams are also not stable across cpnx versions.
+
+    Example:
+        ```python
+        net.run(deadline=time.monotonic() + 30)  # run for up to 30 seconds
+        net.run()  # run to quiescence
+        ```
+    """
+    self.validate()
+    while not self.is_quiescent():
+        if self._should_stop_run(deadline, stop_event) or self._aborted():
+            break
+        self._work_available.clear()
+        if not self.step():
+            self._wait_for_work(deadline, stop_event)
+
+def drive_to_quiescence(
+    self, *, max_ticks: int = 1_000_000, max_spins: int = 10_000_000, inline_actions: bool = False
+) -> DriveResult:
+    """Drive the net to quiescence on its **logical clock**, jumping over timed waits.
+
+    The deterministic counterpart to [`run`][cpnx.PetriNet.run]. Where `run` waits out
+    cooldowns and settle windows on the real wall clock — so a net with an 8-second grinder
+    cooldown takes 8 real seconds — this drives the net on its logical clock: fire every
+    transition enabled at the current instant (awaiting each action so its outputs can enable
+    the next), then, once nothing more fires, jump [`advance_time`][cpnx.PetriNet.advance_time]
+    straight to the next availability boundary. Blocking/back-pressure is fully preserved (a
+    cooling resource is genuinely unavailable for its full *logical* cooldown), but the waiting
+    costs no wall-clock time. Because it never races real time, the marking observed after this
+    returns is a true fixed point — useful for benchmarking engine CPU cost and for
+    property-test oracles that must not race a wall-clock settle window.
+
+    The first call anchors the net onto the logical clock (via `advance_time`); subsequent
+    calls continue from the current logical time. The await after every `step` keeps at most one
+    action in flight, which is what makes the drive single-threaded and deterministic —
+    `max_workers` does not affect it. Use [`run`][cpnx.PetriNet.run] to exploit concurrency.
+
+    Args:
+        max_ticks: Safety cap on logical-clock advances, so a pathological net cannot loop
+            forever. Each [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing passes
+            it to its subnet's drive as that firing's own cap, and a subnet that hits the cap
+            fails the firing.
+        max_spins: Safety cap on the per-firing barrier that awaits each in-flight action, and
+            on the wait for a subnet to settle after a failed substitution firing. The
+            default suits the fast (~microsecond) actions this driver is built for; raise it for
+            nets whose actions legitimately block for longer, so a slow-but-healthy action is
+            not mistaken for a hung one. It counts spins, so how long it lasts depends on the
+            machine; it is not a time bound. It is passed to subnet drives as `max_ticks` is.
+            It does not apply to firings run with `inline_actions`.
+        inline_actions: Run each firing's action on the calling thread instead of handing it to
+            the thread pool. The drive already keeps one firing in flight, so the order of
+            firings, commits and seeded draws is the same either way; inline execution only
+            drops the per-firing handoff and the wait for it, which dominates the cost of
+            cheap actions. The trade-off is the hung-action guard: an inline action that
+            blocks blocks the drive, and `max_spins` cannot cut it short. Set
+            `action_timeout_secs` on a transition whose action can hang; that action still
+            runs on its own worker under the timeout. `SubstitutionTransition` firings run
+            inline too, and their subnet drives inherit the setting. A `KeyboardInterrupt` or
+            `SystemExit` raised by an inline action hands the firing's tokens back exactly
+            as they were taken (a paced permit starts no cooldown), with no attempt counted
+            and nothing dead-lettered, and propagates out of the drive; on the thread pool
+            it is lost with the worker and the firing fails. Any other `BaseException` that
+            is not an `Exception` fails the firing as usual, then propagates. That holds for
+            an interrupt raised inside the action body. One that lands while the engine is
+            committing or rolling back can leave that firing half done. With
+            `action_timeout_secs`, the interrupt reaches the drive while it waits for the
+            action, which keeps running on its worker and may still have side effects after
+            its tokens are back. An inline drive that would fire on a net whose `with` block
+            has exited raises `RuntimeError`, as `step()` does. See ADR 0012.
+
+    Returns:
+        A [`DriveResult`][cpnx.DriveResult] with the number of firings and clock advances.
+
+    Raises:
+        RuntimeError: If an in-flight action does not complete, or a subnet does not settle,
+            within `max_spins` barrier spins.
+    """
+    # Anchor onto the logical clock the first time only. `math.nextafter` (not `+ 1e-9`)
+    # guarantees a strictly-greater value: at monotonic-clock magnitudes one ULP is ~2e-9, so a
+    # fixed epsilon can round back to the current time — the same float hazard guarded against
+    # in `_next_availability_boundary`.
+    if self._model_time is None:
+        self.advance_time(math.nextafter(self.model_time, math.inf))
+
+    self._drive_limits = {"max_ticks": max_ticks, "max_spins": max_spins, "inline_actions": inline_actions}
+    try:
+        return self._drive_logical_clock(max_ticks, max_spins, inline_actions)
+    finally:
+        self._drive_limits = {}
+
+def _drive_logical_clock(self, max_ticks: int, max_spins: int, inline: bool) -> DriveResult:
+    """Fire and advance until a fixed point or *max_ticks*; see `drive_to_quiescence`."""
+    steps = 0
+    ticks = 0
+    while ticks < max_ticks:
+        # Fire everything enabled at the current logical instant. The await after each firing is
+        # deliberate: `step` returns as soon as the action is submitted, so awaiting means at
+        # most one action is ever in flight. This keeps the drive single-threaded (determinism)
+        # and ensures each completed action's outputs are committed before the next enablement
+        # check (instant accounting). An inline firing has committed by the time
+        # `_fire_one` returns, so its await finds nothing in flight.
+        while not self._aborted() and self._fire_one(inline=inline):
+            steps += 1
+            self._await_inflight(max_spins=max_spins)
+        # Nothing fires right now. Done, or just waiting out a cooldown/settle window?
+        if self.is_quiescent() or self._aborted():
+            break
+        boundary = self._next_availability_boundary()
+        if boundary is None or boundary <= self._model_time:
+            if self._has_unsettled_subnet():
+                self._await_subnets_settled(max_spins=max_spins)
+                continue
+            break
+        self.advance_time(boundary)
+        ticks += 1
+    return DriveResult(steps=steps, ticks=ticks)
+
+def _await_subnets_settled(self, *, max_spins: int) -> None:
+    """Block until no subnet of this net has a failed firing left to settle.
+
+    Raises:
+        RuntimeError: If `max_spins` is exceeded while a subnet is still settling.
+    """
+    spins = 0
+    while self._has_unsettled_subnet():
+        if spins >= max_spins:
+            raise RuntimeError(
+                f"drive_to_quiescence: a subnet is still settling a failed firing after max_spins={max_spins} "
+                "— hung action?"
+            )
+        spins += 1
+        time.sleep(0)
+
+def is_quiescent(self) -> bool:
+    """Return `True` if there is no in-flight work and nothing could become enabled soon.
+
+    A net is quiescent when no transition is currently running (in the middle of an
+    action) *and* no transition could possibly fire even once currently-cooling-down or
+    not-yet-settled tokens become available. Unlike [`is_dead`][cpnx.PetriNet.is_dead],
+    which is a pure snapshot of the current marking, `is_quiescent` also accounts for
+    in-flight transitions (including those still running in a subnet whose firing failed,
+    until it has settled and been restored) and treats time-gated tokens (cooldowns, settle
+    windows) as if they were already present — so the net is not considered quiescent merely because
+    work is temporarily blocked by timing. A token parked at `available_at = inf`, as a
+    saturated [`RetryPolicy`][cpnx.RetryPolicy] leaves one, stays out of this: nothing ever
+    releases it, so it is no pending work. This is the condition [`run`][cpnx.PetriNet.run]
+    loops until.
+
+    Returns:
+        `True` if the net has no pending or in-flight work; `False` if a transition is
+        running or could eventually fire (including after a cooldown or settle window
+        elapses).
+    """
+    with self._lock:
+        if self._running_count > 0 or self._has_unsettled_subnet():
+            result = False
+        elif self._incremental_eligible:
+            self._reconcile_dirty()
+            result = not self._potentially_enabled
+        else:
+            result = not any(self._is_transition_potentially_enabled(t) for t in self.transitions.values())
+    self._flush_search_exhaustions()
+    self._flush_priority_key_failures()
+    self._flush_selection_failures()
+    return result
+
+@property
+def marking(self) -> dict[str, tuple[Token, ...]]:
+    """Snapshot the current marking: every place name mapped to its live tokens.
+
+    In CPN formalism the *marking* `M` is a function from places to
+    multisets of colour values. This property returns, for each registered place, a
+    tuple of the [`Token`][cpnx.Token] objects currently held there (taken under the
+    engine lock, so it reflects a single consistent instant).
+
+    Returns:
+        Dict mapping place name to a tuple of tokens currently in that place.
+    """
+    with self._lock:
+        return {name: place.tokens for name, place in self.places.items()}
+
+def is_dead(self) -> bool:
+    """Return `True` if the current marking enables no transition right now (CPN dead state).
+
+    In CPN theory a *dead marking* is one in which no transition can fire
+    given the current token distribution. This checks each transition's full enabling
+    condition — token availability, cooldowns, settle windows, output capacity, and the
+    guard — exactly as of this instant. Unlike [`is_quiescent`][cpnx.PetriNet.is_quiescent],
+    it does **not** account for in-flight transitions, nor does it treat cooling-down or
+    not-yet-settled tokens as available; a net can be dead right now yet become enabled
+    moments later once a cooldown expires or an in-flight transition deposits a token.
+
+    Returns:
+        `True` if every transition's enabling condition currently fails.
+    """
+    with self._lock:
+        if self._incremental_eligible:
+            self._reconcile_dirty()
+            result = not self._enabled_bindings
+        else:
+            result = not any(self._is_transition_enabled(t) for t in self.transitions.values())
+    self._flush_search_exhaustions()
+    self._flush_priority_key_failures()
+    self._flush_selection_failures()
+    return result
+
+def snapshot(self) -> dict:
+    """Return a JSON-serialisable snapshot of current place markings and running count.
+
+    Delegates to the module-level [`snapshot`][cpnx.snapshot] function.
+
+    Returns:
+        Dict with `"places"` (mapping place name to a list of token dicts with
+        keys `id`, `payload`, `created_at`, `is_resource`) and
+        `"running_count"` (number of transitions currently executing in this net; a
+        subnet still settling a failed firing is not counted, so `0` does not mean
+        quiescent).
+
+    Example:
+        ```python
+        import json
+        print(json.dumps(net.snapshot(), indent=2))
+        ```
+    """
+    return snapshot(self)
+
+def to_dot(self, *, highlight_impact_from: str | None = None) -> str:
+    """Render the net's places, transitions, and arcs as a Graphviz DOT string.
+
+    Delegates to the module-level [`to_dot`][cpnx.to_dot] function.
+
+    Place nodes are circles annotated with current token counts.
+    Transition nodes are boxes. Arc labels include `count`,
+    `consume_all`, and `settle_secs` where non-default.
+
+    Args:
+        highlight_impact_from: If given, the name of a transition whose forward
+            blast radius (see [`trace_impact`][cpnx.trace_impact]) is shaded in the
+            output: impacted places/transitions are filled, and the seed transition
+            is accented. `None` (default) renders the plain net, unchanged.
+
+    Returns:
+        A DOT language string. Render with Graphviz or paste into
+        https://dreampuf.github.io/GraphvizOnline/.
+
+    Raises:
+        KeyError: if `highlight_impact_from` names no transition in this net
+            (raised before any DOT is produced).
+    """
+    # Resource-return synthesis happens inside the free `to_dot` (single source of truth),
+    # so the exported `cpnx.to_dot(net)` form is equally honest.
+    return to_dot(self, highlight_impact_from=highlight_impact_from)
+
+def trace_impact(self, transition_name: str, *, colors: object = None) -> ImpactMap:
+    """Trace the forward colour-domain blast radius of a transition.
+
+    Delegates to [`trace_impact`][cpnx.trace_impact]. See its docs for the walk,
+    the colour-pruning gate, and the over-approximation stance.
+
+    Args:
+        transition_name: The seed transition.
+        colors: Optional colour domain to trace; defaults to the transition's
+            [`impacts_colors`][cpnx.Transition] declaration.
+
+    Returns:
+        An [`ImpactMap`][cpnx.ImpactMap] of downstream places and transitions.
+
+    Raises:
+        KeyError: if `transition_name` is not a transition in this net.
+    """
+    # Resource-return synthesis happens inside the free `trace_impact` (single source of
+    # truth), so `cpnx.trace_impact(net, ...)` sees the borrowed pool too.
+    return trace_impact(self, transition_name, colors=colors)
+
+def risk_report(self) -> dict:
+    """Return a JSON-serialisable report fusing lint findings with blast radii.
+
+    Delegates to [`risk_report`][cpnx.risk_report]: for every transition it lints
+    the enabling inscriptions and, for any that trips the linter or declares
+    [`impacts_colors`][cpnx.Transition], attaches its blast radius. This is the
+    verification / debugging entry point that ties cpnx's two safety prongs
+    (best-effort side-effect linting, ADR 0007; colour-domain impact analysis,
+    ADR 0008) together.
+
+    Returns:
+        A dict with `"findings"` (per-transition lint hits) and `"impact_maps"`
+        (per-transition [`ImpactMap`][cpnx.ImpactMap] dicts).
+    """
+    # Synthesis happens inside the free `risk_report` (single source of truth).
+    return risk_report(self)
+
+# ------------------------------------------------------------------
+# Context manager — preferred over __del__ for deterministic shutdown
+# ------------------------------------------------------------------
+
+def __enter__(self) -> "PetriNet":
+    return self
+
+def __exit__(self, *_: object) -> None:
+    """Shut down the thread pool, waiting for in-flight transitions to finish."""
+    self._shut_down = True
+    self._executor.shutdown(wait=True)
+    # Zombie action threads may still be running after a timeout — don't wait.
+    self._action_executor.shutdown(wait=False, cancel_futures=True)
+    self._expr_executor.shutdown(wait=True)
+
+def __del__(self) -> None:
+    try:
+        self._executor.shutdown(wait=False)
+    except Exception:
+        pass
+    try:
+        self._action_executor.shutdown(wait=False)
+    except Exception:
+        pass
+    try:
+        self._expr_executor.shutdown(wait=False)
+    except Exception:
+        pass
+
+# ------------------------------------------------------------------
+# Internal helpers
+# ------------------------------------------------------------------
+
+def _deposit_under_lock(self, place_name: str, token: Token) -> None:
+    """Deposit `token` into an already-registered place (caller holds `self._lock`).
+
+    Unlike the public `deposit`, this method does NOT auto-create missing
+    places — it raises `KeyError` so typos in arc names are caught loudly
+    rather than silently creating a bare `Place` with the
+    wrong type. Callbacks are NOT fired here; callers collect deposits and fire
+    them after releasing the lock.
+
+    Args:
+        place_name: Name of an already-registered place.
+        token: The token to deposit.
+
+    Raises:
+        KeyError: If `place_name` has not been registered with `add_place`.
+    """
+    if place_name not in self.places:
+        raise KeyError(
+            f"Place '{place_name}' is not registered. Call add_place() before referencing it in a Transition arc."
+        )
+    self.places[place_name].deposit(token, model_time=self._get_model_time_under_lock())
+    self._mark_dirty(place_name, token)
+
+def _handle_schema_violation(
+    self,
+    place_name: str,
+    token: Token,
+    error_msg: str,
+    *,
+    transition_name: str,
+    dead_lettered_tokens: list[Token],
+    error_deposits: list[tuple[str, Token]],
+) -> None:
+    """Dead-letter a schema-violating transition output to the error place.
+
+    Builds an error-coloured token carrying the violation detail, deposits it into
+    `error_place`, and records it in `dead_lettered_tokens` (drives the dead-letter and
+    `on_error` callbacks) and — when actually deposited — in `error_deposits`, so
+    `on_token_deposited` fires for it. The error-place deposit happens off the committer's
+    planned-deposit path and would otherwise be invisible to that callback.
+    """
+    error_token = token.evolve(
+        color=ERROR_COLOR,
+        payload_updates={
+            "error": error_msg,
+            "error_type": "Color Set / Schema Violation",
+            "target_place": place_name,
+            "transition": transition_name,
+        },
+    )
+    if self.error_place and self.error_place in self.places:
+        self.places[self.error_place].deposit(error_token, model_time=self._get_model_time_under_lock())
+        self._mark_dirty(self.error_place, error_token)
+        error_deposits.append((self.error_place, error_token))
+    dead_lettered_tokens.append(error_token)
+
+def _deposit_output_under_lock(
+    self,
+    place_name: str,
+    token: Token,
+    transition_name: str,
+    dl_tokens: list[Token],
+    error_deposits: list[tuple[str, Token]],
+) -> bool:
+    if place_name not in self.places:
+        raise KeyError(
+            f"Place '{place_name}' is not registered. Call add_place() before referencing it in a Transition arc."
+        )
+    place = self.places[place_name]
+    # Resource permits carry no payload, so a payload schema never applies to them — see
+    # Place._enforce_schema. `_schema_failure_reason` returns the diagnostic (incl. a raising
+    # predicate's own exception) so the dead-letter carries it instead of a bare rejection.
+    reason = None if token.is_resource else place._schema_failure_reason(token.payload)
+    if reason is not None:
+        error_msg = f"Color Set / Schema Violation: Token schema violation in Place '{place_name}': {reason}"
+        self._handle_schema_violation(
+            place_name,
+            token,
+            error_msg,
+            transition_name=transition_name,
+            dead_lettered_tokens=dl_tokens,
+            error_deposits=error_deposits,
+        )
+        return False
+    # Re-validates schema via place.deposit(); redundant with the check above but cheap and
+    # deterministic (belt-and-suspenders — a bypass would only add API surface).
+    self._deposit_under_lock(place_name, token)
+    return True
+
+def _is_transition_enabled(self, transition: Transition) -> bool:
+    """Return `True` if all preconditions for firing `transition` are satisfied right now.
+
+    Checks output-place capacity (back-pressure), then resolves a binding that
+    satisfies token availability (including cooldowns, thresholds, and settle windows)
+    and the guard, honoring the transition's effective
+    [`BindingPolicy`][cpnx.BindingPolicy]. Called while holding `self._lock`.
+
+    Args:
+        transition: The transition to test.
+
+    Returns:
+        `True` if a guard-satisfying binding exists and every unguarded output arc has
+        capacity; `False` otherwise.
+    """
+    if not self._check_output_capacity(transition):
+        return False
+    m_time = self._get_model_time_under_lock()
+    return self._binding_exists(transition, m_time)
+
+def _effective_policy(self, transition: Transition) -> BindingPolicy:
+    """Return the binding policy in force for `transition` (its own, else the net default)."""
+    return self.binding_policy if transition.binding_policy is None else transition.binding_policy
+
+def _searches_bindings(self, transition: Transition) -> bool:
+    """Whether `transition` resolves under a `RANDOM`/`PRIORITY` search (a selector ignores its policy)."""
+    return transition.binding_selector is None and self._effective_policy(transition) in (
+        BindingPolicy.RANDOM,
+        BindingPolicy.PRIORITY,
+    )
+
+def _arc_available(
+    self,
+    arc: InputArc,
+    place: Place | None,
+    m_time: float | None,
+    ignore_timing: bool,
+    cap: int | None = None,
+    *,
+    lazy: bool = False,
+) -> _Pool | None:
+    """Return the tokens eligible to satisfy one input `arc`, or `None` if it cannot be met.
+
+    Eligibility accounts for token count and — unless `ignore_timing` is set — cooldowns
+    and the arc's settle window. Returns `None` when the place is missing, holds fewer
+    than `arc.count` eligible tokens, or has not yet settled.
+
+    Args:
+        arc: The input arc whose source place is inspected.
+        place: The source place, or `None` if unregistered.
+        m_time: The current model time (used when `ignore_timing` is `False`).
+        ignore_timing: When `True`, treat cooling-down/not-yet-settled tokens as available,
+            except a token parked at `available_at = inf`, which nothing ever releases
+            (used by [`is_quiescent`][cpnx.PetriNet.is_quiescent]).
+        cap: How many ordered tokens the caller can actually consume (see
+            `_gather_arc_pools`). An upper bound on what a bounded FIFO peek or a
+            *key-index* read materializes; `None` disables the index path entirely and
+            leaves the FIFO peek at `binding_search_limit + 1`.
+        lazy: Whether a deep bounded FIFO peek may be returned as a `_PeekStream`
+            (see `_materialize_pool`).
+
+    Returns:
+        The eligible tokens — FIFO, or ascending-key when served from the index — or
+        `None` if the arc cannot be satisfied.
+    """
+    if place is None:
+        return None
+    t_limit = _LAST_FINITE_TIME if ignore_timing else m_time
+    if not place.can_retrieve(arc.count, model_time=t_limit):
+        return None
+    if not ignore_timing and not self._is_settle_time_met(place, arc):
+        return None
+    return self._materialize_pool(arc, place, t_limit, cap, lazy=lazy)
+
+def _materialize_pool(
+    self, arc: InputArc, place: Place, t_limit: float | None, cap: int | None, *, lazy: bool = False
+) -> _Pool:
+    """Read the arc's candidate pool, as narrowly as the arc's shape allows.
+
+    Three routes, cheapest first:
+
+    1. **Bounded FIFO peek.** For a single-token arc with no selection, each candidate is
+       one token in FIFO order and the search consumes only the first
+       `binding_search_limit + 1` of them (see `_iter_candidate_bindings`), so peeking
+       that many yields the identical candidate set while turning an O(marking-depth)
+       scan into an O(limit) one. A head-only transition consumes only the first
+       `count`, so `cap` (see `_gather_arc_pools`) narrows the peek further; on a place
+       holding timed tokens each token peeked costs a heap pop and push. With `lazy`,
+       a peek deeper than one chunk comes back as a `_PeekStream`, so a search that stops
+       early reads a small multiple of what it inspected rather than the whole bound.
+    2. **Key-index read.** A keyed arc is not position-FIFO, so route 1's bound does not
+       apply — but a *certified* key is served from the place's persistent key-index,
+       which yields the same ascending-key prefix without materializing or sorting the
+       pool. This is what makes a deep keyed drain O(N log N) rather than O(N^2 log N).
+       The index declines whenever it cannot represent the whole available pool (none
+       registered, a keying failure, or timed tokens present) and we fall through.
+    3. **Full peek.** A `consume_all`, uncertified-keyed, or uncertified-filtered arc
+       still needs the whole available pool, and pays PR 1's per-firing sort.
+
+    Routes 2 and 3 return the same tokens in the same order; only the cost differs, so
+    falling through is always safe.
+    """
+    if arc.key is None and arc.filter is None and not arc.consume_all and arc.count == 1:
+        return self._fifo_pool(place, t_limit, cap, lazy=lazy)
+    if cap is not None and not arc.consume_all and self._ensure_key_index(arc, place):
+        ordered = place.peek_by_key(id(arc), cap, arc.filter)
+        if ordered is not None:
+            return ordered
+    return place.peek(len(place), model_time=t_limit)
+
+def _fifo_pool(self, place: Place, t_limit: float | None, cap: int | None, *, lazy: bool) -> _Pool:
+    """Route 1 of `_materialize_pool`: the first `cap` tokens, or `binding_search_limit + 1` for `None`.
+
+    `cap` is taken as given, not clamped to `binding_search_limit + 1`. Every caller sizes it
+    to what the path consumes (see `_gather_arc_pools`), and an arc sharing its place with
+    others may need more: the head-only path hands out a place's whole demand from one read,
+    and the search skips the tokens the earlier arcs took.
+    """
+    k = self.binding_search_limit + 1 if cap is None else cap
+    if lazy and k > _PeekStream._FIRST_CHUNK:
+        return _PeekStream(place, t_limit, k)
+    return place.peek(k, model_time=t_limit)
+
+def _ensure_key_index(self, arc: InputArc, place: Place) -> bool:
+    """Whether `arc` may be served from a key-index on `place`, registering one if so.
+
+    Eligibility is deliberately narrow, because the index runs callables in two places
+    that cannot host an unbounded one — keying happens on the *deposit* path, and the
+    filter predicate runs under the place lock:
+
+    - the `key` must be **certified**. An uncertified key belongs on the
+      timeout-bounded executor, and a `deposit()` cannot wait on that.
+    - a `filter`, if present, must also be certified — and not merely for dispatch
+      reasons. Applying an uncertified filter *after* a capped index read would be
+      wrong: the read could return `cap` tokens that the filter then rejects while
+      eligible tokens sit deeper in the index, silently under-selecting. Either the
+      filter runs at pop (so the scan continues past rejects) or the index is not used.
+
+    Registration is lazy rather than done in `add_transition`, since a transition may be
+    registered before its places are. Re-registration is a dict-lookup no-op unless
+    `arc.key` has been reassigned since, in which case the index is rebuilt — so
+    post-construction reassignment cannot leave a stale ordering being served.
+    """
+    if arc.key is None or not arc._key_inline_safe:  # type: ignore[attr-defined]
+        return False
+    if arc.filter is not None and not arc._filter_inline_safe:  # type: ignore[attr-defined]
+        return False
+    if self._key_index_arcs.get(id(arc)) is not arc.key:
+        place.register_key_index(id(arc), arc.key)
+        self._key_index_arcs[id(arc)] = arc.key
+        self._key_index_disabled_arcs.discard(id(arc))
+    return True
+
+def _gather_arc_pools(
+    self,
+    transition: Transition,
+    m_time: float | None,
+    ignore_timing: bool,
+    *,
+    head_only: bool,
+    lazy: bool = False,
+    shared: frozenset[str] | None = None,
+) -> list[tuple[InputArc, _Pool]] | None:
+    """Collect the eligible-token pool for every input arc, or `None` if any is unmet.
+
+    Derives how many ordered tokens each arc could actually consume and passes it as the
+    read cap for both the bounded FIFO peek and the key-index read. Reading only that many
+    keeps a drain proportional to what the search will look at rather than to the depth of
+    the place. The two cases:
+
+    - **head-only** (per `_is_head_only`): `_resolve_input_tokens` takes the leading
+      `count`, so `count` tokens is exactly enough. When several arcs read one place,
+      `_head_binding` gives each the tokens the earlier ones left, so each of them reads
+      as many as all of them take from that place.
+    - **searching**: `_iter_candidate_bindings` keeps the first `binding_search_limit + 1`
+      *combinations* per arc, and for `count > 1` those reach further into the ordering
+      than that many *tokens* — the `(limit + 1)`-th `count`-sized combination spans
+      indices up to `limit + count - 1`. So the cap is `binding_search_limit + count`,
+      collapsing to the familiar `limit + 1` at `count == 1`. Reading short here would
+      silently truncate the candidate set, not merely cost time. An arc on a place that
+      other arcs also read draws its options from the tokens the earlier ones left (see
+      `_distinct_candidates`), up to all they take besides its own `count`, so it reads
+      `binding_search_limit` plus everything the arcs take from that place.
+
+    `shared` is `_shared_places(transition)` when the caller already has it.
+    `head_only` and `lazy` come from `_search_mode`, read once per resolution, so the pools
+    always match the path that consumes them. `lazy` lets a deep FIFO pool come back as a
+    `_PeekStream`.
+    """
+    pools: list[tuple[InputArc, _Pool]] = []
+    if shared is None:
+        shared = _shared_places(transition)
+    demand = _place_demand(transition) if shared else {}
+    for arc in transition.inputs:
+        need = demand[arc.place] if arc.place in shared else arc.count
+        cap = need if head_only else self.binding_search_limit + need
+        available = self._arc_available(arc, self.places.get(arc.place), m_time, ignore_timing, cap, lazy=lazy)
+        if available is None:
+            return None
+        pools.append((arc, available))
+    return pools
+
+def _search_mode(
+    self, transition: Transition, policy: BindingPolicy, *, probe: bool, shared: frozenset[str] | None = None
+) -> tuple[bool, bool]:
+    """Return `(head_only, lazy)` for one resolution of `transition` under `policy`.
+
+    Read once per resolution and passed down, because `guard` and `binding_policy` may be
+    reassigned after construction: pools gathered for one path must not reach the other.
+    `lazy` holds when the caller stops at the first satisfying binding, which is `FIRST`
+    resolution and the existence `probe` under any policy. `RANDOM` and `PRIORITY`
+    resolution scan the whole bounded product, which the eager path does faster. So does a
+    transition wider than `_LAZY_PRODUCT_MAX_STREAMS`, whose product `_lazy_product`
+    would build eagerly anyway: streamed pools would only re-peek each place in chunks.
+    """
+    head_only = self._is_head_only(transition, policy, shared)
+    if head_only or len(transition.inputs) > _LAZY_PRODUCT_MAX_STREAMS:
+        return head_only, False
+    return False, probe or policy is BindingPolicy.FIRST
+
+@staticmethod
+def _is_head_only(transition: Transition, policy: BindingPolicy, shared: frozenset[str] | None = None) -> bool:
+    """Whether `transition` resolves via the O(1) head binding rather than a search.
+
+    This is the **canonical** statement of the head-only rule; the docstrings that mention
+    it elsewhere (`_gather_arc_pools`, `_resolve_binding`, `_resolve_input_tokens`,
+    `_qualifies_for_count_only`) defer here. `FIRST` with no guard reduces to the head
+    (the first candidate is the head and trivially satisfies). `RANDOM`/`PRIORITY` must
+    always enumerate — even guard-free, they select *among* eligible groups, not just the
+    head.
+
+    A transition with a `join_key` arc is never head-only: the head of each place need not
+    share a join key, so even a guard-free one searches (see `_join_candidates`).
+
+    Nor is one where an arc with a `filter` shares its place with another input arc. The
+    head binding hands out a shared place's tokens greedily in arc order (see
+    `_head_binding`), so an earlier arc can take the only token a later arc's filter
+    accepts, while another assignment would bind both. The search tries those assignments.
+    Without a filter every token suits every arc on the place, and the greedy assignment
+    binds whenever enough tokens exist, picking the same tokens the search's first
+    candidate would.
+
+    Depends only on its arguments (no net state), hence `staticmethod`. `shared` is
+    `_shared_places(transition)` when the caller already has it.
+    """
+    return (
+        policy is BindingPolicy.FIRST
+        and transition.guard is None
+        and not _has_join(transition)
+        and not _has_filtered_shared_arc(transition, shared)
+    )
+
+def _try_count_only_binding(
+    self, transition: Transition, m_time: float | None, ignore_timing: bool, shared: frozenset[str]
+) -> "_Binding | None | object":
+    """Resolve a `consume_all` transition by count alone, without materializing the pool.
+
+    Returns:
+        - `_NO_FAST_PATH` if the transition does not qualify (the caller must fall through
+          to the ordinary, materializing resolution);
+        - a `_Binding` (with `_DRAIN` markers for the `consume_all` arcs) if it qualifies
+          and is currently enabled;
+        - `None` if it qualifies but is not currently enabled.
+
+    **Why this is safe.** The only things that read an arc's tokens between resolution and
+    firing are a transition `guard` and a `binding_priority_key` (see
+    `_iter_satisfying_bindings` / `_min_key_pick`). A transition with neither, resolved
+    head-only, inspects no token
+    before it fires and draws **no RNG** while resolving — so deferring a `consume_all`
+    arc's whole-pool read to consume time is behaviour-identical, and in particular cannot
+    perturb the seeded RNG stream that `test_seeded_determinism` pins. Non-`consume_all`
+    arcs are still resolved eagerly here, but their reads are bounded (FIFO head / key
+    index), never the O(N) full-pool peek that this path exists to avoid.
+
+    The fast path is gated on the presence of a `consume_all` arc precisely because that is
+    the only arc shape whose ordinary resolution is unbounded; a transition without one
+    gains nothing and is left on the existing path to keep the change's blast radius small.
+    """
+    if not self._qualifies_for_count_only(transition, shared):
+        return _NO_FAST_PATH
+
+    binding: _Binding = []
+    demand = _place_demand(transition) if shared else {}
+    taken: set[tuple[str, int]] = set()
+    for arc in transition.inputs:
+        if arc.place in shared and not arc.consume_all:
+            resolved = self._count_only_shared_arc(arc, transition.name, m_time, ignore_timing, demand, taken)
+        else:
+            resolved = self._count_only_arc_binding(arc, transition.name, m_time, ignore_timing)
+        if resolved is None:
+            return None
+        binding.append(resolved)
+    return binding
+
+def _count_only_shared_arc(
+    self,
+    arc: InputArc,
+    transition_name: str,
+    m_time: float | None,
+    ignore_timing: bool,
+    demand: dict[str, int],
+    taken: set[tuple[str, int]],
+) -> "tuple[InputArc, list[Token]] | None":
+    """`_count_only_arc_binding` for an arc, not `consume_all`, whose place another arc reads.
+
+    It takes its head from the tokens the earlier arcs left, as in `_head_binding`, reading
+    as many tokens as all the arcs take from the place.
+    """
+    available = self._arc_available(arc, self.places.get(arc.place), m_time, ignore_timing, demand[arc.place])
+    if available is None:
+        return None
+    tokens = self._resolve_untaken(arc, available, taken, transition_name)
+    return None if tokens is None else (arc, tokens)
+
+def _qualifies_for_count_only(self, transition: Transition, shared: frozenset[str]) -> bool:
+    """Whether `transition` may take the count-only `consume_all` fast path.
+
+    Excludes anything that would read tokens before firing (a `guard` or a
+    `binding_priority_key`) or that enumerates rather than taking the head (per
+    `_is_head_only`), and requires at least one `consume_all` arc — the only arc shape
+    whose ordinary resolution is unbounded. See `_try_count_only_binding` for why this
+    exact set keeps the deferral behaviour- and RNG-identical.
+
+    Arcs sharing a place qualify too (`shared` is the transition's `_shared_places`): each
+    takes the head of what the earlier ones left, and a `consume_all` arc among them drains
+    what they leave, since `_consume_binding` drains after every other arc has taken its
+    tokens.
+    """
+    return (
+        transition.guard is None
+        and transition.binding_priority_key is None
+        and any(arc.consume_all for arc in transition.inputs)
+        and self._is_head_only(transition, self._effective_policy(transition), shared)
+    )
+
+def _count_only_arc_binding(
+    self, arc: InputArc, transition_name: str, m_time: float | None, ignore_timing: bool
+) -> "tuple[InputArc, list[Token] | _DrainAll] | None":
+    """Resolve one arc for the count-only path, or `None` if it cannot be satisfied.
+
+    A `consume_all` arc is settled by count alone: enablement is a pure count question
+    (`can_retrieve(count)` short-circuits at O(1) for a place with no cooling tokens) and
+    the pool is drained in one pass at consume time, so it is paired with the `_DRAIN`
+    marker and never materialized on a probe or a losing step. A non-draining arc
+    alongside it is resolved the ordinary (bounded FIFO head / key-index) way.
+    """
+    place = self.places.get(arc.place)
+    if not arc.consume_all:
+        available = self._arc_available(arc, place, m_time, ignore_timing, arc.count)
+        if available is None:
+            return None
+        tokens = self._resolve_input_tokens(arc, available, transition_name=transition_name)
+        if tokens is None:
+            return None
+        return (arc, tokens)
+    if place is None:
+        return None
+    t_limit = _LAST_FINITE_TIME if ignore_timing else m_time
+    if not place.can_retrieve(arc.count, model_time=t_limit):
+        return None
+    if not ignore_timing and not self._is_settle_time_met(place, arc):
+        return None
+    return (arc, _DRAIN)
+
+def _resolve_binding(
+    self, transition: Transition, m_time: float | None, *, ignore_timing: bool = False
+) -> _Binding | None:
+    """Resolve the concrete binding `transition` will fire with, or `None` if not enabled.
+
+    Gathers each input arc's eligible tokens, then selects a guard-satisfying binding
+    according to the transition's effective [`BindingPolicy`][cpnx.BindingPolicy]:
+
+    - **head-only** (per `_is_head_only`): take the first `count` tokens of each arc (its
+      head, or the leading tokens of the arc's `key` ordering) — O(1), no search.
+    - `FIRST` with a guard: return the first guard-satisfying combination in insertion
+      order.
+    - `RANDOM`: return a uniformly-random guard-satisfying combination (drawing from the
+      net's seeded RNG).
+    - `PRIORITY`: return the guard-satisfying combination minimizing
+      `binding_priority_key`.
+
+    All search policies are bounded by `binding_search_limit`. This is the **firing**
+    path — it may consume RNG state — so probes must use
+    `_binding_exists` instead.
+
+    Args:
+        transition: The transition to resolve.
+        m_time: The current model time used for availability/settle checks.
+        ignore_timing: When `True`, ignore cooldowns and settle windows (used by
+            [`is_quiescent`][cpnx.PetriNet.is_quiescent]).
+
+    Returns:
+        The resolved binding (each arc paired with the tokens it will consume), or `None`
+        if no guard-satisfying binding exists within the search limit.
+    """
+    if transition.binding_selector is not None:
+        return self._selector_binding(transition, m_time, ignore_timing)
+    if self._selector_transitions or self._join_registrations:
+        self._release_stale_search_state(transition)
+    shared = _searchable_shared_places(transition)
+    if shared is None:
+        return None
+    fast = self._try_count_only_binding(transition, m_time, ignore_timing, shared)
+    if fast is not _NO_FAST_PATH:
+        return cast("_Binding | None", fast)
+    policy = self._effective_policy(transition)
+    if _has_join(transition):
+        joined = self._join_candidates(transition, m_time, ignore_timing, shared=shared)
+        if joined is None:
+            return None
+        candidates, drained = joined
+        return self._pick_binding(transition, self._satisfying(transition, candidates, drained=drained), policy)
+    head_only, lazy = self._search_mode(transition, policy, probe=False, shared=shared)
+    pools = self._gather_arc_pools(transition, m_time, ignore_timing, head_only=head_only, lazy=lazy, shared=shared)
+    if pools is None:
+        return None
+    if head_only:
+        return self._head_binding(transition, pools, shared=shared)
+    return self._select_binding(transition, pools, policy, lazy=lazy, shared=shared)
+
+def _binding_exists(self, transition: Transition, m_time: float | None, *, ignore_timing: bool = False) -> bool:
+    """Return whether *any* guard-satisfying binding exists — a probe that never draws RNG.
+
+    Existence is policy-independent, so this short-circuits at the first satisfying binding
+    regardless of policy. Used by the enabling/quiescence predicates
+    ([`is_dead`][cpnx.PetriNet.is_dead], [`is_quiescent`][cpnx.PetriNet.is_quiescent]),
+    which must not perturb the seeded RNG — otherwise a timing-dependent number of probe
+    calls would make `RANDOM` runs non-reproducible.
+    """
+    if transition.binding_selector is not None:
+        return self._selector_binding(transition, m_time, ignore_timing) is not None
+    if self._selector_transitions or self._join_registrations:
+        self._release_stale_search_state(transition)
+    shared = _searchable_shared_places(transition)
+    if shared is None:
+        return False
+    fast = self._try_count_only_binding(transition, m_time, ignore_timing, shared)
+    if fast is not _NO_FAST_PATH:
+        return fast is not None
+    if _has_join(transition):
+        joined = self._join_candidates(transition, m_time, ignore_timing, shared=shared, unordered=True)
+        if joined is None:
+            return False
+        candidates, drained = joined
+        return next(self._satisfying(transition, candidates, drained=drained), None) is not None
+    head_only, lazy = self._search_mode(transition, self._effective_policy(transition), probe=True, shared=shared)
+    pools = self._gather_arc_pools(transition, m_time, ignore_timing, head_only=head_only, lazy=lazy, shared=shared)
+    if pools is None:
+        return False
+    if head_only:
+        return self._head_binding(transition, pools, shared=shared) is not None
+    return next(self._iter_satisfying_bindings(transition, pools, lazy=lazy, shared=shared), None) is not None
+
+def _head_binding(
+    self, transition: Transition, pools: list[tuple[InputArc, _Pool]], *, shared: frozenset[str]
+) -> _Binding | None:
+    """Build the head binding: the first `count` tokens per arc, in the arc's own order.
+
+    Both callers reach this only through `_is_head_only`, which is now exactly
+    "`FIRST` and no guard" — `BindingPolicy.LEGACY`, removed in 0.7.0, was the one policy
+    that routed a *guarded* transition here. So the guard is `None` on every real call, and
+    flattening the binding to check it would allocate a throwaway `list[Token]` on every
+    guard-free resolution and every enabledness probe, for a check that cannot fail.
+
+    The check is kept rather than deleted, because "the caller guarantees no guard" is a
+    precondition no signature enforces: a future call site added without the
+    `_is_head_only` gate would otherwise fire a guarded transition on its head without
+    consulting the guard. Guarding the *guard* on `transition.guard is not None` keeps that
+    safety while paying nothing on the hot path.
+
+    When several arcs read one place, each takes its head from the tokens the earlier arcs
+    left, so no token is bound twice (issue #75). A `consume_all` arc on such a place takes
+    what the other arcs there leave, whatever the arc order, as in the search
+    (`_draining_the_rest`). `shared` is `_shared_places(transition)`, from the caller.
+    """
+    taken: set[tuple[str, int]] = set()
+    binding: "_Binding | None" = []
+    drains = False
+    for arc, available in pools:
+        if arc.place in shared and not arc.consume_all:
+            tokens = self._resolve_untaken(arc, available, taken, transition.name)
+        else:
+            tokens = self._resolve_input_tokens(arc, _as_list(available), transition_name=transition.name)
+            drains = drains or arc.place in shared
+        if tokens is None:
+            return None
+        binding.append((arc, tokens))
+    if drains:
+        binding = _draining_the_rest(binding, shared)
+        if binding is None:
+            return None
+    if transition.guard is not None and not self._check_transition_guard(transition, _flatten_binding(binding)):
+        return None
+    return binding
+
+def _resolve_untaken(
+    self, arc: InputArc, available: _Pool, taken: set[tuple[str, int]], transition_name: str
+) -> list[Token] | None:
+    """`_resolve_input_tokens` over the tokens of `available` not in `taken`, adding its pick to `taken`.
+
+    For an arc of `_head_binding` or `_try_count_only_binding` whose place another arc also
+    reads, and that is not `consume_all`.
+    """
+    pool = [token for token in _as_list(available) if (arc.place, id(token)) not in taken]
+    tokens = self._resolve_input_tokens(arc, pool, transition_name=transition_name)
+    if tokens is not None:
+        taken.update((arc.place, id(token)) for token in tokens)
+    return tokens
+
+def _iter_satisfying_bindings(
+    self,
+    transition: Transition,
+    pools: list[tuple[InputArc, _Pool]],
+    *,
+    lazy: bool = False,
+    shared: frozenset[str],
+) -> Iterator[tuple[_Binding, list[Token]]]:
+    """Yield each guard-satisfying `(binding, flat_tokens)` in insertion order, bounded by the limit.
+
+    Enumerates candidate bindings deterministically and yields those whose guard holds,
+    paired with the flattened token list already computed for the guard check (so
+    `PRIORITY`'s key does not re-flatten). Stops after `binding_search_limit` candidates
+    have been examined, signalling exhaustion via `on_binding_search_exhausted` (deferred
+    until the lock releases). This is the shared engine for every search policy: `FIRST`
+    takes the first item, `RANDOM` samples, and `PRIORITY` takes the min-key item.
+
+    `lazy` selects how candidates are enumerated (see `_iter_candidate_bindings` and
+    `_search_mode`). Both settings yield the same bindings in the same order. `shared` is
+    `_shared_places(transition)`, from the caller.
+    """
+    candidates = self._iter_candidate_bindings(pools, transition_name=transition.name, lazy=lazy, shared=shared)
+    drained = _drained_places(transition, shared) if shared else shared
+    return self._satisfying(transition, candidates, drained=drained)
+
+def _satisfying(
+    self, transition: Transition, candidates: "Iterator[_Binding | _DeadEnd]", *, drained: frozenset[str]
+) -> Iterator[tuple[_Binding, list[Token]]]:
+    """Yield each `(binding, flat_tokens)` of `candidates` whose guard holds, bounded by the limit.
+
+    The loop shared by the product search (`_iter_satisfying_bindings`) and the join search
+    (`_join_candidates`): it examines at most `binding_search_limit` candidates, then
+    signals exhaustion.
+
+    Both searches keep the arcs on a shared place apart by construction, join arcs with any
+    `join_key` and arcs without one alike (`_distinct_candidates`, `_key_combos`), so no
+    candidate hands one token to two arcs (issue #75). The exception is a `consume_all`
+    arc, whose single option is the whole pool. `drained` names the shared places such an
+    arc reads, and there it is given what the other arcs leave (`_draining_the_rest`)
+    before the guard sees the candidate. A `_DeadEnd` counts toward the limit and is skipped.
+    """
+    for examined, binding in enumerate(candidates, start=1):
+        if examined > self.binding_search_limit:
+            self._signal_search_exhausted(transition.name)
+            return
+        if binding is _DEAD_END:
+            continue
+        if drained:
+            binding = _draining_the_rest(binding, drained)
+            if binding is None:
+                continue
+        flat = _flatten_binding(binding)
+        if self._check_transition_guard(transition, flat):
+            yield binding, flat
+
+def _select_binding(
+    self,
+    transition: Transition,
+    pools: list[tuple[InputArc, _Pool]],
+    policy: BindingPolicy,
+    *,
+    lazy: bool = False,
+    shared: frozenset[str],
+) -> _Binding | None:
+    """Pick one satisfying binding under a search policy (`FIRST`/`RANDOM`/`PRIORITY`)."""
+    satisfying = self._iter_satisfying_bindings(transition, pools, lazy=lazy, shared=shared)
+    return self._pick_binding(transition, satisfying, policy)
+
+def _pick_binding(
+    self, transition: Transition, gen: Iterator[tuple[_Binding, list[Token]]], policy: BindingPolicy
+) -> _Binding | None:
+    """Pick one of the satisfying bindings `gen` yields, as `policy` directs."""
+    if policy is BindingPolicy.RANDOM:
+        return self._reservoir_pick(gen)
+    if policy is BindingPolicy.PRIORITY:
+        return self._min_key_pick(gen, transition)
+    pair = next(gen, None)
+    return pair[0] if pair is not None else None
+
+def _reservoir_pick(self, bindings: Iterator[tuple[_Binding, list[Token]]]) -> _Binding | None:
+    """Uniformly sample one binding from `bindings` in a single pass (reservoir, size 1).
+
+    Draws from the net's seeded RNG, so a seeded net reproduces the choice. Returns `None`
+    if the iterator is empty.
+    """
+    chosen: _Binding | None = None
+    for seen, (binding, _flat) in enumerate(bindings, start=1):
+        if self._rng.random() < 1.0 / seen:
+            chosen = binding
+    return chosen
+
+def _min_key_pick(
+    self, bindings: Iterator[tuple[_Binding, list[Token]]], transition: Transition
+) -> _Binding | None:
+    """Return the binding minimizing `binding_priority_key` (default: oldest `created_at`).
+
+    Ties are broken by insertion order (the first-encountered minimum wins), so the choice
+    is deterministic. Both the key evaluation *and* the comparison are guarded: a candidate
+    whose key raises, or whose key is not comparable with the running best, is skipped
+    rather than aborting the enabling check (mirroring how a raising guard is treated as
+    `False`). If **every** candidate is skipped this way but satisfying bindings exist, the
+    first satisfying binding (insertion order) is returned — never `None` while bindings
+    exist — so this firing path stays consistent with the RNG-free
+    `_binding_exists` probe (which does not evaluate the
+    key). That silent fallback is surfaced via `on_error` (deferred, de-duplicated) so a
+    wholly-broken key does not vanish without a trace. Returns `None` only if the iterator
+    is empty.
+    """
+    key_fn = _default_priority_key if transition.binding_priority_key is None else transition.binding_priority_key
+    best, first, first_exc = self._reduce_min_key(bindings, key_fn)
+    if best is None and first is not None and first_exc is not None:
+        # Every satisfying candidate's key raised/was incomparable: we still fire the
+        # insertion-order fallback, but PRIORITY was effectively ignored — signal it.
+        self._signal_priority_key_failure(transition.name, first_exc)
+    return best if best is not None else first
+
+@staticmethod
+def _reduce_min_key(
+    bindings: Iterator[tuple[_Binding, list[Token]]], key_fn: Callable[[list[Token]], object]
+) -> tuple[_Binding | None, _Binding | None, Exception | None]:
+    """Scan `bindings`, returning `(best, first, first_exc)` for the min-key selection.
+
+    `best` is the minimum-key binding (ties → first-encountered), or `None` if every key
+    evaluation/comparison raised. `first` is the first satisfying binding (insertion order),
+    used as the fallback. `first_exc` is the first exception a key raised, if any.
+    """
+    first: _Binding | None = None
+    best: _Binding | None = None
+    best_key: object = None
+    first_exc: Exception | None = None
+    for binding, flat in bindings:
+        if first is None:
+            first = binding
+        try:
+            candidate_key = key_fn(flat)
+            if best is None or candidate_key < best_key:  # type: ignore[operator]
+                best, best_key = binding, candidate_key
+        except Exception as exc:
+            if first_exc is None:
+                first_exc = exc
+    return best, first, first_exc
+
+def _iter_candidate_bindings(
+    self,
+    pools: list[tuple[InputArc, _Pool]],
+    *,
+    transition_name: str = "",
+    lazy: bool = False,
+    shared: frozenset[str],
+) -> "Iterator[_Binding | _DeadEnd]":
+    """Yield candidate bindings as the Cartesian product of each arc's token-group options.
+
+    Options are generated in insertion order, so the first binding yielded is the head
+    selection and iteration proceeds deterministically from there: lexicographic in arc
+    order, the last arc varying fastest.
+
+    Each per-arc option stream is truncated to `binding_search_limit + 1` groups. This
+    keeps both time and memory bounded by the search limit even for an arc with
+    `C(n, count)` combinations. The truncation is loss-free within the limit — in the
+    product's lexicographic order a candidate's overall rank is at least its index in any
+    single dimension, so any group beyond index `binding_search_limit` can never appear
+    among the first `binding_search_limit` bindings the search inspects.
+
+    `lazy` chooses between two enumerations of the same sequence:
+
+    - `True`: `_lazy_product` reads each arc's options at most twice as far as the
+      enumeration has reached, so a caller that stops at the first satisfying binding pays
+      for the candidates it inspected, not for the length of the option lists. A
+      `_PeekStream` pool extends that to the place read itself.
+    - `False`: `itertools.product` over the fully built option lists. It builds every
+      list before yielding, but iterates in C, which is cheaper for a caller that will
+      drain the whole bounded product anyway.
+
+    When several arcs read one place (`shared`, required so that no caller gets the
+    token-reusing product by leaving it out), `_distinct_candidates` enumerates instead.
+    """
+    if shared:
+        yield from self._distinct_candidates(pools, shared, transition_name)
+        return
+    arcs = [arc for arc, _ in pools]
+    cap = self.binding_search_limit + 1
+    streams = [
+        itertools.islice(self._arc_options(arc, available, transition_name=transition_name), cap)
+        for arc, available in pools
+    ]
+    combos = _lazy_product(streams) if lazy else itertools.product(*(list(stream) for stream in streams))
+    for combo in combos:
+        yield list(zip(arcs, combo, strict=True))
+
+def _distinct_candidates(
+    self, pools: list[tuple[InputArc, _Pool]], shared: frozenset[str], transition_name: str
+) -> "Iterator[_Binding | _DeadEnd]":
+    """`_iter_candidate_bindings` for a transition with several arcs on one place (issue #75).
+
+    Yields the product's candidates in the product's order, less those that hand one
+    token to two arcs. An arc reading a place that an earlier arc also reads takes its
+    options from the tokens the earlier arcs' choices left, so no such candidate is built.
+    Its options are truncated to `binding_search_limit + 1` *after* that. Truncating first
+    would not be loss-free. A later arc with `count=2` on a deep place has its
+    first `limit + 1` pairs all holding the token an earlier arc took first, so the search
+    would spend the limit on reused tokens and report a binding that exists as missing.
+
+    An option can leave a later arc no tokens at all: a `count=2` arc whose pairs all hold
+    the one token a later `filter` accepts. Such an option yields no candidate, so it is
+    reported as one `_DEAD_END`, which counts toward the limit like a candidate. That keeps
+    `_iter_candidate_bindings`' argument for truncating each arc's options: every option
+    before the `j`-th yields at least one counted item, so an option past index
+    `binding_search_limit` is never reached within the limit, and a miss it causes is
+    signalled as an exhausted search rather than reported silently.
+
+    Every arc's selection (`filter`, `key`) runs once, up front, as in the product. A
+    `consume_all` arc keeps its single option, the whole pool, which overlaps any other
+    arc's tokens on its place; `_satisfying` trims it to what those arcs leave
+    (`_draining_the_rest`).
+    """
+    cap = self.binding_search_limit + 1
+    sources, dependent = self._distinct_sources(pools, shared, transition_name, cap)
+    # As in `_lazy_product`, an arc with no option empties the product, and every arc's
+    # first option is read before giving up. A later arc on a place has an option on the
+    # full pool iff it accepts `count` tokens.
+    needs = [arc.count if later else 1 for (arc, _), later in zip(pools, dependent, strict=True)]
+    if not all([source.has_at_least(need) for source, need in zip(sources, needs, strict=True)]):
+        return
+    arcs = [arc for arc, _ in pools]
+    for combo in self._distinct_combos(arcs, sources, dependent, shared, cap):
+        yield _DEAD_END if combo is _DEAD_END else list(zip(arcs, combo, strict=True))
+
+def _distinct_sources(
+    self, pools: list[tuple[InputArc, _Pool]], shared: frozenset[str], transition_name: str, cap: int
+) -> "tuple[list[_Replay], list[bool]]":
+    """Each arc's source for `_distinct_candidates`, and whether it depends on the earlier arcs.
+
+    An arc on a place that an earlier arc also reads (and not `consume_all`) depends on
+    them: its source is its ordered tokens, from which `_untaken_options` builds options per
+    choice of the earlier arcs. Every other arc's source is its options, cut to `cap`.
+    """
+    sources: list[_Replay] = []
+    dependent: list[bool] = []
+    seen: set[str] = set()
+    for arc, available in pools:
+        later = arc.place in shared and arc.place in seen and not arc.consume_all
+        seen.add(arc.place)
+        dependent.append(later)
+        if not later:
+            sources.append(
+                _Replay(itertools.islice(self._arc_options(arc, available, transition_name=transition_name), cap))
+            )
+            continue
+        ordered = (
+            available
+            if arc.filter is None and arc.key is None
+            else self._order_available(arc, _as_list(available), transition_name=transition_name)
+        )
+        sources.append(_Replay(iter(ordered if ordered is not None else ())))
+    return sources, dependent
+
+def _distinct_combos(
+    self, arcs: list[InputArc], sources: list[_Replay], dependent: list[bool], shared: frozenset[str], cap: int
+) -> "Iterator[tuple[list[Token], ...] | _DeadEnd]":
+    """Yield each arc's option, in product order, for `_distinct_candidates`.
+
+    A depth-first walk with an explicit stack, one level per arc, so a wide transition
+    cannot run out of recursion. `taken[i]` holds the `(place, id(token))` pairs the first
+    `i` arcs' choices took from shared places. An option of an arc whose next arc then has
+    no option yields one `_DEAD_END`.
+
+    `_key_combos` is the same walk for a transition with `join_key` arcs, one per key. The
+    two differ in more than their inputs, so a change to the distinct-token rule in one
+    must be made in the other: this one keeps an immutable `taken` per level and finds a
+    dead end by reading the next level's first option; `_key_combos` keeps one mutable
+    `taken`, yields a `_DeadPrefix` when a level turns out empty, and prunes with the
+    residual Hall check, which only join arcs need.
+    """
+    last = len(arcs) - 1
+    taken: list[frozenset[tuple[str, int]]] = [frozenset()]
+    stack: list[Iterator[list[Token]]] = [self._distinct_level_options(arcs, sources, dependent, 0, taken[0], cap)]
+    chosen: list[list[Token]] = []
+    while stack:
+        level = len(stack) - 1
+        del chosen[level:]
+        option = next(stack[level], None)
+        if option is None:
+            stack.pop()
+            taken.pop()
+            continue
+        chosen.append(option)
+        if level == last:
+            yield tuple(chosen)
+            continue
+        arc = arcs[level]
+        place = arc.place
+        if place in shared and not arc.consume_all:  # a draining arc takes what the others leave
+            after = taken[level] | {(place, id(token)) for token in option}
+        else:
+            after = taken[level]
+        following = self._distinct_level_options(arcs, sources, dependent, level + 1, after, cap)
+        first = next(following, None)
+        if first is None:
+            yield _DEAD_END
+            continue
+        stack.append(itertools.chain((first,), following))
+        taken.append(after)
+
+def _distinct_level_options(
+    self,
+    arcs: list[InputArc],
+    sources: list[_Replay],
+    dependent: list[bool],
+    i: int,
+    taken: frozenset[tuple[str, int]],
+    cap: int,
+) -> Iterator[list[Token]]:
+    """Arc `i`'s options for `_distinct_combos`, given what the earlier arcs took."""
+    arc = arcs[i]
+    if not dependent[i]:
+        return iter(sources[i])
+    return _untaken_options(sources[i], arc.place, taken, arc.count, self.binding_search_limit + arc.count, cap)
+
+def _join_candidates(
+    self,
+    transition: Transition,
+    m_time: float | None,
+    ignore_timing: bool,
+    *,
+    shared: frozenset[str],
+    unordered: bool = False,
+) -> "tuple[Iterator[_Binding | _DeadEnd], frozenset[str]] | None":
+    """Return the candidate bindings of a transition with `join_key` arcs, or `None` if there are none.
+
+    Returned with the shared places a `consume_all` arc reads (see `_JoinPlan.drained`),
+    where `_satisfying` gives that arc what the other arcs leave.
+
+    The candidates are the product search's candidates whose `join_key` arcs all agree on
+    their key, in the same lexicographic order (arc order, the last arc varying fastest),
+    less any that would hand one token to two arcs. A `consume_all` arc on a shared place
+    is the exception: its option is still the whole pool, until `_satisfying` trims it.
+    See `docs/adr/0010-equi-join-index.md`.
+
+    When every join arc is served by its place's join index, the transition's `_JoinMatch`
+    already knows which keys bind at every join place (ADR 0011), and lists them sorted by a
+    lower bound on their candidates, so `_matched_join_combos` opens them one at a time
+    (`_merge_from_bounds`). Otherwise
+    `_unmatched_join_combos` reads every key of the places.
+
+    An arc without a `join_key` alone on its place, or `consume_all`, contributes its usual
+    options, capped at `binding_search_limit + 1` as in `_iter_candidate_bindings`. One on
+    a shared place contributes its ordered tokens (`_Ordered`, read `_plain_read_depth`
+    deep), from which each key's walk (`_key_combos`, per `_JoinPlan`) draws options among
+    the tokens the earlier arcs left, capped likewise. `join_key` arcs are not capped: their
+    groups hold only matching tokens, however deep the place. A choice that leaves a later
+    arc no option arrives as a `_DeadEnd`, counted like a candidate.
+
+    `unordered` is for the existence probe, which only asks whether some candidate
+    satisfies the guard. `shared` is `_shared_places(transition)`, from the caller.
+    """
+    t_limit = _LAST_FINITE_TIME if ignore_timing else m_time
+    gathered = self._join_arc_options(transition, t_limit, ignore_timing, shared)
+    if gathered is None:
+        return None
+    options, joins = gathered
+    # Every token of an available group is a valid choice for its arc only because a join arc
+    # takes exactly one token and has no `key` or `filter` (ADR 0010 §1). The one-key probe
+    # relies on that, so a future relaxation of the rule must revisit it.
+    assert all(arc.count == 1 and arc.key is None and arc.filter is None for _, arc, _ in joins)
+    shape = _join_shape(transition, joins, shared)
+    plan = _join_plan(transition, shared, options)
+    match = self._serving_join_match(transition.name, joins, shape, t_limit)
+    if match is None:
+        combos = self._unmatched_join_combos(transition.name, joins, shape, options, plan, t_limit, unordered)
+    else:
+        assert t_limit is not None
+        first_only = unordered and plan.shortcut and transition.guard is None
+        combos = self._matched_join_combos(match, joins, options, plan, t_limit, first_only)
+    if combos is None:
+        return None
+    return self._join_bindings(transition.inputs, options, combos), plan.drained
+
+def _matched_join_combos(
+    self,
+    match: _JoinMatch,
+    joins: list[tuple[int, InputArc, Place]],
+    options: "list[list[tuple[int, list[Token]]] | None]",
+    plan: _JoinPlan,
+    t_limit: float,
+    first_only: bool,
+) -> Iterator[tuple] | None:
+    """The join candidates as `(position, value)` combinations, from the keys `match` lists.
+
+    Every listed key binds: each place reports a key only once each of its join arcs can take
+    a token of its own (issues #75 and #78). So with no guard, an existence probe
+    (`first_only`) needs one key, the first by when it binds, and costs O(1) however many keys
+    the places hold.
+
+    Otherwise the keys come sorted by their first join arc's first entry
+    (`_JoinMatch.ordered_keys`). With the least positions of the arcs before it, which do not
+    depend on the key, that entry bounds every candidate of the key from below, so
+    `_merge_from_bounds` opens keys only as the merge reaches them. Examining `n` candidates
+    reads about `n + 1` keys, at O(log keys) each, where merging every key's candidates would
+    read them all. The bound is exact unless an earlier arc on the first join arc's place, or
+    the residual Hall check, keeps that arc off its first token; the merge then opens a key
+    early, never late.
+
+    `first_only` is set only where `_JoinPlan.shortcut` holds: every key then shows the same
+    pattern of candidates and dead ends, so one key decides as firing would (`_join_shortcut`
+    has the rule: an arc without a `join_key` that reads a join place, or that can dead-end
+    ahead of a join arc, makes the keys differ or repeats its dead ends once per key).
+
+    Each key's candidates come from one `_key_opener`, built here, so the walk of the arcs
+    after the join arcs is shared by every key the search opens.
+    """
+    opener = _key_opener(plan, options, self.binding_search_limit + 1)
+    if first_only:
+        # The first key that still opens: one, unless a place lost keys without the engine lock.
+        for key in match.iter_keys_at(t_limit):
+            candidates = self._open_join_key(match, joins, options, opener, key, t_limit)
+            if candidates is not None:
+                return candidates
+        return None
+    ordered = match.ordered_keys(t_limit)
+    if not ordered:
+        return None
+    if len(ordered) == 1:
+        return self._open_join_key(match, joins, options, opener, match.key_of(ordered[0][1]), t_limit)
+    prefix = _bound_prefix(options, joins[0][0])
+    return _merge_from_bounds(
+        (
+            (*prefix, first),
+            functools.partial(self._open_join_key, match, joins, options, opener, match.key_of(uid), t_limit),
+        )
+        for first, uid in ordered
+    )
+
+def _open_join_key(
+    self,
+    match: _JoinMatch,
+    joins: list[tuple[int, InputArc, Place]],
+    options: "list[list[tuple[int, list[Token]]] | None]",
+    opener: Callable[[list], Iterator[tuple]],
+    key: object,
+    t_limit: float,
+) -> Iterator[tuple] | None:
+    """The product of `key`'s groups with the other arcs' options, or `None` if a place has lost the key.
+
+    Reads one group per join arc from its index, at O(1) each. A place can lose a key the match
+    still lists only when it is changed without the engine lock (see `_JoinMatch`). Each arc
+    is read through its function's index (`_JoinMatch.index_ids`), which the match's refresh
+    has just found serving, so an index can decline here only after such a change too, and
+    the key is then treated as gone, as with any stale read. `opener` (`_key_opener`)
+    enumerates the candidates.
+    """
+    streams: list[Iterable] = list(options)  # type: ignore[arg-type]  # join slots are filled below
+    for (i, _, place), index_id in zip(joins, match.index_ids, strict=True):
+        groups = place.peek_join(index_id, (key,), model_time=t_limit)
+        group = None if groups is None else groups.get(key)
+        if not group:
+            return None
+        streams[i] = group
+    return opener(streams)
+
+def _unmatched_join_combos(
+    self,
+    transition_name: str,
+    joins: list[tuple[int, InputArc, Place]],
+    shape: _JoinShape,
+    options: "list[list[tuple[int, list[Token]]] | None]",
+    plan: _JoinPlan,
+    t_limit: float | None,
+    unordered: bool,
+) -> Iterator[tuple] | None:
+    """The join candidates when no `_JoinMatch` serves, reading every key of the join places.
+
+    Each surviving key (`_join_key_groups`) contributes the product of its groups with the
+    other arcs' options, and `heapq.merge` interleaves those per-key products back into the
+    product's order by comparing each candidate's per-arc read positions. Keys are disjoint,
+    so no two candidates tie. This costs O(keys in the smallest join place).
+    """
+    grouped = self._join_key_groups(transition_name, joins, shape, t_limit)
+    if grouped is None:
+        return None
+    groups_by_arc, keys = grouped
+    per_key = [
+        [groups_by_arc[i][key] if arc_options is None else arc_options for i, arc_options in enumerate(options)]
+        for key in keys
+    ]
+    return self._join_combos(per_key, plan, unordered=unordered)
+
+def _join_key_groups(
+    self,
+    transition_name: str,
+    joins: list[tuple[int, InputArc, Place]],
+    shape: _JoinShape,
+    t_limit: float | None,
+) -> "tuple[dict[int, dict], list[object]] | None":
+    """Read each join arc's groups for the keys every join place has, smallest place first.
+
+    Starts from every key of the first place and narrows to the keys each later place has.
+    Returns the groups by arc index and the surviving keys, or `None` when no key survives.
+
+    In a self-join, where several join arcs read one place with one `join_key` function, each
+    takes a different token of the key's group (issue #75), so a group smaller than that
+    number of arcs is dropped (`_JoinShape.depths`).
+    Its candidates would all reuse a token, and each would spend one of the
+    `binding_search_limit` candidates `_satisfying` examines: a backlog of keys holding one
+    token each could then hide a key that holds a pair.
+    A place read with *different* `join_key` functions is checked the same way, through
+    Hall's condition (`_has_distinct_tokens`): one token can carry a key under both
+    functions, so per-function depths alone would keep keys whose every candidate reuses
+    that token (issue #78).
+    """
+    keys: list[object] | None = None
+    groups_by_arc: dict[int, dict] = {}
+    for i, arc, place in sorted(joins, key=lambda join: len(join[2])):
+        depth = shape.depths[i]
+        groups = _with_enough_tokens(
+            self._join_groups(i, arc, place, keys, t_limit, transition_name, depth=shape.index_depths[i]), depth
+        )
+        if not groups:
+            return None
+        groups_by_arc[i] = groups
+        keys = list(groups)
+    assert keys is not None
+    keys = _keys_with_distinct_tokens(shape, groups_by_arc, keys)
+    return (groups_by_arc, keys) if keys else None
+
+def _serving_join_match(
+    self,
+    transition_name: str,
+    joins: list[tuple[int, InputArc, Place]],
+    shape: _JoinShape,
+    t_limit: float | None,
+) -> _JoinMatch | None:
+    """The transition's `_JoinMatch`, refreshed, or `None` when it cannot serve this probe.
+
+    `None`, so that `_join_candidates` reads the places' keys itself, when some join arc's
+    place is not served by a join index (an uncertified key, a `Place` subclass, a disabled
+    index), or on the wall clock (`t_limit` is `None`), where the place picks the time it
+    reads at.
+    """
+    match = self._join_match(transition_name, joins, shape) if t_limit is not None else None
+    if match is None:
+        self._join_matches.pop(transition_name, None)
+        return None
+    # A place whose index is not serving makes this probe fall back, but the match is kept:
+    # it absorbed the other places' changes, and that place's next report is a full one.
+    return match if match.refresh() else None
+
+def _join_match(
+    self, transition_name: str, joins: list[tuple[int, InputArc, Place]], shape: _JoinShape
+) -> _JoinMatch | None:
+    """The transition's `_JoinMatch` for `joins`, made anew if they changed; `None` if one is not indexed.
+
+    Each join arc must be read through a place join index: a certified key on a plain
+    `Place`. Each is registered here if it is not yet, as `_join_groups` would register it,
+    so the match serves from a transition's first probe. Waiting for `_join_groups` would
+    not do: it stops at the first place with no usable key, so a self-join whose keys all
+    hold one token would leave its later arcs unregistered, and fall back on every probe.
+
+    Each join place reports through one index per `join_key` function its join arcs use
+    there, that of the function's first arc, with how many arcs use it (`_JoinShape.places`).
+    """
+    index_by_position: dict[int, int] = {}
+    for i, arc, place in joins:
+        certified: bool = arc._join_key_inline_safe  # type: ignore[attr-defined]
+        join_key = arc.join_key
+        if not certified or type(place) is not Place or join_key is None:
+            return None
+        index_by_position[i] = self._ensure_join_index(
+            transition_name, i, arc, place, join_key, depth=shape.index_depths[i]
+        )
+    ids = tuple(index_by_position[i] for i, _, _ in joins)
+    places = tuple(place for _, _, place in joins)
+    match = self._join_matches.get(transition_name)
+    if match is None or not match.serves(ids, places):
+        sources = _join_sources(joins, shape, index_by_position)
+        match = self._join_matches[transition_name] = _JoinMatch(ids, places, sources)
+    return match
+
+def _join_arc_options(
+    self, transition: Transition, t_limit: float | None, ignore_timing: bool, shared: frozenset[str]
+) -> "tuple[list[list[tuple[int, list[Token]]] | None], list[tuple[int, InputArc, Place]]] | None":
+    """Check every input arc of a join transition and read the options of those without a `join_key`.
+
+    Returns `(options, joins)`: per arc, its `(index, group)` options, or `None` for a
+    `join_key` arc, which is listed in `joins` with its place instead. An arc without a
+    `join_key` on a shared place (and not `consume_all`) gets its ordered tokens instead,
+    as an `_Ordered`, read `_plain_read_depth` deep: `_key_combos` draws its options from
+    those the earlier arcs left. `None` when an arc is unmet, as
+    `_arc_available` decides it.
+    """
+    limit = self.binding_search_limit
+    demand = _place_demand(transition) if shared else {}
+    options: list[list[tuple[int, list[Token]]] | None] = []
+    joins: list[tuple[int, InputArc, Place]] = []
+    for i, arc in enumerate(transition.inputs):
+        place = self.places.get(arc.place)
+        if place is None or not self._join_arc_ready(arc, place, t_limit, ignore_timing):
+            return None
+        if arc.join_key is not None:
+            options.append(None)
+            joins.append((i, arc, place))
+            continue
+        depth = _plain_read_depth(arc, limit, demand) if arc.place in shared and not arc.consume_all else None
+        arc_options = self._plain_join_options(arc, place, t_limit, depth, transition.name)
+        if arc_options is None:
+            return None
+        options.append(arc_options)
+    return options, joins
+
+def _join_arc_ready(self, arc: InputArc, place: Place, t_limit: float | None, ignore_timing: bool) -> bool:
+    """Whether `place` holds `arc.count` available tokens and, unless `ignore_timing`, has settled."""
+    if not place.can_retrieve(arc.count, model_time=t_limit):
+        return False
+    return ignore_timing or self._is_settle_time_met(place, arc)
+
+def _plain_join_options(
+    self, arc: InputArc, place: Place, t_limit: float | None, depth: int | None, transition_name: str
+) -> "list | None":
+    """A join transition's arc without a `join_key`: its options, or its `_Ordered` tokens `depth` deep.
+
+    `depth` is set for an arc on a shared place (not `consume_all`), whose options
+    `_key_combos` draws per key from the tokens the earlier arcs left. `None` if unmet.
+    """
+    if depth is not None:
+        return self._ordered_tokens(arc, place, t_limit, depth, transition_name)
+    limit = self.binding_search_limit
+    pool = self._materialize_pool(arc, place, t_limit, limit + arc.count)
+    arc_options = list(itertools.islice(self._arc_options(arc, pool, transition_name=transition_name), limit + 1))
+    return list(enumerate(arc_options)) if arc_options else None
+
+def _ordered_tokens(
+    self, arc: InputArc, place: Place, t_limit: float | None, depth: int, transition_name: str
+) -> "_Ordered | None":
+    """`arc`'s eligible tokens on `place` in its order, `depth` deep, or `None` if fewer than `count`."""
+    pool = _as_list(self._materialize_pool(arc, place, t_limit, depth))
+    ordered = (
+        pool
+        if arc.filter is None and arc.key is None
+        else self._order_available(arc, pool, transition_name=transition_name)
+    )
+    if ordered is None or len(ordered) < arc.count:
+        return None
+    return _Ordered(ordered, arc.count)
+
+def _join_combos(self, per_key: list[list], plan: _JoinPlan, *, unordered: bool) -> Iterator[tuple]:
+    """Enumerate the per-key products of `_join_candidates`, merged into product order unless `unordered` allows.
+
+    Where `plan` has a shared place, each key's candidates come from `_key_combos`, which
+    builds no candidate that reuses a token and counts its dead ends.
+    """
+    products = map(_key_opener(plan, per_key[0], self.binding_search_limit + 1), per_key)
+    if len(per_key) == 1:
+        return next(products)
+    if unordered and _join_candidate_count(per_key) <= self.binding_search_limit:
+        # Every candidate fits within the search limit, so the order they are examined in
+        # cannot change whether one satisfies: skip the merge.
+        return itertools.chain.from_iterable(products)
+    return heapq.merge(*products, key=_read_positions)
+
+@staticmethod
+def _join_bindings(
+    arcs: list[InputArc], options: list[list[tuple[int, list[Token]]] | None], combos: Iterator[tuple]
+) -> "Iterator[_Binding | _DeadEnd]":
+    """Turn `(position, value)` combinations into bindings: a `join_key` arc's value is one token.
+
+    A `_DeadPrefix` from `_key_combos` becomes a `_DeadEnd`, which `_satisfying` counts.
+    """
+    is_join = [arc_options is None for arc_options in options]
+    for combo in combos:
+        if type(combo) is _DeadPrefix:
+            yield _DEAD_END
+            continue
+        yield [
+            (arc, [value] if join else value) for arc, join, (_, value) in zip(arcs, is_join, combo, strict=True)
+        ]
+
+def _join_groups(
+    self,
+    position: int,
+    arc: InputArc,
+    place: Place,
+    keys: list[object] | None,
+    t_limit: float | None,
+    transition_name: str,
+    *,
+    depth: int,
+) -> "dict[object, Iterable[tuple[object, Token]]] | None":
+    """Return `arc`'s available tokens grouped by `join_key`, restricted to `keys` unless `None`.
+
+    `depth` is the depth the arc's index is registered with (`_JoinShape.index_depths`): how
+    many join arcs of the transition read `place` with this arc's `join_key`, or every join
+    arc on the place when they use several functions.
+
+    Each group yields `(position, token)` in the place's read order, where positions order
+    the tokens the same way, and has a `len`. A certified `join_key` on a plain
+    [`Place`][cpnx.Place] is served from the place's join index
+    ([`peek_join`][cpnx.Place.peek_join]) as lazy views, at O(1) per requested key.
+    Otherwise, or when that index has disabled itself, this reads the whole available pool
+    and keys every token, dispatching the key as certification allows. A key that raises,
+    or returns an unhashable value, makes the arc unsatisfiable and is reported once
+    through `on_error`, as a raising `key` or `filter` is.
+    """
+    join_key = arc.join_key
+    assert join_key is not None
+    inline_safe = arc._join_key_inline_safe  # type: ignore[attr-defined]
+    if inline_safe and type(place) is Place:
+        index_id = self._ensure_join_index(transition_name, position, arc, place, join_key, depth=depth)
+        indexed = place.peek_join(index_id, keys, model_time=t_limit)
+        if indexed is not None:
+            return indexed
+    grouped = self._group_pool_by_join_key(arc, place, t_limit, transition_name)
+    if grouped is None or keys is None:
+        return grouped
+    return {key: grouped[key] for key in keys if key in grouped}
+
+def _ensure_join_index(
+    self,
+    transition_name: str,
+    position: int,
+    arc: InputArc,
+    place: Place,
+    join_key: Callable[[Token], object],
+    *,
+    depth: int,
+) -> int:
+    """Register the join index for input `position` of the transition on `place`; return its id.
+
+    A no-op returning the existing id when that exact registration (same arc, place,
+    `join_key` and `depth`) is in place. Otherwise the position's old registration is
+    released (`_release_join_entry`), and the position shares the index of another of the
+    transition's positions that reads `place` with the same `join_key` and `depth`, or gets
+    a new one with a fresh id from `_JOIN_INDEX_IDS`.
+
+    So a transition keeps one index per (place, function): the join arcs of a self-join read
+    one group, and the match drains that index, so no registered index goes unread (ADR 0011
+    §2). Two transitions never share one, even through a shared `InputArc` object.
+    """
+    registered = self._join_registrations.setdefault(transition_name, {})
+    entry = registered.get(position)
+    if entry is not None:
+        if _registration_matches(entry, arc, place, join_key, depth):
+            return entry[3]
+        del registered[position]
+        _release_join_entry(registered, entry)
+    index_id = _shared_join_index(registered, place, join_key, depth)
+    if index_id is None:
+        index_id = next(_JOIN_INDEX_IDS)
+        place.register_join_index(index_id, join_key, depth)
+    registered[position] = (arc, place, join_key, index_id, depth)
+    return index_id
+
+def _release_stale_join_indexes(self, transition: Transition) -> None:
+    """Drop each join index of `transition` whose arc no longer reads its place through it.
+
+    That is an arc whose `join_key` was reassigned (including back to `None`), an arc no
+    longer at that input position, or one whose place name now maps to another place.
+    Without this, every later deposit into the old place would keep keying tokens for an
+    index nothing reads. A `join_key` that is still in use is registered again by
+    `_ensure_join_index` on its next read.
+    """
+    registered = self._join_registrations.get(transition.name)
+    if not registered:
+        return
+    inputs = transition.inputs
+    for position, (arc, place, join_key, _index_id, _depth) in list(registered.items()):
+        if (
+            position >= len(inputs)
+            or inputs[position] is not arc
+            or arc.join_key is not join_key
+            or self.places.get(arc.place) is not place
+        ):
+            entry = registered.pop(position)
+            _release_join_entry(registered, entry)
+            self._join_matches.pop(transition.name, None)
+
+def _group_pool_by_join_key(
+    self, arc: InputArc, place: Place, t_limit: float | None, transition_name: str
+) -> "dict[object, list[tuple[object, Token]]] | None":
+    """`_join_groups` without the index: key every available token, reporting a failing key."""
+    pool = place.peek(len(place), model_time=t_limit)
+    inline_safe = arc._join_key_inline_safe  # type: ignore[attr-defined]
+    grouped: dict[object, list[tuple[object, Token]]] = {}
+    try:
+        for position, token in enumerate(pool):
+            key = self._eval_expression(arc.join_key, token, inline_safe)
+            grouped.setdefault(key, []).append((position, token))
+    except Exception as exc:
+        self._signal_selection_failure((transition_name, arc.place), exc, pool, arc)
+        return None
+    return grouped
+
+def _arc_options(self, arc: InputArc, available: _Pool, *, transition_name: str = "") -> Iterator[list[Token]]:
+    """Yield each `count`-sized token group one input `arc` could consume, in order.
+
+    A `consume_all` arc has a single option: every available token, FIFO, with `key`
+    and `filter` deliberately bypassed (see the warning on `InputArc`). Otherwise the tokens
+    are filtered and ordered (by the arc's `filter`/`key`, else FIFO) and every
+    `count`-sized combination is yielded in index order — so the first yielded group is
+    the arc's head selection. An arc whose `key`/`filter` raises, or that has fewer than
+    `count` eligible tokens, yields nothing (making the transition unbindable).
+
+    `available` is a `_PeekStream` only for an arc with no selection and `count == 1`, so
+    it normally reaches the single-token loop unchanged and is read only as far as the
+    consumer pulls. Every other branch takes `_as_list(available)`, so a pool and an arc
+    shape that disagree (after a concurrent reassignment) still read correctly.
+    """
+    if arc.consume_all:
+        yield _as_list(available)
+        return
+    if arc.filter is None and arc.key is None:
+        ordered: _Pool | None = available
+    else:
+        ordered = self._order_available(arc, _as_list(available), transition_name=transition_name)
+    if ordered is None:
+        return
+    if arc.count == 1:
+        # Fast path for the common single-token arc. `combinations(ordered, 1)` yields one
+        # 1-tuple per token which is then rebuilt as a list; emitting `[token]` directly
+        # produces the identical groups in the identical order (so seeded `RANDOM` streams
+        # are unaffected) while skipping the combinations machinery in the hottest loop of
+        # the binding search.
+        for token in ordered:
+            yield [token]
+        return
+    for combo in itertools.combinations(ordered, arc.count):
+        yield list(combo)
+
+def _order_available(
+    self, arc: InputArc, available: list[Token], *, transition_name: str = ""
+) -> list[Token] | None:
+    """Return the arc-eligible tokens in consumption order, or `None` if selection fails.
+
+    Applies the arc's selection in two steps, mirroring the two halves of
+    [`InputArc`][cpnx.InputArc]:
+
+    1. **`filter`** — drop every token the per-token predicate rejects (they stay in
+       the place, merely ineligible for this arc);
+    2. **`key`** — order what survives **ascending** by the per-token key. Python's
+       sort is stable, so equal keys retain the incoming FIFO (insertion-`seq`) order
+       — the tiebreak that keeps a keyed drain deterministic.
+
+    With neither set, `available` is returned unchanged (FIFO). Each callable is
+    evaluated inline if certified closed-world, else via the timed expression pool. A
+    callable that raises — or a key whose values are mutually incomparable, which
+    surfaces as a `TypeError` out of `sort` rather than out of the callable — returns
+    `None`, making the arc unsatisfiable rather than firing on a partial pool.
+
+    COST: this filters and sorts whatever pool it is handed, every firing. What keeps
+    that cheap is `_materialize_pool` handing it a *bounded* pool: for a **certified**
+    key the place's persistent key-index supplies only the leading `cap` tokens in key
+    order, so the work here is O(cap log cap) — independent of how deep the place is —
+    and a deep keyed drain is O(N log N) overall. This method stays the authority on
+    ordering even then: it re-sorts what the index returned, so the index can only ever
+    be a selection hint, never a source of order.
+
+    The **uncertified** case still pays PR 1's cost, and is the one to watch. The pool
+    is the whole available marking, so draining a deep place is O(N^2 log N), and both
+    callables run *per token*: `expr_timeout_secs` bounds each dispatch, not the loop,
+    and `binding_search_limit` does not apply (it truncates candidate bindings in
+    `_iter_candidate_bindings`, downstream of this). The `sort` below is inline and
+    unbounded regardless of certification, so a key returning values with an expensive
+    `__lt__` holds the lock for as long as it takes. Both limits are documented on
+    `PetriNet.expr_timeout_secs` and `InputArc` — together they are why certifying a
+    selection callable matters most exactly where it used to matter least, on a deep
+    place. The other residual is timed×key: a keyed place also holding cooling tokens
+    cannot be indexed (see `Place.peek_by_key`) and keeps the quadratic cost.
+    """
+    if arc.filter is None and arc.key is None:
+        return available
+    fault_id = (transition_name, arc.place)
+    pool = available  # the tokens the *failing stage* saw — the witnesses if it fails
+    try:
+        if arc.filter is not None:
+            available = self._apply_filter(arc, available)
+            # Narrow the witnesses to the survivors: a token the filter rejects is not one
+            # the `key` ever saw, and a permanently-rejected one would otherwise sit in the
+            # witness set forever and mute every later fault on this arc. If the *filter*
+            # raised we never get here, so `pool` is still the pre-filter list — correct,
+            # since that is what the filter was handed.
+            pool = available
+        if arc.key is not None:
+            available = self._sort_by_key(arc, available)
+    except Exception as exc:
+        # Selection failed: the arc is unsatisfiable for this pass (unchanged behaviour),
+        # but say so rather than merely looking disabled. Only a *raising* callable reaches
+        # here — a `filter` that legitimately rejects every token returns an empty list,
+        # which is an ordinary "not enabled", not an error, and stays silent.
+        self._signal_selection_failure(fault_id, exc, pool, arc)
+        return None
+    if id(arc) in self._key_index_disabled_arcs:
+        self._maybe_rearm_key_index(arc)
+    return available
+
+def _maybe_rearm_key_index(self, arc: InputArc) -> None:
+    """Re-arm a disabled key-index once selection succeeds again for *arc* (issue #34).
+
+    Called on the success path of `_order_available` for an arc recorded in
+    `_key_index_disabled_arcs`. A successful selection means the surviving pool keys
+    cleanly, so the place can usually rebuild its index from the ready set; on success we
+    stop tracking the arc. A rate-limited or still-failing rebuild returns ``False`` and is
+    retried on the next success. Takes the place lock under the engine lock — the same
+    ordering `_signal_selection_failure` already uses for `Place.key_index_disabled`.
+    """
+    place = self.places.get(arc.place)
+    if place is not None and place.rearm_key_index(id(arc)):
+        self._key_index_disabled_arcs.discard(id(arc))
+
+def _sort_by_key(self, arc: InputArc, available: list[Token]) -> list[Token]:
+    """Order *available* ascending by `arc.key`, dispatching as certification allows.
+
+    A *certified* callable is by definition called directly (that is all
+    `_eval_expression` does for an inline-safe one), so hand it to `sorted` and let the
+    sort drive the calls from C instead of paying an interpreted dispatch per token.
+    `sorted(key=...)` is stable and never compares the tokens themselves, so this is
+    exactly the `(key, seq)` ordering the decorated path produces — measurably faster,
+    identical result. This is the path a certified-but-unindexed arc takes (notably the
+    timed×key residual), and without it the split would have left that case slower than
+    the single opaque `sorted()` it replaced.
+    """
+    if arc._key_inline_safe:  # type: ignore[attr-defined]
+        return sorted(available, key=arc.key)
+    keyed = [
+        (self._eval_expression(arc.key, token, False), token)  # uncertified: via the pool
+        for token in available
+    ]
+    keyed.sort(key=_first)
+    return [token for _, token in keyed]
+
+def _apply_filter(self, arc: InputArc, available: list[Token]) -> list[Token]:
+    """Drop the tokens `arc.filter` rejects, dispatching each call as certification allows.
+
+    Split out so the certified case is a plain comprehension over a directly-called
+    predicate — the same reasoning as the `sorted` fast path above: for an inline-safe
+    callable `_eval_expression` *is* a direct call, so routing through it only adds an
+    interpreted frame per token.
+    """
+    if arc._filter_inline_safe:  # type: ignore[attr-defined]
+        predicate = arc.filter
+        return [token for token in available if predicate(token)]
+    return [
+        token
+        for token in available
+        if self._eval_expression(arc.filter, token, False)  # uncertified: via the pool
+    ]
+
+def _signal_search_exhausted(self, transition_name: str) -> None:
+    """Record a search exhaustion for `transition_name` to dispatch after the lock releases.
+
+    Called from inside the enabling check (under the engine lock). The callback itself
+    must run *outside* the lock (so it may safely call back into the net), so this only
+    buffers the transition name; `_flush_search_exhaustions` drains the buffer and fires
+    the callback once the caller has released the lock.
+    """
+    self._pending_exhaustions.add(transition_name)
+
+def _flush_search_exhaustions(self) -> None:
+    """Dispatch any buffered search-exhaustion callbacks. Must be called off the lock.
+
+    Swaps out the pending set under a brief lock, then fires `on_binding_search_exhausted`
+    once per distinct transition, swallowing callback errors. Safe to call unconditionally;
+    a no-op when nothing exhausted.
+    """
+    with self._lock:
+        if not self._pending_exhaustions:
+            return
+        pending = self._pending_exhaustions
+        self._pending_exhaustions = set()
+    callback = self.on_binding_search_exhausted
+    if callback is None:
+        return
+    for name in pending:
+        try:
+            callback(name)
+        except Exception:
+            pass
+
+def _signal_priority_key_failure(self, transition_name: str, first_exc: Exception) -> None:
+    """Buffer a "PRIORITY key failed for every candidate" event for off-lock `on_error` dispatch.
+
+    Called under the engine lock from `_min_key_pick`; keeps only the first exception per
+    transition (`on_error` must run off the lock, so this only buffers). See
+    `_flush_priority_key_failures`.
+    """
+    self._pending_key_failures.setdefault(transition_name, first_exc)
+
+def _flush_priority_key_failures(self) -> None:
+    """Dispatch buffered PRIORITY-key failures via `on_error`. Must be called off the lock.
+
+    Swaps out the pending map under a brief lock, then fires `on_error(name, exc, None)` once
+    per distinct transition with a descriptive `RuntimeError` (chaining the first key error),
+    swallowing callback errors. Safe to call unconditionally; a no-op when nothing failed.
+    """
+    with self._lock:
+        if not self._pending_key_failures:
+            return
+        pending = self._pending_key_failures
+        self._pending_key_failures = {}
+    callback = self.on_error
+    if callback is None:
+        return
+    for name, first_exc in pending.items():
+        err = RuntimeError(
+            f"binding_priority_key raised for every candidate binding of transition '{name}'; "
+            f"PRIORITY selection fell back to insertion order. First error: {first_exc!r}"
+        )
+        err.__cause__ = first_exc
+        try:
+            callback(name, err, None)
+        except Exception:
+            pass
+
+def _signal_selection_failure(
+    self, fault_id: tuple[str, str], exc: Exception, pool: list[Token], arc: InputArc
+) -> None:
+    """Buffer a raising `InputArc.key`/`filter` for off-lock `on_error` dispatch (issue #29).
+
+    Called from `_order_available` under the engine lock, so this only records; the
+    callback must run off the lock (it may call back into the net). Keyed by
+    ``(transition, place)`` and **edge-triggered**: a fault reports once when selection
+    starts failing and then stays quiet while the *same* tokens keep failing. Buffering
+    alone is not enough — every `step()` drains the buffer, so a per-pass `setdefault`
+    still fires on all of them, and selection re-runs on every enabling check for as long
+    as the offending token sits in the place.
+
+    The edge is identified by **witnesses**: the ids of the tokens the failing *stage*
+    saw — which is why `_order_available` re-points `pool` after a successful filter. A
+    later fault sharing any of them is the same ongoing fault; one sharing none is a new
+    event. This is deliberately not "clear the latch on the next success", which is
+    wrong in two ways that both silently break the feature:
+
+    - the place can drain below `arc.count`, so `_gather_arc_pools` bails before selection
+      runs at all and a success never comes. Removing the poison token is the *most
+      likely* response to the report this raises, so that path is common, and it would
+      mute the arc permanently.
+    - `step()` and `is_quiescent()` evaluate *different* pools (the latter passes
+      `ignore_timing=True`, so it sees cooling tokens the former cannot). A cooling poison
+      token makes the two disagree forever: the timed view succeeds and clears, the
+      untimed view fails and reports, once per poll.
+
+    Cost: the witness set is built only when a report is actually emitted. The ongoing-fault
+    check short-circuits on the first token still present, which matters because a broken
+    arc can never fire — so `run()` polls it indefinitely, and materialising the witnesses
+    eagerly on each poll made that O(pool) per enabling check, under the lock (1.7 ms per
+    check on a 20k-deep place). Steady-state is now a dict lookup and one membership test.
+    Memory is one frozenset of token-id *references* per faulted arc, and nothing for a
+    healthy one.
+
+    Reuses `_signal_priority_key_failure`'s buffer-under-lock/dispatch-off-lock template,
+    but not its *cadence*: that one de-duplicates only within a pass, so it re-reports
+    roughly once per `step()`. The difference is deliberate and documented on
+    `PetriNet.on_error`.
+
+    A failure that first surfaces in a place key-index (`places._KeyIndex` disables itself
+    and the engine falls back) needs no separate report: the fallback immediately re-runs
+    the same callable over the same pool and arrives here, carrying the transition context
+    the index does not have. A broken key therefore reports exactly once, from one place —
+    and since the index has already disabled itself by then, asking the place whether it
+    did is how the report decides to carry the #34 caveat, rather than guessing from
+    certification (a `filter` fault never touches the index at all).
+    """
+    previous = self._selection_faulted.get(fault_id)
+    if previous is not None and any(token.id in previous for token in pool):
+        return  # the same offending tokens are still here — one ongoing fault, stay quiet
+    self._selection_faulted[fault_id] = frozenset(token.id for token in pool)
+    # Only reached on a genuinely new report, so this stays off the polled fault path.
+    # `.get` because the place always exists for a net that actually ran selection, but
+    # direct unit-test calls to `_resolve_input_tokens` need not have registered it.
+    place = self.places.get(arc.place)
+    index_lost = place is not None and place.key_index_disabled(id(arc))
+    if index_lost:
+        self._key_index_disabled_arcs.add(id(arc))
+    self._pending_selection_failures[fault_id] = (exc, index_lost)
+
+def _flush_selection_failures(self) -> None:
+    """Dispatch buffered selection failures via `on_error`. Must be called off the lock.
+
+    Swaps out the pending map under a brief lock, then fires `on_error(name, exc, None)`
+    once per distinct ``(transition, place)`` with a descriptive `RuntimeError` chaining
+    the original, swallowing callback errors. Safe to call unconditionally; a no-op when
+    nothing failed.
+
+    The key-index caveat is appended only when this arc's index *actually* disabled itself
+    (recorded at signal time). It is inapplicable to a `filter` fault, which never touches
+    the index, and to an uncertified key, for which no index is ever registered — the
+    majority of reports — so making it unconditional buried the real error under advice
+    about a mechanism that was not in play.
+    """
+    self._flush_selector_failures()
+    with self._lock:
+        if not self._pending_selection_failures:
+            return
+        pending = self._pending_selection_failures
+        self._pending_selection_failures = {}
+    callback = self.on_error
+    if callback is None:
+        return
+    for (name, place), (first_exc, index_disabled) in pending.items():
+        caveat = (
+            "This also disabled that arc's place key-index, so selection stays correct but "
+            "temporarily reverts to the slower per-firing sort; the index re-arms "
+            "automatically once selection succeeds again after the fault clears (see issue "
+            "#34). "
+            if index_disabled
+            else ""
+        )
+        err = RuntimeError(
+            f"InputArc selection raised for transition '{name}' on place '{place}'; the arc "
+            f"is treated as unsatisfiable, so the transition will not fire while this "
+            f"persists. {caveat}First error: {first_exc!r}"
+        )
+        err.__cause__ = first_exc
+        try:
+            callback(name, err, None)
+        except Exception:
+            pass
+
+# ------------------------------------------------------------------
+# External binding selection (ADR 0013)
+# ------------------------------------------------------------------
+
+def _selector_binding(self, transition: Transition, m_time: float | None, ignore_timing: bool) -> _Binding | None:
+    """Ask `transition.binding_selector` for a binding and check it, or `None` if it fires nothing.
+
+    Resolution and probes both land here, so each enablement check calls the selector once.
+    A raising selector, or a choice that fails a check, is buffered for `on_error` and reads
+    as "not enabled". Caller holds the lock.
+    """
+    name = transition.name
+    t_limit = _LAST_FINITE_TIME if ignore_timing else m_time
+    places = self._prepare_selector(transition, t_limit, ignore_timing)
+    if places is None:
+        return None
+    view = BindingView(
+        name,
+        transition.inputs,
+        places,
+        self._get_model_time_under_lock(),
+        t_limit if t_limit is not None else self._get_model_time_under_lock(),
+        f"{self._selector_seed}:{name}:{self._selector_firings.get(name, 0)}",
+        lambda arc, key, keys: self._selector_groups(name, places, arc, key, keys, t_limit),
+    )
+    selector = cast("Callable[[BindingView], object]", transition.binding_selector)
+    try:
+        choice = self._call_selector(selector, view)
+        if choice is None:
+            self._rearm_selector_view(name, ignore_timing)
+            return None
+        per_arc = normalize_choice(choice, transition.inputs)
+        self._check_selection(transition, places, per_arc, t_limit)
+    except Exception as exc:
+        return self._reject_selection(transition, exc, ignore_timing)
+    self._rearm_selector_view(name, ignore_timing)
+    return list(zip(transition.inputs, per_arc, strict=True))
+
+def _prepare_selector(
+    self, transition: Transition, t_limit: float | None, ignore_timing: bool
+) -> list[Place] | None:
+    """Bring a selector transition's state up to date; its arcs' places, or `None` if it cannot be asked.
+
+    Adopts a selector assigned on a live net, drops place indexes nothing reads any more
+    (`join_key` indexes always; selector indexes on arcs that moved, and all of them while a
+    conflict stands), and reports a conflict. Caller holds the lock.
+    """
+    name = transition.name
+    if self._selector_fns.get(name) is not transition.binding_selector:
+        self._switch_selector(transition)
+    if self._join_registrations and name in self._join_registrations:
+        self._release_join_indexes_of(name)  # a selector never reads them, even mid-conflict
+    conflict = selector_conflict(transition)
+    if conflict is not None:
+        self._release_stale_selector_indexes(name, [])  # it cannot be asked: nothing reads them
+        return self._reject_selection(transition, InvalidSelection(conflict), ignore_timing)
+    places = self._selector_places(transition, t_limit, ignore_timing)
+    if places is None:
+        if name in self._selector_indexes:
+            self._release_stale_selector_indexes(name, [self.places.get(arc.place) for arc in transition.inputs])
+        return None
+    self._release_stale_selector_indexes(name, places)
+    return places
+
+def _selector_places(
+    self, transition: Transition, t_limit: float | None, ignore_timing: bool
+) -> list[Place] | None:
+    """Each input arc's place, or `None` when an arc cannot be met at all (so the selector is not asked).
+
+    Arcs that share a place need their counts together, as a search does (#77), so a shared
+    place too shallow for all of them is not enabled rather than a selector failure. A place
+    that cannot meet the counts re-arms this view's failure latch: the tokens a latched
+    failure involved are gone. An unmet settle window does not, since the tokens stay.
+    """
+    needed: dict[str, int] = {}
+    for arc in transition.inputs:
+        needed[arc.place] = needed.get(arc.place, 0) + arc.count
+    places: list[Place] = []
+    for arc in transition.inputs:
+        place = self.places.get(arc.place)
+        if place is None or not place.can_retrieve(needed[arc.place], model_time=t_limit):
+            self._rearm_selector_view(transition.name, ignore_timing)
+            return None
+        if not ignore_timing and not self._is_settle_time_met(place, arc):
+            return None
+        places.append(place)
+    return places
+
+def _check_selection(
+    self, transition: Transition, places: list[Place], per_arc: list[list[Token]], t_limit: float | None
+) -> None:
+    """Raise `InvalidSelection` unless every chosen token is available in its place and the guard holds."""
+    for arc, place, tokens in zip(transition.inputs, places, per_arc, strict=True):
+        if not place.holds_available(tokens, model_time=t_limit):
+            ids = [t.id for t in tokens]
+            raise InvalidSelection(f"token(s) {ids} chosen for input arc on '{arc.place}' are not available there.")
+    if not self._check_transition_guard(transition, [t for tokens in per_arc for t in tokens]):
+        raise InvalidSelection("the guard rejects the selector's choice.")
+
+def _call_selector(self, selector: "Callable[[BindingView], object]", view: BindingView) -> object:
+    """Call *selector* under the engine lock, turning a call back into the net into a `RuntimeError`.
+
+    The engine lock is not re-entrant, so a selector that reads `net.marking` (say) would
+    otherwise block on it forever. For the length of the call the net's lock is swapped for a
+    guard that raises on the selector's own thread and behaves as the lock on any other.
+    """
+    lock = self._lock
+    self._lock = _SelectorLockGuard(lock, threading.get_ident())  # type: ignore[assignment]
+    try:
+        return selector(view)
+    finally:
+        self._lock = lock
+
+def _reject_selection(self, transition: Transition, exc: Exception, ignore_timing: bool) -> None:
+    """Buffer `exc` for `on_error` and report no binding. Caller holds the lock.
+
+    Edge-triggered per transition and view (timed, or timing-ignoring), because selector
+    transitions are re-asked on every enabling check and `run()`'s polling would otherwise
+    report a persistent failure on each poll. The same failure (same type and message, which
+    names any offending tokens):
+
+    - reports once, and stays quiet while that view keeps failing with it;
+    - reports again after that view's ask succeeds, or its place can no longer meet the
+      arcs' counts (`_rearm_selector_view`), or the transition fires;
+    - is not reported a second time from one view while the other view is still failing with
+      it, which is when the other view confirmed it in this flush epoch or the one before. A
+      latch the other view stopped confirming (its timing-ignoring probe runs only while
+      tokens are cooling) does not silence a recurrence.
+
+    A failure is latched only once it is actually buffered, so one that loses this pass's
+    single slot to the other view reports on a later pass.
+    """
+    name = transition.name
+    signature = (type(exc).__qualname__, str(exc))
+    faults = self._selector_faults
+    epoch = self._selector_epoch
+    own = faults.get((name, ignore_timing))
+    if own is not None and own[0] == signature:
+        faults[(name, ignore_timing)] = (signature, epoch)
+        return None
+    other = faults.get((name, not ignore_timing))
+    if other is not None and other[0] == signature and other[1] >= epoch - 1:
+        faults[(name, ignore_timing)] = (signature, epoch)
+        return None
+    if name not in self._pending_selector_failures:
+        self._pending_selector_failures[name] = exc
+        faults[(name, ignore_timing)] = (signature, epoch)
+    return None
+
+def _rearm_selector_view(self, name: str, ignore_timing: bool) -> None:
+    """Let this view's next failure report. Caller holds the lock.
+
+    Called when the view's ask gave a valid binding or `None`, and when its places drained
+    below the arcs' counts: the tokens that failed are gone, so a later identical failure
+    involves new ones and is worth reporting, as an arc key's fault report does.
+    """
+    if self._selector_faults:
+        self._selector_faults.pop((name, ignore_timing), None)
+
+def _clear_selector_faults(self, name: str) -> None:
+    """Forget both views' reported failures for `name`, so the next failure reports. Caller holds the lock."""
+    self._selector_faults.pop((name, False), None)
+    self._selector_faults.pop((name, True), None)
+
+def _switch_selector(self, transition: Transition) -> None:
+    """First ask of this selector function on `transition`. Caller holds the lock.
+
+    A transition that gained its selector on a live net is adopted. One whose selector was
+    swapped for another function drops the old function's latches and place indexes, which
+    the new one may never read or evict.
+    """
+    name = transition.name
+    if name not in self._selector_transitions:
+        self._adopt_selector(transition)
+    elif name in self._selector_fns:
+        self._clear_selector_faults(name)
+        self._release_stale_selector_indexes(name, [])
+    self._selector_fns[name] = transition.binding_selector
+
+def _adopt_selector(self, transition: Transition) -> None:
+    """Take over a transition that gained a selector after it joined the net. Caller holds the lock.
+
+    Its scheduler state was built for a search (not volatile, maybe a cached search binding),
+    so rebuild the scheduler before asking the selector. `_prepare_selector` also releases any
+    `join_key` index it registered before.
+    """
+    self._selector_transitions.add(transition.name)
+    self._scheduler_ready = False
+
+def _release_join_indexes_of(self, name: str) -> None:
+    """Unregister every place join index transition `name` registered for its `join_key` arcs."""
+    registered = self._join_registrations.pop(name, None)
+    if registered:
+        while registered:
+            _release_join_entry(registered, registered.pop(next(iter(registered))))
+    self._join_matches.pop(name, None)
+
+def _release_stale_search_state(self, transition: Transition) -> None:
+    """Before a search: drop join indexes and selector state `transition` no longer uses. Caller holds the lock."""
+    if self._selector_transitions and transition.name in self._selector_transitions:
+        self._forget_selector(transition)
+    if self._join_registrations:
+        self._release_stale_join_indexes(transition)
+
+def _reset_selector_state(self, name: str) -> None:
+    """Drop the latches and place indexes of a selector transition being replaced. Caller holds the lock."""
+    self._clear_selector_faults(name)
+    self._release_stale_selector_indexes(name, [])
+    self._selector_transitions.discard(name)
+    self._selector_fns.pop(name, None)
+
+def _forget_selector(self, transition: Transition) -> None:
+    """Drop the selector state of a transition whose `binding_selector` was cleared. Caller holds the lock."""
+    name = transition.name
+    self._selector_transitions.discard(name)
+    self._selector_fns.pop(name, None)
+    self._clear_selector_faults(name)
+    self._release_stale_selector_indexes(name, [])
+    if self._searches_bindings(transition) and not self._has_search_policy_transition:
+        self._has_search_policy_transition = True
+        self._scheduler_ready = False
+
+def _release_stale_selector_indexes(self, transition_name: str, places: "Sequence[Place | None]") -> None:
+    """Unregister a transition's selector indexes on arcs that are gone or now read another place.
+
+    *places* is each input arc's current place, in order; an empty list releases them all.
+    """
+    by_position = self._selector_indexes.get(transition_name)
+    if not by_position:
+        return
+    for position in list(by_position):
+        registered = by_position[position]
+        place = places[position] if position < len(places) else None
+        stale = [k for k, (_key, held, _id) in registered.items() if held is not place]
+        for k in stale:
+            _key, held, index_id = registered.pop(k)
+            held.unregister_join_index(index_id)
+        if not registered:
+            del by_position[position]
+    if not by_position:
+        del self._selector_indexes[transition_name]
+
+def _flush_selector_failures(self) -> None:
+    """Dispatch buffered selector failures via `on_error`, off the lock, one per transition."""
+    with self._lock:
+        self._selector_epoch += 1
+        if not self._pending_selector_failures:
+            return
+        pending = self._pending_selector_failures
+        self._pending_selector_failures = {}
+    callback = self.on_error
+    if callback is None:
+        return
+    for name, first_exc in pending.items():
+        err = RuntimeError(
+            f"binding_selector of transition '{name}' gave no binding the engine can fire; the "
+            f"transition is treated as not enabled. {first_exc!r}"
+        )
+        err.__cause__ = first_exc
+        try:
+            callback(name, err, None)
+        except Exception:
+            pass
+
+def _selector_groups(
+    self,
+    transition_name: str,
+    places: list[Place],
+    position: int,
+    key: Callable[[Token], object],
+    keys: Iterable[object] | None,
+    t_limit: float | None,
+) -> "dict[object, Iterable[tuple[object, Token]]]":
+    """`BindingView.groups`: from a place join index when *key* certifies, else by keying the pool.
+
+    Either way every key comes back in the order its first available token is read, so the
+    view a selector sees does not depend on whether this ask was served by a scan or an index.
+    """
+    place = places[position]
+    keys_cache = self._selector_keys
+    if type(place) is Place and keys_cache.seen_before(key) and keys_cache.inline_safe(key):
+        index_id = self._selector_index(transition_name, position, key, place)
+        indexed = place.peek_join(index_id, keys, model_time=t_limit)
+        if indexed is not None:
+            ordered = _in_read_order(cast("dict[object, _JoinGroup]", indexed)) if keys is None else indexed
+            return cast("dict[object, Iterable[tuple[object, Token]]]", ordered)
+    grouped: dict[object, list[tuple[object, Token]]] = {}
+    for token in place.peek(len(place), model_time=t_limit):
+        grouped.setdefault(key(token), []).append((None, token))
+    if keys is None:
+        return dict(grouped)
+    return {k: grouped[k] for k in keys if k in grouped}
+
+def _selector_index(self, transition_name: str, position: int, key: Callable[[Token], object], place: Place) -> int:
+    """The id of the place join index for *key* at this selector arc, registering it if needed.
+
+    Keeps at most `_SELECTOR_INDEXES_PER_ARC` per arc, dropping the oldest, which bounds the
+    indexes a selector that rotates through several reused keys keeps registered. (A key built
+    anew on every call never gets here: `KeyCertifications.seen_before` turns it away.)
+    """
+    registered = self._selector_indexes.setdefault(transition_name, {}).setdefault(position, {})
+    entry = registered.get(id(key))
+    if entry is not None and entry[0] is key and entry[1] is place:
+        return entry[2]
+    if entry is not None:
+        entry[1].unregister_join_index(entry[2])
+        del registered[id(key)]
+    while len(registered) >= _SELECTOR_INDEXES_PER_ARC:
+        _, old_place, old_id = registered.pop(next(iter(registered)))
+        old_place.unregister_join_index(old_id)
+    index_id = next(_JOIN_INDEX_IDS)
+    place.register_join_index(index_id, key)
+    registered[id(key)] = (key, place, index_id)
+    return index_id
+
+def _is_settle_time_met(self, place: Place, arc: InputArc) -> bool:
+    if arc.settle_secs <= 0.0:
+        return True
+    if self._model_time is not None:
+        elapsed = self._model_time - place.last_deposit_time_model
+    else:
+        elapsed = time.monotonic() - place.last_deposit_time
+    return elapsed >= arc.settle_secs
+
+def _eval_expression(self, expression, arg: Token | list[Token], inline_safe: bool = False):
+    """Evaluate a callable `expression` over `arg`.
+
+    Centralizes the dispatch shared by input-arc selection (`_order_available`'s
+    per-**token** `key`/`filter`), output-arc conditions (`_is_arc_active`), and
+    transition guards (`_check_transition_guard`) — hence the widened `arg`: the
+    input-arc callables take one `Token`, the rest take the candidate token list.
+    Two execution modes, chosen by what was proven at construction:
+
+    - **certified callable** (`inline_safe`) — called directly, no executor. It
+      was proven closed-world and terminating (see `cpnx.certification`), so it is
+      safe to run under the engine lock without a timeout, and skips the ~90x
+      thread round-trip;
+    - **uncertified callable** — dispatched to the timeout-bounded executor via
+      `_call_expr`.
+
+    Callers coerce/bound the result and handle exceptions.
+    """
+    if inline_safe:
+        return expression(arg)
+    return self._call_expr(expression, arg, timeout=self.expr_timeout_secs)
+
+def _resolve_input_tokens(
+    self, arc: InputArc, available: list[Token], *, transition_name: str = ""
+) -> list[Token] | None:
+    """Resolve which tokens input `arc` would consume from `available`.
+
+    Returns the selected tokens, or `None` if the arc cannot be satisfied —
+    either its `key`/`filter` raised, or fewer than `arc.count` tokens
+    are eligible. In CPN semantics arc multiplicity is all-or-nothing: an arc
+    demanding `count` tokens is not enabled unless at least `count` are
+    resolved, so a selection that yields fewer (or none) disables the
+    transition rather than firing with a short or zero-length token list.
+
+    Used by `_head_binding` to build the head selection whenever a transition resolves
+    head-only (`_is_head_only` defines which those are). Guard-free `RANDOM`/`PRIORITY`
+    do **not** use this path; they enumerate. The multiplicity rule applies either way,
+    so a short selection disables the transition rather than firing with too few tokens.
+    """
+    if arc.consume_all:
+        # A draining arc takes the whole available pool untouched — `key` and `filter`
+        # are bypassed, exactly as the arc inscription they replaced was. Documented as
+        # a footgun on `InputArc`; pinned by `test_consume_all_bypasses_key_and_filter`.
+        tokens = available
+    else:
+        ordered = self._order_available(arc, available, transition_name=transition_name)
+        if ordered is None:
+            return None
+        tokens = ordered[: arc.count]
+    if len(tokens) < arc.count:
+        return None
+    return tokens
+
+def _check_output_capacity(self, transition: Transition) -> bool:
+    # Back-pressure: refuse to fire if an unconditional output arc's target place is full.
+    # Conditional arcs are skipped — their target may never receive a token, so checking
+    # capacity speculatively would cause spurious blocking.
+    for arc in transition.outputs:
+        if arc.condition is not None:
+            continue
+        place = self.places.get(arc.place)
+        if place is not None and not place.can_deposit(arc.count):
+            return False
+    return True
+
+def _check_transition_guard(self, transition: Transition, candidate_tokens: list[Token]) -> bool:
+    if transition.guard is None:
+        return True
+    try:
+        return bool(
+            self._eval_expression(transition.guard, candidate_tokens, transition._inline_safe)  # type: ignore[attr-defined]
+        )
+    except Exception:
+        return False
+
+def _is_transition_potentially_enabled(self, transition: Transition) -> bool:
+    """Return `True` if `transition` could fire given current token counts, ignoring timing.
+
+    Unlike `_is_transition_enabled`, this ignores cooldown timers on
+    `PacedResourcePlace` (tokens in cooldown are counted as present), settle windows, and
+    output-place back-pressure. It probes for a guard-satisfying binding under the
+    transition's effective [`BindingPolicy`][cpnx.BindingPolicy] via
+    `_binding_exists` (never drawing the seeded RNG, so
+    quiescence polling cannot perturb `RANDOM` reproducibility). Used by
+    [`is_quiescent`][cpnx.PetriNet.is_quiescent] to distinguish "no work possible" from
+    "work temporarily blocked by timing".
+
+    Args:
+        transition: The transition to test.
+
+    Returns:
+        `True` if a guard-satisfying binding exists once timing is ignored.
+    """
+    return self._binding_exists(transition, float("inf"), ignore_timing=True)
+
+def _earliest_cooldown_boundary(self, now: float) -> float | None:
+    """Smallest future `available_at` among tokens in non-sink places, or `None` if none.
+
+    Each place answers in O(1)/O(log n) from its cooling heap
+    (`Place.earliest_available_boundary`) rather than this method scanning the whole
+    marking of every place — otherwise a deep place makes each clock advance O(depth),
+    and the advance runs per tick, so draining is O(N^2).
+    """
+    boundaries = (
+        place.earliest_available_boundary(now) for place in self.places.values() if not isinstance(place, SinkPlace)
+    )
+    return min((b for b in boundaries if b is not None), default=None)
+
+def _pending_settle_boundary(self, arc: InputArc, now: float) -> float | None:
+    """Future boundary at which `arc`'s settle window becomes satisfied, or `None` if not pending."""
+    if arc.settle_secs <= 0:
+        return None
+    place = self.places.get(arc.place)
+    if place is None or isinstance(place, SinkPlace) or len(place) == 0:
+        return None
+    last_deposit = getattr(place, "last_deposit_time_model", 0.0)
+    if now - last_deposit >= arc.settle_secs:
+        return None  # window already satisfied; nothing to wait for
+    # The window is still pending, so its boundary is mathematically in the future — but
+    # `last_deposit + settle_secs` can *round* to exactly `now` in float64 (one ULP at
+    # monotonic-clock magnitudes is ~2e-9). Stepping to the next representable float
+    # guarantees forward progress rather than stranding with the window unmet.
+    boundary = max(last_deposit + arc.settle_secs, math.nextafter(now, math.inf))
+    return boundary if boundary > now else None
+
+def _earliest_settle_boundary(self, now: float) -> float | None:
+    """Smallest future settle-window boundary among all transitions' input arcs, or `None`."""
+    candidates = (
+        b
+        for transition in self.transitions.values()
+        for arc in transition.inputs
+        if (b := self._pending_settle_boundary(arc, now)) is not None
+    )
+    return min(candidates, default=None)
+
+def _next_availability_boundary(self) -> float | None:
+    """Smallest future logical time at which a currently-blocked token/window becomes available.
+
+    Scans token cooldowns (`available_at`, set by `PacedResourcePlace` and retries) and
+    input-arc settle windows. Returns `None` if nothing is time-gated (a genuine deadlock or
+    completion), so [`drive_to_quiescence`][cpnx.PetriNet.drive_to_quiescence] stops instead of
+    advancing the clock forever. Called only between firings, after `_await_inflight`, so no
+    worker thread is mutating the marking.
+
+    A non-finite boundary is treated as no boundary at all. An uncapped `RetryPolicy` whose
+    delay has saturated parks its token at `available_at = inf`, which is unreachable by
+    definition: advancing the clock to it would be both a lie and ruinous, since at
+    `_model_time = inf` that token matures again immediately and every finite delay in the
+    net collapses with it. Reporting `None` lets the drive stop on a genuinely parked token
+    instead of spinning on it forever.
+    """
+    now = self.model_time
+    candidates = [
+        b
+        for b in (self._earliest_cooldown_boundary(now), self._earliest_settle_boundary(now))
+        if b is not None and math.isfinite(b)
+    ]
+    return min(candidates, default=None)
+
+def _await_inflight(self, *, max_spins: int = 10_000_000) -> None:
+    """Block until no transition action is mid-flight (barrier for `drive_to_quiescence`).
+
+    Spins on `_running_count` with `time.sleep(0)` (yields the GIL to worker threads without a
+    real sleep). Safe as a barrier: `_execute_transition` decrements `_running_count` *after*
+    committing its output deposits, so observing zero implies every completed action's outputs
+    are visible.
+
+    Args:
+        max_spins: Safety cap. Actions are expected to complete promptly; a hung action would
+            otherwise spin forever, so exceeding the cap raises rather than hangs silently.
+
+    Raises:
+        RuntimeError: If `max_spins` is exceeded while an action is still in flight.
+    """
+    spins = 0
+    while self._running_count > 0:
+        if spins >= max_spins:
+            raise RuntimeError(
+                f"_await_inflight exceeded max_spins={max_spins} with "
+                f"{self._running_count} action(s) still in flight — hung action?"
+            )
+        spins += 1
+        time.sleep(0)
+
+def _resolve_retry_schedule(self) -> _RetrySchedule:
+    """Bind this net's default policy to its jitter stream for one rollback.
+
+    Built per failed firing rather than cached, so `retry_policy`/`retry_delay` stay
+    live-tunable; the per-transition policy is resolved against this default inside the
+    rollback, where the failing transition is known.
+    """
+    return _RetrySchedule(default=self._retry_policy, rng=self._retry_rng)
+
+def _commit_or_rollback_transition(
+    self,
+    transition: Transition,
+    success: bool,
+    consumed_tokens: list[Token],
+    output_tokens: list[Token],
+    token_sources: list[tuple[str, Token]],
+    error: BaseException | None,
+) -> tuple[bool, BaseException | None, list[Token], list[Token], list[tuple[str, Token]]]:
+    data_tokens: list[Token] = []
+    dl_data: list[Token] = []
+    deposited: list[tuple[str, Token]] = []
+
+    if success:
+        try:
+            success, error, data_tokens, dl_data, deposited = self._try_commit_transition(
+                transition, consumed_tokens, output_tokens, token_sources
+            )
+        except BaseException as exc:
+            success = False
+            error = exc
+
+    if not success:
+        deposited, dl_data, data_tokens = _rollback_failed_transition(
+            transition,
+            token_sources,
+            retry=self._resolve_retry_schedule(),
+            deposit=self._deposit_under_lock,
+            error_place=self.error_place,
+            ref_time=self._get_model_time_under_lock(),
+        )
+    return success, error, data_tokens, dl_data, deposited
+
+def _execute_transition(
+    self,
+    transition: Transition,
+    consumed_tokens: list[Token],
+    token_sources: list[tuple[str, Token]],
+    *,
+    inline: bool = False,
+) -> None:
+    start_time = time.monotonic()
+    try:
+        if isinstance(transition, SubstitutionTransition):
+            outcome = self._fire_substitution_atomically(transition, consumed_tokens, token_sources, inline=inline)
+        else:
+            outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, inline=inline)
+        if outcome is None:
+            return
+
+        # --- OUTSIDE THE LOCK ---
+        self._invoke_transition_callbacks(transition, *outcome)
+
+        error = outcome[2]
+        if error is not None and not isinstance(error, Exception):
+            raise error
+
+    finally:
+        # Decrement running count and signal work available under lock
+        with self._lock:
+            self._running_count -= 1
+            idle = self._running_count == 0
+        self._work_available.set()
+        if idle:
+            self._try_settle()
+
+def _fire_and_commit(
+    self,
+    transition: Transition,
+    consumed_tokens: list[Token],
+    token_sources: list[tuple[str, Token]],
+    start_time: float,
+    action_error: BaseException | None = None,
+    *,
+    inline: bool = False,
+) -> "_FiringOutcome | None":
+    """Run the action and commit or roll back; *action_error* fails the firing without it.
+
+    Returns `None` for a firing that belongs to a failed firing of this net or a net enclosing
+    it: one that starts after that failure, or whose subnet drive the failure cuts short. It
+    hands its tokens back without retrying, dead-lettering or calling back, and the restore
+    resets the net.
+
+    On an *inline* firing, an action that raises `KeyboardInterrupt` or `SystemExit` is the
+    caller stopping the drive, not the firing failing: its tokens go back exactly as they were
+    taken (`_return_unstarted`, so a paced permit keeps its availability), with no attempt
+    counted, and the interrupt is re-raised. Any other `BaseException` (`CancelledError`,
+    `GeneratorExit`) fails the firing like an `Exception` and is re-raised after the rollback
+    by `_execute_transition`, so a caller that catches it and drives again cannot re-fire the
+    same token forever. On the pool nothing would receive the re-raise, so a worker rolls
+    every interrupt back as a failure.
+    """
+    if self._aborted():
+        self._return_unstarted(token_sources)
+        return None
+    if action_error is None:
+        success, output_tokens, error = self._execute_transition_action(transition, consumed_tokens, token_sources)
+    else:
+        success, output_tokens, error = False, [], action_error
+    if isinstance(error, _EnclosingFiringFailed):
+        self._return_interrupted(token_sources)
+        return None
+    if inline and isinstance(error, (KeyboardInterrupt, SystemExit)):
+        self._return_unstarted(token_sources)
+        raise error
+    with self._lock:
+        duration = time.monotonic() - start_time
+        success, error, data_tokens, dl_data, deposited = self._commit_or_rollback_transition(
+            transition, success, consumed_tokens, output_tokens, token_sources, error
+        )
+    return success, duration, error, data_tokens, dl_data, deposited
+
+def _return_unstarted(self, token_sources: list[tuple[str, Token]]) -> None:
+    """Put a firing's consumed tokens back where they came from, as if it never fired.
+
+    Each token goes back as it was taken, not through `deposit`, so a paced permit keeps
+    its availability instead of starting a cooldown for work that never ran.
+    """
+    with self._lock:
+        for src, token in token_sources:
+            self.places[src]._return_token(token)
+            self._mark_dirty(src, token)
+
+def _return_interrupted(self, token_sources: list[tuple[str, Token]]) -> None:
+    """Hand back the tokens of a firing whose subnet drive an enclosing failure cut short.
+
+    Data tokens go back unchanged, with no retry counted. Resource tokens go back through
+    `deposit`, as a rollback returns them, so a paced permit starts its cooldown.
+    """
+    with self._lock:
+        for src, token in token_sources:
+            if token.is_resource:
+                self._deposit_under_lock(src, token)
+            else:
+                self.places[src]._return_token(token)
+                self._mark_dirty(src, token)
+
+def _aborted(self) -> bool:
+    """Whether this net, or a net enclosing it, has a failed firing still to settle.
+
+    Also true while `_drive_subnet` judges a subnet's drive, including one that then commits:
+    no new work may start in that window.
+    """
+    net: PetriNet | None = self
+    while net is not None:
+        if net._closing or net._pending_restore is not None:
+            return True
+        net = net._parent_net()
+    return False
+
+def _fire_substitution_atomically(
+    self,
+    transition: SubstitutionTransition,
+    consumed_tokens: list[Token],
+    token_sources: list[tuple[str, Token]],
+    *,
+    inline: bool = False,
+) -> "_FiringOutcome | None":
+    """Fire a substitution transition as one transaction on its subnet.
+
+    Firings of one transition run one at a time, and each starts only once the subnet has
+    settled: nothing of an earlier failed firing still running, and its restore applied. A
+    firing that commits leaves the subnet as it reached it. One that fails has the subnet
+    restored to the checkpoint as soon as the subnet settles, which is at once unless an
+    action of the failed firing is still running.
+    """
+    subnet = transition.subnet
+    arrived = time.monotonic()
+    with transition._firing_lock:
+        start_time = time.monotonic()
+        try:
+            bound = transition.subnet_deadline_secs
+            settled = subnet._await_settled(arrived, math.inf if bound is None else bound, self._aborted)
+        except BaseException as exc:
+            return self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, exc)
+        if self._aborted():
+            self._return_unstarted(token_sources)
+            return None
+        if not settled:
+            error = RuntimeError(
+                f"SubstitutionTransition '{transition.name}': subnet is still running an action of a "
+                f"failed firing after subnet_deadline_secs={transition.subnet_deadline_secs}."
+            )
+            return self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, error)
+        try:
+            checkpoint = subnet._checkpoint_marking()
+        except BaseException as exc:
+            return self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, exc)
+        subnet._nested_undo = nested = []
+        try:
+            outcome = self._fire_and_commit(transition, consumed_tokens, token_sources, start_time, inline=inline)
+        except BaseException:
+            subnet._request_restore(checkpoint, nested)
+            raise
+        if outcome is not None and outcome[0]:
+            subnet._nested_undo = None
+            with self._lock:
+                if self._nested_undo is not None:
+                    self._nested_undo.append((transition, checkpoint, nested))
+        else:
+            subnet._request_restore(checkpoint, nested)
+    return outcome
+
+def _request_restore(self, checkpoint: dict[str, tuple[Token, ...]], journal: list["_NestedUndo"]) -> None:
+    """Restore this subnet to *checkpoint*, and undo *journal*, as soon as it has settled.
+
+    The journal stays attached as `_nested_undo` until then, so a substitution firing of the
+    failed firing that is still running and commits later is undone too.
+    """
+    with self._lock:
+        self._pending_restore = (checkpoint, journal, time.monotonic())
+    self._try_settle()
+
+def _try_settle(self) -> None:
+    """Apply the pending restore once nothing in this net, or in a subnet under it, is running.
+
+    Called by the failed firing and by the last action of this net to finish, so a restore
+    never runs while an action of the failed firing can still move tokens: every such action
+    completes through its own arcs first. Settling here can let the parent's own pending
+    restore go ahead, so the parent is tried next.
+    """
+    if self._pending_restore is None:
+        return
+    with self._settle_lock:
+        with self._lock:
+            pending = self._pending_restore
+            if pending is None or self._running_count or self._has_unsettled_subnet():
+                return
+        checkpoint, journal, _ = pending
+        self._restore_marking(checkpoint)
+        self._roll_back_nested(journal)
+        with self._lock:
+            self._nested_undo = None
+            self._pending_restore = None
+            self._closing = False
+    self._work_available.set()
+    parent = self._parent_net()
+    if parent is not None:
+        parent._work_available.set()
+        parent._try_settle()
+
+def _await_settled(self, arrived: float, bound: float, abandon: Callable[[], bool]) -> bool:
+    """Wait until no restore is pending on this subnet; `False` if *bound* runs out or *abandon*.
+
+    The bound runs from the failure or from *arrived*, whichever is later. A firing that
+    arrived before the failure gets the full bound, however long it sat behind the failed
+    firing, and firings parked together share one wait instead of taking it in turn.
+    """
+    while (pending := self._pending_restore) is not None:
+        if time.monotonic() >= max(arrived, pending[2]) + bound or abandon():
+            return False
+        time.sleep(0.001)
+    return True
+
+def _has_unsettled_subnet(self) -> bool:
+    """Whether a subnet of this net still has a failed firing to settle."""
+    return any(subnet._pending_restore is not None and subnet._parent_net() is self for subnet in self._subnets)
+
+def _roll_back_nested(self, journal: list["_NestedUndo"]) -> None:
+    """Undo the substitution firings this net committed during a firing that failed.
+
+    Newest first, each restores its subnet and then its own nested firings. Only called once
+    this net and every subnet under it have settled, so nothing can be firing in a subnet
+    being restored.
+    """
+    for transition, checkpoint, nested in reversed(journal):
+        transition.subnet._restore_marking(checkpoint)
+        transition.subnet._roll_back_nested(nested)
+
+def _is_finished(self) -> bool:
+    """Return whether no transition can fire at the current time or any finite later time.
+
+    Wider than `is_quiescent`, which ignores output back-pressure: a transition with a
+    consumable binding but a full output place is potentially enabled, yet can never fire
+    if nothing drains that place.
+    """
+    if self.is_quiescent():
+        return True
+    with self._lock:
+        if self._running_count or self._has_unsettled_subnet():
+            return False
+    # Boundary first: a cooldown ending between the two reads must not read as finished.
+    return self._next_availability_boundary() is None and self.is_dead()
+
+def _checkpoint_marking(self) -> dict[str, tuple[Token, ...]]:
+    """Snapshot the places a rollback touches: every place except sinks."""
+    with self._lock:
+        return {name: place.tokens for name, place in self.places.items() if not isinstance(place, SinkPlace)}
+
+def _restore_marking(self, checkpoint: dict[str, tuple[Token, ...]]) -> None:
+    """Put each checkpointed place back to its checkpointed tokens.
+
+    A token deposited into a restored place since the checkpoint is discarded, even one
+    deposited from outside the subnet, so a subnet should take input only through its ports.
+    A resource pool gets back only its permit count: a permit borrowed and returned by one
+    transition has already come back through that firing's arcs, with any cooldown it
+    started, so this drops a port's copy of a parent permit and puts back a permit one
+    transition moved into another pool for a later transition to return. A sink is left
+    as it is, because it cannot enable anything. The clock is not moved; checkpointed tokens
+    were available then and the clock has only advanced.
+    """
+    with self._lock:
+        for name, tokens in checkpoint.items():
+            if not self.places[name]._roll_back_to(tokens):
+                continue
+            self._mark_dirty(name)
+            for token in tokens:
+                self._mark_dirty(name, token)
+    self._work_available.set()
+
+def _try_commit_transition(
+    self,
+    transition: Transition,
+    consumed_tokens: list[Token],
+    output_tokens: list[Token],
+    token_sources: list[tuple[str, Token]],
+) -> tuple[bool, BaseException | None, list[Token], list[Token], list[tuple[str, Token]]]:
+    res_deque: deque[Token] = deque(t for t in consumed_tokens if t.is_resource)
+    out_deque: deque[Token] = deque(t for t in output_tokens if not t.is_resource)
+    active_outputs = self._evaluate_output_guards(transition, list(out_deque))
+
+    planned_deposits, plan_error = self._plan_and_validate_deposits(
+        transition, active_outputs, res_deque, out_deque
+    )
+
+    if plan_error is not None:
+        return False, plan_error, [], [], []
+
+    dl_data: list[Token] = []
+    error_deposits: list[tuple[str, Token]] = []
+    deposited = _enact_planned_deposits(
+        planned_deposits,
+        active_outputs,
+        res_deque,
+        out_deque,
+        deposit=lambda place_name, token: self._deposit_output_under_lock(
+            place_name, token, transition.name, dl_data, error_deposits
+        ),
+    )
+    # Schema-dead-lettered outputs land in the error place off the planned-deposit path;
+    # fold them into `deposited` so `on_token_deposited` fires for them too.
+    deposited.extend(error_deposits)
+    deposited.extend(
+        _return_leftover_resources(
+            res_deque,
+            token_sources,
+            deposit=self._deposit_under_lock,
+        )
+    )
+    return True, None, [], dl_data, deposited
+
+def _execute_transition_action(
+    self,
+    transition: Transition,
+    consumed_tokens: list[Token],
+    token_sources: list[tuple[str, Token]],
+) -> tuple[bool, list[Token], BaseException | None]:
+    success = False
+    output_tokens: list[Token] = []
+    error: BaseException | None = None
+    try:
+        if isinstance(transition, SubstitutionTransition):
+            output_tokens = self._execute_substitution_transition(transition, consumed_tokens, token_sources)
+        elif transition.action_timeout_secs is None:
+            output_tokens = transition.action(consumed_tokens)
+        else:
+            fut = self._action_executor.submit(transition.action, consumed_tokens)
+            try:
+                output_tokens = fut.result(timeout=transition.action_timeout_secs)
+            except concurrent.futures.TimeoutError:
+                raise RuntimeError(
+                    f"Transition '{transition.name}' action exceeded "
+                    f"{transition.action_timeout_secs}s timeout — tokens rolled back. "
+                    f"The action thread is still running in the background; "
+                    f"use native I/O timeouts inside your action to prevent zombie accumulation."
+                ) from None
+        success = True
+    except BaseException as exc:
+        error = exc
+    return success, output_tokens, error
+
+def _is_arc_active(self, arc: OutputArc, output_tokens_data: list[Token]) -> bool:
+    if arc.condition is None:
+        return True
+    return bool(
+        self._eval_expression(arc.condition, output_tokens_data, arc._inline_safe)  # type: ignore[attr-defined]
+    )
+
+def _evaluate_output_guards(
+    self, transition: Transition, output_tokens_data: list[Token]
+) -> list[tuple[OutputArc, bool]]:
+    active_outputs: list[tuple[OutputArc, bool]] = []
+    for arc in transition.outputs:
+        is_res = isinstance(self.places.get(arc.place), (ResourcePlace, PacedResourcePlace))
+        if self._is_arc_active(arc, output_tokens_data):
+            active_outputs.append((arc, is_res))
+    return active_outputs
+
+@staticmethod
+def _verify_token_demand(
+    transition_name: str,
+    active_outputs: list[tuple[OutputArc, bool]],
+    res_count: int,
+    out_count: int,
+) -> ValueError | None:
+    resource_demand = sum(arc.count for arc, is_res in active_outputs if is_res)
+    data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)
+
+    if res_count < resource_demand:
+        return ValueError(
+            f"Transition '{transition_name}': active resource output arcs require "
+            f"{resource_demand} resource token(s) but only {res_count} were consumed. "
+            f"Ensure each ResourcePlace/PacedResourcePlace InputArc has a matching OutputArc."
+        )
+    if out_count < data_demand:
+        return ValueError(
+            f"Transition '{transition_name}': action returned {out_count} non-resource "
+            f"token(s) but active non-resource output arcs require {data_demand}. "
+            f"Ensure your action returns at least as many tokens as the sum of "
+            f"non-resource OutputArc counts (after arc guard evaluation)."
+        )
+    return None
+
+@staticmethod
+def _verify_no_surplus_outputs(
+    transition_name: str, active_outputs: list[tuple[OutputArc, bool]], out_count: int
+) -> ValueError | None:
+    """Refuse subnet outputs the parent's arcs cannot take: dropping them would lose tokens."""
+    data_demand = sum(arc.count for arc, is_res in active_outputs if not is_res)
+    if out_count > data_demand:
+        return ValueError(
+            f"SubstitutionTransition '{transition_name}': subnet produced {out_count} output "
+            f"token(s) but active non-resource output arcs take {data_demand}, leaving "
+            f"{out_count - data_demand} surplus."
+        )
+    return None
+
+@staticmethod
+def _build_deposit_plan(
+    active_outputs: list[tuple[OutputArc, bool]],
+    res_deque: deque[Token],
+    out_deque: deque[Token],
+) -> list[tuple[str, Token]]:
+    planned_deposits: list[tuple[str, Token]] = []
+    res_temp = deque(res_deque)
+    out_temp = deque(out_deque)
+    for arc, is_res_place in active_outputs:
+        for _ in range(arc.count):
+            t = res_temp.popleft() if is_res_place else out_temp.popleft()
+            planned_deposits.append((arc.place, t))
+    return planned_deposits
+
+@staticmethod
+def _get_deposit_counts(planned_deposits: list[tuple[str, Token]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for place_name, _ in planned_deposits:
+        counts[place_name] = counts.get(place_name, 0) + 1
+    return counts
+
+def _check_token_acceptance(self, planned_deposits: list[tuple[str, Token]]) -> Exception | None:
+    for place_name, token in planned_deposits:
+        place = self.places.get(place_name)
+        if place is None:
+            return KeyError(f"Place '{place_name}' is not registered.")
+        if place.color_set is not None and token.color not in place.color_set:
+            return TypeError(f"Place '{place_name}' cannot accept token with color '{token.color}'.")
+    return None
+
+def _check_capacity_bounds(self, counts: dict[str, int]) -> Exception | None:
+    for place_name, count in counts.items():
+        place = self.places.get(place_name)
+        if place is not None and not place.can_deposit(count):
+            return ValueError(f"Place '{place_name}' would exceed its bound of {place.bound}.")
+    return None
+
+def _verify_deposit_constraints(
+    self,
+    planned_deposits: list[tuple[str, Token]],
+) -> Exception | None:
+    err = self._check_token_acceptance(planned_deposits)
+    if err:
+        return err
+    return self._check_capacity_bounds(self._get_deposit_counts(planned_deposits))
+
+def _plan_and_validate_deposits(
+    self,
+    transition: Transition,
+    active_outputs: list[tuple[OutputArc, bool]],
+    res_deque: deque[Token],
+    out_deque: deque[Token],
+) -> tuple[list[tuple[str, Token]], Exception | None]:
+    demand_err = self._verify_token_demand(transition.name, active_outputs, len(res_deque), len(out_deque))
+    if demand_err is None and isinstance(transition, SubstitutionTransition):
+        demand_err = self._verify_no_surplus_outputs(transition.name, active_outputs, len(out_deque))
+    if demand_err:
+        return [], demand_err
+
+    planned_deposits = self._build_deposit_plan(active_outputs, res_deque, out_deque)
+
+    constraint_err = self._verify_deposit_constraints(planned_deposits)
+    if constraint_err:
+        return [], constraint_err
+
+    return planned_deposits, None
+
+def _dispatch_transition_fired(self, transition_name: str, duration: float) -> None:
+    if self.on_transition_fired:
+        try:
+            self.on_transition_fired(transition_name, duration)
+        except Exception:
+            pass
+
+def _dispatch_transition_error(
+    self, transition_name: str, error: BaseException | None, data_tokens: list[Token]
+) -> None:
+    # We explicitly check for Exception (ignoring BaseException like SystemExit/KeyboardInterrupt)
+    # because on_error is meant for business logic/execution errors. Fatal process signals
+    # should bubble up without triggering user-defined monitoring hooks.
+    if not (self.on_error and isinstance(error, Exception)):
+        return
+    # When the firing consumed no data tokens, still notify once with None.
+    dispatch_tokens: list[Token | None] = list(data_tokens) if data_tokens else [None]
+    for dt in dispatch_tokens:
+        try:
+            self.on_error(transition_name, error, dt)
+        except Exception:
+            pass
+
+def _dispatch_dead_letters(self, transition_name: str, dead_lettered_data_tokens: list[Token]) -> None:
+    if self.on_token_dead_lettered and dead_lettered_data_tokens:
+        for dt in dead_lettered_data_tokens:
+            try:
+                self.on_token_dead_lettered(transition_name, dt)
+            except Exception:
+                pass
+
+def _dispatch_deposits(self, deposited: list[tuple[str, Token]]) -> None:
+    if self.on_token_deposited:
+        for pname, tok in deposited:
+            try:
+                self.on_token_deposited(pname, tok)
+            except Exception:
+                pass
+
+def _invoke_transition_callbacks(
+    self,
+    transition: Transition,
+    success: bool,
+    duration: float,
+    error: BaseException | None,
+    data_tokens: list[Token],
+    dead_lettered_data_tokens: list[Token],
+    deposited: list[tuple[str, Token]],
+) -> None:
+    if success:
+        self._dispatch_transition_fired(transition.name, duration)
+        if dead_lettered_data_tokens:
+            self._dispatch_dead_letters(transition.name, dead_lettered_data_tokens)
+            for dl_token in dead_lettered_data_tokens:
+                err_msg = dl_token.payload.get("error", "Color Set / Schema Violation")
+                self._dispatch_transition_error(transition.name, TypeError(err_msg), [dl_token])
+    else:
+        self._dispatch_transition_error(transition.name, error, data_tokens)
+        self._dispatch_dead_letters(transition.name, dead_lettered_data_tokens)
+
+    self._dispatch_deposits(deposited)
+
+@staticmethod
+def _map_sockets_to_ports(port_socket_map: dict[str, str]) -> dict[str, list[str]]:
+    socket_to_ports: dict[str, list[str]] = {}
+    for port, socket in port_socket_map.items():
+        socket_to_ports.setdefault(socket, []).append(port)
+    return socket_to_ports
+
+@staticmethod
+def _verify_port_socket_boundaries(
+    token_sources: list[tuple[str, Token]], socket_to_ports: dict[str, list[str]]
+) -> None:
+    for socket_name, _ in token_sources:
+        if socket_name not in socket_to_ports:
+            raise ValueError(
+                f"Port/Socket Boundary Violation: Parent place '{socket_name}' "
+                f"is not mapped to any port, but tokens were consumed from it."
+            )
+
+@staticmethod
+def _deposit_into_subnet(
+    subnet: "PetriNet", token_sources: list[tuple[str, Token]], socket_to_ports: dict[str, list[str]]
+) -> None:
+    for socket_name, token in token_sources:
+        for port_name in socket_to_ports[socket_name]:
+            subnet.deposit(port_name, token.evolve())
+
+def _retrieve_subnet_outputs(
+    self, subnet: "PetriNet", port_socket_map: dict[str, str], parent_outputs: list[str]
+) -> list[Token]:
+    output_tokens = []
+    for port, socket in port_socket_map.items():
+        port_place = subnet.places.get(port)
+        # A pool port hands back every permit, whether or not the parent declares a return
+        # arc and whatever its cooldown: the permits and their cooldown belong to the socket.
+        is_pool = isinstance(port_place, ResourcePlace)
+        if port_place is not None and (is_pool or socket in parent_outputs):
+            tokens = port_place.retrieve_all(model_time=_LAST_FINITE_TIME if is_pool else subnet.model_time)
+            output_tokens.extend(tokens)
+    return output_tokens
+
+@staticmethod
+def _verify_permit_balance(
+    transition_name: str,
+    token_sources: list[tuple[str, Token]],
+    socket_to_ports: dict[str, list[str]],
+    output_tokens: list[Token],
+) -> None:
+    """Refuse a firing whose ports do not hand back exactly the permit copies they were lent.
+
+    The parent returns the permits it consumed whatever the subnet does, so a copy the subnet
+    keeps would mint a permit and one it adds would vanish. Permits share one colour, so the
+    place flow over them (`CPN-PFLOW`) holds exactly when the counts match.
+    """
+    lent = sum(len(socket_to_ports[socket]) for socket, token in token_sources if token.is_resource)
+    returned = sum(token.is_resource for token in output_tokens)
+    if returned < lent:
+        raise ValueError(
+            f"SubstitutionTransition '{transition_name}': subnet kept {lent - returned} of the "
+            f"{lent} permit copies lent to its ports; the parent returns its own permits anyway."
+        )
+    if returned > lent:
+        raise ValueError(
+            f"SubstitutionTransition '{transition_name}': subnet returned {returned} permit(s) "
+            f"through its ports but the firing lent it {lent}."
+        )
+
+def _execute_substitution_transition(
+    self,
+    transition: SubstitutionTransition,
+    consumed_tokens: list[Token],
+    token_sources: list[tuple[str, Token]],
+) -> list[Token]:
+    """Run a hierarchical sub-net and return its output tokens, isolated from parent context."""
+    subnet = transition.subnet
+
+    socket_to_ports = self._map_sockets_to_ports(transition.port_socket_map)
+    self._verify_port_socket_boundaries(token_sources, socket_to_ports)
+    self._deposit_into_subnet(subnet, token_sources, socket_to_ports)
+    self._drive_subnet(transition)
+
+    parent_outputs = [arc.place for arc in transition.outputs]
+    output_tokens = self._retrieve_subnet_outputs(subnet, transition.port_socket_map, parent_outputs)
+    self._verify_permit_balance(transition.name, token_sources, socket_to_ports, output_tokens)
+    return output_tokens
+
+def _run_subnet(self, subnet: "PetriNet", bound: float | None) -> None:
+    """Run *subnet* on the wall clock until it has finished, for at most *bound* seconds."""
+    end = math.inf if bound is None else time.monotonic() + bound
+    # `run()` returns only once quiescent, which a back-pressured subnet never is. A slice
+    # shorter than `run()`'s own setup would end before its first step.
+    slice_secs = max(subnet.cooldown_interval, _MIN_SUBNET_SLICE_SECS)
+    while not self._aborted():
+        now = time.monotonic()
+        if now >= end:
+            return
+        subnet.run(deadline=min(end, now + slice_secs))
+        if subnet._is_finished():
+            return
+
+def _drive_subnet(self, transition: SubstitutionTransition) -> None:
+    """Drive the subnet to quiescence in the parent's clock regime, raising if it gets stuck."""
+    subnet = transition.subnet
+
+    # Fire the subnet in the parent's clock *regime*, but on the subnet's OWN clock. The
+    # subnet's clock is isolated — the parent's logical time is never pushed onto it (doing so
+    # was unsound: a subnet fires once per binding, so a second firing at the same parent
+    # instant moved the subnet clock backward-or-equal, which `advance_time` rejects; that
+    # ValueError surfaced as a firing failure, rolled the transition back, and stranded the
+    # deposited token inside the subnet while `is_quiescent()` still reported True). What the
+    # subnet *does* inherit is whether time is logical or real:
+    #
+    #   - parent on the logical clock (`drive_to_quiescence`): drive the subnet logically too,
+    #     so its internal cooldowns/settles are jumped for free and the firing is deterministic
+    #     and cheap (the tight `drive_to_quiescence` loop, not `run()`'s wall-clock wait). The
+    #     subnet anchors and advances its own logical clock, unrelated to the parent's value.
+    #   - parent on the wall clock (`run()`, production): run the subnet on the wall clock, so
+    #     real cooldowns are genuinely waited out — the correct production semantics.
+    #
+    # `subnet_deadline_secs` bounds the drive only on the wall-clock path (`None`: unbounded); a
+    # logically-driven subnet is bounded by the parent's `drive_to_quiescence` limits, per firing.
+    # A subnet left short of quiescence by either bound fails the firing. See `tests/test_subnet.py`,
+    # `tests/test_subnet_failure.py` and `benchmarks/bench_subnet.py`.
+    with self._lock:
+        parent_on_logical_clock = self._model_time is not None
+    try:
+        if parent_on_logical_clock:
+            ticks = subnet.drive_to_quiescence(**self._drive_limits).ticks
+        else:
+            self._run_subnet(subnet, transition.subnet_deadline_secs)
+    except Exception:
+        if self._aborted():
+            raise _EnclosingFiringFailed(transition.name) from None
+        raise
+    # Closed before the check: work still queued must not start while the verdict is out.
+    subnet._closing = True
+    if subnet._is_finished():
+        subnet._closing = False
+        return
+    if self._aborted():
+        raise _EnclosingFiringFailed(transition.name)
+    if parent_on_logical_clock:
+        raise RuntimeError(
+            f"SubstitutionTransition '{transition.name}': subnet did not reach quiescence "
+            f"on the logical clock after {ticks} clock advance(s)."
+        )
+    raise TimeoutError(
+        f"SubstitutionTransition '{transition.name}': subnet did not reach quiescence "
+        f"within subnet_deadline_secs={transition.subnet_deadline_secs}."
+    )
+````
+
+```
+
+### binding_policy
+
+```
+
+binding_policy: BindingPolicy
+
+```
+
+Net-level default binding policy for transitions that do not set their own.
+
+Reassignable after construction. Because a transition's *effective* policy is this
+default when the transition leaves `binding_policy` unset, changing it can move a
+transition into or out of a `RANDOM`/`PRIORITY` search policy — which gates the
+incremental scheduler (see `_incremental_eligible`). The setter therefore recomputes
+`_has_search_policy_transition` over the current transition set and invalidates the
+scheduler, so the seeded-determinism guarantee holds even if the default is mutated
+mid-life.
+
+### retry_policy
+
+```
+
+retry_policy: RetryPolicy
+
+```
+
+Default RetryPolicy for transitions that declare none.
+
+A transition's own retry_policy wins when it has one; this is
+the fallback. Assigning anything but a `RetryPolicy` raises `TypeError`.
+
+### retry_delay
+
+```
+
+retry_delay: float
+
+```
+
+Base delay in seconds before a rolled-back data token's first retry.
+
+A view onto the default policy's delay: reading it returns
+`retry_policy.delay`, and assigning it swaps in a default policy with the new delay,
+leaving the rest of the schedule alone. Assigning a non-number, a negative, `NaN`,
+or an infinity raises.
+
+### model_time
+
+```
+
+model_time: float
+
+```
+
+Current time used for settle windows, cooldowns, and thresholds.
+
+Returns the logical clock set via advance_time, if one
+has ever been set; otherwise returns the real wall-clock time (`time.monotonic()`).
+A net that never calls `advance_time` runs entirely on real time.
+
+Returns:
+
+| Type | Description |
+| --- | --- |
+| `float` | The current logical clock value, or time.monotonic() if no logical clock is set. |
+
+### marking
+
+```
+
+marking: dict\[str, tuple[Token, ...]\]
+
+```
+
+Snapshot the current marking: every place name mapped to its live tokens.
+
+In CPN formalism the *marking* `M` is a function from places to
+multisets of colour values. This property returns, for each registered place, a
+tuple of the Token objects currently held there (taken under the
+engine lock, so it reflects a single consistent instant).
+
+Returns:
+
+| Type | Description |
+| --- | --- |
+| `dict[str, tuple[Token, ...]]` | Dict mapping place name to a tuple of tokens currently in that place. |
+
+### __init__
+
+```
+
+__init__( max_workers: int = 4, error_place: str = "failed", places: list[Place] | None = None, transitions: list[Transition] | None = None, cooldown_interval: float = 0.05, timeout_secs: float = 1.0, expr_timeout_secs: float = 0.1, retry_delay: float | None = None, binding_policy: BindingPolicy = BindingPolicy.FIRST, binding_search_limit: int = 1000, seed: int | None = None, \*, retry_policy: RetryPolicy | None = None, retry_rng: Random | None = None, ) -> None
+
+```
+
+Construct the net, its thread pools, and register any initial places/transitions.
+
+Parameters:
+
+| Name | Type | Description | Default |
+| --- | --- | --- | --- |
+| `max_workers` | `int` | Maximum number of transitions that may fire concurrently (default: 4). Also sizes the internal action thread pool. | `4` |
+| `error_place` | `str` | Name of the place that receives data tokens from failed transitions (default: "failed"). Created automatically as a standard Place, but can be overridden by registering a custom place (like a SinkPlace) with the same name before it is needed. | `'failed'` |
+| `places` | `list[Place] | None` | Optional list of Place (or subclass) instances to register at construction time (default: None). | `None` |
+| `transitions` | `list[Transition] | None` | Optional list of Transition instances to register at construction time (default: None). | `None` |
+| `cooldown_interval` | `float` | Cooldown check polling interval in seconds, used by run (default: 0.05). | `0.05` |
+| `timeout_secs` | `float` | Maximum allowed execution time in seconds for transition action callables that declare no per-transition timeout (run off the engine lock) (default: 1.0). | `1.0` |
+| `expr_timeout_secs` | `float` | Maximum allowed execution time in seconds for guard and arc selection callables. These are evaluated while holding the engine lock, so this value caps how long a single evaluation can block concurrent deposit() and step() calls. Note that under BindingPolicy.FIRST one enabling check may evaluate a callable guard up to binding_search_limit times in sequence, so the worst-case lock-hold time is binding_search_limit \* expr_timeout_secs — size both accordingly. Keep well under 1 s (default: 0.1). \*\*An uncertified `InputArc.key`/`filter` is dispatched \*per token\* over the whole available pool, which `binding_search_limit` does not bound\*\* — it truncates candidate \*bindings\*, after selection has already visited every token. The worst case is therefore `len(place) \* expr_timeout_secs` per such arc, per enabling check. This is the one place the guard bound above does not generalise: a guard is evaluated once per \*candidate binding\* (bounded), `key`/`filter` once per \*token in the pool\* (unbounded). Prefer callables that certify (see [`cpnx.certification`]) on deep places — a certified callable runs inline with no executor round-trip at all. A second caveat applies only to an uncertified `key`: this timeout bounds the \*key extraction\*, not the \*\*comparisons\*\*. `_order_available` sorts inline under the lock, so a key whose values have a slow or diverging `__lt__` can hold the lock past any timeout. Keys should return plain comparables (numbers, strings, tuples thereof). | `0.1` |
+| `retry_delay` | `float | None` | Shorthand for retry_policy=RetryPolicy(delay=...): the base delay in seconds before a rolled-back data token's first retry (default: 1.0). Mutually exclusive with retry_policy — passing both raises ValueError, since they would set the same thing. PetriNet.retry_delay stays readable and assignable either way; it is a view onto the default policy's delay. | `None` |
+| `binding_policy` | `BindingPolicy` | Net-wide default strategy for resolving which input tokens bind a transition — see BindingPolicy. Defaults to BindingPolicy.FIRST (deterministic-complete binding search, which resolves head-only and search-free for a guard-free transition). A transition may override this via its own binding_policy. Must be a BindingPolicy member — unlike Transition(binding_policy=None), None is rejected here, because a net is the default and has nothing to inherit from. The default was the head-only `BindingPolicy.LEGACY` through 0.5.0. 0.6.0 made `FIRST` the default and kept `LEGACY` as a warning-emitting opt-out; 0.7.0 removed it, so the name no longer exists. See `docs/adr/0001-combinatorial-binding-search.md`. | `FIRST` |
+| `binding_search_limit` | `int` | Maximum number of input-token combinations tried per enablement check when a transition uses BindingPolicy.FIRST (default: 1000). Bounds both the work and the memory of a search (each arc's candidate stream is truncated to this many groups), and with a callable guard also bounds the lock-hold time to roughly binding_search_limit \* expr_timeout_secs. If exhausted without finding a guard-satisfying binding, the transition is treated as disabled for that check and on_binding_search_exhausted (if set) is invoked after the lock releases. Because exhaustion means "disabled", a net whose only satisfiable binding lies beyond the limit can reach quiescence — and run can return — with that work still pending, signalled only via the callback; raise the limit if this is a concern. Must be >= 1. Ignored for guard-free FIRST transitions, which take each arc's head without searching, except those that search anyway: one with a join_key arc, and one whose filter arc shares its place with another input arc. When several arcs read one place, a candidate that would hand one token to two arcs is never built (unless one of them is consume_all), but an arc's choice that leaves a later arc on that place no tokens counts toward the limit as a candidate, so the work stays bounded by the limit. Under BindingPolicy.RANDOM/PRIORITY the search cannot short-circuit (it must scan every candidate to sample or rank), so the limit truncates the selection space to the first limit candidates: if that prefix contains a satisfying binding they select over it and fire (signalling the truncation); if it does not, the transition is disabled for that check and can stall exactly like FIRST. | `1000` |
+| `seed` | `int | None` | Optional integer seed for the net's internal random generator (random.Random(seed)). When set, it drives both the scheduler's tie-break among equal-priority enabled transitions and BindingPolicy.RANDOM binding selection. None (default) uses an unseeded instance (non-reproducible). Reproducibility caveats: use max_workers=1 for strict replay — above 1, identical seeds are not guaranteed to reproduce, because concurrent action-commit ordering (an OS-scheduled race) can change which transitions are enabled at a firing step and hence the draw sequence. Each SubstitutionTransition subnet is its own PetriNet with its own RNG, so seed subnets separately if they contain RANDOM transitions. Seeded streams are not stable across cpnx versions. | `None` |
+| `retry_policy` | `RetryPolicy | None` | Default RetryPolicy for transitions that declare none of their own — how long a rolled-back data token waits before each retry (capped exponential backoff, optionally jittered). Defaults to RetryPolicy(), a flat 1-second delay, which is what cpnx did before policies existed. A transition paces its own dependency by setting Transition.retry_policy; this is only the fallback. Mutually exclusive with retry_delay. | `None` |
+| `retry_rng` | `Random | None` | Jitter source, used only by a policy with jitter=True. One stream per net, shared by every transition's policy. Defaults to a private random.Random(seed) — reproducible under seed but a separate stream from the one driving scheduling and BindingPolicy.RANDOM, so how often actions fail cannot shift the seeded firing sequence. Pass an instance to control the draws directly (e.g. random.Random(0) in a test). Drawn only under the engine lock, so it is never used concurrently. | `None` |
+
+Raises:
+
+| Type | Description |
+| --- | --- |
+| `ValueError` | If binding_search_limit < 1; if both retry_delay and retry_policy are given; or if retry_delay is negative, NaN, or infinite. A retry_policy validates its own fields — see RetryPolicy. |
+| `TypeError` | If retry_delay is not a number, retry_policy is not a RetryPolicy, retry_rng has no callable uniform(a, b), or binding_policy is not a BindingPolicy (including None). |
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def __init__( self, max_workers: int = 4, error_place: str = "failed", places: list[Place] | None = None, transitions: list[Transition] | None = None, cooldown_interval: float = 0.05, timeout_secs: float = 1.0, expr_timeout_secs: float = 0.1, retry_delay: float | None = None, binding_policy: BindingPolicy = BindingPolicy.FIRST, binding_search_limit: int = 1000, seed: int | None = None, \*, retry_policy: RetryPolicy | None = None, retry_rng: random.Random | None = None, ) -> None: """Construct the net, its thread pools, and register any initial places/transitions.
+
+```
+Args:
+    max_workers: Maximum number of transitions that may fire concurrently
+        (default: 4). Also sizes the internal action thread pool.
+    error_place: Name of the place that receives data tokens from failed
+                 transitions (default: `"failed"`). Created automatically as a
+                 standard `Place`, but can be overridden by registering a custom
+                 place (like a `SinkPlace`) with the same name before it is needed.
+    places: Optional list of [`Place`][cpnx.Place] (or subclass) instances to
+            register at construction time (default: `None`).
+    transitions: Optional list of [`Transition`][cpnx.Transition] instances to
+                 register at construction time (default: `None`).
+    cooldown_interval: Cooldown check polling interval in seconds, used by
+                       [`run`][cpnx.PetriNet.run] (default: 0.05).
+    timeout_secs: Maximum allowed execution time in seconds for transition
+                  action callables that declare no per-transition timeout
+                  (run off the engine lock) (default: 1.0).
+    expr_timeout_secs: Maximum allowed execution time in seconds for guard
+                       and arc selection callables. These are evaluated
+                       while holding the engine lock, so this value caps how long a
+                       *single* evaluation can block concurrent
+                       `deposit()` and `step()` calls. Note that under
+                       `BindingPolicy.FIRST` one enabling check may evaluate a
+                       callable guard up to `binding_search_limit` times in sequence,
+                       so the worst-case lock-hold time is
+                       `binding_search_limit * expr_timeout_secs` — size both
+                       accordingly. Keep well under 1 s (default: 0.1).
+
+                       **An uncertified `InputArc.key`/`filter` is dispatched *per
+                       token* over the whole available pool, which
+                       `binding_search_limit` does not bound** — it truncates
+                       candidate *bindings*, after selection has already visited
+                       every token. The worst case is therefore
+                       `len(place) * expr_timeout_secs` per such arc, per enabling
+                       check. This is the one place the guard bound above does not
+                       generalise: a guard is evaluated once per *candidate binding*
+                       (bounded), `key`/`filter` once per *token in the pool*
+                       (unbounded). Prefer callables that certify (see
+                       [`cpnx.certification`]) on deep places — a certified callable
+                       runs inline with no executor round-trip at all.
+
+                       A second caveat applies only to an uncertified `key`: this
+                       timeout bounds the *key extraction*, not the **comparisons**.
+                       `_order_available` sorts inline under the lock, so a key whose
+                       values have a slow or diverging `__lt__` can hold the lock past
+                       any timeout. Keys should return plain comparables (numbers,
+                       strings, tuples thereof).
+    retry_delay: Shorthand for `retry_policy=RetryPolicy(delay=...)`: the base
+                 delay in seconds before a rolled-back data token's first retry
+                 (default: 1.0). Mutually exclusive with `retry_policy` — passing
+                 both raises `ValueError`, since they would set the same thing.
+                 `PetriNet.retry_delay` stays readable and assignable either way; it
+                 is a view onto the default policy's `delay`.
+    binding_policy: Net-wide default strategy for resolving which input tokens
+                 bind a transition — see [`BindingPolicy`][cpnx.BindingPolicy].
+                 Defaults to `BindingPolicy.FIRST` (deterministic-complete
+                 binding search, which resolves head-only and search-free for a
+                 guard-free transition). A transition may override this via its
+                 own `binding_policy`. Must be a `BindingPolicy` member —
+                 unlike `Transition(binding_policy=None)`, `None` is rejected
+                 here, because a net *is* the default and has nothing to inherit
+                 from.
+
+                 The default was the head-only `BindingPolicy.LEGACY` through
+                 0.5.0. 0.6.0 made `FIRST` the default and kept `LEGACY` as a
+                 warning-emitting opt-out; 0.7.0 removed it, so the name no longer
+                 exists. See `docs/adr/0001-combinatorial-binding-search.md`.
+    binding_search_limit: Maximum number of input-token combinations tried per
+                 enablement check when a transition uses `BindingPolicy.FIRST`
+                 (default: 1000). Bounds both the work and the memory of a search
+                 (each arc's candidate stream is truncated to this many groups), and
+                 with a callable guard also bounds the lock-hold time to roughly
+                 `binding_search_limit * expr_timeout_secs`. If exhausted without
+                 finding a guard-satisfying binding, the transition is treated as
+                 disabled for that check and `on_binding_search_exhausted` (if set) is
+                 invoked after the lock releases. Because exhaustion means "disabled",
+                 a net whose only satisfiable binding lies beyond the limit can reach
+                 quiescence — and [`run`][cpnx.PetriNet.run] can return — with that
+                 work still pending, signalled only via the callback; raise the limit
+                 if this is a concern. Must be `>= 1`. Ignored for guard-free `FIRST`
+                 transitions, which take each arc's head without searching, except
+                 those that search anyway: one with a `join_key` arc, and one whose
+                 `filter` arc shares its place with another input arc. When several arcs
+                 read one place, a candidate that would hand one token to two arcs is
+                 never built (unless one of them is `consume_all`), but an arc's choice
+                 that leaves a later arc on that place no tokens counts toward the
+                 limit as a candidate, so the work stays bounded by the limit. Under
+                 `BindingPolicy.RANDOM`/`PRIORITY` the search cannot short-circuit
+                 (it must scan every candidate to sample or rank),
+                 so the limit truncates the selection space to the first `limit`
+                 candidates: if that prefix contains a satisfying binding they select
+                 over it and fire (signalling the truncation); if it does not, the
+                 transition is disabled for that check and can stall exactly like
+                 `FIRST`.
+    seed: Optional integer seed for the net's internal random generator
+                 (`random.Random(seed)`). When set, it drives **both** the scheduler's
+                 tie-break among equal-priority enabled transitions **and**
+                 `BindingPolicy.RANDOM` binding selection. `None` (default) uses an
+                 unseeded instance (non-reproducible). Reproducibility caveats: use
+                 `max_workers=1` for strict replay — above 1, identical seeds are **not
+                 guaranteed** to reproduce, because concurrent action-commit ordering
+                 (an OS-scheduled race) can change which transitions are enabled at a
+                 firing step and hence the draw sequence. Each
+                 [`SubstitutionTransition`][cpnx.SubstitutionTransition] subnet is its
+                 own `PetriNet` with its own RNG, so seed subnets separately if they
+                 contain `RANDOM` transitions. Seeded streams are not stable across
+                 cpnx versions.
+    retry_policy: Default [`RetryPolicy`][cpnx.RetryPolicy] for transitions that
+                 declare none of their own — how long a rolled-back data token waits
+                 before each retry (capped exponential backoff, optionally jittered).
+                 Defaults to `RetryPolicy()`, a flat 1-second delay, which is what
+                 cpnx did before policies existed. A transition paces its own
+                 dependency by setting [`Transition.retry_policy`][cpnx.Transition];
+                 this is only the fallback. Mutually exclusive with `retry_delay`.
+    retry_rng: Jitter source, used only by a policy with `jitter=True`. One
+                 stream per net, shared by every transition's policy. Defaults to a
+                 private `random.Random(seed)` — reproducible under `seed` but a
+                 **separate stream** from the one driving scheduling and
+                 `BindingPolicy.RANDOM`, so how often actions fail cannot shift the
+                 seeded firing sequence. Pass an instance to control the draws
+                 directly (e.g. `random.Random(0)` in a test). Drawn only under the
+                 engine lock, so it is never used concurrently.
+
+Raises:
+    ValueError: If `binding_search_limit < 1`; if both `retry_delay` and
+        `retry_policy` are given; or if `retry_delay` is negative, `NaN`, or
+        infinite. A `retry_policy` validates its own fields — see
+        [`RetryPolicy`][cpnx.RetryPolicy].
+    TypeError: If `retry_delay` is not a number, `retry_policy` is not a
+        `RetryPolicy`, `retry_rng` has no callable `uniform(a, b)`, or
+        `binding_policy` is not a `BindingPolicy` (including `None`).
+"""
+#: Created first: the `retry_policy`/`retry_delay` setters below take it, and
+#: `_init_retry` goes through them.
+self._lock = threading.Lock()
+self.max_workers = max_workers
+self.error_place = error_place
+self.cooldown_interval = cooldown_interval
+self.timeout_secs = timeout_secs
+self.expr_timeout_secs = expr_timeout_secs
+self._init_retry(retry_delay, retry_policy, retry_rng, seed)
+#: Backing field for the `binding_policy` property. Set directly here (the property
+#: setter recomputes `_has_search_policy_transition`, which needs `self.transitions`
+#: to already exist — it does not yet at this point in construction), so the setter's
+#: validation is applied explicitly first.
+_reject_non_binding_policy(binding_policy, name="PetriNet(binding_policy=...)", allow_none=False)
+self._binding_policy = binding_policy
+if binding_search_limit < 1:
+    raise ValueError(f"binding_search_limit must be >= 1, got {binding_search_limit}.")
+self.binding_search_limit = binding_search_limit
+self._rng = random.Random(seed)
+self._init_selectors(seed)
+self._has_timed_features = False
+self._model_time: float | None = None
+self.places: dict[str, Place] = {}
+self.transitions: dict[str, Transition] = {}
+self._running_count = 0
+self._drive_limits: dict[str, int | bool] = {}
+self._nested_undo: list[_NestedUndo] | None = None
+self._pending_restore: tuple[dict[str, tuple[Token, ...]], list[_NestedUndo], float] | None = None
+self._settle_lock = threading.Lock()
+self._closing = False
+#: Set by `__exit__`. An inline drive never submits to `_executor`, so it checks this to
+#: refuse to fire on a closed net, as `step()` does when its submit raises.
+self._shut_down = False
+self._parent: weakref.ref[PetriNet] | None = None
+self._subnets: list[PetriNet] = []
+self._executor = ThreadPoolExecutor(max_workers=max_workers)
+self._action_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="cpnx-action")
+self._expr_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cpnx-expr")
+# Signalled whenever tokens are deposited; wakes run() without busy-waiting.
+self._work_available = threading.Event()
+
+#: Called after a transition completes successfully.
+#: Signature: `(transition_name: str, duration_secs: float) -> None`.
+#: Fires outside the engine lock — safe to call `deposit` from here.
+self.on_transition_fired: Callable[[str, float], None] | None = None
+
+#: Called after any token is deposited into any place.
+#: Signature: `(place_name: str, token: Token) -> None`.
+#: Fires outside the engine lock — safe to call `deposit` from here.
+#: Warning: do **not** call `add_place` or `add_transition` from
+#: within this callback.
+self.on_token_deposited: Callable[[str, Token], None] | None = None
+
+#: Called when a data token is dead-lettered to the error place (due to exhausted retries or immediate failure).
+#: Signature: `(transition_name: str, token: Token) -> None`.
+#: Fires outside the engine lock.
+self.on_token_dead_lettered: Callable[[str, Token], None] | None = None
+
+#: Called when a transition's action raises an exception.
+#: Signature: `(transition_name: str, exc: Exception, token: Token | None) -> None`.
+#: `token` is the data token that was routed to the error place or rolled back,
+#: or `None` if the transition had no data inputs.
+#: Fires outside the engine lock.
+self.on_error: Callable[[str, Exception, Token | None], None] | None = None
+
+#: Called with a transition name when a binding search reaches `binding_search_limit`.
+#: The meaning depends on policy: under `BindingPolicy.FIRST` the limit was hit
+#: **without** a guard-satisfying binding, so the transition is treated as disabled for
+#: that check; under `BindingPolicy.RANDOM`/`PRIORITY` (which must scan every candidate)
+#: it signals that the candidate space was **truncated** to the first `limit`
+#: candidates — a binding may still have been selected and the transition may still
+#: fire. In both cases: raise `binding_search_limit` if you need the full space
+#: considered.
+#: Signature: `(transition_name: str) -> None`.
+#: Fires **outside** the engine lock — it is safe to call back into the net (e.g.
+#: `deposit`) from here. Exhaustions are de-duplicated *within* a single enabling pass
+#: (so cross-thread interleavings collapse to one call), but it still fires once per
+#: pass: a busy `run()` loop re-checks each transition on every `step()`/
+#: `is_quiescent()` iteration, so an over-limit transition signals repeatedly while
+#: the loop runs. Keep the callback cheap, and debounce on your side if needed.
+#: Guard-free `FIRST` transitions signal it too when they search: a `join_key`
+#: transition, and one whose `filter` arc shares its place with another arc.
+self.on_binding_search_exhausted: Callable[[str], None] | None = None
+#: Transition names whose binding search exhausted the limit during the current
+#: lock-holding enabling pass; drained and dispatched (de-duplicated) after the lock
+#: is released. A `set` so repeated exhaustions in one pass collapse to one callback.
+self._pending_exhaustions: set[str] = set()
+#: ``id(InputArc)`` -> the ``key`` last registered as a place key-index for it.
+#: Lets `_ensure_key_index` skip re-registering on the hot path, while still
+#: rebuilding when an arc's ``key`` is reassigned after construction.
+self._key_index_arcs: dict[int, Callable[[Token], object]] = {}
+#: Transition name -> ``{input position: (arc, place, join_key, index_id, depth)}`` for
+#: each join arc read through a place join index (see `_ensure_join_index`). Positions
+#: reading one place with one `join_key` share an index id; two transitions never do, so
+#: an `InputArc` object shared by two transitions is read through two indexes, each with
+#: one reader (ADR 0011 §2).
+#: Holding the place lets `_release_stale_join_indexes` drop an index once its arc stops
+#: reading that place through it.
+self._join_registrations: dict[str, dict[int, _JoinRegistration]] = {}
+#: Transition name -> the `_JoinMatch` that tracks which join keys all its join places
+#: hold (see `_matched_join_combos`). Dropped whenever it cannot serve.
+self._join_matches: dict[str, _JoinMatch] = {}
+#: Transition name -> first exception from a `binding_priority_key` that raised for
+#: *every* candidate binding during the current enabling pass (so `PRIORITY` silently
+#: fell back to insertion order). Drained and dispatched via `on_error` (de-duplicated)
+#: after the lock releases, so a broken key surfaces instead of failing silently.
+self._pending_key_failures: dict[str, Exception] = {}
+#: ``(transition, place)`` -> the first exception an `InputArc.key`/`filter` raised
+#: while selecting for that arc, paired with whether that arc's place key-index
+#: disabled itself as a result (which decides whether the report carries the #34
+#: caveat). Buffered under the lock, dispatched via `on_error` (de-duplicated) by
+#: `_flush_selection_failures` — see issue #29.
+self._pending_selection_failures: dict[tuple[str, str], tuple[Exception, bool]] = {}
+#: ``(transition, place)`` -> the ids of the tokens that were in the pool the last
+#: time it reported. A later fault sharing *any* of those tokens is the same ongoing
+#: fault and stays quiet; one sharing none is a new event and reports. Identifying the
+#: fault by its witnesses rather than by a success-clears-it flag is what makes this
+#: correct when selection is never reached (the place drained below `count`, so
+#: `_gather_arc_pools` bailed first) and when two *different* views of the pool
+#: alternate (`step()` excludes cooling tokens, `is_quiescent()` includes them) — the
+#: latter otherwise cleared and re-armed the latch on every poll.
+self._selection_faulted: dict[tuple[str, str], frozenset[str]] = {}
+#: ``id(InputArc)`` for arcs whose place key-index disabled itself on a *reported*
+#: selection fault. The engine re-arms the index (`Place.rearm_key_index`) the next
+#: time selection succeeds for the arc and discards it here, so the fast path recovers
+#: once the offending token is gone rather than staying disabled for the life of the
+#: net (issue #34). Empty for a net whose keys never raise, so the healthy path pays
+#: only a set-membership test.
+self._key_index_disabled_arcs: set[int] = set()
+
+# --- Incremental enablement scheduler (ADR 0006) ---
+# `self._has_timed_features` (declared above) also gates the incremental fast path off
+# (see `_incremental_eligible`): `PacedResourcePlace` cooldowns and `settle_secs` windows
+# re-enable as *time* advances with no marking mutation, which a per-place dirty set
+# cannot observe. It is monotonic (only ever flips False→True).
+#: True when any registered transition resolves under an effective
+#: `BindingPolicy.RANDOM`/`PRIORITY`. Those draw the seeded RNG *during binding
+#: resolution, per enabled transition, per step*; the incremental scheduler resolves
+#: a different count of them, which would shift the seeded stream. Latched True by
+#: `add_transition`, and *recomputed* over the whole transition set by the
+#: `binding_policy` setter — reassigning the net-level default can flip a transition's
+#: *effective* policy into (or out of) a search policy, so the flag cannot be treated
+#: as monotonic once the default is mutable.
+self._has_search_policy_transition = False
+#: Whether the routing tables + dirty seed have been built for the current transition
+#: set. Reset by `add_transition`; rebuilt lazily by `_ensure_scheduler_ready`.
+self._scheduler_ready = False
+#: Whether resource-return self-loops have been synthesized for the current topology.
+#: Reset by `add_place`/`add_transition`; done once (idempotently) before the first
+#: firing or introspection via `_ensure_resource_returns_synthesized`.
+self._resource_returns_synthesized = False
+#: Place name -> transitions with an `InputArc` on it (adding tokens may enable them).
+#: A source table for `_dirty_routing`, which is what a reconcile reads.
+self._input_routing: dict[str, list[Transition]] = {}
+#: Place name -> transitions with an *unconditional* `OutputArc` on it. Removing tokens
+#: from such a place can release back-pressure (`_check_output_capacity`) and re-enable
+#: the producer; conditional arcs never block, so they are excluded. A source table for
+#: `_dirty_routing`, like `_input_routing`.
+self._output_routing: dict[str, list[Transition]] = {}
+#: Place name -> names of the transitions in `_input_routing` or `_output_routing` for it:
+#: the transitions a change to that place may enable or unblock. `_reconcile_dirty` folds
+#: each dirty place into its re-check set with one set union against this.
+self._dirty_routing: dict[str, frozenset[str]] = {}
+#: Places whose token pool changed since the last reconcile (the "dirty set").
+self._dirty_places: set[str] = set()
+#: Transitions re-evaluated on *every* reconcile because their enablement can change
+#: with no input-place mutation (input-less sources, guard/key/filter that may read
+#: external mutable state). See `_is_volatile`. Rebuilt by the scheduler seed.
+self._volatile_transitions: set[str] = set()
+#: Transitions with a satisfiable binding held back *only* by output back-pressure.
+#: Re-checked every reconcile so they unblock the moment their output place drops below
+#: bound — including an out-of-band `place.retrieve()` the dirty set never sees.
+self._capacity_blocked: set[str] = set()
+#: Selection-enabled transitions (output capacity OK *and* a timing-aware binding
+#: resolved) -> that resolved binding, maintained incrementally. Reused by `is_dead`.
+self._enabled_bindings: dict[str, _Binding] = {}
+#: Transitions with a binding *ignoring* timing and capacity — the quiescence
+#: predicate (`_is_transition_potentially_enabled`). Lets `is_quiescent` answer in O(1).
+self._potentially_enabled: set[str] = set()
+#: `priority` value -> list of selection-enabled transition names at that priority.
+#: Selection picks the minimum non-empty bucket, so `step` is O(1). Maintained by
+#: swap-remove (`_bucket_add`/`_bucket_remove`), so bucket order is not registration
+#: order — safe because eligible (`FIRST`) nets draw RNG only for the tie-break,
+#: whose stream advance depends on candidate *count*, not order.
+self._priority_buckets: dict[int, list[str]] = {}
+#: Transition name -> its index within its priority bucket (for O(1) swap-remove).
+self._bucket_index: dict[str, int] = {}
+#: Transition name -> registration order. Reconcile re-evaluates the affected set in this
+#: order so bucket membership (and hence the seeded `_rng.choice` tie-break) is
+#: deterministic across processes — a plain `set` iteration is hash-seed-randomized.
+self._transition_order: dict[str, int] = {}
+#: Min-heap of `(available_at, place_name)` for future-dated (retry-delayed) tokens.
+#: Drained at reconcile: a popped boundary <= now re-dirties its place, so a rolled-back
+#: token re-enables its transition once `retry_delay` elapses without a full-net rescan.
+self._reactivation: list[tuple[float, str]] = []
+
+self.add_place(Place(error_place))
+for p in places or []:
+    self.add_place(p)
+for t in transitions or []:
+    self.add_transition(t)
+```
+
+```
+
+### advance_time
+
+```
+
+advance_time(new_time: float) -> None
+
+```
+
+Advance the net's logical clock to `new_time` and wake any waiting `run` loop.
+
+Once called, the net switches from real (`time.monotonic()`) to logical time for all
+settle-window, cooldown, and threshold checks. Subsequent calls must strictly increase
+the clock.
+
+Parameters:
+
+| Name | Type | Description | Default |
+| --- | --- | --- | --- |
+| `new_time` | `float` | The new logical timestamp. Must be strictly greater than the current model time (if one has already been set), and must be finite. | *required* |
+
+Raises:
+
+| Type | Description |
+| --- | --- |
+| `ValueError` | If new_time is less than or equal to the current model time, or is not finite. |
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def advance_time(self, new_time: float) -> None: """Advance the net's logical clock to `new_time` and wake any waiting `run` loop.
+
+```
+Once called, the net switches from real (`time.monotonic()`) to logical time for all
+settle-window, cooldown, and threshold checks. Subsequent calls must strictly increase
+the clock.
+
+Args:
+    new_time: The new logical timestamp. Must be strictly greater than the current
+        model time (if one has already been set), and must be finite.
+
+Raises:
+    ValueError: If `new_time` is less than or equal to the current model time, or is
+        not finite.
+"""
+if not math.isfinite(new_time):
+    # A non-finite clock is unrecoverable, not merely odd: at `_model_time = inf`
+    # every `available_at > t_limit` comparison is false, so tokens parked at
+    # infinity mature immediately and *every* finite delay, cooldown and settle
+    # window in the net collapses to "already elapsed". Reject it at the setter so no
+    # caller — `drive_to_quiescence` included — can get the net into that state.
+    raise ValueError(
+        f"Clock mutability violation: the global clock must be finite, got {new_time}. "
+        "A non-finite clock makes every delay, cooldown, and settle window compare as "
+        "already elapsed."
+    )
+with self._lock:
+    if self._model_time is not None and new_time <= self._model_time:
+        raise ValueError(
+            f"Clock mutability violation: cannot decrement global clock backward or equal "
+            f"from {self._model_time} to {new_time}."
+        )
+    self._model_time = new_time
+# Signal that new work might have become available due to time advancing!
+self._work_available.set()
+```
+
+```
+
+### add_place
+
+```
+
+add_place(place: Place) -> None
+
+```
+
+Register `place` with the net under its `place.name`.
+
+Must be called before any transition arc references this place by name
+and before run or step is invoked.
+
+Parameters:
+
+| Name | Type | Description | Default |
+| --- | --- | --- | --- |
+| `place` | `Place` | A Place, ResourcePlace, PacedResourcePlace, or ThresholdPlace/SinkPlace instance. | *required* |
+
+Raises:
+
+| Type | Description |
+| --- | --- |
+| `ValueError` | If place.name is already registered as a transition name, or the place is a socket whose colour set differs from its port's. |
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def add_place(self, place: Place) -> None: """Register `place` with the net under its `place.name`.
+
+```
+Must be called before any transition arc references this place by name
+and before [`run`][cpnx.PetriNet.run] or [`step`][cpnx.PetriNet.step] is invoked.
+
+Args:
+    place: A [`Place`][cpnx.Place], [`ResourcePlace`][cpnx.ResourcePlace],
+           [`PacedResourcePlace`][cpnx.PacedResourcePlace], or
+           `ThresholdPlace`/`SinkPlace` instance.
+
+Raises:
+    ValueError: If `place.name` is already registered as a transition name, or the
+        place is a socket whose colour set differs from its port's.
+"""
+with self._lock:
+    if place.name in self.transitions:
+        raise ValueError(f"Name overlap: '{place.name}' is already registered as a Transition.")
+    for transition in self.transitions.values():
+        if isinstance(transition, SubstitutionTransition):
+            self._reject_port_socket_mismatch(transition, {place.name: place})
+    self.places[place.name] = place
+    if isinstance(place, PacedResourcePlace):
+        self._has_timed_features = True
+    # A newly-registered place may reclassify an arc as a resource borrow.
+    self._resource_returns_synthesized = False
+```
+
+```
+
+### add_transition
+
+```
+
+add_transition(transition: Transition) -> None
+
+```
+
+Register `transition` with the net under its `transition.name`.
+
+All places referenced by the transition's input and output arcs must be
+registered via add_place before the first time the
+transition fires — referencing an undeclared name raises `KeyError` at fire time.
+
+Parameters:
+
+| Name | Type | Description | Default |
+| --- | --- | --- | --- |
+| `transition` | `Transition` | The Transition (or SubstitutionTransition) to register. | *required* |
+
+Raises:
+
+| Type | Description |
+| --- | --- |
+| `ValueError` | If transition.name is already registered as a place name, or if transition is a SubstitutionTransition whose subnet is this net, encloses it, or is already wrapped in another net, or with a port whose colour set differs from its socket's, a port that is a resource pool when its socket is not (or the reverse), or a resource pool mapped as a port that holds permits of its own. |
+| `TypeError` | If one of the transition's arcs targets another transition's name instead of a place. |
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def add_transition(self, transition: Transition) -> None: """Register `transition` with the net under its `transition.name`.
+
+```
+All places referenced by the transition's input and output arcs must be
+registered via [`add_place`][cpnx.PetriNet.add_place] before the first time the
+transition fires — referencing an undeclared name raises `KeyError` at fire time.
+
+Args:
+    transition: The [`Transition`][cpnx.Transition] (or
+        [`SubstitutionTransition`][cpnx.SubstitutionTransition]) to register.
+
+Raises:
+    ValueError: If `transition.name` is already registered as a place name, or if
+        `transition` is a [`SubstitutionTransition`][cpnx.SubstitutionTransition] whose
+        subnet is this net, encloses it, or is already wrapped in another net, or with
+        a port whose colour set differs from its socket's, a port that is a resource
+        pool when its socket is not (or the reverse), or a resource pool mapped as a port
+        that holds permits of its own.
+    TypeError: If one of the transition's arcs targets another transition's name
+        instead of a place.
+"""
+_warn_if_drained_twice(transition)
+with self._lock:
+    self._validate_new_transition(transition)
+    if isinstance(transition, SubstitutionTransition):
+        self._reject_subnet_link(transition)
+        self._reject_port_socket_mismatch(transition, self.places)
+        self._reject_filled_pool_port(transition)
+    self._unlink_replaced(self.transitions.get(transition.name))
+    self._reset_selector_state(transition.name)
+    self.transitions[transition.name] = transition
+    if isinstance(transition, SubstitutionTransition):
+        self._subnets.append(transition.subnet)
+        transition.subnet._parent = weakref.ref(self)
+    if any(arc.settle_secs > 0.0 for arc in transition.inputs):
+        self._has_timed_features = True
+    if self._searches_bindings(transition):
+        self._has_search_policy_transition = True
+    if transition.binding_selector is not None:
+        self._selector_transitions.add(transition.name)
+    # The transition set changed: the routing tables and dirty seed must be rebuilt
+    # before the incremental scheduler is next consulted.
+    self._scheduler_ready = False
+    # …and its resource borrows may need a synthesized return arc.
+    self._resource_returns_synthesized = False
+```
+
+```
+
+### deposit
+
+```
+
+deposit(place_name: str, token: Token) -> None
+
+```
+
+Deposit `token` into `place_name`, auto-creating a bare place if it does not exist.
+
+This is the primary entry point for injecting work items from external
+sources (data loaders, scheduled events, API responses, etc.). Also wakes any
+thread blocked in run and invokes `on_token_deposited`
+(if set) outside the engine lock.
+
+Note
+
+Auto-creation always produces a bare Place.
+If you need a ResourcePlace or
+`ThresholdPlace`, call add_place first.
+
+Parameters:
+
+| Name | Type | Description | Default |
+| --- | --- | --- | --- |
+| `place_name` | `str` | Name of the target place. | *required* |
+| `token` | `Token` | The token to deposit. | *required* |
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def deposit(self, place_name: str, token: Token) -> None: """Deposit `token` into `place_name`, auto-creating a bare place if it does not exist.
+
+```
+This is the primary entry point for injecting work items from external
+sources (data loaders, scheduled events, API responses, etc.). Also wakes any
+thread blocked in [`run`][cpnx.PetriNet.run] and invokes `on_token_deposited`
+(if set) outside the engine lock.
+
+Note:
+    Auto-creation always produces a bare [`Place`][cpnx.Place].
+    If you need a [`ResourcePlace`][cpnx.ResourcePlace] or
+    `ThresholdPlace`, call [`add_place`][cpnx.PetriNet.add_place] first.
+
+Args:
+    place_name: Name of the target place.
+    token: The token to deposit.
+"""
+with self._lock:
+    if place_name not in self.places:
+        self.places[place_name] = Place(place_name)
+    self.places[place_name].deposit(token, model_time=self._get_model_time_under_lock())
+    self._mark_dirty(place_name, token)
+self._work_available.set()
+if self.on_token_deposited:
+    try:
+        self.on_token_deposited(place_name, token)
+    except Exception:
+        pass
+```
+
+```
+
+### step
+
+```
+
+step() -> bool
+
+```
+
+Fire one enabled transition and return immediately, without waiting for it to finish.
+
+Selects the highest-priority enabled transition (ties broken at random among
+transitions sharing the lowest `priority` value), consumes its input tokens, and
+submits its action to the thread pool — all atomically under the engine lock. Returns
+before the action completes; the transition's effects are committed later, from a
+worker thread, once the action finishes.
+
+Returns:
+
+| Type | Description |
+| --- | --- |
+| `bool` | True if a transition was selected and its action was scheduled; False if no |
+| `bool` | transition is currently enabled. A False return does not mean the net is |
+| `bool` | finished — transitions may still be in flight, or may become enabled once |
+| `bool` | in-flight transitions or cooldowns complete. Use |
+| `bool` | is_quiescent to check for that. |
+
+Raises:
+
+| Type | Description |
+| --- | --- |
+| `RuntimeError` | If submitting to the internal thread pool fails (e.g. the pool has already been shut down, such as after exiting a with block). Any tokens already consumed from input places are returned before the error propagates. |
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def step(self) -> bool: """Fire one enabled transition and return immediately, without waiting for it to finish.
+
+```
+Selects the highest-priority enabled transition (ties broken at random among
+transitions sharing the lowest `priority` value), consumes its input tokens, and
+submits its action to the thread pool — all atomically under the engine lock. Returns
+before the action completes; the transition's effects are committed later, from a
+worker thread, once the action finishes.
+
+Returns:
+    `True` if a transition was selected and its action was scheduled; `False` if no
+    transition is currently enabled. A `False` return does not mean the net is
+    finished — transitions may still be in flight, or may become enabled once
+    in-flight transitions or cooldowns complete. Use
+    [`is_quiescent`][cpnx.PetriNet.is_quiescent] to check for that.
+
+Raises:
+    RuntimeError: If submitting to the internal thread pool fails (e.g. the pool has
+        already been shut down, such as after exiting a `with` block). Any tokens
+        already consumed from input places are returned before the error propagates.
+"""
+return self._fire_one(inline=False)
+```
+
+```
+
+### validate
+
+```
+
+validate() -> None
+
+```
+
+Check the net's structural topology and raise on the first problem found.
+
+Checks for name overlaps between places and transitions, and verifies
+that all transition arcs connect to valid, registered places rather than
+transitions. Called automatically at the start of run.
+
+Also **synthesizes resource-return arcs** (once, idempotently): for every transition
+that borrows from a ResourcePlace via an `InputArc` with no
+matching `OutputArc`, an `OutputArc(pool)` marked `synthesized=True` is appended so the
+permit's return is expressed structurally. This is behaviour-preserving — permits were
+already returned on success — and is suppressed per transition by declaring the arc
+yourself or setting `auto_return_resources=False` (see
+Transition). `consume_all` resource borrows are left on the
+implicit path.
+
+Raises:
+
+| Type | Description |
+| --- | --- |
+| `ValueError` | If a name is registered as both a place and a transition, a port and its socket declare different colour sets, only one of them is a resource pool, or a resource pool mapped as a port holds permits of its own. |
+| `TypeError` | If a transition's arc targets another transition's name. |
+| `KeyError` | If a transition's arc references a place that has not been registered via add_place. |
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def validate(self) -> None: """Check the net's structural topology and raise on the first problem found.
+
+```
+Checks for name overlaps between places and transitions, and verifies
+that all transition arcs connect to valid, registered places rather than
+transitions. Called automatically at the start of [`run`][cpnx.PetriNet.run].
+
+Also **synthesizes resource-return arcs** (once, idempotently): for every transition
+that borrows from a [`ResourcePlace`][cpnx.ResourcePlace] via an `InputArc` with no
+matching `OutputArc`, an `OutputArc(pool)` marked `synthesized=True` is appended so the
+permit's return is expressed structurally. This is behaviour-preserving — permits were
+already returned on success — and is suppressed per transition by declaring the arc
+yourself or setting `auto_return_resources=False` (see
+[`Transition`][cpnx.Transition]). `consume_all` resource borrows are left on the
+implicit path.
+
+Raises:
+    ValueError: If a name is registered as both a place and a transition, a port
+        and its socket declare different colour sets, only one of them is a resource
+        pool, or a resource pool mapped as a port holds permits of its own.
+    TypeError: If a transition's arc targets another transition's name.
+    KeyError: If a transition's arc references a place that has not been
+        registered via [`add_place`][cpnx.PetriNet.add_place].
+"""
+with self._lock:
+    # Check overlap between place names and transition names
+    overlaps = set(self.places.keys()) & set(self.transitions.keys())
+    if overlaps:
+        raise ValueError(f"Name overlap: '{list(overlaps)[0]}' is registered as both a Place and a Transition.")
+
+    # Make each resource borrow's return structural before validating arcs, so the
+    # synthesized return arcs are checked alongside the author's own.
+    self._synthesize_resource_returns_under_lock()
+
+    for name, transition in self.transitions.items():
+        self._validate_transition_arcs(name, transition)
+        if isinstance(transition, SubstitutionTransition):
+            self._reject_port_socket_mismatch(transition, self.places)
+            self._reject_filled_pool_port(transition)
+```
+
+```
+
+### run
+
+```
+
+run( deadline: float | None = None, \*, stop_event: Event | None = None, ) -> None
+
+```
+
+Repeatedly call `step` until the net is quiescent, the deadline passes, or stopped.
+
+Validates the net first (see validate), then loops:
+clear the work-available signal, try to fire a transition via
+step, and if nothing fired, sleep on an internal
+`threading.Event` (bounded by `cooldown_interval`, or by 0.1s when `stop_event` is
+given) rather than busy-waiting — the event wakes immediately when new tokens are
+deposited, a transition completes, or the clock advances. The loop checks
+`stop_event`/`deadline` before each firing attempt, so it exits promptly rather than
+only between full sleep cycles.
+
+Parameters:
+
+| Name | Type | Description | Default |
+| --- | --- | --- | --- |
+| `deadline` | `float | None` | Absolute monotonic timestamp after which the loop exits, even if the net is not yet quiescent. Always construct this as time.monotonic() + <seconds>. If None (default), runs until the net is quiescent, with no time limit. | `None` |
+| `stop_event` | `Event | None` | Optional threading.Event. If set (by another thread) at any point during the loop, run exits promptly, leaving any in-flight transitions running in the background. | `None` |
+
+Warning
+
+Passing a raw duration (e.g. `run(30)`) instead of an absolute
+deadline causes immediate exit because `time.monotonic()` is always
+much larger than small floats. Use `run(deadline=time.monotonic() + 30)`.
+
+
+Note
+
+A `BindingPolicy.FIRST` transition whose only satisfiable binding lies beyond
+`binding_search_limit` counts as disabled, so `run` can return "quiescent" while
+that token still sits in its place. The exhaustion is surfaced via
+`on_binding_search_exhausted`; raise `binding_search_limit` if such tokens must be
+processed. `RANDOM`/`PRIORITY` stall the same way *when no satisfying binding lies
+within the first `limit` candidates*; if one does, they select over that truncated
+prefix and fire (still signalling the truncation).
+
+
+Note
+
+Reproducibility of a seeded net (`PetriNet(seed=...)`) holds for **synchronous
+stepping** and for nets whose enablement does not depend on in-flight deposits.
+In a pipelined net with concurrent actions, whether a worker-thread deposit lands
+before or after the next `step` acquires the lock is OS-scheduled; that can change
+which transitions are enabled at a firing step and hence the RNG draw sequence.
+For strict replay use `max_workers=1`; above 1, identical seeds are **not**
+guaranteed to reproduce. Seeded streams are also not stable across cpnx versions.
+
+
+Example
+
+```
+
+net.run(deadline=time.monotonic() + 30) # run for up to 30 seconds net.run() # run to quiescence
+
+```
+
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def run( self, deadline: float | None = None, \*, stop_event: threading.Event | None = None, ) -> None: """Repeatedly call `step` until the net is quiescent, the deadline passes, or stopped.
+
+````
+Validates the net first (see [`validate`][cpnx.PetriNet.validate]), then loops:
+clear the work-available signal, try to fire a transition via
+[`step`][cpnx.PetriNet.step], and if nothing fired, sleep on an internal
+`threading.Event` (bounded by `cooldown_interval`, or by 0.1s when `stop_event` is
+given) rather than busy-waiting — the event wakes immediately when new tokens are
+deposited, a transition completes, or the clock advances. The loop checks
+`stop_event`/`deadline` before each firing attempt, so it exits promptly rather than
+only between full sleep cycles.
+
+Args:
+    deadline: **Absolute** monotonic timestamp after which the loop exits, even if
+        the net is not yet quiescent. Always construct this as
+        `time.monotonic() + <seconds>`. If `None` (default), runs until the net is
+        quiescent, with no time limit.
+    stop_event: Optional `threading.Event`. If set (by another thread) at any point
+        during the loop, `run` exits promptly, leaving any in-flight transitions
+        running in the background.
+
+Warning:
+    Passing a raw duration (e.g. `run(30)`) instead of an absolute
+    deadline causes immediate exit because `time.monotonic()` is always
+    much larger than small floats. Use `run(deadline=time.monotonic() + 30)`.
+
+Note:
+    A `BindingPolicy.FIRST` transition whose only satisfiable binding lies beyond
+    `binding_search_limit` counts as disabled, so `run` can return "quiescent" while
+    that token still sits in its place. The exhaustion is surfaced via
+    `on_binding_search_exhausted`; raise `binding_search_limit` if such tokens must be
+    processed. `RANDOM`/`PRIORITY` stall the same way *when no satisfying binding lies
+    within the first `limit` candidates*; if one does, they select over that truncated
+    prefix and fire (still signalling the truncation).
+
+Note:
+    Reproducibility of a seeded net (`PetriNet(seed=...)`) holds for **synchronous
+    stepping** and for nets whose enablement does not depend on in-flight deposits.
+    In a pipelined net with concurrent actions, whether a worker-thread deposit lands
+    before or after the next `step` acquires the lock is OS-scheduled; that can change
+    which transitions are enabled at a firing step and hence the RNG draw sequence.
+    For strict replay use `max_workers=1`; above 1, identical seeds are **not**
+    guaranteed to reproduce. Seeded streams are also not stable across cpnx versions.
+
+Example:
+    ```python
+    net.run(deadline=time.monotonic() + 30)  # run for up to 30 seconds
+    net.run()  # run to quiescence
+    ```
+"""
+self.validate()
+while not self.is_quiescent():
+    if self._should_stop_run(deadline, stop_event) or self._aborted():
+        break
+    self._work_available.clear()
+    if not self.step():
+        self._wait_for_work(deadline, stop_event)
+````
+
+```
+
+### drive_to_quiescence
+
+```
+
+drive_to_quiescence( \*, max_ticks: int = 1000000, max_spins: int = 10000000, inline_actions: bool = False, ) -> DriveResult
+
+```
+
+Drive the net to quiescence on its **logical clock**, jumping over timed waits.
+
+The deterministic counterpart to run. Where `run` waits out
+cooldowns and settle windows on the real wall clock — so a net with an 8-second grinder
+cooldown takes 8 real seconds — this drives the net on its logical clock: fire every
+transition enabled at the current instant (awaiting each action so its outputs can enable
+the next), then, once nothing more fires, jump advance_time
+straight to the next availability boundary. Blocking/back-pressure is fully preserved (a
+cooling resource is genuinely unavailable for its full *logical* cooldown), but the waiting
+costs no wall-clock time. Because it never races real time, the marking observed after this
+returns is a true fixed point — useful for benchmarking engine CPU cost and for
+property-test oracles that must not race a wall-clock settle window.
+
+The first call anchors the net onto the logical clock (via `advance_time`); subsequent
+calls continue from the current logical time. The await after every `step` keeps at most one
+action in flight, which is what makes the drive single-threaded and deterministic —
+`max_workers` does not affect it. Use run to exploit concurrency.
+
+Parameters:
+
+| Name | Type | Description | Default |
+| --- | --- | --- | --- |
+| `max_ticks` | `int` | Safety cap on logical-clock advances, so a pathological net cannot loop forever. Each SubstitutionTransition firing passes it to its subnet's drive as that firing's own cap, and a subnet that hits the cap fails the firing. | `1000000` |
+| `max_spins` | `int` | Safety cap on the per-firing barrier that awaits each in-flight action, and on the wait for a subnet to settle after a failed substitution firing. The default suits the fast (~microsecond) actions this driver is built for; raise it for nets whose actions legitimately block for longer, so a slow-but-healthy action is not mistaken for a hung one. It counts spins, so how long it lasts depends on the machine; it is not a time bound. It is passed to subnet drives as max_ticks is. It does not apply to firings run with inline_actions. | `10000000` |
+| `inline_actions` | `bool` | Run each firing's action on the calling thread instead of handing it to the thread pool. The drive already keeps one firing in flight, so the order of firings, commits and seeded draws is the same either way; inline execution only drops the per-firing handoff and the wait for it, which dominates the cost of cheap actions. The trade-off is the hung-action guard: an inline action that blocks blocks the drive, and max_spins cannot cut it short. Set action_timeout_secs on a transition whose action can hang; that action still runs on its own worker under the timeout. SubstitutionTransition firings run inline too, and their subnet drives inherit the setting. A KeyboardInterrupt or SystemExit raised by an inline action hands the firing's tokens back exactly as they were taken (a paced permit starts no cooldown), with no attempt counted and nothing dead-lettered, and propagates out of the drive; on the thread pool it is lost with the worker and the firing fails. Any other BaseException that is not an Exception fails the firing as usual, then propagates. That holds for an interrupt raised inside the action body. One that lands while the engine is committing or rolling back can leave that firing half done. With action_timeout_secs, the interrupt reaches the drive while it waits for the action, which keeps running on its worker and may still have side effects after its tokens are back. An inline drive that would fire on a net whose with block has exited raises RuntimeError, as step() does. See ADR 0012. | `False` |
+
+Returns:
+
+| Type | Description |
+| --- | --- |
+| `DriveResult` | A DriveResult with the number of firings and clock advances. |
+
+Raises:
+
+| Type | Description |
+| --- | --- |
+| `RuntimeError` | If an in-flight action does not complete, or a subnet does not settle, within max_spins barrier spins. |
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def drive_to_quiescence( self, \*, max_ticks: int = 1_000_000, max_spins: int = 10_000_000, inline_actions: bool = False ) -> DriveResult: """Drive the net to quiescence on its **logical clock**, jumping over timed waits.
+
+```
+The deterministic counterpart to [`run`][cpnx.PetriNet.run]. Where `run` waits out
+cooldowns and settle windows on the real wall clock — so a net with an 8-second grinder
+cooldown takes 8 real seconds — this drives the net on its logical clock: fire every
+transition enabled at the current instant (awaiting each action so its outputs can enable
+the next), then, once nothing more fires, jump [`advance_time`][cpnx.PetriNet.advance_time]
+straight to the next availability boundary. Blocking/back-pressure is fully preserved (a
+cooling resource is genuinely unavailable for its full *logical* cooldown), but the waiting
+costs no wall-clock time. Because it never races real time, the marking observed after this
+returns is a true fixed point — useful for benchmarking engine CPU cost and for
+property-test oracles that must not race a wall-clock settle window.
+
+The first call anchors the net onto the logical clock (via `advance_time`); subsequent
+calls continue from the current logical time. The await after every `step` keeps at most one
+action in flight, which is what makes the drive single-threaded and deterministic —
+`max_workers` does not affect it. Use [`run`][cpnx.PetriNet.run] to exploit concurrency.
+
+Args:
+    max_ticks: Safety cap on logical-clock advances, so a pathological net cannot loop
+        forever. Each [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing passes
+        it to its subnet's drive as that firing's own cap, and a subnet that hits the cap
+        fails the firing.
+    max_spins: Safety cap on the per-firing barrier that awaits each in-flight action, and
+        on the wait for a subnet to settle after a failed substitution firing. The
+        default suits the fast (~microsecond) actions this driver is built for; raise it for
+        nets whose actions legitimately block for longer, so a slow-but-healthy action is
+        not mistaken for a hung one. It counts spins, so how long it lasts depends on the
+        machine; it is not a time bound. It is passed to subnet drives as `max_ticks` is.
+        It does not apply to firings run with `inline_actions`.
+    inline_actions: Run each firing's action on the calling thread instead of handing it to
+        the thread pool. The drive already keeps one firing in flight, so the order of
+        firings, commits and seeded draws is the same either way; inline execution only
+        drops the per-firing handoff and the wait for it, which dominates the cost of
+        cheap actions. The trade-off is the hung-action guard: an inline action that
+        blocks blocks the drive, and `max_spins` cannot cut it short. Set
+        `action_timeout_secs` on a transition whose action can hang; that action still
+        runs on its own worker under the timeout. `SubstitutionTransition` firings run
+        inline too, and their subnet drives inherit the setting. A `KeyboardInterrupt` or
+        `SystemExit` raised by an inline action hands the firing's tokens back exactly
+        as they were taken (a paced permit starts no cooldown), with no attempt counted
+        and nothing dead-lettered, and propagates out of the drive; on the thread pool
+        it is lost with the worker and the firing fails. Any other `BaseException` that
+        is not an `Exception` fails the firing as usual, then propagates. That holds for
+        an interrupt raised inside the action body. One that lands while the engine is
+        committing or rolling back can leave that firing half done. With
+        `action_timeout_secs`, the interrupt reaches the drive while it waits for the
+        action, which keeps running on its worker and may still have side effects after
+        its tokens are back. An inline drive that would fire on a net whose `with` block
+        has exited raises `RuntimeError`, as `step()` does. See ADR 0012.
+
+Returns:
+    A [`DriveResult`][cpnx.DriveResult] with the number of firings and clock advances.
+
+Raises:
+    RuntimeError: If an in-flight action does not complete, or a subnet does not settle,
+        within `max_spins` barrier spins.
+"""
+# Anchor onto the logical clock the first time only. `math.nextafter` (not `+ 1e-9`)
+# guarantees a strictly-greater value: at monotonic-clock magnitudes one ULP is ~2e-9, so a
+# fixed epsilon can round back to the current time — the same float hazard guarded against
+# in `_next_availability_boundary`.
+if self._model_time is None:
+    self.advance_time(math.nextafter(self.model_time, math.inf))
+
+self._drive_limits = {"max_ticks": max_ticks, "max_spins": max_spins, "inline_actions": inline_actions}
+try:
+    return self._drive_logical_clock(max_ticks, max_spins, inline_actions)
+finally:
+    self._drive_limits = {}
+```
+
+```
+
+### is_quiescent
+
+```
+
+is_quiescent() -> bool
+
+```
+
+Return `True` if there is no in-flight work and nothing could become enabled soon.
+
+A net is quiescent when no transition is currently running (in the middle of an
+action) *and* no transition could possibly fire even once currently-cooling-down or
+not-yet-settled tokens become available. Unlike is_dead,
+which is a pure snapshot of the current marking, `is_quiescent` also accounts for
+in-flight transitions (including those still running in a subnet whose firing failed,
+until it has settled and been restored) and treats time-gated tokens (cooldowns, settle
+windows) as if they were already present — so the net is not considered quiescent merely because
+work is temporarily blocked by timing. A token parked at `available_at = inf`, as a
+saturated RetryPolicy leaves one, stays out of this: nothing ever
+releases it, so it is no pending work. This is the condition run
+loops until.
+
+Returns:
+
+| Type | Description |
+| --- | --- |
+| `bool` | True if the net has no pending or in-flight work; False if a transition is |
+| `bool` | running or could eventually fire (including after a cooldown or settle window |
+| `bool` | elapses). |
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def is_quiescent(self) -> bool: """Return `True` if there is no in-flight work and nothing could become enabled soon.
+
+```
+A net is quiescent when no transition is currently running (in the middle of an
+action) *and* no transition could possibly fire even once currently-cooling-down or
+not-yet-settled tokens become available. Unlike [`is_dead`][cpnx.PetriNet.is_dead],
+which is a pure snapshot of the current marking, `is_quiescent` also accounts for
+in-flight transitions (including those still running in a subnet whose firing failed,
+until it has settled and been restored) and treats time-gated tokens (cooldowns, settle
+windows) as if they were already present — so the net is not considered quiescent merely because
+work is temporarily blocked by timing. A token parked at `available_at = inf`, as a
+saturated [`RetryPolicy`][cpnx.RetryPolicy] leaves one, stays out of this: nothing ever
+releases it, so it is no pending work. This is the condition [`run`][cpnx.PetriNet.run]
+loops until.
+
+Returns:
+    `True` if the net has no pending or in-flight work; `False` if a transition is
+    running or could eventually fire (including after a cooldown or settle window
+    elapses).
+"""
+with self._lock:
+    if self._running_count > 0 or self._has_unsettled_subnet():
+        result = False
+    elif self._incremental_eligible:
+        self._reconcile_dirty()
+        result = not self._potentially_enabled
+    else:
+        result = not any(self._is_transition_potentially_enabled(t) for t in self.transitions.values())
+self._flush_search_exhaustions()
+self._flush_priority_key_failures()
+self._flush_selection_failures()
+return result
+```
+
+```
+
+### is_dead
+
+```
+
+is_dead() -> bool
+
+```
+
+Return `True` if the current marking enables no transition right now (CPN dead state).
+
+In CPN theory a *dead marking* is one in which no transition can fire
+given the current token distribution. This checks each transition's full enabling
+condition — token availability, cooldowns, settle windows, output capacity, and the
+guard — exactly as of this instant. Unlike is_quiescent,
+it does **not** account for in-flight transitions, nor does it treat cooling-down or
+not-yet-settled tokens as available; a net can be dead right now yet become enabled
+moments later once a cooldown expires or an in-flight transition deposits a token.
+
+Returns:
+
+| Type | Description |
+| --- | --- |
+| `bool` | True if every transition's enabling condition currently fails. |
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def is_dead(self) -> bool: """Return `True` if the current marking enables no transition right now (CPN dead state).
+
+```
+In CPN theory a *dead marking* is one in which no transition can fire
+given the current token distribution. This checks each transition's full enabling
+condition — token availability, cooldowns, settle windows, output capacity, and the
+guard — exactly as of this instant. Unlike [`is_quiescent`][cpnx.PetriNet.is_quiescent],
+it does **not** account for in-flight transitions, nor does it treat cooling-down or
+not-yet-settled tokens as available; a net can be dead right now yet become enabled
+moments later once a cooldown expires or an in-flight transition deposits a token.
+
+Returns:
+    `True` if every transition's enabling condition currently fails.
+"""
+with self._lock:
+    if self._incremental_eligible:
+        self._reconcile_dirty()
+        result = not self._enabled_bindings
+    else:
+        result = not any(self._is_transition_enabled(t) for t in self.transitions.values())
+self._flush_search_exhaustions()
+self._flush_priority_key_failures()
+self._flush_selection_failures()
+return result
+```
+
+```
+
+### snapshot
+
+```
+
+snapshot() -> dict
+
+```
+
+Return a JSON-serialisable snapshot of current place markings and running count.
+
+Delegates to the module-level snapshot function.
+
+Returns:
+
+| Type | Description |
+| --- | --- |
+| `dict` | Dict with "places" (mapping place name to a list of token dicts with |
+| `dict` | keys id, payload, created_at, is_resource) and |
+| `dict` | "running_count" (number of transitions currently executing in this net; a |
+| `dict` | subnet still settling a failed firing is not counted, so 0 does not mean |
+| `dict` | quiescent). |
+
+Example
+
+```
+
+import json print(json.dumps(net.snapshot(), indent=2))
+
+```
+
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def snapshot(self) -> dict: """Return a JSON-serialisable snapshot of current place markings and running count.
+
+````
+Delegates to the module-level [`snapshot`][cpnx.snapshot] function.
+
+Returns:
+    Dict with `"places"` (mapping place name to a list of token dicts with
+    keys `id`, `payload`, `created_at`, `is_resource`) and
+    `"running_count"` (number of transitions currently executing in this net; a
+    subnet still settling a failed firing is not counted, so `0` does not mean
+    quiescent).
+
+Example:
+    ```python
+    import json
+    print(json.dumps(net.snapshot(), indent=2))
+    ```
+"""
+return snapshot(self)
+````
+
+```
+
+### to_dot
+
+```
+
+to_dot(\*, highlight_impact_from: str | None = None) -> str
+
+```
+
+Render the net's places, transitions, and arcs as a Graphviz DOT string.
+
+Delegates to the module-level to_dot function.
+
+Place nodes are circles annotated with current token counts.
+Transition nodes are boxes. Arc labels include `count`,
+`consume_all`, and `settle_secs` where non-default.
+
+Parameters:
+
+| Name | Type | Description | Default |
+| --- | --- | --- | --- |
+| `highlight_impact_from` | `str | None` | If given, the name of a transition whose forward blast radius (see trace_impact) is shaded in the output: impacted places/transitions are filled, and the seed transition is accented. None (default) renders the plain net, unchanged. | `None` |
+
+Returns:
+
+| Name | Type | Description |
+| --- | --- | --- |
+|  | `str` | A DOT language string. Render with Graphviz or paste into |
+| `https` | `str` | //dreampuf.github.io/GraphvizOnline/. |
+
+Raises:
+
+| Type | Description |
+| --- | --- |
+| `KeyError` | if highlight_impact_from names no transition in this net (raised before any DOT is produced). |
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def to_dot(self, \*, highlight_impact_from: str | None = None) -> str: """Render the net's places, transitions, and arcs as a Graphviz DOT string.
+
+```
+Delegates to the module-level [`to_dot`][cpnx.to_dot] function.
+
+Place nodes are circles annotated with current token counts.
+Transition nodes are boxes. Arc labels include `count`,
+`consume_all`, and `settle_secs` where non-default.
+
+Args:
+    highlight_impact_from: If given, the name of a transition whose forward
+        blast radius (see [`trace_impact`][cpnx.trace_impact]) is shaded in the
+        output: impacted places/transitions are filled, and the seed transition
+        is accented. `None` (default) renders the plain net, unchanged.
+
+Returns:
+    A DOT language string. Render with Graphviz or paste into
+    https://dreampuf.github.io/GraphvizOnline/.
+
+Raises:
+    KeyError: if `highlight_impact_from` names no transition in this net
+        (raised before any DOT is produced).
+"""
+# Resource-return synthesis happens inside the free `to_dot` (single source of truth),
+# so the exported `cpnx.to_dot(net)` form is equally honest.
+return to_dot(self, highlight_impact_from=highlight_impact_from)
+```
+
+```
+
+### trace_impact
+
+```
+
+trace_impact( transition_name: str, \*, colors: object = None ) -> ImpactMap
+
+```
+
+Trace the forward colour-domain blast radius of a transition.
+
+Delegates to trace_impact. See its docs for the walk,
+the colour-pruning gate, and the over-approximation stance.
+
+Parameters:
+
+| Name | Type | Description | Default |
+| --- | --- | --- | --- |
+| `transition_name` | `str` | The seed transition. | *required* |
+| `colors` | `object` | Optional colour domain to trace; defaults to the transition's impacts_colors declaration. | `None` |
+
+Returns:
+
+| Type | Description |
+| --- | --- |
+| `ImpactMap` | An ImpactMap of downstream places and transitions. |
+
+Raises:
+
+| Type | Description |
+| --- | --- |
+| `KeyError` | if transition_name is not a transition in this net. |
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def trace_impact(self, transition_name: str, \*, colors: object = None) -> ImpactMap: """Trace the forward colour-domain blast radius of a transition.
+
+```
+Delegates to [`trace_impact`][cpnx.trace_impact]. See its docs for the walk,
+the colour-pruning gate, and the over-approximation stance.
+
+Args:
+    transition_name: The seed transition.
+    colors: Optional colour domain to trace; defaults to the transition's
+        [`impacts_colors`][cpnx.Transition] declaration.
+
+Returns:
+    An [`ImpactMap`][cpnx.ImpactMap] of downstream places and transitions.
+
+Raises:
+    KeyError: if `transition_name` is not a transition in this net.
+"""
+# Resource-return synthesis happens inside the free `trace_impact` (single source of
+# truth), so `cpnx.trace_impact(net, ...)` sees the borrowed pool too.
+return trace_impact(self, transition_name, colors=colors)
+```
+
+```
+
+### risk_report
+
+```
+
+risk_report() -> dict
+
+```
+
+Return a JSON-serialisable report fusing lint findings with blast radii.
+
+Delegates to risk_report: for every transition it lints
+the enabling inscriptions and, for any that trips the linter or declares
+impacts_colors, attaches its blast radius. This is the
+verification / debugging entry point that ties cpnx's two safety prongs
+(best-effort side-effect linting, ADR 0007; colour-domain impact analysis,
+ADR 0008) together.
+
+Returns:
+
+| Type | Description |
+| --- | --- |
+| `dict` | A dict with "findings" (per-transition lint hits) and "impact_maps" |
+| `dict` | (per-transition ImpactMap dicts). |
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def risk_report(self) -> dict: """Return a JSON-serialisable report fusing lint findings with blast radii.
+
+```
+Delegates to [`risk_report`][cpnx.risk_report]: for every transition it lints
+the enabling inscriptions and, for any that trips the linter or declares
+[`impacts_colors`][cpnx.Transition], attaches its blast radius. This is the
+verification / debugging entry point that ties cpnx's two safety prongs
+(best-effort side-effect linting, ADR 0007; colour-domain impact analysis,
+ADR 0008) together.
+
+Returns:
+    A dict with `"findings"` (per-transition lint hits) and `"impact_maps"`
+    (per-transition [`ImpactMap`][cpnx.ImpactMap] dicts).
+"""
+# Synthesis happens inside the free `risk_report` (single source of truth).
+return risk_report(self)
+```
+
+```
+
+### __exit__
+
+```
+
+__exit__(\*\_: object) -> None
+
+```
+
+Shut down the thread pool, waiting for in-flight transitions to finish.
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+def __exit__(self, \*\_: object) -> None: """Shut down the thread pool, waiting for in-flight transitions to finish.""" self.\_shut_down = True self.\_executor.shutdown(wait=True) # Zombie action threads may still be running after a timeout — don't wait. self.\_action_executor.shutdown(wait=False, cancel_futures=True) self.\_expr_executor.shutdown(wait=True)
+
+```
+
+## cpnx.DriveResult
+
+Counters from a drive_to_quiescence run.
+
+Source code in `src/cpnx/engine.py`
+
+```
+
+@dataclass(frozen=True) class DriveResult: """Counters from a \[`drive_to_quiescence`\][cpnx.PetriNet.drive_to_quiescence] run."""
+
+```
+steps: int  #: number of successful ``step()`` firings
+ticks: int  #: number of logical-clock advances (cooldown/settle boundaries jumped)
+```
+
+```
+
+## Impact analysis
+
+Declarative colour-domain **blast-radius** analysis: given a transition that mutates or side-effects a token colour domain, trace how far downstream its effect can spread. This is the sibling safety prong to the [side-effect linter](https://philgresh.github.io/cpnx/latest/reference/transitions/#side-effect-linting) — the linter flags *which* transitions are hazards, the tracer bounds *how far* each one reaches (see [ADR 0008](https://github.com/philgresh/cpnx/blob/main/docs/adr/0008-color-domain-impact-analysis.md)). The forward walk is a sound, over-approximate cone-of-influence slice, gated by each place's `color_set`; annotate a transition with impacts_colors to prune the trace to a declared colour domain.
+
+## cpnx.trace_impact
+
+```
+
+trace_impact( net: "PetriNet", transition_name: str, \*, colors: object = None, ) -> ImpactMap
+
+```
+
+Trace the forward blast radius of a transition over the net's static topology.
+
+Breadth-first from `transition_name`'s **output** places, hopping
+place→(consuming transition)→(its output places) and pruning any place whose
+declared `color_set` is disjoint from the traced colour domain (see
+:func:`_in_domain`). Terminates on cycles (each transition is expanded once).
+
+The walk reads only the *structure* (`net.transitions`, `net.places`, each
+transition's input/output arc `place` references) under the engine lock, so it is
+safe to call on a live net and does not depend on the scheduler having started;
+the place→consumers routing is rebuilt fresh each call, so transitions added
+after an earlier trace are picked up.
+
+Note on precision: an **undeclared** seed (`impacts_colors is None` and no
+`colors=` override) traces *universally*, so its radius bleeds through every
+shared ResourcePlace into every transition that borrows the
+same permit pool — a resource self-loop is a legitimate downstream hop. That is the
+documented sound over-approximation, not a bug; narrow it by *declaring* the seed's
+colours (any set excluding `"resource"` prunes the pools, since a resource pool's
+`color_set` is `{"resource"}`).
+
+Parameters:
+
+| Name | Type | Description | Default |
+| --- | --- | --- | --- |
+| `net` | `'PetriNet'` | The PetriNet to analyse. | *required* |
+| `transition_name` | `str` | The seed transition. | *required* |
+| `colors` | `object` | Colour domain to trace. None (default) uses the seed's impacts_colors declaration (itself possibly None → universal). Pass an explicit set of colour names to override the declaration for this trace (accepts the same shapes as the field — a bare str raises; see :func:coerce_color_domain). | `None` |
+
+Returns:
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `An` | `ImpactMap` | class:ImpactMap. |
+
+Raises:
+
+| Type | Description |
+| --- | --- |
+| `KeyError` | if transition_name is not a transition in net. |
+
+Source code in `src/cpnx/analysis.py`
+
+```
+
+def trace_impact( net: "PetriNet", transition_name: str, \*, colors: object = None, ) -> ImpactMap: """Trace the forward blast radius of a transition over the net's static topology.
+
+```
+Breadth-first from ``transition_name``'s **output** places, hopping
+place→(consuming transition)→(its output places) and pruning any place whose
+declared ``color_set`` is disjoint from the traced colour domain (see
+:func:`_in_domain`). Terminates on cycles (each transition is expanded once).
+
+The walk reads only the *structure* (`net.transitions`, `net.places`, each
+transition's input/output arc `place` references) under the engine lock, so it is
+safe to call on a live net and does not depend on the scheduler having started;
+the place→consumers routing is rebuilt fresh each call, so transitions added
+after an earlier trace are picked up.
+
+Note on precision: an **undeclared** seed (``impacts_colors is None`` and no
+``colors=`` override) traces *universally*, so its radius bleeds through every
+shared [`ResourcePlace`][cpnx.ResourcePlace] into every transition that borrows the
+same permit pool — a resource self-loop is a legitimate downstream hop. That is the
+documented sound over-approximation, not a bug; narrow it by *declaring* the seed's
+colours (any set excluding ``"resource"`` prunes the pools, since a resource pool's
+``color_set`` is ``{"resource"}``).
+
+Args:
+    net: The [`PetriNet`][cpnx.PetriNet] to analyse.
+    transition_name: The seed transition.
+    colors: Colour domain to trace. ``None`` (default) uses the seed's
+            [`impacts_colors`][cpnx.Transition] declaration (itself possibly
+            ``None`` → universal). Pass an explicit set of colour names to
+            override the declaration for this trace (accepts the same shapes as
+            the field — a bare ``str`` raises; see :func:`coerce_color_domain`).
+
+Returns:
+    An :class:`ImpactMap`.
+
+Raises:
+    KeyError: if ``transition_name`` is not a transition in ``net``.
+"""
+# Make resource-return arcs structural before the static walk, so a borrowed pool is
+# reachable (ADR 0009). Done here — not only in `PetriNet.trace_impact` — so the exported
+# free-function form is honest too. One-time and idempotent; must run outside the lock
+# (`_ensure_...` acquires the same non-reentrant lock).
+net._ensure_resource_returns_synthesized()
+override = coerce_color_domain(colors, field="trace_impact(colors=...)")
+
+with net._lock:
+    transitions = net.transitions
+    if transition_name not in transitions:
+        known = ", ".join(sorted(transitions)) or "<none>"
+        raise KeyError(f"trace_impact: no transition named {transition_name!r} in this net (known: {known}).")
+    seed: "Transition" = transitions[transition_name]
+
+    # Colour precision: explicit override wins; else the seed's declaration.
+    traced: frozenset[str] | None = override if colors is not None else getattr(seed, "impacts_colors", None)
+
+    # Rebuild the place -> consuming-transitions routing fresh (structure is the
+    # source of truth; keeps the tracer independent of scheduler state).
+    consumers: dict[str, list["Transition"]] = {}
+    for t in transitions.values():
+        for arc in t.inputs:
+            consumers.setdefault(arc.place, []).append(t)
+
+    places = net.places
+
+    def gate(place_name: str) -> bool:
+        place = places.get(place_name)
+        return _in_domain(place.color_set if place is not None else None, traced)
+
+    impacted_places: set[str] = set()
+    impacted_transitions: set[str] = set()
+    edges: list[tuple[str, str]] = []
+    seen_edges: set[tuple[str, str]] = set()
+    expanded: set[str] = {transition_name}  # never re-expand the seed (cycle safety)
+
+    def add_edge(a: str, b: str) -> None:
+        if (a, b) not in seen_edges:
+            seen_edges.add((a, b))
+            edges.append((a, b))
+
+    frontier: deque[str] = deque()
+
+    def visit_outputs(source_transition: "Transition") -> None:
+        for out in source_transition.outputs:
+            if not gate(out.place):
+                continue
+            add_edge(source_transition.name, out.place)
+            if out.place not in impacted_places:
+                impacted_places.add(out.place)
+                frontier.append(out.place)
+
+    visit_outputs(seed)
+
+    while frontier:
+        place_name = frontier.popleft()
+        for consumer in consumers.get(place_name, []):
+            add_edge(place_name, consumer.name)
+            if consumer.name != transition_name:
+                impacted_transitions.add(consumer.name)
+            if consumer.name in expanded:
+                continue
+            expanded.add(consumer.name)
+            visit_outputs(consumer)
+
+return ImpactMap(
+    origin=transition_name,
+    colors=traced,
+    places=frozenset(impacted_places),
+    transitions=frozenset(impacted_transitions),
+    edges=tuple(edges),
+)
+```
+
+```
+
+## cpnx.ImpactMap
+
+The forward blast radius of a transition within a (optional) colour domain.
+
+Attributes:
+
+| Name | Type | Description |
+| --- | --- | --- |
+| `origin` | `str` | Name of the transition the trace started from (its seed). |
+| `colors` | `frozenset[str] | None` | The traced colour domain — a frozenset[str] of colour names, or None for a universal trace (no colour pruning). |
+| `places` | `frozenset[str]` | Names of every downstream Place reachable from origin within colors. |
+| `transitions` | `frozenset[str]` | Names of every downstream Transition reachable from origin within colors. Excludes origin itself (even if a cycle leads back to it). |
+| `edges` | `tuple[tuple[str, str], ...]` | The traced graph edges as ordered (from_name, to_name) pairs (place→transition and transition→place hops), de-duplicated with first-seen order preserved — handy for rendering or auditing the walk. |
+
+Source code in `src/cpnx/analysis.py`
+
+```
+
+@dataclass(frozen=True) class ImpactMap: """The forward blast radius of a transition within a (optional) colour domain.
+
+```
+Attributes:
+    origin: Name of the transition the trace started from (its *seed*).
+    colors: The traced colour domain — a ``frozenset[str]`` of colour names, or
+            ``None`` for a *universal* trace (no colour pruning).
+    places: Names of every downstream [`Place`][cpnx.Place] reachable from
+            ``origin`` within ``colors``.
+    transitions: Names of every downstream [`Transition`][cpnx.Transition]
+            reachable from ``origin`` within ``colors``. **Excludes** ``origin``
+            itself (even if a cycle leads back to it).
+    edges: The traced graph edges as ordered ``(from_name, to_name)`` pairs
+            (place→transition and transition→place hops), de-duplicated with
+            first-seen order preserved — handy for rendering or auditing the walk.
+"""
+
+origin: str
+colors: frozenset[str] | None
+places: frozenset[str]
+transitions: frozenset[str]
+edges: tuple[tuple[str, str], ...]
+
+def to_dict(self) -> dict:
+    """Return a JSON-serialisable view (sorted for stable diffs / snapshots)."""
+    return {
+        "origin": self.origin,
+        "colors": None if self.colors is None else sorted(self.colors),
+        "places": sorted(self.places),
+        "transitions": sorted(self.transitions),
+        "edges": [list(edge) for edge in self.edges],
+    }
+```
+
+```
+
+### to_dict
+
+```
+
+to_dict() -> dict
+
+```
+
+Return a JSON-serialisable view (sorted for stable diffs / snapshots).
+
+Source code in `src/cpnx/analysis.py`
+
+```
+
+def to_dict(self) -> dict: """Return a JSON-serialisable view (sorted for stable diffs / snapshots).""" return { "origin": self.origin, "colors": None if self.colors is None else sorted(self.colors), "places": sorted(self.places), "transitions": sorted(self.transitions), "edges": [list(edge) for edge in self.edges], }
+
+```
+
+## cpnx.risk_report
+
+```
+
+risk_report(net: 'PetriNet') -> dict
+
+```
+
+Fuse the side-effect linter with blast-radius tracing into one report.
+
+The verification / debugging entry point. For every transition it lints each
+enabling inscription (guard, arc `key`/`filter`/`join_key`, `binding_priority_key`,
+`binding_selector`);
+for any transition that either **trips the linter** or carries an explicit
+:attr:`~cpnx.Transition.impacts_colors` declaration, it attaches that
+transition's :meth:`ImpactMap.to_dict`. The result answers, in one place, both
+"which transitions reach outside the decidable core?" (ADR 0007) and "how far
+downstream can each one's effect spread?" (this module).
+
+Returns:
+
+| Type | Description |
+| --- | --- |
+| `dict` | A JSON-serialisable dict:: { "findings": [ {"transition": , "findings": [{"role": , "category": , "symbol": }, ...]}, ... ], "impact_maps": {: , ...}, } |
+| `dict` | findings lists only transitions with at least one lint finding; |
+| `dict` | impact_maps covers every transition that was linted-dirty or |
+| `dict` | colour-annotated. |
+
+Source code in `src/cpnx/analysis.py`
+
+```
+
+def risk_report(net: "PetriNet") -> dict: """Fuse the side-effect linter with blast-radius tracing into one report.
+
+```
+The verification / debugging entry point. For every transition it lints each
+enabling inscription (guard, arc ``key``/``filter``/``join_key``, ``binding_priority_key``,
+``binding_selector``);
+for any transition that either **trips the linter** or carries an explicit
+:attr:`~cpnx.Transition.impacts_colors` declaration, it attaches that
+transition's :meth:`ImpactMap.to_dict`. The result answers, in one place, both
+"which transitions reach outside the decidable core?" (ADR 0007) and "how far
+downstream can each one's effect spread?" (this module).
+
+Returns:
+    A JSON-serialisable ``dict``::
+
+        {
+          "findings": [
+            {"transition": <name>,
+             "findings": [{"role": <str>, "category": <str>, "symbol": <str>}, ...]},
+            ...
+          ],
+          "impact_maps": {<transition name>: <ImpactMap.to_dict()>, ...},
+        }
+
+    ``findings`` lists only transitions with at least one lint finding;
+    ``impact_maps`` covers every transition that was linted-dirty **or**
+    colour-annotated.
+"""
+from cpnx.linting import lint_callable  # local import: avoid import-time coupling
+
+# Structural resource returns before tracing, so the exported free-function form matches
+# `PetriNet.risk_report` (ADR 0009). Outside the lock; idempotent.
+net._ensure_resource_returns_synthesized()
+
+with net._lock:
+    transitions = list(net.transitions.values())
+
+findings_out: list[dict] = []
+impact_maps: dict[str, dict] = {}
+
+for t in transitions:
+    t_findings: list[dict] = []
+    for role, fn in _selection_callables(t):
+        for finding in lint_callable(fn):
+            t_findings.append({"role": role, "category": finding.category, "symbol": finding.symbol})
+
+    declared = getattr(t, "impacts_colors", None) is not None
+    if t_findings or declared:
+        try:
+            impact_maps[t.name] = trace_impact(net, t.name).to_dict()
+        except KeyError:
+            # The transition list was snapshotted under the lock, but each
+            # trace re-acquires it: a concurrent removal between snapshot and
+            # trace leaves a stale name. Skip it rather than aborting the whole
+            # report — a live-mutation edge, not a bug in a static net.
+            pass
+    if t_findings:
+        findings_out.append({"transition": t.name, "findings": t_findings})
+
+return {"findings": findings_out, "impact_maps": impact_maps}
+```
+
+```
+```
