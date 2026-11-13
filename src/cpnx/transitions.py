@@ -721,6 +721,12 @@ class Transition:
                the transition and its firing count, so the same seed and selector give the same
                firings across processes. Use [`BindingView.groups`][cpnx.BindingView.groups]
                with a certified key for indexed lookups that stay O(keys) as places deepen.
+               Arcs that read one place each see all of that place's tokens and must choose
+               disjoint ones; the selector is asked only when the place holds enough for all of
+               them. Returning `None` means "not enabled", including for quiescence: a
+               selector that waits for a model time by testing `view.model_time` reads as
+               quiescent, so `run()` exits and `drive_to_quiescence` stops. Express such a wait
+               as a token's `available_at` or an arc's `settle_secs` instead.
                Input arcs of a selector transition may not set `key`, `filter`, `join_key` or
                `consume_all`, and `binding_priority_key` must be unset: assigning the selector,
                or `binding_priority_key` afterwards, raises `ValueError`. A conflict introduced

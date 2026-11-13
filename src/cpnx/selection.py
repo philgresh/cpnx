@@ -64,7 +64,8 @@ class BindingView:
     """What a [`binding_selector`][cpnx.Transition] sees: the tokens each input arc could take.
 
     Read-only, and valid only for the duration of the selector call: it reads the places
-    directly, under the engine lock, without copying them.
+    directly, under the engine lock, without copying them. Arcs that read one place see the same
+    tokens through `available`, `has_available` and `groups`; choose disjoint ones for them.
 
     Attributes:
         transition: The name of the transition being resolved.

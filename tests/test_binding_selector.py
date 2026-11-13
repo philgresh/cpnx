@@ -860,3 +860,90 @@ def test_replacing_a_selector_transition_releases_its_place_indexes():
         net.add_transition(Transition("t", [InputArc("jobs")], [OutputArc("out")], _identity))
     assert not net.places["jobs"]._store._join_indexes
     assert net._selector_indexes == {}
+
+
+def other_skill_one(view: BindingView):
+    group = view.group(0, key_a, 0)
+    return [group[0]] if group else None
+
+
+def test_swapping_the_selector_function_releases_the_old_ones_indexes_and_latches():
+    net = _jobs_net(match_certified_one)
+    errors: list[BaseException] = []
+    net.on_error = lambda _name, error, _token: errors.append(error)
+    with net:
+        net.is_dead()
+        net.is_dead()
+        old_ids = set(net.places["jobs"]._store._join_indexes)
+        assert old_ids
+        net.transitions["t"].binding_selector = nothing
+        net.is_dead()
+        assert not net.places["jobs"]._store._join_indexes, "the new selector never reads the old indexes"
+        net.transitions["t"].binding_selector = raises
+        net.step()
+        net.transitions["t"].binding_selector = flaky_everywhere
+        _FLAKY["fail"] = True
+        net.step()
+        net.transitions["t"].binding_selector = raises
+        net.step()
+    assert len(errors) == 3, "each swap starts with a clean latch, so the same failure reports again"
+
+
+def first_of_each(view: BindingView):
+    tokens = list(view.available(0))
+    return [tokens[0], tokens[1]]
+
+
+def _shared_place_net(n_tokens: int) -> PetriNet:
+    net = PetriNet(seed=1, places=[Place("in"), Place("out")])
+    net.add_transition(
+        Transition(
+            "t",
+            [InputArc("in"), InputArc("in")],
+            [OutputArc("out", count=2)],
+            _identity,
+            binding_selector=first_of_each,
+        )
+    )
+    for i in range(n_tokens):
+        net.deposit("in", Token(payload={"i": i}))
+    return net
+
+
+def test_arcs_sharing_a_place_are_not_asked_until_it_holds_enough_for_all():
+    net = _shared_place_net(1)
+    errors: list[BaseException] = []
+    net.on_error = lambda _name, error, _token: errors.append(error)
+    with net:
+        assert net.step() is False
+        assert net.is_dead()
+    assert errors == []
+
+
+def test_arcs_sharing_a_place_fire_disjoint_choices():
+    net = _shared_place_net(4)
+    with net:
+        net.drive_to_quiescence()
+    assert sorted(_payloads(net, "out")) == [0, 1, 2, 3]
+
+
+def test_a_group_read_raises_index_error_for_a_token_that_left_the_place():
+    from collections import OrderedDict
+
+    from cpnx.places import _JoinGroup
+
+    place = Place("jobs")
+    tokens = [Token(payload={"i": i, "skill": 0}) for i in range(3)]
+    for token in tokens:
+        place.deposit(token)
+    place.register_join_index(1, skill)
+    group = place.peek_join(1, [0])[0]
+    place.retrieve_specific([tokens[1]])  # changed directly, outside any engine lock
+    assert group.token_at(1) is tokens[2], "the live list shifted under the view"
+    with pytest.raises(IndexError):
+        group.token_at(2)
+
+    entry = (0, 0.0, 7)  # an index entry whose token is no longer stored
+    orphan = _JoinGroup([entry], 1, entry, OrderedDict(), {})
+    with pytest.raises(IndexError, match="left the place"):
+        orphan.token_at(0)

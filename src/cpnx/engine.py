@@ -2297,6 +2297,9 @@ class PetriNet:
         #: Transitions that have, or had, a selector: when one loses it, `_forget_selector` drops
         #: its place indexes and puts its own policy back into `_has_search_policy_transition`.
         self._selector_transitions: set[str] = set()
+        #: Transition name -> the selector function its latches and place indexes were made for,
+        #: so `_prepare_selector` can drop them when the function is swapped for another.
+        self._selector_fns: dict[str, object] = {}
         #: Transition name -> the first error its selector raised or returned this pass,
         #: dispatched via `on_error` off the lock by `_flush_selection_failures`.
         self._pending_selector_failures: dict[str, Exception] = {}
@@ -5255,8 +5258,8 @@ class PetriNet:
         conflict stands), and reports a conflict. Caller holds the lock.
         """
         name = transition.name
-        if name not in self._selector_transitions:
-            self._adopt_selector(transition)
+        if self._selector_fns.get(name) is not transition.binding_selector:
+            self._switch_selector(transition)
         if self._join_registrations and name in self._join_registrations:
             self._release_join_indexes_of(name)  # a selector never reads them, even mid-conflict
         conflict = selector_conflict(transition)
@@ -5274,11 +5277,18 @@ class PetriNet:
     def _selector_places(
         self, transition: Transition, t_limit: float | None, ignore_timing: bool
     ) -> list[Place] | None:
-        """Each input arc's place, or `None` when an arc cannot be met at all (so the selector is not asked)."""
+        """Each input arc's place, or `None` when an arc cannot be met at all (so the selector is not asked).
+
+        Arcs that share a place need their counts together, as a search does (#77), so a shared
+        place too shallow for all of them is not enabled rather than a selector failure.
+        """
+        needed: dict[str, int] = {}
+        for arc in transition.inputs:
+            needed[arc.place] = needed.get(arc.place, 0) + arc.count
         places: list[Place] = []
         for arc in transition.inputs:
             place = self.places.get(arc.place)
-            if place is None or not place.can_retrieve(arc.count, model_time=t_limit):
+            if place is None or not place.can_retrieve(needed[arc.place], model_time=t_limit):
                 return None
             if not ignore_timing and not self._is_settle_time_met(place, arc):
                 return None
@@ -5356,11 +5366,26 @@ class PetriNet:
         self._selector_faults.pop((name, False), None)
         self._selector_faults.pop((name, True), None)
 
+    def _switch_selector(self, transition: Transition) -> None:
+        """First ask of this selector function on `transition`. Caller holds the lock.
+
+        A transition that gained its selector on a live net is adopted. One whose selector was
+        swapped for another function drops the old function's latches and place indexes, which
+        the new one may never read or evict.
+        """
+        name = transition.name
+        if name not in self._selector_transitions:
+            self._adopt_selector(transition)
+        elif name in self._selector_fns:
+            self._clear_selector_faults(name)
+            self._release_stale_selector_indexes(name, [])
+        self._selector_fns[name] = transition.binding_selector
+
     def _adopt_selector(self, transition: Transition) -> None:
         """Take over a transition that gained a selector after it joined the net. Caller holds the lock.
 
         Its scheduler state was built for a search (not volatile, maybe a cached search binding),
-        so rebuild the scheduler before asking the selector. `_selector_binding` also releases any
+        so rebuild the scheduler before asking the selector. `_prepare_selector` also releases any
         `join_key` index it registered before.
         """
         self._selector_transitions.add(transition.name)
@@ -5386,11 +5411,13 @@ class PetriNet:
         self._clear_selector_faults(name)
         self._release_stale_selector_indexes(name, [])
         self._selector_transitions.discard(name)
+        self._selector_fns.pop(name, None)
 
     def _forget_selector(self, transition: Transition) -> None:
         """Drop the selector state of a transition whose `binding_selector` was cleared. Caller holds the lock."""
         name = transition.name
         self._selector_transitions.discard(name)
+        self._selector_fns.pop(name, None)
         self._clear_selector_faults(name)
         self._release_stale_selector_indexes(name, [])
         if self._searches_bindings(transition) and not self._has_search_policy_transition:
@@ -5466,8 +5493,9 @@ class PetriNet:
     def _selector_index(self, transition_name: str, position: int, key: Callable[[Token], object], place: Place) -> int:
         """The id of the place join index for *key* at this selector arc, registering it if needed.
 
-        Keeps at most `_SELECTOR_INDEXES_PER_ARC` per arc, dropping the oldest, so a selector that
-        builds a new key function on every call pays a rebuild instead of leaking indexes.
+        Keeps at most `_SELECTOR_INDEXES_PER_ARC` per arc, dropping the oldest, which bounds the
+        indexes a selector that rotates through several reused keys keeps registered. (A key built
+        anew on every call never gets here: `KeyCertifications.seen_before` turns it away.)
         """
         registered = self._selector_indexes.setdefault(transition_name, {}).setdefault(position, {})
         entry = registered.get(id(key))

@@ -45,8 +45,11 @@ eligibility is membership (`job.skill in server.skills`):
   `InvalidSelection` for a rejected choice or a conflict.
 - **Enablement.** The selector is the probe: `_binding_exists` asks it too. A transition with a
   selector is volatile (ADR 0006), so every reconcile asks it again. Before asking, the engine
-  checks each arc's count and settle window, so an arc that cannot be met never reaches the
-  selector.
+  checks each arc's count (summed over arcs that share a place, which see the same tokens and
+  must choose disjoint ones) and settle window, so an arc that cannot be met never reaches the
+  selector. `None` means "not enabled" for quiescence too: the timing-ignoring probe gets the
+  same `model_time`, so a wait for a model time must be a token's `available_at` or a settle
+  window, not a test of `view.model_time`, or `run()` and `drive_to_quiescence` stop.
 - **Determinism.** `view.random` is a `random.Random` seeded with a string built from the net's
   `seed`, the transition's name and how many of its selector bindings have been consumed. So
   the stream is a function of the firing, not of how many times the engine asks between
@@ -55,15 +58,15 @@ eligibility is membership (`job.skill in server.skills`):
   must be a pure function of the view, as a guard must be (ADR 0003); `verify_callable_purity`
   and the side-effect linter check it at assignment.
 - **Indexed lookups.** `groups(i, key)` with a certified `key` registers a place join index
-  (ADR 0010) for that key on first use and reads it at O(keys) afterwards. At most four key
-  functions per arc keep an index; a fifth evicts the oldest, so a selector that builds a new
-  lambda on every call pays a rebuild rather than leaking indexes. An index is built only for a
-  key object passed a second time, so a key built inline on every call (a fresh lambda, or a
+  (ADR 0010) for that key on its second use and reads it at O(keys) afterwards. At most four
+  reused key functions per arc keep an index; a fifth evicts the oldest. An index is built only
+  for a key object passed a second time, so a key built inline on every call (a fresh lambda, or a
   bound method, which is a new object on each access) is keyed by a scan, not by rebuilding an
   index over the whole place on each ask; such a key is never certified either. Verdicts for
   keys passed again are cached weakly on the key object. A transition's indexes are
-  released when its arc moves to another place, when its selector is cleared or the transition is
-  replaced, and while a conflict keeps the selector from being asked. A selector assigned to a
+  released when its arc moves to another place, when its selector is cleared, swapped for another
+  function or the transition is replaced, and while a conflict keeps the selector from being
+  asked. A selector assigned to a
   transition already in a net is picked up the next time the transition is evaluated or chosen:
   the scheduler is rebuilt and any `join_key` index it had is released. An uncertified key,
   or a place type other than `Place`, is keyed on each call.
@@ -100,6 +103,7 @@ eligibility is membership (`job.skill in server.skills`):
   shared Linux container. The selector is still costlier than `FIRST`, because it scores all
   100 servers and is asked about five times per firing (each reconcile, plus the
   timing-ignoring quiescence probe).
-- Nets without a selector take the same paths: one `is not None` check per resolution.
+- Nets without a selector take the same paths, plus one `is not None` check per resolution and
+  one brief lock to count each selector-failure flush (about 0.06 µs).
 - Follow-up: cache a selector's answer per marking change of its input places, which would cut
   the repeated asks; and let `available(i)` honour an arc's `key` ordering.
