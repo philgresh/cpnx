@@ -69,7 +69,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .certification import _UNRESOLVED, _resolve_name, _root_name
-from .sandbox import _alike_note, _callable_nodes_or_empty
+from .sandbox import _alike_note, _callable_nodes_or_empty, _own_function
 
 #: Category label for findings whose root symbol is a network client/transport.
 NETWORK = "network"
@@ -366,13 +366,16 @@ def lint_callable(func: Callable) -> list[LintFinding]:
     if not callable(func):
         return []
     nodes = _callable_nodes_or_empty(func)
+    # Names resolve against the function those nodes are: a decorator's wrapper (an
+    # `lru_cache`, say) need not be a Python function, or hold its globals.
+    function = _own_function(func)
     note = _alike_note(nodes)
     findings: list[LintFinding] = []
     seen: set[tuple[str, str, int]] = set()
     for child in (child for node in nodes for child in ast.walk(node)):
         if not isinstance(child, ast.Call):
             continue
-        hit = _classify_call(child, func)
+        hit = _classify_call(child, function)
         if hit is None:
             continue
         category, symbol = hit

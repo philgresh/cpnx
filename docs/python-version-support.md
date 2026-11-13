@@ -311,7 +311,11 @@ tripping a Python-level deprecation.
   that runs, positions aside: a `.pyc` written by 3.12.3 records other positions than
   3.12.13 compiles, and 3.12.13 still loads it. REPL input is read from 3.13, when
   the REPL started keeping it, through the private `linecache._getlines_from_code` (looked
-  up with `getattr`, so its absence only loses REPL lookups). Lambdas on one line that use
+  up with `getattr`, so its absence only loses REPL lookups). The gates' own parse and compile
+  of a file are silenced for that file only: through `warnings.catch_warnings` where filters
+  are per thread (`sys.flags.context_aware_warnings`, 3.14), and elsewhere by one filter put
+  into `warnings.filters` and taken out, with the private `warnings._filters_mutated()` (there
+  from 3.10 to 3.15) telling the module its filters changed. Lambdas on one line that use
   the same names are left; each is held to
   what any of them does, and the error, certification reason or lint message says that
   several functions start on the line. `tests/test_same_line_callables.py` runs one case

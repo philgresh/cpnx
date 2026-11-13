@@ -1,8 +1,12 @@
 import __future__
 
 import ast
+import contextlib
+import functools
 import inspect
 import linecache
+import math
+import re
 import sys
 import threading
 import types
@@ -54,10 +58,23 @@ _FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 _Position = tuple[int, int, int, int]
 
 
-def _own_code(func: Callable) -> types.CodeType | None:
-    """Return the code object `func` runs, or `None` if it has none of its own."""
+def _own_function(func: Callable) -> types.FunctionType | None:
+    """Return the Python function `func` is, or the one a decorator wraps (`__wrapped__`); else `None`.
+
+    A bound method counts as its function. Anything else (a class, a callable object, a
+    builtin, a `functools.partial`) is `None`, also when it carries or forwards a `__code__`
+    or a `__func__`: what runs is then its own `__call__`, not the code it points at.
+    """
     func = inspect.unwrap(func)
-    return getattr(getattr(func, "__func__", func), "__code__", None)
+    if isinstance(func, types.MethodType):
+        func = func.__func__
+    return func if isinstance(func, types.FunctionType) else None
+
+
+def _own_code(func: Callable) -> types.CodeType | None:
+    """Return the code object `func` runs (`_own_function`), or `None` if it has none of its own."""
+    function = _own_function(func)
+    return None if function is None else function.__code__
 
 
 def _body_anchor(func: Callable) -> _Position | None:
@@ -263,11 +280,37 @@ for _feature in __future__.all_feature_names:
     if _feature != "nested_scopes":
         _FUTURE_FLAGS |= getattr(__future__, _feature).compiler_flag
 
-#: Held while a source is compiled with its warnings silenced: before Python 3.14
-#: `warnings.catch_warnings` swaps a process-wide filter list, so two at once would interleave.
-#: The swap is still process-wide there: a warning another thread raises during the compile
-#: (a few milliseconds per file, once per file) is silenced with it.
-_COMPILE_LOCK = threading.Lock()
+
+@contextlib.contextmanager
+def _quiet_about(path: str):
+    """Silence the warnings the parser and compiler give about the file `path`, and only those.
+
+    The import gave them already (or a `.pyc` was loaded and they were never due); given
+    again, they would be printed at net construction, and under an "error" filter they would
+    refuse every callable in the file. Where warning filters are kept per thread
+    (`sys.flags.context_aware_warnings`), `warnings.catch_warnings` does it. Elsewhere it
+    would swap the process-wide filter list and could restore its own copy over another
+    thread's, so one filter is put at the front of the list in place and taken out again.
+    It matches only warnings attributed to `path`'s module name, which is what the compiler
+    gives its warnings, so another thread's warnings are untouched unless they are about
+    that very file in the same moment.
+    """
+    if getattr(sys.flags, "context_aware_warnings", False):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            yield
+        return
+    module = path[:-3] if path.endswith(".py") else path
+    entry = ("ignore", None, Warning, re.compile(re.escape(module) + r"\Z"), 0)
+    filters = warnings.filters
+    filters.insert(0, entry)
+    warnings._filters_mutated()
+    try:
+        yield
+    finally:
+        with contextlib.suppress(ValueError):
+            del filters[next(index for index, each in enumerate(filters) if each is entry)]
+        warnings._filters_mutated()
 
 
 class _ParsedSource:
@@ -317,8 +360,7 @@ class _ParsedSource:
         """
         flags = code.co_flags & _FUTURE_FLAGS
         if flags not in self.compiled:
-            with _COMPILE_LOCK, warnings.catch_warnings():
-                warnings.simplefilter("ignore")
+            with _quiet_about(self.path):
                 module = compile(
                     self.source,
                     self.path,
@@ -345,10 +387,23 @@ def _without_positions(code: types.CodeType) -> types.CodeType:
     3.12.13, say) can record them differently for the same source, in a `.pyc` that the
     other still loads.
     """
-    consts = tuple(
-        _without_positions(const) if isinstance(const, types.CodeType) else const for const in code.co_consts
-    )
-    return code.replace(co_consts=consts, co_linetable=b"")
+    return code.replace(co_consts=tuple(_comparable(const) for const in code.co_consts), co_linetable=b"")
+
+
+#: One stand-in per kind of NaN constant. Each compile makes NaN objects of its own, and
+#: `nan != nan`, so code holding one (`1e999 - 1e999`, folded) never equals its source's.
+_NAN_STAND_INS: dict[tuple[type, str], object] = {}
+
+
+def _comparable(const: object) -> object:
+    """Return a constant as `_without_positions` compares it: nested code bare, NaNs by their kind."""
+    if isinstance(const, types.CodeType):
+        return _without_positions(const)
+    if isinstance(const, (tuple, frozenset)):
+        return type(const)(_comparable(each) for each in const)
+    if isinstance(const, (float, complex)) and any(math.isnan(part) for part in (const.real, const.imag)):
+        return _NAN_STAND_INS.setdefault((type(const), repr(const)), object())
+    return const
 
 
 #: ``path -> _ParsedSource``, keyed on the file's bytes. The purity check, the linter
@@ -403,7 +458,9 @@ def _parsed_source(path: str, func: Callable, code: types.CodeType) -> _ParsedSo
         cached = _SOURCE_CACHE.pop(path, None)
     if cached is None or cached.source != source:
         # Bytes where there is a file, so ast.parse honours a PEP 263 coding cookie.
-        cached = _ParsedSource(source, path, ast.parse(source, filename=path))
+        with _quiet_about(path):
+            tree = ast.parse(source, filename=path)
+        cached = _ParsedSource(source, path, tree)
     with _SOURCE_CACHE_LOCK:
         _SOURCE_CACHE[path] = cached  # last, as the most recently used
         while len(_SOURCE_CACHE) > _SOURCE_CACHE_SIZE:
@@ -576,11 +633,13 @@ def verify_callable_purity(func: Callable) -> None:
 
     The default values the callable was defined with are checked as they are, not as its
     source spells them (the source may have been edited since): a ``list``, ``dict`` or
-    ``set`` is rejected, also when the default names one (``s=STATE``), and a Python function
-    whose source can be read is checked as a callable in its own right (and rejected if that
-    source no longer compiles to it). A default function with no source to read at all
-    (``os.path.join`` from a frozen module, a ``.pyc``-only install) is left to
-    :mod:`cpnx.certification`, which holds every default to its own rule.
+    ``set`` is rejected, also when the default names one (``s=STATE``). A default is followed
+    through ``functools.partial`` and bound methods: a forbidden builtin (``print``,
+    ``os.system``, ``time.sleep``) is rejected, and a Python function is checked as a callable
+    in its own right (and rejected if its source no longer parses or compiles to it). One with
+    no source to read at all (``os.path.join`` from a frozen module, a ``.pyc``-only install)
+    is left to :mod:`cpnx.certification`, which holds every default to its own rule, as it
+    does any other callable object.
 
     It also raises when the callable's own ``def`` or ``lambda`` cannot be found in its
     source: a builtin, a ``functools.partial``, a class or other callable object, code with
@@ -624,16 +683,42 @@ def _verify_default_values(func: Callable, seen: frozenset[int]) -> None:
             raise PermissionError(
                 f"Mutable default argument '{name}' in CPN callable introduces hidden state between firings."
             )
-        if not isinstance(value, types.FunctionType) or id(value) in seen:
+        target = _called_through(value)
+        if isinstance(target, types.BuiltinFunctionType) and target.__name__ in _FORBIDDEN_FUNCS | _FORBIDDEN_ATTRS:
+            raise PermissionError(f"Forbidden function '{target.__name__}' held as default '{name}' of {_label(func)}.")
+        if not isinstance(target, types.FunctionType) or id(target) in seen:
             continue
         try:
-            nodes = _callable_nodes(value)
-        except _SOURCE_UNAVAILABLE:
-            continue  # No source to read at all: left to certification.
-        try:
-            _verify_purity(value, seen, nodes)
+            _verify_default_function(target, seen)
         except PermissionError as exc:
             raise PermissionError(f"Default '{name}' of {_label(func)}: {exc}") from None
+
+
+def _called_through(value: object) -> object:
+    """Return what calling `value` runs, as far as can be told: through `functools.partial` and bound methods."""
+    while isinstance(value, functools.partial):
+        value = value.func
+    if isinstance(value, types.MethodType) and isinstance(value.__func__, types.FunctionType):
+        return value.__func__
+    return value
+
+
+def _verify_default_function(value: types.FunctionType, seen: frozenset[int]) -> None:
+    """Check a Python function held as a default, unless it has no source to read at all.
+
+    Only a missing source (`OSError`: a frozen module, a `.pyc`-only install, a deleted file)
+    is let through, to certification. Source that no longer parses or compiles to the function
+    is refused, as it is for the callable itself.
+    """
+    nodes = None
+    if getattr(value, "__wrapped__", None) is None:
+        try:
+            nodes = _callable_nodes(value)
+        except OSError:
+            return
+        except _SOURCE_UNAVAILABLE as exc:
+            raise _source_unavailable(value) from exc
+    _verify_purity(value, seen, nodes)
 
 
 def _label(func: Callable) -> str:
@@ -646,16 +731,14 @@ def _default_values(func: Callable) -> list[tuple[str, object]]:
     They ran once, where the function was defined, so they are not in its code and cannot
     be checked through it: only the values themselves say what the callable was given.
     """
-    target = getattr(func, "__func__", func)
-    positional = getattr(target, "__defaults__", None) or ()
-    code = getattr(target, "__code__", None)
-    parameters = code.co_varnames[: code.co_argcount] if code is not None else ()
-    names = parameters[len(parameters) - len(positional) :] if len(parameters) >= len(positional) else ()
-    keywords = getattr(target, "__kwdefaults__", None) or {}
-    return [
-        *((names[index] if names else f"#{index}", value) for index, value in enumerate(positional)),
-        *keywords.items(),
-    ]
+    target = func.__func__ if isinstance(func, types.MethodType) else func
+    if not isinstance(target, types.FunctionType):
+        return []  # Only a Python function holds defaults the gates can name; others are refused.
+    parameters = target.__code__.co_varnames[: target.__code__.co_argcount]
+    # The positional defaults fill the last parameters; any beyond their number are never used.
+    positional = (target.__defaults__ or ())[-len(parameters) :] if parameters else ()
+    names = parameters[len(parameters) - len(positional) :]
+    return [*zip(names, positional, strict=True), *(target.__kwdefaults__ or {}).items()]
 
 
 def _source_unavailable(func: Callable) -> PermissionError:
@@ -677,9 +760,9 @@ def _why_unseen(func: Callable) -> str:
         return ""
     try:
         parsed = _parsed_source(code.co_filename, func, code)
+        if not parsed.locate(code.co_firstlineno, None) or _held_nodes(parsed, code) != ():
+            return ""
     except _SOURCE_UNAVAILABLE:
-        return ""
-    if not parsed.locate(code.co_firstlineno, None) or _held_nodes(parsed, code) != ():
         return ""
     return (
         " (its source no longer compiles to the code that runs: the file was edited since it was "

@@ -47,7 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The purity check now looks at the default values a callable holds, not only at their
     source: a default that *names* a `list`, `dict` or `set` (`def guard(t, s=STATE)`) is
     rejected like a literal one, and a function default whose source can be read must pass
-    the purity check itself (the message names the parameter). Certification holds each
+    the purity check itself (the message names the parameter, and one whose source no longer
+    parses is refused). Defaults are followed through `functools.partial` and bound methods, and
+    a forbidden builtin held as one (`run=print`, `run=os.system`) is refused like a call to it
+    in the body. Certification holds each
     default to the rule for a global read, allowing of the builtins only those a guard may
     call (`len`, not `print`) and the methods of immutable builtin types (`str.lower`).
 
@@ -277,10 +280,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function as a callable of its own (once each, so defaults that hold each other end; one with no
   source to read is left to certification); certification holds each value to the rule for a global
   read (immutable, a builtin a guard may call or a method of an immutable builtin type, or a
-  certifying callable), and an unhashable callable is not certified rather than raising. The compile
-  allows top-level `await`, as a notebook cell may use it, and is silent: a compiler warning
-  elsewhere in the file (`x is 1`) is neither printed again nor, under an "error" filter, a reason
-  to refuse the file's callables.
+  certifying callable), and an unhashable callable is not certified rather than raising. A global
+  read is now held to that same rule, so a global bound to `len` or `str.lower` certifies. The
+  compile allows top-level `await`, as a notebook cell may use it, and it and the parse before it
+  are silent: a warning elsewhere in the file (`x is 1`, an invalid escape such as `'\d+'`) is
+  neither printed again nor, under an "error" filter, a reason to refuse the file's callables. The
+  silencing is one filter, for that file alone, put into the filter list in use and taken out again,
+  so another thread's filters and warnings are left alone. A NaN constant (`1e999 - 1e999`, folded)
+  is compared by its kind, as two compiles make two NaNs that are not equal. Only a Python function
+  (or a bound method of one) is read as its code: a callable object that carries or forwards a
+  `__code__` or `__func__` is "source unavailable", as before. The lint reads a decorated
+  callable's own body even where the wrapper is not a Python function (`functools.lru_cache`).
 
 - **A callable that shares its source line with another is now checked against its own body**
   ([#90](https://github.com/philgresh/cpnx/issues/90)). The purity check, the side-effect lint

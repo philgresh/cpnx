@@ -446,7 +446,8 @@ def test_every_function_of_cpnx_itself_is_found_at_its_own_definition(either_way
                 assert func.__name__ == "__annotate__", func.__qualname__
                 continue
             found += 1
-            where = (func.__name__, func.__code__.co_firstlineno)
+            own = inspect.unwrap(func)  # a decorated one (`contextmanager`) is read as its own body
+            where = (own.__name__, own.__code__.co_firstlineno)
             located = [(getattr(node, "name", None), cpnx.sandbox._first_line(node)) for node in nodes]
             assert located == [where], func.__qualname__
     assert found > 300

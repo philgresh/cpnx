@@ -101,7 +101,7 @@ _BUILTIN_VALUES = tuple(
 
 #: Builtin types whose methods cannot change the value they are called on (``str.lower``):
 #: such a method, held as a default value, is what the same spelling in the body reads.
-_IMMUTABLE_BUILTIN_TYPES = (int, float, complex, str, bytes, bool, tuple, frozenset, range)
+_IMMUTABLE_BUILTIN_TYPES = (*_IMMUTABLE_LEAVES, tuple, frozenset)
 
 
 def _is_inert_builtin(value: object) -> bool:
@@ -310,21 +310,33 @@ class _Certifier:
         return self._check_default_values(func, stack)
 
     def _check_default_values(self, func: Callable, stack: frozenset[Callable]) -> Verdict:
-        """Each default value must be one a guard may read: immutable, a builtin, or a certifying callable.
+        """Each default value must be one a guard may read, by the rule for a global read (:meth:`_check_value`).
 
         The walk of the source checks the default *expressions*, but those ran once, where
         the callable was defined, and the source may have changed since: a file edited so that
         only a default differs still compiles to the same code. So the values the callable
-        holds are checked too, by the rule a global read is held to (:meth:`_check_name`).
+        holds are checked too.
         """
-        for _name, value in _default_values(func):
-            value = _force_lazy_import(value)
-            if _is_immutable(value) or _is_inert_builtin(value):
-                continue
-            if callable(value) and self.certify(value, stack).certified:
-                continue
-            return Verdict(False, "default value is mutable or uncertified")
+        for name, value in _default_values(func):
+            verdict = self._check_value(_force_lazy_import(value), stack)
+            if not verdict.certified:
+                return Verdict(False, f"default '{name}' is mutable or uncertified{verdict.reason}")
         return Verdict(True)
+
+    def _check_value(self, value: object, stack: frozenset[Callable]) -> Verdict:
+        """Whether a guard may read `value`, from a global, a closure or a default.
+
+        It may if `value` is immutable (:func:`_is_immutable`), a builtin it may call or a
+        method of an immutable builtin type (:func:`_is_inert_builtin`), or a callable that
+        certifies. When it may not, the reason is empty, or says why that callable did not
+        certify, in parentheses.
+        """
+        if _is_immutable(value) or _is_inert_builtin(value):
+            return Verdict(True)
+        if not callable(value):
+            return Verdict(False)
+        inner = self.certify(value, stack)
+        return inner if inner.certified else Verdict(False, f" ({inner.reason})")
 
     def _certify_node(self, func: Callable, node: ast.AST, stack: frozenset[Callable]) -> Verdict:
         if isinstance(node, ast.AsyncFunctionDef):
@@ -381,9 +393,7 @@ class _Certifier:
         if node.id in bound:
             return Verdict(True)
         value = _resolve_name(func, node.id)
-        if value is _UNRESOLVED or _is_immutable(value):
-            return Verdict(True)
-        if callable(value) and self.certify(value, stack).certified:
+        if value is _UNRESOLVED or self._check_value(value, stack).certified:
             return Verdict(True)
         return Verdict(False, f"reads mutable/uncertified external '{node.id}'")
 
