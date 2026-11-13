@@ -16,7 +16,7 @@ import pytest
 from cpnx import InputArc, OutputArc, Transition
 from cpnx.certification import Verdict, certify
 from cpnx.linting import lint_callable
-from cpnx.sandbox import _callable_node, verify_callable_purity
+from cpnx.sandbox import _callable_nodes, verify_callable_purity
 
 ANNOTATED = "def guard(tokens: list) -> bool:\n    seen: int = len(tokens)\n    return seen > 0\n"
 
@@ -70,10 +70,12 @@ def test_certifying_skips_annotations_without_changing_the_shared_tree(tmp_path)
     path = tmp_path / "annotated.py"
     path.write_text(ANNOTATED)
     guard = _load(path, "annotated_guard").guard
-    before = ast.dump(_callable_node(guard), include_attributes=True)
+    (node,) = _callable_nodes(guard)
+    before = ast.dump(node, include_attributes=True)
     assert certify(guard).certified
     assert certify(guard).certified
-    assert ast.dump(_callable_node(guard), include_attributes=True) == before
+    assert _callable_nodes(guard) == (node,)
+    assert ast.dump(node, include_attributes=True) == before
 
 
 def test_a_local_annotation_naming_a_module_class_is_skipped(tmp_path):

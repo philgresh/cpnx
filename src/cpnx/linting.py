@@ -69,7 +69,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .certification import _UNRESOLVED, _resolve_name, _root_name
-from .sandbox import _callable_node_or_none
+from .sandbox import _alike_note, _callable_nodes_or_empty
 
 #: Category label for findings whose root symbol is a network client/transport.
 NETWORK = "network"
@@ -355,16 +355,19 @@ def lint_callable(func: Callable) -> list[LintFinding]:
     when *func* is not callable or its source cannot be recovered (a compiled
     builtin, a REPL lambda) — an unseeable body is reported as "nothing found",
     never as a false positive, consistent with the best-effort contract.
+
+    Before Python 3.11 (and under ``-X no_debug_ranges``) the interpreter records no column
+    positions, so two lambdas that start on one source line and use the same names cannot be
+    told apart: each is then reported with the findings of both, and each message says so.
+    Put them on separate lines to lint each alone.
     """
     if not callable(func):
         return []
-    node = _callable_node_or_none(func)
-    if node is None:
-        return []
-
+    nodes = _callable_nodes_or_empty(func)
+    note = _alike_note(nodes)
     findings: list[LintFinding] = []
     seen: set[tuple[str, str, int]] = set()
-    for child in ast.walk(node):
+    for child in (child for node in nodes for child in ast.walk(node)):
         if not isinstance(child, ast.Call):
             continue
         hit = _classify_call(child, func)
@@ -381,7 +384,7 @@ def lint_callable(func: Callable) -> list[LintFinding]:
                 category=category,
                 symbol=symbol,
                 lineno=lineno,
-                message=f"'{symbol}' looks like {category} ({_WHY[category]})",
+                message=f"'{symbol}' looks like {category} ({_WHY[category]}){note}",
             )
         )
     return findings

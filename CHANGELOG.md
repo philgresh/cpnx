@@ -206,6 +206,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A callable that shares its source line with another is now checked against its own body.**
+  The purity check, the side-effect lint and inline-safety certification found a callable in
+  its source file by the line it starts on alone, so two lambdas on one line were both read
+  as the last one. With `key=lambda t: print(t), filter=lambda t: t.payload["n"] > 0` on one
+  line, the `key` passed the purity check and was certified to run inline, unbounded, because
+  the `filter` is clean; with the two swapped, the clean one was rejected. The same held for a
+  lambda and the lambda it returns, and for a `def` with a lambda default on its first line,
+  which was read as that lambda. On Python 3.11 and later each callable is now found by where
+  its own code lies (`code.co_positions`). Python 3.10 records no columns, and neither does
+  `-X no_debug_ranges`: there a callable is told from the others on its line by what it is
+  (a `def` by its name, a lambda as a lambda) and by the names its code carries, so a guard
+  beside an `action=lambda b: print(b)` is still checked alone. Only lambdas on one line that
+  use the same names cannot be told apart there. Those are held to what any of them does:
+  one that fails the purity check or certification fails it for the others, each is
+  reported with the lint findings of all, and the error, the certification reason and the
+  lint message say that N functions start on that line and to put them on separate lines.
+
+  A decorated `def` was also read as some other function: as a lambda among its decorator's
+  arguments, or, inside a function, as the function around it, whose locals then counted as
+  its own, so a read of an enclosing variable certified. On every Python it is now found as
+  itself, starting from its first decorator, as its code does. It is not certified ("decorated
+  callable"), and the purity check and the lint read its own body. That also covers a
+  decorated `def` outside any function, which was not found before: the purity check then read
+  its source text, which gives up at the first `=` and let a `print` or `open` in the body
+  through, and the lint reported nothing. The lint now reports such a callable's findings,
+  so a decorated guard may start to warn, or to raise under strict lint.
+
 - **Certification no longer admits three callables that run more than it checked.** A
   certified guard, key or filter runs inline, so these were real gaps:
 
