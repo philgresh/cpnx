@@ -14,7 +14,7 @@ import sys
 import pytest
 
 from cpnx import InputArc, OutputArc, Transition
-from cpnx.certification import certify
+from cpnx.certification import Verdict, certify
 from cpnx.linting import lint_callable
 from cpnx.sandbox import _callable_node, verify_callable_purity
 
@@ -236,6 +236,37 @@ def test_a_guard_with_a_long_expression_still_certifies(tmp_path, terms):
     guard = _load(path, f"deep_guard_{terms}").guard
     assert certify(guard).certified
     Transition(name="t", inputs=[InputArc("p")], outputs=[OutputArc("q")], action=_passthrough, guard=guard)
+
+
+def _deep_tuple(depth):
+    value = ()
+    for _ in range(depth):
+        value = (value,)
+    return value
+
+
+def _helper_chain(length):
+    helpers = "def h0(t):\n    return True\n\n\n" + "".join(
+        f"def h{i}(t):\n    return h{i - 1}(t)\n\n\n" for i in range(1, length)
+    )
+    return helpers + f"def guard(tokens):\n    return h{length - 1}(tokens)\n"
+
+
+# The walks are iterative, but a value or call graph nested past the recursion limit still
+# recurses (_is_immutable on a closed-over tuple, certifying one helper per call). certify()
+# never raises, so that must come back as not certified rather than as a RecursionError.
+@pytest.mark.parametrize("shape", ["deep_tuple", "helper_chain"])
+def test_something_nested_past_the_recursion_limit_is_not_certified(tmp_path, shape):
+    limit = sys.getrecursionlimit()
+    path = tmp_path / f"nested_{shape}.py"
+    if shape == "deep_tuple":
+        path.write_text("DEEP = None\n\n\ndef guard(tokens):\n    return DEEP is not None\n")
+        module = _load(path, f"nested_{shape}_guard")
+        module.DEEP = _deep_tuple(2 * limit)
+    else:
+        path.write_text(_helper_chain(limit + 200))
+        module = _load(path, f"nested_{shape}_guard")
+    assert certify(module.guard) == Verdict(False, "too deeply nested to certify")
 
 
 def test_an_edited_file_is_parsed_again_by_every_check(tmp_path):
