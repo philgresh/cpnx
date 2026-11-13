@@ -16,7 +16,8 @@ Two views:
   worker that is busy for 1.0 after each firing, so the matured backlog grows to about N.
   `untimed` is the identical net with the arrivals deposited `AVAILABLE_NOW`, as a control.
   With the matured heap and the head-only FIFO peek (#59 causes A and B) the timed arm
-  tracks the control.
+  tracks the control. `inline` is the timed arm driven with `inline_actions=True` (#79), which
+  runs each firing on the driving thread instead of handing it to the thread pool.
 
 Report the *shape* (flat vs linear growth per doubling) and the ratio, not raw microseconds.
 Native stdlib only.
@@ -53,7 +54,7 @@ def _boundary_us(depth: int) -> float:
     return timeit.timeit(lambda: place.earliest_available_boundary(now), number=CALLS) / CALLS * 1e6
 
 
-def _drive_us_per_step(depth: int, *, timed: bool) -> float:
+def _drive_us_per_step(depth: int, *, timed: bool, inline: bool = False) -> float:
     """Microseconds per firing to drain `depth` arrivals through one worker on the logical clock."""
     net = PetriNet(seed=0)
     for name in ("inbox", "worker", "out"):
@@ -76,7 +77,7 @@ def _drive_us_per_step(depth: int, *, timed: bool) -> float:
         net.deposit("inbox", Token(available_at=1.0 + 0.01 * (i + 1) if timed else AVAILABLE_NOW))
 
     started = time.perf_counter()
-    result = net.drive_to_quiescence()
+    result = net.drive_to_quiescence(inline_actions=inline)
     elapsed = time.perf_counter() - started
     assert len(net.places["out"]) == depth
     return elapsed / result.steps * 1e6
@@ -95,13 +96,20 @@ def main() -> None:
 
     print()
     print("-- drive: drive_to_quiescence through one worker, timed vs untimed arrivals --")
-    print(f"   {'depth N':>8}  {'timed us/step':>14}  {'untimed us/step':>16}  {'timed growth':>13}")
+    print(
+        f"   {'depth N':>8}  {'timed us/step':>14}  {'untimed us/step':>16}  {'timed growth':>13}"
+        f"  {'inline us/step':>15}  {'pool/inline':>12}"
+    )
     prev = None
     for depth in DRIVE_DEPTHS:
         timed_us = _drive_us_per_step(depth, timed=True)
         untimed_us = _drive_us_per_step(depth, timed=False)
+        inline_us = _drive_us_per_step(depth, timed=True, inline=True)
         growth = f"x{timed_us / prev:.2f}" if prev else "-"
-        print(f"   {depth:>8}  {timed_us:>14.1f}  {untimed_us:>16.1f}  {growth:>13}")
+        print(
+            f"   {depth:>8}  {timed_us:>14.1f}  {untimed_us:>16.1f}  {growth:>13}"
+            f"  {inline_us:>15.1f}  {timed_us / inline_us:>11.2f}x"
+        )
         prev = timed_us
 
     print()
@@ -109,6 +117,7 @@ def main() -> None:
     print("   matured heap it ~doubled per doubling of N, which made each clock advance O(backlog).")
     print("   'timed us/step' tracks 'untimed us/step' and grows only slowly with N. Before #59's")
     print("   fixes it grew roughly linearly with N, far above the untimed control.")
+    print("   'inline us/step' is below 'timed us/step' by the thread-pool handoff it skips (#79).")
 
 
 if __name__ == "__main__":

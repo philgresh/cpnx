@@ -46,6 +46,25 @@ def test_deep_place_drains_in_one_firing():
         assert net.places["out"].tokens[-1].payload["count"] == n
 
 
+def test_a_drain_with_no_outputs_fires_once_then_is_not_enabled():
+    """Draining at firing time flags the place as changed, so the emptied arc is looked at again.
+
+    The drain is the transition's only arc and it deposits nothing, so nothing else flags the
+    place. Were the drain not to flag it, the cached binding would stay and `step()` would
+    keep firing on an empty place.
+    """
+    net = PetriNet(
+        places=[Place("inbox")],
+        transitions=[Transition("drain", [InputArc("inbox", consume_all=True)], [], lambda tokens: [])],
+    )
+    with net:
+        for i in range(2):
+            net.deposit("inbox", Token(payload={"i": i}))
+        assert net.step() is True
+        assert len(net.places["inbox"]) == 0
+        assert net.step() is False
+
+
 def test_threshold_gate_then_full_sweep():
     """ThresholdPlace + consume_all: blocked below threshold, sweeps the whole pool at/above it."""
     net = PetriNet(

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Building a transition no longer re-parses the module that defines its callables.** The
+  purity check, the linter and the certifier each parsed the callable's whole source file and
+  walked its whole tree for every guard, key, filter and action, on every transition built.
+  They now share one parse per file (parsed again whenever the file's bytes change) and look
+  each callable's node up once. One shared-place property-test example (a net built from a
+  2,400-line test module) went from ~350 ms to ~1 ms, and the full test suite from ~5 min to
+  ~20 s on 4 cores. Source files are now read as bytes, so a module with a PEP 263 coding
+  cookie (e.g. `latin-1`) and non-ASCII text no longer makes the linter or the certifier raise
+  `UnicodeDecodeError`, and the purity check takes its precise path on it instead of the
+  stricter `getsource` fallback.
+
+- **Two `consume_all` input arcs on one place are never enabled, and adding such a transition
+  warns** ([#75](https://github.com/philgresh/cpnx/issues/75)). Each would drain what the
+  other leaves. A guard-free `FIRST` transition of that shape used to fire, the first arc
+  draining the place and the second taking nothing; with a guard or another policy it raised
+  `ValueError`. Keep one of the two arcs.
+
 - **A [`SubstitutionTransition`][cpnx.SubstitutionTransition] firing now fails loudly, runs one
   at a time, and keeps its parent busy until a failed firing has settled**
   ([#38](https://github.com/philgresh/cpnx/issues/38)). These come with the subnet restore
@@ -81,6 +98,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`drive_to_quiescence(inline_actions=True)` runs each firing on the driving thread**
+  ([#79](https://github.com/philgresh/cpnx/issues/79),
+  [ADR 0012](https://github.com/philgresh/cpnx/blob/main/docs/adr/0012-inline-drive-actions.md)).
+  The drive already keeps one firing in flight, so handing each action to the thread pool and
+  spinning until it commits was pure overhead. Inline, the firings, commits, retries, dead
+  letters and seeded draws happen in the same order, and substitution firings and their subnet
+  drives run inline too. On #79's two-transition chain (5 000 tokens, 10 000 firings) the cost
+  per firing drops from about 137 to about 50 µs, about 2.8×; `bench_timed_backlog.py`'s drive
+  arm gains an `inline` column (about 1.5× there). It is opt-in because an inline action that
+  blocks blocks the drive, and `max_spins` cannot cut it short; set `action_timeout_secs` on an
+  action that can hang. A `KeyboardInterrupt` or `SystemExit` raised by an inline action
+  hands its tokens back exactly as they were taken (no attempt counted, nothing dead-lettered,
+  no permit cooldown) and propagates out of the drive. With `action_timeout_secs`, the action
+  itself may still be running on its worker. Any other `BaseException` from an inline action,
+  such as `asyncio.CancelledError`, fails the firing as usual (an attempt is counted, and it
+  can dead-letter) and then propagates out of the drive. `step()`, `run()` and the default drive are unchanged.
+- **`Transition.binding_selector` lets outside logic choose the tokens a transition binds**
+  ([#80](https://github.com/philgresh/cpnx/issues/80),
+  [ADR 0013](https://github.com/philgresh/cpnx/blob/main/docs/adr/0013-binding-selector.md)).
+  The selector gets a read-only [`BindingView`][cpnx.BindingView] of the tokens each input arc
+  could take (lazy, plus `groups`/`group` lookups served from a place index when the key
+  certifies) and a `view.random` stream seeded from the net's seed, the transition and its
+  firing count. It returns one choice per arc, or `None`. The engine checks that the tokens are
+  available, distinct and pass the guard, then fires exactly those; an invalid choice is
+  reported through `on_error` and does not fire. On #80's dispatcher (100 servers, 13 skills), a
+  selector that picks uniformly among all eligible pairs costs about the same per firing at
+  1 000, 2 000 and 4 000 waiting jobs (×0.96, ×1.01), while `RANDOM`'s roughly doubles to
+  about 2.2× the selector's, and its
+  first pick over 200 seeds ranges over the whole queue where `RANDOM`'s stays within the first
+  10 jobs. `BindingPolicy` now documents that truncation. New benchmark:
+  `benchmarks/bench_dispatch_selector.py`. `Place.holds_available` is new too.
 - **`InputArc.join_key` joins input arcs on equal keys, and a join with no match no longer
   walks every candidate** ([#64](https://github.com/philgresh/cpnx/issues/64),
   [ADR 0010](https://github.com/philgresh/cpnx/blob/main/docs/adr/0010-equi-join-index.md)).
@@ -158,6 +206,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A callable that shares its source line with another is now checked against its own body.**
+  The purity check, the side-effect lint and inline-safety certification found a callable in
+  its source file by the line it starts on alone, so two lambdas on one line were both read
+  as the last one. With `key=lambda t: print(t), filter=lambda t: t.payload["n"] > 0` on one
+  line, the `key` passed the purity check and was certified to run inline, unbounded, because
+  the `filter` is clean; with the two swapped, the clean one was rejected. The same held for a
+  lambda and the lambda it returns, and for a `def` with a lambda default on its first line,
+  which was read as that lambda. On Python 3.11 and later each callable is now found by where
+  its own code lies (`code.co_positions`). Python 3.10 records no columns, and neither does
+  `-X no_debug_ranges`: there a callable is told from the others on its line by what it is
+  (a `def` by its name, a lambda as a lambda) and by the names its code carries, so a guard
+  beside an `action=lambda b: print(b)` is still checked alone. Only lambdas on one line that
+  use the same names cannot be told apart there. Those are held to what any of them does:
+  one that fails the purity check or certification fails it for the others, each is
+  reported with the lint findings of all, and the error, the certification reason and the
+  lint message say that N functions start on that line and to put them on separate lines.
+
+  A decorated `def` was also read as some other function: as a lambda among its decorator's
+  arguments, or, inside a function, as the function around it, whose locals then counted as
+  its own, so a read of an enclosing variable certified. On every Python it is now found as
+  itself, starting from its first decorator, as its code does. It is not certified ("decorated
+  callable"), and the purity check and the lint read its own body. That also covers a
+  decorated `def` outside any function, which was not found before: the purity check then read
+  its source text, which gives up at the first `=` and let a `print` or `open` in the body
+  through, and the lint reported nothing. The lint now reports such a callable's findings,
+  so a decorated guard may start to warn, or to raise under strict lint.
+
+- **Certification no longer admits three callables that run more than it checked.** A
+  certified guard, key or filter runs inline, so these were real gaps:
+
+  - **A nested `def`'s annotations are now checked before 3.14** (without
+    `from __future__ import annotations`). They run every time the `def` statement does, i.e.
+    on every call, but were skipped like the callable's own annotations. A side effect: on
+    3.10–3.13, a nested `def` whose annotations name anything other than a builtin, `typing`
+    constructs included (`def rank(x: Optional[int]) -> int`, `def key(t: Token) -> int`),
+    now uncertifies its callable, which then runs on the executor (a guard) or loses the
+    place index (a key or filter). The reason names the annotation's name, e.g. "reads
+    mutable/uncertified external 'Optional'". Drop the nested annotations or add the future
+    import to keep it inline.
+  - **A `class` statement inside a callable is rejected.** Its body runs on every call,
+    including its annotations before 3.14, and its names were counted as the callable's own,
+    hiding reads of same-named mutable globals.
+  - **A walrus in the callable's own default values no longer counts as a local binding.**
+    Defaults run once, at definition, so `def guard(t, _=(STATE := 0))` binds nothing when it
+    runs, and its read of a mutable global `STATE` is now rejected.
+
+- **`certify()` no longer raises `RecursionError` on a very long guard expression.** Binding
+  collection recursed once per AST level, so a guard of ~1,500 `a + b + …` terms aborted
+  `Transition` construction. Every AST walk in certification is now iterative, and anything
+  else nested too deeply to certify is reported as not certified, as `certify` documents.
+
+- **Two input arcs on one place now take two different tokens**
+  ([#75](https://github.com/philgresh/cpnx/issues/75)). A transition with two arcs reading the
+  same place, whether the same `InputArc` twice or two separate ones, with or without
+  `join_key`, could bind one token to both. Firing then removed it twice and
+  `retrieve_specific` raised `ValueError`. Each arc now takes tokens of its own, as one arc with
+  `count=2` does. The head-only path gives each arc the head of what the earlier arcs left,
+  reading the place's whole demand even past `binding_search_limit`. The product search
+  draws a later arc's options from the tokens the earlier arcs left and only then cuts them to
+  the limit, so a guarded `[p, p×2]` on a deep place still binds; an option that leaves a
+  later arc nothing counts toward the limit. The `join_key` search builds no candidate that
+  reuses a token either (below). One token no longer enables two arcs.
+  A guard-free `FIRST` transition whose `filter` arc shares its place now searches (see
+  below), so it can exhaust `binding_search_limit` and call `on_binding_search_exhausted`,
+  which guard-free `FIRST` transitions without a `join_key` never did before.
+  In a self-join (N join arcs on one place with one `join_key` function), a key binds only
+  once the place holds N of its tokens; arcs with different functions need one token each.
+  Its join indexes now track each key's first N tokens, so ADR 0011's match lists only keys
+  that bind and the one-key existence probe stays correct. On a place read by join arcs with
+  different functions, a token whose key is the same under both lists a key that only it
+  holds, so such keys are filtered by Hall's condition (below). Without the index, keys with
+  fewer tokens are dropped before building candidates, so a backlog of them can't use up
+  `binding_search_limit` ahead of a key that holds a pair. Such a place also drops keys that
+  fail Hall's condition (some set of its functions reaches fewer distinct tokens than arcs),
+  so a backlog of tokens carrying one key under both functions can't hide a pair either
+  ([#78](https://github.com/philgresh/cpnx/issues/78)). The place reports when each key passes
+  Hall's condition as its tokens change, rechecking only the keys a deposit or removal touches
+  (ADR 0011 §4a), so the guard-free existence probe asks for one key again and a backlog of
+  keys that fail costs nothing per probe. Firing and guarded probes no longer merge every key's
+  candidates: they sort keys by a lower bound on their candidates and open each only once the
+  search reaches that bound (ADR 0011 §3), with the same candidates in the same order. On a `manager == id` chain (`benchmarks/bench_self_join_chain.py`) a `FIRST`
+  firing takes about 14 µs at 1 000, 4 000 and 16 000 keys, where `main` takes 1.9, 7.7 and
+  34.7 ms. A self-join of three or more arcs with one function skips a key's self-pairings
+  unbuilt, so a key deeper than the limit still binds.
+  Every arc on a shared place of a join transition takes tokens the earlier arcs left: join
+  arcs with any `join_key`, and arcs without one, drawn from the remaining tokens as in the
+  product search. Both are pruned by a residual Hall check so that neither strands a later
+  join arc on its place, which a plain arc read first could do by taking a key's only token. A
+  choice that leaves a later arc nothing counts toward `binding_search_limit`, so the search
+  stays bounded, and arcs without a `join_key` on a place deeper than the limit still bind.
+  A plain arc taking several tokens steps over the combinations it may not take rather than
+  reading them, so its cost stays with the options it yields. Each key's walk costs O(1) to
+  start, and plain arcs after every join arc, off the key's places, are walked once for all
+  keys. The existence probe keeps its one-key shortcut unless an arc
+  without a `join_key` on a shared place reads a join place, or sits before a join arc on a
+  place where some arc has a `filter`. Such an arc can run a later arc out of tokens once
+  per key, so firing can use up `binding_search_limit` where one key alone would bind, and
+  the probe then reads every key as firing does.
+  Draining 200 pairs past 16 000
+  one-token keys took 1 690 ms and now takes about 170 ms, level with a two-place join.
+  A guard-free `FIRST` transition whose `filter` arc shares its place
+  with another arc now searches instead of taking heads greedily, which could leave the
+  filtered arc without the one token it accepts and report the transition dead.
+  A `consume_all` arc that shares its place with another input arc takes every token that arc
+  leaves, which may be none, so "marker + drain" (`[batch(filter=is_flush),
+  batch(consume_all)]`) takes the marker and drains the rest. Before, that held only for a
+  guard-free `FIRST` transition with the `consume_all` arc last: the other arc order, a
+  guard, `RANDOM`, `PRIORITY` or a `join_key` arc raised `ValueError`. The shared places are found once per
+  resolution: a guard-free two-arc probe costs 3.16 µs against 3.04 µs on `main`.
 - **`drive_to_quiescence` no longer stops before a later cooling token matures**
   ([#68](https://github.com/philgresh/cpnx/issues/68)). When a place already held two or more
   timed tokens as the incremental scheduler started, it tracked only that place's earliest
