@@ -61,7 +61,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from .sandbox import SandboxEvaluator, _alike_note, _callable_nodes_or_empty
+from .sandbox import SandboxEvaluator, _alike_note, _callable_nodes_or_empty, _default_values
 from .tokens import FrozenDict
 
 #: Builtins that iterate/reduce a finite iterable. Added on top of the string
@@ -92,6 +92,34 @@ _IMMUTABLE_LEAVES = (int, float, str, bytes, bool, type(None))
 #: straight through. So both recurse through :func:`_is_immutable` on keys *and* values.
 _FROZEN_MAPPINGS = tuple(t for t in (FrozenDict, getattr(builtins, "frozendict", None)) if t is not None)
 
+#: The builtins a default value may be: those a certified body may call
+#: (``_ALLOWED_CALL_NAMES``). ``print``, ``open``, ``eval`` and the rest are not, nor is
+#: anything put into ``builtins`` at run time.
+_BUILTIN_VALUES = tuple(
+    value for name, value in vars(builtins).items() if name in _ALLOWED_CALL_NAMES and not name.startswith("_")
+)
+
+#: Builtin types whose methods cannot change the value they are called on (``str.lower``):
+#: such a method, held as a default value, is what the same spelling in the body reads.
+_IMMUTABLE_BUILTIN_TYPES = (*_IMMUTABLE_LEAVES, tuple, frozenset)
+
+
+def _is_inert_builtin(value: object) -> bool:
+    """Say whether `value` is a builtin a guard may hold: one it may call, or a method of an immutable builtin type.
+
+    The method may be unbound (``str.lower``) or bound to an immutable value (``"-".join``).
+    """
+    if any(value is builtin for builtin in _BUILTIN_VALUES):
+        return True
+    receiver = getattr(value, "__self__", None)
+    if isinstance(value, types.BuiltinMethodType) and type(receiver) in _IMMUTABLE_BUILTIN_TYPES:
+        return _is_immutable(receiver)
+    owner = getattr(value, "__objclass__", None)
+    return isinstance(value, (types.MethodDescriptorType, types.ClassMethodDescriptorType)) and owner in (
+        _IMMUTABLE_BUILTIN_TYPES
+    )
+
+
 #: ``types.LazyImportType`` on 3.15+ (:pep:`810`), else ``None``.
 _LAZY_IMPORT_TYPE = getattr(types, "LazyImportType", None)
 
@@ -113,8 +141,10 @@ def certify(func: Callable) -> Verdict:
     """Return a :class:`Verdict` on whether *func* is safe to run inline.
 
     Never raises for an un-certifiable callable; an unverifiable one yields
-    ``Verdict(False, <reason>)``. A fresh memo/cycle-stack is used per top-level
-    call, so the result reflects the current call graph and closure state.
+    ``Verdict(False, <reason>)``. An unexpected error from the source lookup itself (a bug,
+    not missing or unreadable source) propagates, as it does from the purity check. A fresh
+    memo/cycle-stack is used per top-level call, so the result reflects the current call
+    graph and closure state.
 
     The AST walks are iterative, but a value or call graph nested deeply enough can
     still exhaust the interpreter's stack (``_is_immutable`` on a deeply nested
@@ -251,6 +281,12 @@ class _Certifier:
         self._memo: dict[Callable, Verdict] = {}
 
     def certify(self, func: Callable, stack: frozenset[Callable]) -> Verdict:
+        try:
+            hash(func)
+        except TypeError:
+            # The memo and the cycle stack key on the callable: an unhashable one (a dataclass
+            # with `__call__`) cannot be tracked through them, so it is not certified.
+            return Verdict(False, "unhashable callable")
         if func in stack:
             return Verdict(False, "cyclic call graph")
         if func in self._memo:
@@ -271,7 +307,36 @@ class _Certifier:
                 # With several nodes `func` is one of them, and which one cannot be told: any
                 # failure fails it, and the reason says so.
                 return Verdict(False, f"{verdict.reason}{_alike_note(nodes)}")
+        return self._check_default_values(func, stack)
+
+    def _check_default_values(self, func: Callable, stack: frozenset[Callable]) -> Verdict:
+        """Each default value must be one a guard may read, by the rule for a global read (:meth:`_check_value`).
+
+        The walk of the source checks the default *expressions*, but those ran once, where
+        the callable was defined, and the source may have changed since: a file edited so that
+        only a default differs still compiles to the same code. So the values the callable
+        holds are checked too.
+        """
+        for name, value in _default_values(func):
+            verdict = self._check_value(_force_lazy_import(value), stack)
+            if not verdict.certified:
+                return Verdict(False, f"default '{name}' is mutable or uncertified{verdict.reason}")
         return Verdict(True)
+
+    def _check_value(self, value: object, stack: frozenset[Callable]) -> Verdict:
+        """Whether a guard may read `value`, from a global, a closure or a default.
+
+        It may if `value` is immutable (:func:`_is_immutable`), a builtin it may call or a
+        method of an immutable builtin type (:func:`_is_inert_builtin`), or a callable that
+        certifies. When it may not, the reason is empty, or says why that callable did not
+        certify, in parentheses.
+        """
+        if _is_immutable(value) or _is_inert_builtin(value):
+            return Verdict(True)
+        if not callable(value):
+            return Verdict(False)
+        inner = self.certify(value, stack)
+        return inner if inner.certified else Verdict(False, f" ({inner.reason})")
 
     def _certify_node(self, func: Callable, node: ast.AST, stack: frozenset[Callable]) -> Verdict:
         if isinstance(node, ast.AsyncFunctionDef):
@@ -328,9 +393,7 @@ class _Certifier:
         if node.id in bound:
             return Verdict(True)
         value = _resolve_name(func, node.id)
-        if value is _UNRESOLVED or _is_immutable(value):
-            return Verdict(True)
-        if callable(value) and self.certify(value, stack).certified:
+        if value is _UNRESOLVED or self._check_value(value, stack).certified:
             return Verdict(True)
         return Verdict(False, f"reads mutable/uncertified external '{node.id}'")
 

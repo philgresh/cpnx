@@ -17,7 +17,7 @@ release there was **no `sys.version_info` gating anywhere in `src/`**.
 | module | AST surface | other introspection |
 | --- | --- | --- |
 | `cpnx/certification.py` | 34 distinct `ast.*` names, 46 references | `func.__code__` (source comes from `sandbox._callable_nodes`) |
-| `cpnx/sandbox.py` | 17 distinct `ast.*` names | `inspect.getsource{,file,lines}`, `code.co_positions()` where it exists |
+| `cpnx/sandbox.py` | 24 distinct `ast.*` names | `inspect.{unwrap,getmodule}`, `linecache`, `compile`, `code.co_positions()` where it exists, `ast.PyCF_ALLOW_TOP_LEVEL_AWAIT` |
 | `cpnx/linting.py` | 7 distinct `ast.*` names | `inspect.currentframe` + `f_back` walk, `code.co_filename`, `ast.unparse` |
 
 All three decide by matching on node **classes**. That makes exactly two kinds of release
@@ -302,7 +302,21 @@ tripping a Python-level deprecation.
   `-X no_debug_ranges` on any version; there it goes by what the code object does say: its
   name (a `def`'s own, `<lambda>` for a lambda) and the names it carries (`co_names` and the
   variable tables, through nested code objects). A lambda whose body uses a name the code
-  lacks is ruled out. Lambdas on one line that use the same names are left; each is held to
+  lacks is ruled out. Names inside a nested scope (a lambda or generator expression, and on
+  3.10 and 3.11 a list, set or dict comprehension, which PEP 709 inlines from 3.12) count
+  only when the code has a code object for each: in a branch the compiler drops, none is
+  made. If no node left uses every global and attribute name the code does, the nodes on
+  the line that do are read ([#90](https://github.com/philgresh/cpnx/issues/90)). On every
+  version, a node is used only if its source compiles to a code object equal to the one
+  that runs, positions aside: a `.pyc` written by 3.12.3 records other positions than
+  3.12.13 compiles, and 3.12.13 still loads it. REPL input is read from 3.13, when
+  the REPL started keeping it, through the private `linecache._getlines_from_code` (looked
+  up with `getattr`, so its absence only loses REPL lookups). The gates' own parse and compile
+  of a file are silenced for that file only: through `warnings.catch_warnings` where filters
+  are per thread (`sys.flags.context_aware_warnings`, 3.14), and elsewhere by one filter put
+  into `warnings.filters` and taken out, with the private `warnings._filters_mutated()` (there
+  from 3.10 to 3.15) telling the module its filters changed. Lambdas on one line that use
+  the same names are left; each is held to
   what any of them does, and the error, certification reason or lint message says that
   several functions start on the line. `tests/test_same_line_callables.py` runs one case
   in a child interpreter under `-X no_debug_ranges`, so a change in how CPython reports a

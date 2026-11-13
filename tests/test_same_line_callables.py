@@ -13,6 +13,7 @@ something the callable's code does not. Callables that are still alike after tha
 told apart; each is held to what any of them does, and the error says so.
 """
 
+import ast
 import importlib
 import importlib.util
 import inspect
@@ -85,6 +86,14 @@ def top_impure(tokens):
     count = len(tokens)
     print(count)
     return count == 1
+clean_g, dead_genexp = (lambda b: True), (lambda b: print(b) if 1 else (ww for ww in b))
+clean_l, dead_listcomp = (lambda b: True), (lambda b: [ww for ww in b] if 0 else print(b))
+clean_d, dead_dictcomp = (lambda b: True), (lambda b: print(b) or 0 and {ww: 1 for ww in b})
+clean_n, dead_lambda = (lambda b: True), (lambda b: 0 and (lambda: ww) or print(b))
+class Mangles:
+    reads, prints = (lambda s: s.__x), (lambda s: print(s))
+plain_m, dead_maker = (lambda b: b), (lambda k: (lambda b: b if 1 else (w for w in b)))
+gen_prints, gen_clean = (lambda t: sorted(print(x) for x in t)), (lambda t: sorted(x for x in t))
 """
 
 _names = itertools.count()
@@ -101,28 +110,6 @@ def case(tmp_path_factory):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-def _forget_columns(monkeypatch):
-    monkeypatch.setattr(cpnx.sandbox, "_body_anchor", lambda func: None)
-    cpnx.sandbox._SOURCE_CACHE.clear()
-
-
-@pytest.fixture
-def no_columns(monkeypatch):
-    """Check as an interpreter without column positions does (3.10, or `-X no_debug_ranges`)."""
-    _forget_columns(monkeypatch)
-    yield
-    cpnx.sandbox._SOURCE_CACHE.clear()
-
-
-@pytest.fixture(params=["columns as the interpreter records them", "no columns"])
-def either_way(request, monkeypatch):
-    """Run a test on both lookups: what must hold whether or not there are columns."""
-    if request.param == "no columns":
-        _forget_columns(monkeypatch)
-    yield
-    cpnx.sandbox._SOURCE_CACHE.clear()
 
 
 def _is_pure(func) -> bool:
@@ -329,6 +316,78 @@ def test_without_columns_clean_lambdas_on_one_line_still_pass_and_certify(case, 
         assert lint_callable(func) == []
 
 
+_DEAD_BRANCHES = ("dead_genexp", "dead_listcomp", "dead_dictcomp", "dead_lambda")
+
+
+@pytest.mark.parametrize("name", _DEAD_BRANCHES)
+def test_a_nested_scope_in_a_dead_branch_does_not_rule_out_its_lambda(case, name, either_way):
+    # No code object is made for a generator expression, comprehension or lambda in a branch
+    # the compiler drops, so the names inside it reach no code. Counted, they ruled out the
+    # impure lambda's own node, which was then judged by its clean neighbour and certified.
+    func = getattr(case, name)
+    with pytest.raises(PermissionError, match="Forbidden function call 'print'"):
+        verify_callable_purity(func)
+    assert not certify(func).certified
+
+
+def test_without_columns_a_lambda_ruled_out_by_names_falls_back_to_the_nodes_that_name_its_code(
+    case, no_columns, monkeypatch
+):
+    # Should the compiler drop a name some other way, no node left would use every name the
+    # code does. Then the line's nodes that do are read: the lambda's own, never the neighbour.
+    real = cpnx.sandbox._lambda_names
+    monkeypatch.setattr(cpnx.sandbox, "_lambda_names", lambda node, code: real(node, code) | {"never_compiled"})
+    (node,) = cpnx.sandbox._callable_nodes(case.prints)
+    assert ast.unparse(node) == "lambda t: print(t)"
+    assert not _is_pure(case.prints)
+    assert not certify(case.prints).certified
+    (node,) = cpnx.sandbox._callable_nodes(case.clean)
+    assert ast.unparse(node) == "lambda t: t.payload['n']"
+    assert _is_pure(case.clean)
+    # `key_a` and `key_b` use the same global and attribute names: both are read for each.
+    assert len(cpnx.sandbox._callable_nodes(case.key_a)) == 2
+
+
+def test_without_columns_a_dead_branch_in_a_returned_lambda_does_not_rule_out_its_maker(case, no_columns):
+    # The generator expression is dropped inside the inner lambda, so the outer lambda's code
+    # holds one nested code object where its source has two nested scopes.
+    for func, source in ((case.dead_maker, "lambda k:"), (case.dead_maker(0), "lambda b: b if 1")):
+        found = [ast.unparse(node) for node in cpnx.sandbox._callable_nodes(func)]
+        assert any(text.startswith(source) for text in found), found
+
+
+def test_without_columns_live_nested_scopes_still_tell_lambdas_apart(case, no_columns):
+    # Nothing was dropped (each generator expression has its code object), so the names inside
+    # them count, as on `main`: the clean lambda is not held to its neighbour's `print`.
+    assert len(cpnx.sandbox._callable_nodes(case.gen_clean)) == 1
+    assert _is_pure(case.gen_clean)
+    assert lint_callable(case.gen_clean) == []
+    assert not _is_pure(case.gen_prints)
+
+
+@pytest.mark.parametrize(
+    ("stored", "readings"),
+    [
+        ("_K__x", ("__x",)),
+        ("_A__B__x", ("__B__x", "__x")),
+        ("_K___x", ("___x", "__x")),
+        ("foo__bar", ()),
+        ("plain", ()),
+        ("__x", ()),
+        ("_K__dunder__", ()),
+    ],
+)
+def test_a_stored_name_is_read_back_as_the_private_names_it_can_mangle(stored, readings):
+    assert sorted(cpnx.sandbox._demanglings(stored)) == sorted(readings)
+
+
+def test_without_columns_a_mangled_name_still_counts_as_its_own(case, no_columns):
+    # In a class, `s.__x` compiles to `_Mangles__x`; the lambda that reads it is still found alone.
+    assert len(cpnx.sandbox._callable_nodes(case.Mangles.reads)) == 1
+    assert _is_pure(case.Mangles.reads)
+    assert not _is_pure(case.Mangles.prints)
+
+
 @has_columns
 def test_an_interpreter_run_without_debug_ranges_takes_the_no_columns_path(case):
     # The tests above take the columns away by patching. This one asks a real interpreter
@@ -387,7 +446,8 @@ def test_every_function_of_cpnx_itself_is_found_at_its_own_definition(either_way
                 assert func.__name__ == "__annotate__", func.__qualname__
                 continue
             found += 1
-            where = (func.__name__, func.__code__.co_firstlineno)
+            own = inspect.unwrap(func)  # a decorated one (`contextmanager`) is read as its own body
+            where = (own.__name__, own.__code__.co_firstlineno)
             located = [(getattr(node, "name", None), cpnx.sandbox._first_line(node)) for node in nodes]
             assert located == [where], func.__qualname__
     assert found > 300

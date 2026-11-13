@@ -271,7 +271,11 @@ def test_something_nested_past_the_recursion_limit_is_not_certified(tmp_path, sh
     assert certify(module.guard) == Verdict(False, "too deeply nested to certify")
 
 
-def test_an_edited_file_is_parsed_again_by_every_check(tmp_path):
+def test_an_edited_file_is_parsed_again_by_every_check(tmp_path, monkeypatch):
+    # With bytecode written, a same-size edit within one mtime tick reloads the old `.pyc`:
+    # the code runs from before the edit, and the gates refuse it as not in its file
+    # (`tests/test_purity_source_lookup.py`). Without, each load compiles the file as it is.
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
     path = tmp_path / "edited.py"
     path.write_text("import random\n\n\ndef guard(tokens):\n    return bool(tokens)\n")
     guard = _load(path, "edited_guard").guard
@@ -292,8 +296,8 @@ def test_an_edited_file_is_parsed_again_by_every_check(tmp_path):
 
 def test_a_latin_1_source_file_is_decoded_by_its_coding_cookie(tmp_path):
     path = tmp_path / "latin.py"
-    # `.get(...)` is rejected only by the stricter getsource fallback, so passing the purity
-    # check shows the precise path read this file.
+    # A callable whose source cannot be read and parsed fails the purity check, so passing it
+    # shows this file was decoded.
     path.write_bytes(b"# -*- coding: latin-1 -*-\ndef guard(tokens):\n    return tokens.get('caf\xe9')\n")
     guard = _load(path, "latin_guard").guard
     verify_callable_purity(guard)

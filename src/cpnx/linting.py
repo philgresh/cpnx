@@ -69,7 +69,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .certification import _UNRESOLVED, _resolve_name, _root_name
-from .sandbox import _alike_note, _callable_nodes_or_empty
+from .sandbox import _alike_note, _callable_nodes_or_empty, _own_function
 
 #: Category label for findings whose root symbol is a network client/transport.
 NETWORK = "network"
@@ -350,11 +350,13 @@ def _classify_call(node: ast.Call, func: Callable) -> tuple[str, str] | None:
 def lint_callable(func: Callable) -> list[LintFinding]:
     """Scan *func*'s body for network / database / clock / randomness trouble spots.
 
-    Pure inspection: never warns, never raises, never mutates. Returns findings in
-    source order, de-duplicated by ``(category, symbol, lineno)``. Returns ``[]``
+    Pure inspection: never warns, never mutates, and raises only for an unexpected error
+    in the source lookup itself (a bug, which the purity check raises as well). Returns
+    findings in source order, de-duplicated by ``(category, symbol, lineno)``. Returns ``[]``
     when *func* is not callable or its source cannot be recovered (a compiled
-    builtin, a REPL lambda) — an unseeable body is reported as "nothing found",
-    never as a false positive, consistent with the best-effort contract.
+    builtin, code with no source, a REPL lambda before Python 3.13) — an unseeable
+    body is reported as "nothing found", never as a false positive, consistent with
+    the best-effort contract.
 
     Before Python 3.11 (and under ``-X no_debug_ranges``) the interpreter records no column
     positions, so two lambdas that start on one source line and use the same names cannot be
@@ -364,13 +366,16 @@ def lint_callable(func: Callable) -> list[LintFinding]:
     if not callable(func):
         return []
     nodes = _callable_nodes_or_empty(func)
+    # Names resolve against the function those nodes are: a decorator's wrapper (an
+    # `lru_cache`, say) need not be a Python function, or hold its globals.
+    function = _own_function(func)
     note = _alike_note(nodes)
     findings: list[LintFinding] = []
     seen: set[tuple[str, str, int]] = set()
     for child in (child for node in nodes for child in ast.walk(node)):
         if not isinstance(child, ast.Call):
             continue
-        hit = _classify_call(child, func)
+        hit = _classify_call(child, function)
         if hit is None:
             continue
         category, symbol = hit
