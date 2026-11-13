@@ -568,28 +568,36 @@ def test_the_key_match_follows_a_timed_head_and_a_reassigned_key():
     assert not net._binding_exists(transition, 3.0)
 
 
+def _times(heads):
+    """A head report's `(when, first)` values, cut to `when`."""
+    return None if heads is None else {key: None if head is None else head[0] for key, head in heads.items()}
+
+
 def test_head_changes_report_each_head_change_once():
     store = _TokenStore()
     store.register_join_index(1, WID)
+    source = ((1, 1),)
     store.append(Token(payload={"wid": 0, "n": 0}, available_at=5.0))
-    generation, every_head, changes = store.join_head_changes(1, None)
-    assert every_head == {0: 5.0} and changes == {}
+    generation, every_head, changes = store.join_head_changes(source, None)
+    assert _times(every_head) == {0: 5.0} and changes == {}
     late = Token(payload={"wid": 0, "n": 1}, available_at=9.0)
     store.append(late)
-    assert store.join_head_changes(1, generation) == (generation, None, {})
+    assert store.join_head_changes(source, generation) == (generation, None, {})
     early = Token(payload={"wid": 0, "n": 2})
     store.append(early)
     store.append(Token(payload={"wid": 3, "n": 3}, available_at=1.0))
-    assert store.join_head_changes(1, generation) == (generation, None, {0: float("-inf"), 3: 1.0})
+    got, every_head, changes = store.join_head_changes(source, generation)
+    assert got == generation and every_head is None and _times(changes) == {0: float("-inf"), 3: 1.0}
+    assert changes[0][1] == (0, 0.0, 2)  # the first entry: the ready token, seq 2
     store.remove_identity([late])
-    assert store.join_head_changes(1, generation) == (generation, None, {})
+    assert store.join_head_changes(source, generation) == (generation, None, {})
     store.remove_identity([early])
-    assert store.join_head_changes(1, generation) == (generation, None, {0: 5.0})
+    assert _times(store.join_head_changes(source, generation)[2]) == {0: 5.0}
     store.drop_all()
-    new_generation, every_head, changes = store.join_head_changes(1, generation)
+    new_generation, every_head, changes = store.join_head_changes(source, generation)
     assert new_generation != generation and every_head == {} and changes == {}
     store.append(Token(payload={}))
-    assert store.join_head_changes(1, new_generation) is None
+    assert store.join_head_changes(source, new_generation) is None
 
 
 def test_two_transitions_sharing_a_join_arc_each_see_every_change():
@@ -622,15 +630,15 @@ def test_two_transitions_sharing_a_join_arc_each_see_every_change():
 def test_the_key_match_keeps_its_state_while_an_index_is_down_and_rebuilds_after(monkeypatch):
     monkeypatch.setattr(places, "_KEY_INDEX_REARM_MIN_DEPOSITS", 4)
     full_reports = []
-    original = places._JoinIndex.head_changes
+    original = places._TokenStore.join_head_changes
 
-    def spy(self, generation):
-        report = original(self, generation)
-        if report[1] is not None:
+    def spy(self, sources, generations):
+        report = original(self, sources, generations)
+        if report is not None and report[1] is not None:
             full_reports.append(report[1])
         return report
 
-    monkeypatch.setattr(places._JoinIndex, "head_changes", spy)
+    monkeypatch.setattr(places._TokenStore, "join_head_changes", spy)
     net = _join_net()
     net.on_error = lambda *args: None
     for wid in range(50):

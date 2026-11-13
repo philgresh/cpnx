@@ -50,15 +50,18 @@ behaviour** — symmetric with the closure-cell immutability rule below and with
 a compiled string expression, both of which are frozen at construction.
 """
 
+import __future__
+
 import ast
 import builtins
-import copy
 import inspect
+import sys
 import types
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from .sandbox import SandboxEvaluator, _source_node
+from .sandbox import SandboxEvaluator, _callable_node_or_none
 from .tokens import FrozenDict
 
 #: Builtins that iterate/reduce a finite iterable. Added on top of the string
@@ -112,10 +115,18 @@ def certify(func: Callable) -> Verdict:
     Never raises for an un-certifiable callable; an unverifiable one yields
     ``Verdict(False, <reason>)``. A fresh memo/cycle-stack is used per top-level
     call, so the result reflects the current call graph and closure state.
+
+    The AST walks are iterative, but a value or call graph nested deeply enough can
+    still exhaust the interpreter's stack (``_is_immutable`` on a deeply nested
+    tuple, a very long chain of helpers). That is reported as not certified, so this
+    stays a function that never raises.
     """
     if not callable(func):
         return Verdict(False, "not callable")
-    return _Certifier().certify(func, frozenset())
+    try:
+        return _Certifier().certify(func, frozenset())
+    except RecursionError:
+        return Verdict(False, "too deeply nested to certify")
 
 
 def is_inline_safe(func: Callable) -> bool:
@@ -141,24 +152,6 @@ def _is_immutable(value: object) -> bool:
     if isinstance(value, _FROZEN_MAPPINGS):
         return all(_is_immutable(key) and _is_immutable(item) for key, item in value.items())
     return False
-
-
-def _get_ast_node(func: Callable) -> ast.AST | None:
-    """Recover the ``Lambda``/``FunctionDef`` AST node for *func*, or ``None``.
-
-    Returns ``None`` when the source cannot be located (compiled builtins, REPL
-    lambdas, ``exec``-created code) — which certification treats as *not
-    certified*, never as *allowed*.
-
-    The node is a private copy of the one in the shared per-file parse
-    (:func:`cpnx.sandbox._source_node`), because :func:`_strip_annotations` changes it in
-    place and the purity and lint checks read the shared one.
-    """
-    try:
-        node = _source_node(func)
-    except (OSError, TypeError, SyntaxError):
-        return None
-    return copy.deepcopy(node)
 
 
 def _param_names(node: ast.AST) -> frozenset[str]:
@@ -269,7 +262,7 @@ class _Certifier:
     def _certify_uncached(self, func: Callable, stack: frozenset[Callable]) -> Verdict:
         if getattr(func, "__wrapped__", None) is not None:
             return Verdict(False, "decorated callable (wrapper hides certified body)")
-        node = _get_ast_node(func)
+        node = _callable_node_or_none(func)
         if node is None:
             return Verdict(False, "source unavailable")
         if isinstance(node, ast.AsyncFunctionDef):
@@ -287,10 +280,10 @@ class _Certifier:
         immutable or a certifying helper (see :meth:`_check_name`). This unified
         read check covers both closure cells and module globals.
         """
-        _strip_annotations(node)
+        inert = _inert_annotations(node, func)
         params = _param_names(node)
-        bound = params | _bound_names(node)
-        for child in ast.walk(node):
+        bound = params | _bound_names(node, inert)
+        for child in _walk_live(node, inert):
             verdict = self._check_node(child, func, params, bound, stack)
             if not verdict.certified:
                 return verdict
@@ -407,30 +400,81 @@ def _unpacked_element(node: ast.AST) -> ast.AST | None:
 
 
 def _comp_target_names(target: ast.AST) -> list[str]:
-    """Names bound by a comprehension target (handles tuple unpacking)."""
-    if isinstance(target, ast.Name):
-        return [target.id]
-    if isinstance(target, (ast.Tuple, ast.List)):
-        return [name for element in target.elts for name in _comp_target_names(element)]
-    return []
+    """Names bound by a comprehension target (handles tuple unpacking), in source order."""
+    names: list[str] = []
+    todo = [target]
+    while todo:
+        current = todo.pop()
+        if isinstance(current, ast.Name):
+            names.append(current.id)
+        elif isinstance(current, (ast.Tuple, ast.List)):
+            todo.extend(reversed(current.elts))
+    return names
 
 
-def _strip_annotations(node: ast.AST) -> None:
-    """Blank out type annotations in-place before the certification walk.
+#: Set in a code object's ``co_flags`` by ``from __future__ import annotations``.
+_FUTURE_ANNOTATIONS_FLAG = __future__.annotations.compiler_flag
 
-    Parameter/return/variable annotations (``tokens: list[Token]``, ``-> bool``)
-    reference *types* that are never evaluated when the callable is *called*, so
-    they must not disqualify it — otherwise every type-annotated guard would fail
-    on the class name in its own signature. The node is a private copy
-    (:func:`_get_ast_node`), so mutating it is safe.
+
+def _signature_annotations(node: ast.AST) -> list[ast.AST]:
+    """The parameter and return annotations of a ``def`` node (none for a lambda)."""
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return []
+    args = node.args
+    params = [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]
+    found = [param.annotation for param in params if param is not None and param.annotation is not None]
+    return found if node.returns is None else [*found, node.returns]
+
+
+def _annotations_are_lazy(func: Callable) -> bool:
+    """True if a ``def`` nested in *func* would not evaluate its annotations when defined."""
+    code = getattr(func, "__code__", None)
+    return sys.version_info >= (3, 14) or bool(getattr(code, "co_flags", 0) & _FUTURE_ANNOTATIONS_FLAG)
+
+
+def _inert_annotations(root: ast.AST, func: Callable) -> frozenset[int]:
+    """The ``id()`` of every annotation under *root* that never runs when *func* is called.
+
+    These reference *types*, so they must not disqualify the callable — otherwise every
+    type-annotated guard would fail on the class name in its own signature — and nothing
+    inside one may count as a binding: a walrus in one (``x: (STATE := int) = 1``, legal
+    before 3.14) never runs, so it must not hide a read of a same-named global. They are:
+
+    * *root*'s own parameter and return annotations, evaluated once when it was defined;
+    * every local variable annotation (``AnnAssign``), never evaluated in function scope.
+      That holds because every ``AnnAssign`` a certified callable can hold is in function
+      scope: :func:`_check_structural` rejects a nested ``class``, whose body would run its
+      annotations on every call before 3.14;
+    * a nested ``def``'s parameter and return annotations **only** when annotations are
+      lazy (3.14+, or ``from __future__ import annotations``). Before that they run each
+      time the nested ``def`` statement does, i.e. on every call of *func*, so they are
+      walked like any other code.
+
+    Annotations are skipped rather than stripped because *root* belongs to the shared
+    source cache (:mod:`cpnx.sandbox`), which must never be mutated.
     """
-    for child in ast.walk(node):
-        if isinstance(child, ast.arg):
-            child.annotation = None
-        elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            child.returns = None
-        elif isinstance(child, ast.AnnAssign):
-            child.annotation = ast.Constant(value=None)
+    inert = _signature_annotations(root)
+    lazy = _annotations_are_lazy(func)
+    for node in ast.walk(root):
+        if isinstance(node, ast.AnnAssign):
+            inert.append(node.annotation)
+        elif lazy and node is not root:
+            inert.extend(_signature_annotations(node))
+    return frozenset(id(node) for node in inert)
+
+
+def _live_children(node: ast.AST, inert: frozenset[int]) -> Iterator[ast.AST]:
+    """Like :func:`ast.iter_child_nodes`, leaving out the annotations in *inert*."""
+    return (child for child in ast.iter_child_nodes(node) if id(child) not in inert)
+
+
+def _walk_live(node: ast.AST, inert: frozenset[int]) -> Iterator[ast.AST]:
+    """Walk *node* breadth-first like :func:`ast.walk`, leaving out the annotations in *inert*."""
+    todo = deque([node])
+    while todo:
+        current = todo.popleft()
+        todo.extend(_live_children(current, inert))
+        yield current
 
 
 def _check_structural(node: ast.AST) -> Verdict | None:
@@ -448,12 +492,16 @@ def _check_structural(node: ast.AST) -> Verdict | None:
         return Verdict(False, "unbounded iteration (for/while)")
     if isinstance(node, (ast.Await, ast.Yield, ast.YieldFrom)):
         return Verdict(False, "await/yield")
+    if isinstance(node, ast.ClassDef):
+        # A class body runs on every call: its annotations are evaluated before 3.14, and its
+        # names would otherwise leak into the callable's bound names (see _bound_names).
+        return Verdict(False, "class definition")
     if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
         return Verdict(False, f"private/dunder attribute '{node.attr}'")
     return None
 
 
-def _bound_names(node: ast.AST) -> frozenset[str]:
+def _bound_names(node: ast.AST, inert: frozenset[int]) -> frozenset[str]:
     """Names bound in *node*'s **own** scope — assignments/targets plus the names
     of nested functions defined here.
 
@@ -473,11 +521,23 @@ def _bound_names(node: ast.AST) -> frozenset[str]:
     conservatively rejected (the safe direction). Note ``bound`` is a
     false-*reject*-avoidance heuristic, not a soundness mechanism; other Python
     scope-introducers not reachable in a certifiable body today (e.g. a nested
-    ``class``) would share the same shadowing trait if they became reachable.
+    ``class``, which :func:`_check_structural` rejects) would share the same
+    shadowing trait if they became reachable.
+
+    *node*'s own ``arguments`` are left out of the *bindings*: the parameter names
+    come from :func:`_param_names`, and the default values ran once, when *node*
+    was defined, so a walrus in one (``def guard(t, _=(STATE := 0))``) binds nothing
+    when the callable runs and must not hide a read of a same-named global. The
+    defaults stay in the *walk* (:func:`_walk_live`), though: a default holding a
+    mutable global (``def guard(t, _=STATE)``) hands the callable live state through
+    a parameter whose reads are never checked, so the read in the default is what
+    rejects it.
     """
     names: set[str] = set()
-    for child in ast.iter_child_nodes(node):
-        _collect_scope_bindings(child, names)
+    signature = getattr(node, "args", None)
+    for child in _live_children(node, inert):
+        if child is not signature:
+            _collect_scope_bindings(child, names, inert)
     return frozenset(names)
 
 
@@ -487,7 +547,7 @@ def _bound_names(node: ast.AST) -> frozenset[str]:
 _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
-def _collect_scope_bindings(node: ast.AST, names: set[str]) -> None:
+def _collect_scope_bindings(node: ast.AST, names: set[str], inert: frozenset[int]) -> None:
     """Accumulate the names *node* binds in the current scope, without recursing
     into scopes whose bindings do not belong to it.
 
@@ -498,34 +558,38 @@ def _collect_scope_bindings(node: ast.AST, names: set[str]) -> None:
     the same false accept as a nested-``def`` binding), but a walrus (``:=``)
     binding *does* leak out to the enclosing function, so those are collected
     (see :func:`_leaked_walrus_targets`). Everything else is walked through.
+
+    Iterative, like :func:`_walk_live`, so a very deep expression cannot raise
+    ``RecursionError`` out of :func:`certify`.
     """
-    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-        names.add(node.id)
-        return
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        names.add(node.name)
-        return
-    if isinstance(node, ast.Lambda):
-        return
-    if isinstance(node, _COMPREHENSIONS):
-        _leaked_walrus_targets(node, names)
-        return
-    for child in ast.iter_child_nodes(node):
-        _collect_scope_bindings(child, names)
+    todo = [node]
+    while todo:
+        current = todo.pop()
+        if isinstance(current, ast.Name) and isinstance(current.ctx, ast.Store):
+            names.add(current.id)
+        elif isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.add(current.name)
+        elif isinstance(current, _COMPREHENSIONS):
+            _leaked_walrus_targets(current, names, inert)
+        elif not isinstance(current, ast.Lambda):
+            todo.extend(_live_children(current, inert))
 
 
-def _leaked_walrus_targets(node: ast.AST, names: set[str]) -> None:
+def _leaked_walrus_targets(node: ast.AST, names: set[str], inert: frozenset[int]) -> None:
     """Collect walrus (``NamedExpr``) target names that leak from *node* into the
     enclosing function scope.
 
     A walrus inside a comprehension binds in the nearest enclosing *function*
     scope (PEP 572), transparently through any number of comprehension layers —
     so descend through comprehensions, but stop at a nested ``Lambda``/``def``
-    boundary, whose walruses are scoped to *it*, not to us.
+    boundary, whose walruses are scoped to *it*, not to us. Iterative, as
+    :func:`_collect_scope_bindings` is.
     """
-    if isinstance(node, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)):
-        return
-    if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
-        names.add(node.target.id)
-    for child in ast.iter_child_nodes(node):
-        _leaked_walrus_targets(child, names)
+    todo = [node]
+    while todo:
+        current = todo.pop()
+        if isinstance(current, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if isinstance(current, ast.NamedExpr) and isinstance(current.target, ast.Name):
+            names.add(current.target.id)
+        todo.extend(_live_children(current, inert))
